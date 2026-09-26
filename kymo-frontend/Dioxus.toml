@@ -1,0 +1,6 @@
+[application]
+name = "kymo"
+default_platform = "web"
+
+[web.app]
+title = "kymo — Metrics Dashboard"

@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "postgresql": {
+    "version": "17.10.0",
+    "base_url": "https://github.com/theseus-rs/postgresql-binaries/releases/download/17.10.0",
+    "targets": {
+      "macos-arm64": {
+        "filename": "postgresql-17.10.0-aarch64-apple-darwin.tar.gz",
+        "size": 12711817,
+        "sha256": "e15b5d3b86363d51fe06c9f26ee1d35d09b13951be82641b8f4b2d0e06e2c51e",
+        "format": "tar-gz-tree"
+      },
+      "linux-x86_64": {
+        "filename": "postgresql-17.10.0-x86_64-unknown-linux-gnu.tar.gz",
+        "size": 11752668,
+        "sha256": "333937dac26a33d367810b0db20892bbca6cf244f670e26f54f3e0b57dcb50b6",
+        "format": "tar-gz-tree"
+      }
+    }
+  },
+  "clickhouse": {
+    "version": "25.3.14.14",
+    "base_url": "https://github.com/ClickHouse/ClickHouse/releases/download/v25.3.14.14-lts",
+    "targets": {
+      "macos-arm64": {
+        "filename": "clickhouse-macos-aarch64",
+        "size": 107227436,
+        "sha256": "468e33062f3cbfeb6bbaa8709b7fdd31c73a177e31cb60ed7933452a6685648b",
+        "installed_sha256": "31f60cd7ae73563e8a1ff5f46df9b8572561e04b7b8da1654d43aa4bd1a2b130",
+        "format": "executable"
+      },
+      "linux-x86_64": {
+        "filename": "clickhouse-common-static-25.3.14.14-amd64.tgz",
+        "size": 164399833,
+        "sha256": "4fd9c705eb4952335c30ca09fa29a021e63d0e7e05da7f8d9f965e2f4cfb246a",
+        "installed_sha256": "a413905b60d914a684e054e61449c38ffbe1b4d61e3821367d7be038e107e438",
+        "format": "tar-gz-clickhouse"
+      }
+    }
+  }
+}

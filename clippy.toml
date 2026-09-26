@@ -1,0 +1,4 @@
+# tonic::Status is the public error type of the gRPC handlers. Boxing it to
+# satisfy Clippy's generic size heuristic would add indirection throughout the
+# service without shrinking the wire or request state.
+large-error-threshold = 256

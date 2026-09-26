@@ -1,0 +1,2356 @@
+/* === Design Tokens === */
+:root {
+    /* UserConfig sets this before routed content mounts. Typography and
+       text controls use rem to follow this root size. */
+    --kymo-user-font-size: 16px;
+    font-size: var(--kymo-user-font-size);
+    /* The sidebar drag (sidebar.rs) overrides this on <html> with the saved percentage. */
+    --kymo-sidebar-w: 20vw;
+    --bg0: #0E0F21;
+    --bg1: #13152C;
+    --bg2: #191B31;
+    --bg3: #22253F;
+    --text-main: #FFFFFF;
+    --text-disabled: #FFFFFFA0;
+    --text-placeholder: #FFFFFF77;
+    --text-headings: #F5F3C2;
+    --warning: #FF7878;
+    --success: #2ecc71;
+    --caution: #F2B33D;
+    /* Axis ticks stroke this too (AI-1384: ticks and gridlines stay one color). */
+    --chart-grid: #333;
+    --chart-axis: #888;
+    --scrollbar-thumb: var(--bg3);
+    --scrollbar-thumb-hover: #5f668c;
+    /* Native widgets and unstyled scrollbars follow the theme. */
+    color-scheme: dark;
+    /* 0s on purpose: every hover/focus change lands the same frame as the
+       pointer — snappy beats smooth here. The declarations keep the token
+       so re-tuning stays a one-line change. */
+    --transition: 0s;
+    --font-ui: "Source Sans Pro", -apple-system, BlinkMacSystemFont, "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
+    --font-heading: var(--font-ui);
+    --font-mono: "JetBrains Mono", "Source Code Pro", "Fira Code", Consolas, monospace;
+    /* Typography tiers retain their 15px design base; rem scales them with the user font size. */
+    --font-size-7: 0.4667rem;
+    --font-size-10: 0.6667rem;
+    --font-size-11: 0.7333rem;
+    --font-size-12: 0.8rem;
+    --font-size-13: 0.8667rem;
+    --font-size-14: 0.9333rem;
+    --font-size-15: 1rem;
+    --font-size-16: 1.0667rem;
+    --font-size-17: 1.1333rem;
+    --font-size-18: 1.2rem;
+    --font-size-20: 1.3333rem;
+    --font-size-24: 1.6rem;
+    --font-size-28: 1.8667rem;
+    --spacing-xs: 4px;
+    --spacing-sm: 8px;
+    --spacing-md: 16px;
+    --spacing-lg: 24px;
+    --spacing-xl: 32px;
+    /* Label column of .binding-field rows; their sub-rows indent past it. */
+    --field-label-width: 4.2667rem;
+}
+
+/* === Reset & Base === */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    font-family: var(--font-ui);
+    line-height: 1.45;
+    color: var(--text-main);
+    background: var(--bg0);
+}
+
+/* Form controls default to the UA font instead of inheriting. */
+button, input, select, textarea { font-family: inherit; }
+
+a { color: var(--text-headings); text-decoration: none; transition: color var(--transition); }
+a:hover { color: var(--text-main); }
+
+h1, h2, h3, h4, h5, h6 {
+    font-family: var(--font-heading);
+    color: var(--text-headings);
+    font-weight: 600;
+}
+
+/* === Scrollbar === */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: var(--bg1); }
+::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); }
+::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); }
+/* Firefox has no thumb hover, so its thumb always takes the hover color. */
+@supports not selector(::-webkit-scrollbar-thumb) {
+    * { scrollbar-width: thin; scrollbar-color: var(--scrollbar-thumb-hover) var(--bg1); }
+}
+
+/* === Range Sliders === */
+input[type="range"] {
+    appearance: none;
+    -webkit-appearance: none;
+    background: var(--bg0);
+    height: 10px;
+    outline: none;
+    padding: 0;
+    width: 100%;
+    border: 2px solid transparent;
+    border-radius: 3px;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    background: var(--bg3);
+    cursor: pointer;
+    height: 20px;
+    width: 10px;
+    border-radius: 3px;
+}
+
+input[type="range"]::-moz-range-thumb {
+    background: var(--bg3);
+    cursor: pointer;
+    height: 20px;
+    width: 10px;
+    border-radius: 3px;
+    border: none;
+}
+
+input[type="range"]:focus::-webkit-slider-thumb {
+    background: var(--text-headings);
+}
+
+input[type="range"]:focus::-moz-range-thumb {
+    background: var(--text-headings);
+}
+
+/* === Shared Controls === */
+/* Bare action buttons that brighten on hover; size, padding, and opacity gating are per-site. */
+.navbar-action, .section-action, .rect-action, .navbar-search-clear,
+.sidebar-trash-trigger, .sidebar-trash-cancel, .run-overflow-trigger {
+    background: none;
+    border: none;
+    color: var(--text-disabled);
+    cursor: pointer;
+    line-height: 1.3; /* numeric for .icon-button's 1lh */
+    transition: color var(--transition);
+}
+.navbar-action:hover, .section-action:hover, .rect-action:hover, .navbar-search-clear:hover { color: var(--text-headings); }
+
+/* Inline text buttons; color per-site. */
+.btn-link, .binding-remove {
+    background: none;
+    border: none;
+    font-size: var(--font-size-14);
+    padding: 0;
+    cursor: pointer;
+}
+
+/* Text fields: no UA outline, headings border when focused. */
+.rect-title-input, .sidebar-filter, .projects-filter,
+.binding-field select,
+.binding-field input[type="text"],
+.binding-field input[type="number"] {
+    outline: none;
+}
+.rect-title-input:focus, .sidebar-filter:focus, .projects-filter:focus,
+.binding-field select:focus,
+.binding-field input[type="text"]:focus,
+.binding-field input[type="number"]:focus {
+    border-color: var(--text-headings);
+}
+input::placeholder { color: var(--text-placeholder); }
+
+/* Custom checkboxes, app-wide. Sidebar visibility markers override this
+   square/check treatment below without changing their native semantics. */
+input[type="checkbox"] {
+    appearance: none;
+    width: 14px;
+    height: 14px;
+    background: var(--bg3);
+    cursor: pointer;
+    flex-shrink: 0;
+    position: relative;
+}
+input[type="checkbox"]:checked { background: var(--text-headings); }
+input[type="checkbox"]:focus-visible {
+    outline: 2px solid var(--text-headings);
+    outline-offset: 2px;
+}
+input[type="checkbox"]:checked::before {
+    content: '';
+    position: absolute;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    width: 8px; height: 8px;
+    background-color: var(--bg0);
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41L9 16.17z'/%3E%3C/svg%3E");
+    mask-size: contain;
+}
+
+/* === Overflow Fade === */
+/* Overflowing text fades over its last 16px. util/overflow_fade.js sets data-overflow only while the content is wider than the box, so text that fits keeps its full width. Inline-block children let in-place text changes re-mark the box. The mask also fades the box's own paint (background, focus ring) and clips descendants shown outside it, fixed ones included: use an unpainted box and turn the mask off for hover reveals. */
+.fade-overflow {
+    display: block;
+    overflow: hidden;
+    white-space: nowrap;
+}
+.fade-overflow > * { display: inline-block; }
+.fade-overflow[data-overflow] {
+    mask-image: linear-gradient(to right, #000 calc(100% - 16px), transparent);
+}
+
+/* === App Shell === */
+/* app-root is a flex column holding the notice bar and the route root. List pages let the
+   document scroll (the router's scroll restoration works on the window), so app-root is only
+   min-height there; the dashboard shell is pinned to the viewport and scrolls its own columns. */
+.app-root {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+.app-root:has(> .app-shell) { height: 100vh; }
+.app-shell {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+/* === Notice Bar === */
+.notice-bar {
+    flex-shrink: 0;
+    border-bottom: 1px solid var(--bg3);
+    background: color-mix(in srgb, var(--bg1) 85%, var(--warning));
+    font-size: var(--font-size-13);
+    /* Many or wrapped notices must never push the app off-screen. */
+    max-height: 40vh;
+    overflow-y: auto;
+}
+.notice-bar:empty { border-bottom: 0; }
+.notice {
+    display: flex;
+    align-items: baseline;
+    gap: var(--spacing-sm);
+    padding: var(--spacing-xs) var(--spacing-md);
+}
+.notice-text { min-width: 0; }
+.notice-dismiss {
+    margin-left: auto;
+    white-space: nowrap;
+    background: none;
+    border: 1px solid var(--bg3);
+    color: var(--text-disabled);
+    font: inherit;
+    padding: 0 var(--spacing-sm);
+    cursor: pointer;
+}
+.notice-dismiss:hover { color: var(--text-main); }
+
+/* === Navbar === */
+.navbar {
+    min-height: 2.4rem;
+    background: var(--bg1);
+    border-bottom: 1px solid var(--bg3);
+    display: flex;
+    align-items: center;
+    padding: 0.1333rem var(--spacing-md);
+    gap: var(--spacing-sm);
+    flex-shrink: 0;
+}
+
+.navbar-brand { color: var(--text-disabled); font-size: var(--font-size-14); }
+.navbar-brand:hover { color: var(--text-main); }
+.navbar-sep { color: var(--bg3); }
+.navbar-current {
+    color: var(--text-main);
+    font-weight: 600;
+    font-size: var(--font-size-14);
+    min-width: 0;
+}
+.navbar-spacer { flex: 1; }
+
+/* === Content Area === */
+.content-row {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+    position: relative;
+}
+
+/* The main column's non-scrolling box: scroll lives in .main-content
+   inside it, so an absolutely positioned overlay child covers exactly the
+   column's visible area — independent of scroll position, sidebar width,
+   or sidebar collapse. */
+.main-wrap {
+    flex: 1;
+    min-width: 0;
+    position: relative;
+    display: flex;
+    flex-direction: column;
+}
+
+.main-content {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    position: relative;
+    /* Own stacking context: in-grid z-indexes (actions 55, title pop 60, tips 70) resolve locally, so nothing in the grid can hit-test or paint above the sibling maximize overlay (50). In-grid fixed CDN lightboxes still cover sidebar/navbar: those are z-auto/static and paint earlier. Editor dialogs use the browser top layer. */
+    isolation: isolate;
+}
+/* While the maximize overlay is up, freeze the underlying scrollbar so the
+   illusion of a flat full-area panel isn't broken by a vestigial gutter. */
+.main-content-locked { overflow: hidden; }
+
+/* === Maximize Overlay === */
+/* Anchored to .main-wrap (the main column's non-scrolling box), NOT the
+   viewport: the run sidebar stays visible and usable while a chart is
+   maximized (AI-1339), and the navbar stays above. .main-wrap doesn't
+   scroll, so inset: 0 is the column's visible area no matter where the
+   user had scrolled when maximizing. */
+.maximize-overlay:focus {
+    outline: none;
+}
+
+.maximize-overlay {
+    position: absolute;
+    inset: 0;
+    background: var(--bg0);
+    z-index: 50;
+    display: flex;
+    flex-direction: column;
+    padding: var(--spacing-md);
+}
+.maximize-content {
+    flex: 1;
+    display: flex;
+    min-height: 0;
+}
+.maximize-content > .metric-rect {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+}
+/* In maximized mode, action buttons should stay visible without hover —
+   the rect already fills the screen, so there's no "ambient" state. */
+.maximize-content .rect-actions { opacity: 1; }
+
+/* === Sidebar === */
+.sidebar {
+    width: var(--kymo-sidebar-w);
+    background: var(--bg1);
+    border-right: 1px solid var(--bg3);
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+    overflow: hidden;
+    position: relative;
+}
+
+.sidebar-resize {
+    position: absolute;
+    top: 0;
+    right: 0;
+    width: 5px;
+    height: 100%;
+    cursor: col-resize;
+    z-index: 5;
+}
+.sidebar-resize:hover { background: var(--bg3); }
+
+.sidebar-meta { font-size: var(--font-size-11); color: var(--text-disabled); }
+
+.sidebar-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.2667rem var(--spacing-md);
+    gap: 0.2667rem;
+    border-bottom: 1px solid var(--bg3);
+}
+.sidebar-actions > .btn-link { min-height: 1.6rem; }
+
+.sidebar-actions-end {
+    display: flex;
+    align-items: center;
+    gap: 0.2667rem;
+    flex-shrink: 0;
+}
+
+.sidebar-trash-trigger,
+.sidebar-trash-cancel {
+    width: 1.6rem;
+    height: 1.6rem;
+    font-size: var(--font-size-14);
+}
+.sidebar-trash-trigger:hover,
+.sidebar-trash-cancel:hover { color: var(--text-main); }
+.sidebar-trash-trigger:disabled,
+.sidebar-trash-cancel:disabled,
+.sidebar-trash-mode .btn-link:disabled { cursor: default; opacity: 0.45; }
+.sidebar-trash-mode .sidebar-actions {
+    background: var(--bg2);
+    background: color-mix(in srgb, var(--bg2) 94%, var(--warning));
+}
+.sidebar-trash-busy .sidebar-filter-row,
+.sidebar-trash-busy .sidebar-body { pointer-events: none; }
+
+.sidebar-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: var(--spacing-xs) 0;
+}
+
+.sidebar-empty { padding: var(--spacing-sm) var(--spacing-md); font-size: var(--font-size-12); color: var(--text-disabled); }
+
+/* Run row layout: the visibility marker sits beside one status/name group.
+   The overflow button overlays the name tail instead of reserving a column,
+   so hidden actions never make the name fade prematurely. */
+.sidebar-run {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: center;
+    /* The marker label owns the full visual gap before the linked status, so
+       the adjacent hit targets meet without a dead strip between them. */
+    column-gap: 0;
+    /* No row padding: the left one lives in .run-marker-toggle so it is part of the marker's clickable label, and names fade out at the right edge. */
+    /* Row height IS the text line box; the name host stretches to it,
+       so the full height of every row is clickable and consecutive rows
+       tile with no dead strips between rows. */
+    line-height: 1.75;
+    /* Keep the row pinned while the hovered name leaves the flow. */
+    min-height: 1lh;
+    cursor: pointer;
+    position: relative;
+    /* Both modes drag-paint across rows, so a press must not also start a text
+       selection. This sits on the crossed rows, not just the pressed marker,
+       because WebKit still begins one from a user-select:none origin. */
+    user-select: none;
+}
+/* Hover, or chart hover mirrored into the run list (toggled by
+   __kymo_setHl): same look either way. */
+.sidebar-run:hover, .sidebar-run-hl { background: var(--bg2); --row-bg: var(--bg2); }
+.sidebar-run-hl .run-name-host { color: var(--text-headings); }
+
+.sidebar-run > * { justify-self: center; }
+.sidebar-run > .run-details {
+    justify-self: stretch;
+    align-self: stretch;
+    min-width: 0;
+}
+
+/* Status and name share one destination and therefore one link/focus stop.
+   Their own grid retains the original 8px spacing between the two. */
+.run-details {
+    display: grid;
+    grid-template-columns: 14px minmax(0, 1fr);
+    align-items: center;
+    column-gap: var(--spacing-sm);
+}
+.run-details > * { justify-self: center; }
+.run-details > .run-name-host {
+    justify-self: stretch;
+    align-self: stretch;
+    min-width: 0;
+}
+.run-details-link:hover .run-name-host { color: var(--text-headings); }
+
+.sidebar-run-trash:focus-visible {
+    background: var(--bg2);
+    --row-bg: var(--bg2);
+    outline: 1px solid var(--text-headings);
+    outline-offset: -1px;
+}
+.sidebar-run-trash-selected,
+.sidebar-run-trash-selected:hover,
+.sidebar-run-trash-selected:focus-visible {
+    background: var(--bg3);
+    --row-bg: var(--bg3);
+}
+.run-overflow-trigger {
+    /* Centred by auto margins, not a transform: Firefox resolves the row popovers' anchor() against the untransformed box. */
+    position: absolute;
+    inset: 0 var(--spacing-xs) 0 auto;
+    margin: auto 0;
+    z-index: 61;
+    width: 1.6rem;
+    height: 1.6rem;
+    background: var(--row-bg, var(--bg1));
+    font-size: var(--font-size-16);
+    opacity: 0;
+    /* Keep the invisible hit target active: the control reveals only when
+       the pointer reaches the area that can actually be clicked. */
+    pointer-events: auto;
+}
+.run-overflow-trigger:hover,
+.run-overflow-trigger:focus-visible {
+    opacity: 1;
+}
+.run-overflow-trigger:hover { color: var(--text-main); }
+@media (hover: none) {
+    .run-overflow-trigger { opacity: 1; }
+}
+
+/* Native label semantics: any click on the label toggles visibility, so its
+   padding and stretched height ARE the enlarged hitbox. Split the original
+   one-sided padding around the marker: this adds clickable room on its right,
+   moves the marker and status/name group slightly left, and preserves their
+   original visual spacing. In Trash mode the row owns checkbox semantics and
+   this wrapper is presentation-only. */
+.run-marker-toggle {
+    align-self: stretch;
+    display: flex;
+    align-items: center;
+    padding: 0 var(--spacing-sm) 0 12px;
+    cursor: pointer;
+}
+
+.run-name-host {
+    font-size: var(--font-size-15);
+    color: var(--text-main);
+}
+.run-name-host:hover { color: var(--text-headings); }
+.run-name-inline-host {
+    display: flex;
+    align-items: center;
+}
+.run-name-inline-input {
+    width: 100%;
+    min-width: 0;
+    height: 1.6rem;
+    padding: 0 var(--spacing-xs);
+    outline: none;
+    border: 1px solid var(--text-headings);
+    background: var(--bg0);
+    color: var(--text-main);
+    font: inherit;
+    line-height: 1;
+}
+.run-name-inline-input-error { border-color: var(--warning); }
+.run-name-inline-input[readonly] { color: var(--text-disabled); }
+.sidebar-run:has(.run-name-inline-input) .run-overflow-trigger { display: none; }
+/* Keep the host in flow as the popup anchor. The name alone pops out, and
+   pointer-events:none preserves row dragging and wheel scrolling beneath it. */
+.sidebar-run { anchor-scope: --run-link; }
+.run-name-host { anchor-name: --run-link; }
+.sidebar-run:hover .run-name-host { mask-image: none; }
+.sidebar-run:hover .run-name {
+    position: fixed;
+    position-anchor: --run-link;
+    top: anchor(top);
+    left: anchor(left);
+    width: max-content;
+    background: var(--row-bg, var(--bg2));
+    pointer-events: none;
+    /* above the maximize overlay (50) like the color picker */
+    z-index: 60;
+}
+
+/* === Projects Page === */
+
+.projects-page-inner {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: var(--spacing-xl) var(--spacing-md);
+}
+
+.projects-page h1 { font-size: var(--font-size-24); margin-bottom: var(--spacing-lg); }
+
+.projects-filter { margin-bottom: var(--spacing-md); font-size: var(--font-size-14); }
+.project-list { display: flex; flex-direction: column; gap: var(--spacing-sm); }
+
+.projects-title-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--spacing-md);
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: var(--spacing-lg);
+}
+.projects-page .projects-title-row h1 { margin-bottom: 0; }
+.projects-page-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--spacing-md);
+}
+.project-card {
+    display: block;
+    padding: var(--spacing-sm) var(--spacing-md);
+    background: var(--bg1);
+    border: 1px solid var(--bg3);
+    transition: border-color var(--transition);
+}
+.project-card:hover { border-color: var(--text-headings); }
+.project-card-name {
+    font-weight: 600;
+    color: var(--text-main);
+    overflow-wrap: anywhere;
+}
+
+/* === Trash Page === */
+.trash-page-inner {
+    max-width: 1120px;
+    margin: 0 auto;
+    padding: var(--spacing-xl) var(--spacing-md);
+}
+.trash-header { margin-bottom: var(--spacing-xl); }
+.trash-back-link {
+    display: inline-block;
+    margin-bottom: var(--spacing-sm);
+    color: var(--text-disabled);
+    font-size: var(--font-size-14);
+}
+.trash-back-link:hover { color: var(--text-main); }
+.trash-heading h1 { font-size: var(--font-size-28); }
+.trash-description {
+    margin-top: var(--spacing-xs);
+    color: var(--text-disabled);
+    font-size: var(--font-size-15);
+}
+.trash-section {
+    border: 1px solid var(--bg3);
+    background: var(--bg1);
+    overflow-x: auto;
+}
+.trash-table {
+    width: 100%;
+    border-collapse: collapse;
+    table-layout: fixed;
+}
+.trash-table th {
+    padding: var(--spacing-sm) var(--spacing-md);
+    border-bottom: 1px solid var(--bg3);
+    color: var(--text-disabled);
+    font-size: var(--font-size-13);
+    font-weight: 400;
+    text-align: left;
+}
+.trash-table th:nth-child(2) { width: 35%; }
+.trash-table th:nth-child(3) { width: 9rem; }
+.trash-table-title {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: var(--spacing-sm);
+}
+.trash-table-title h2 {
+    font-family: var(--font-ui);
+    font-size: var(--font-size-16);
+}
+.trash-count {
+    color: var(--text-disabled);
+    font-size: var(--font-size-13);
+}
+.trash-actions-heading { text-align: right; }
+.visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+}
+.trash-run {
+    anchor-scope: --trash-run-name;
+}
+.trash-run td {
+    padding: var(--spacing-xs) var(--spacing-md);
+    border-bottom: 1px solid var(--bg3);
+    vertical-align: middle;
+}
+.trash-run:last-child td { border-bottom: 0; }
+.trash-run-title-line {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+}
+.trash-run-link {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 8px;
+    min-width: 0;
+}
+.trash-run-link:hover .trash-run-name,
+.trash-run-link:focus-visible .trash-run-name {
+    text-decoration: underline 2px;
+    text-underline-offset: 2px;
+}
+.trash-run-link:focus-visible { outline: none; }
+.trash-run-meta {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+}
+.trash-run-name-host {
+    anchor-name: --trash-run-name;
+    position: relative;
+}
+.trash-run-name,
+.trash-run-name-placeholder {
+    color: var(--text-main);
+    font-family: var(--font-ui);
+    font-size: var(--font-size-17);
+    white-space: nowrap;
+}
+.trash-run-name-placeholder { visibility: hidden; }
+.trash-run-name {
+    position: absolute;
+    top: 0;
+    left: 0;
+}
+.trash-run-link:hover .trash-run-name,
+.trash-run-link:focus-visible .trash-run-name {
+    position: fixed;
+    position-anchor: --trash-run-name;
+    top: anchor(top);
+    left: anchor(left);
+    width: max-content;
+    background: var(--bg1);
+    z-index: 2;
+    pointer-events: none;
+}
+.trash-run-link:hover .trash-run-name-host,
+.trash-run-link:focus-visible .trash-run-name-host { mask-image: none; }
+.trash-run-ordinal,
+.trash-run-project,
+.trash-run-deleted {
+    color: var(--text-disabled);
+    font-size: var(--font-size-14);
+}
+.trash-run-project { color: var(--text-headings); }
+.trash-run-project:hover { text-decoration: underline; }
+.trash-run-project:focus-visible {
+    outline: none;
+    color: var(--text-main);
+    text-decoration: underline 2px;
+    text-underline-offset: 2px;
+}
+.trash-run-meta-separator { color: var(--text-disabled); }
+.trash-run-expiry {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: var(--spacing-xs) var(--spacing-sm);
+    color: var(--text-main);
+    font-size: var(--font-size-14);
+}
+.trash-expiry-relative {
+    color: var(--text-disabled);
+    font-size: var(--font-size-13);
+}
+.trash-run-action { text-align: right; }
+.trash-run-action .btn {
+    min-height: 32px;
+    padding: var(--spacing-xs) 12px;
+    color: var(--text-headings);
+    font-size: var(--font-size-16);
+    font-weight: 600;
+    border: 1px solid var(--bg3);
+    background: var(--bg0);
+}
+.trash-run-action .btn:hover:not(:disabled) {
+    border-color: var(--text-headings);
+    background: var(--bg2);
+}
+.trash-run-action .btn:disabled {
+    color: var(--text-disabled);
+    cursor: default;
+}
+.trash-load-more {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-end;
+    gap: var(--spacing-md);
+    padding: var(--spacing-sm) var(--spacing-md);
+    color: var(--text-disabled);
+    font-size: var(--font-size-13);
+}
+.trash-load-more .btn {
+    min-width: 96px;
+    border: 1px solid var(--bg3);
+    color: var(--text-main);
+}
+.trash-empty {
+    padding: var(--spacing-lg) var(--spacing-md);
+    text-align: center;
+}
+.trash-empty h3 {
+    font-family: var(--font-ui);
+    font-size: var(--font-size-17);
+}
+.trash-empty p {
+    margin-top: var(--spacing-xs);
+    color: var(--text-disabled);
+    font-size: var(--font-size-14);
+}
+
+@media (max-width: 800px) {
+    .trash-table, .trash-table thead, .trash-table tbody { display: block; }
+    .trash-table tr {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+    }
+    .trash-table th:first-child, .trash-run td:first-child { grid-column: 1 / -1; }
+    .trash-table th:nth-child(2), .trash-table th:nth-child(3) { width: auto; }
+    .trash-run td:first-child { border-bottom: 0; }
+    .trash-run-title-line {
+        flex-direction: column;
+        align-items: stretch;
+        gap: var(--spacing-xs);
+        white-space: normal;
+    }
+    .trash-run-meta { flex-wrap: wrap; white-space: normal; }
+    .trash-run-project { overflow-wrap: anywhere; }
+    .trash-run-ordinal { flex-shrink: 0; }
+    .trash-run-name-host { white-space: normal; }
+    .trash-run-link .trash-run-name,
+    .trash-run-link:hover .trash-run-name,
+    .trash-run-link:focus-visible .trash-run-name {
+        /* inline, not the fade's inline-block, so the ordinal aligns with the first line */
+        display: inline;
+        position: static;
+        width: auto;
+        white-space: normal;
+        overflow-wrap: anywhere;
+    }
+    .trash-run-name-placeholder { display: none; }
+    .trash-run-expiry { flex-direction: column; align-items: flex-start; }
+    .trash-run-action { align-self: end; }
+}
+
+.trash-error,
+.run-load-error {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--spacing-md);
+    margin-bottom: var(--spacing-md);
+    padding: var(--spacing-sm) var(--spacing-md);
+    border: 1px solid var(--bg3);
+    background: var(--bg1);
+    color: var(--text-main);
+    font-size: var(--font-size-14);
+}
+.run-load-error { margin: var(--spacing-md); }
+.trash-action-message {
+    position: sticky;
+    top: var(--spacing-sm);
+    z-index: 10;
+    margin-bottom: var(--spacing-sm);
+    padding: var(--spacing-sm) var(--spacing-md);
+    border: 1px solid var(--bg3);
+    background: var(--bg2);
+    color: var(--text-main);
+    font-size: var(--font-size-14);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.24);
+}
+.trashed-run-notice {
+    display: flex;
+    align-items: baseline;
+    gap: var(--spacing-sm);
+    margin: var(--spacing-md);
+    padding: var(--spacing-sm) var(--spacing-md);
+    border: 1px solid var(--bg3);
+    background: var(--bg1);
+    color: var(--text-disabled);
+    font-size: var(--font-size-13);
+}
+.trashed-run-notice strong {
+    color: var(--text-main);
+    font-family: var(--font-ui);
+}
+.trashed-run-notice a {
+    margin-left: auto;
+    white-space: nowrap;
+}
+@media (max-width: 900px) {
+    .trashed-run-notice { flex-wrap: wrap; }
+}
+
+/* === Metric Grid === */
+.metric-sections { display: flex; flex-direction: column; }
+
+
+/* Centered placeholder text; height (and size where noted) per site. */
+.empty-state, .rect-error, .rect-loading, .rect-empty,
+.cdn-gallery-empty, .cdn-gallery-loading, .cdn-gallery-pending,
+.metadata-empty {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-disabled);
+    font-size: var(--font-size-13);
+}
+.empty-state { height: 120px; }
+
+/* === Section === */
+.section {
+    position: relative;
+    border-bottom: 1px solid var(--bg3);
+}
+/* Insertion marker, centred on the 1px border it replaces (the padding box ends above the border). */
+.section::before, .section::after { content: ""; position: absolute; left: 0; right: 0; height: 3px; z-index: 1; pointer-events: none; background: transparent; }
+.section::before { top: -1px; }
+.section::after { bottom: -2px; }
+.section[data-insert-before="true"]::before, .section[data-insert-after="true"]::after { background: var(--text-headings); }
+.section[data-dragging="true"] > .section-header { opacity: 0.5; }
+.section-drag-handle { color: var(--text-disabled); font-size: var(--font-size-15); cursor: grab; user-select: none; }
+.section-drag-handle:hover { color: var(--text-headings); }
+
+.section-header {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-sm);
+    padding: var(--spacing-sm) var(--spacing-md);
+}
+
+.section-header:hover .section-action,
+.section-header:focus-within .section-action { opacity: 1; }
+
+.section-name {
+    font-family: var(--font-heading);
+    font-size: var(--font-size-15);
+    font-weight: 600;
+    color: var(--text-headings);
+    cursor: pointer;
+}
+.section-name:hover { color: var(--text-main); }
+
+.section-count { font-size: var(--font-size-11); color: var(--text-disabled); margin-left: var(--spacing-xs); }
+
+.section-action {
+    font-size: var(--font-size-14);
+    opacity: 0;
+    transition: opacity var(--transition), color var(--transition);
+    padding: 2px 4px;
+}
+.section-action-danger:hover { color: var(--warning); }
+
+.section-grid {
+    display: grid;
+    /* grid-template-columns is set inline by Section based on max_columns */
+    gap: var(--spacing-xs);
+    padding: 0 var(--spacing-sm) var(--spacing-sm);
+}
+
+/* Grid items default to min-width: auto (= min-content), which lets a wide
+   child (e.g. a many-column metadata table) push the track past the configured
+   span. Force them back to the track width; inner content scrolls instead. */
+.section-grid > * {
+    min-width: 0;
+}
+
+.section-page-label {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: var(--font-size-11);
+    color: var(--text-disabled);
+    padding: 0 var(--spacing-xs);
+    user-select: none;
+    min-width: 36px;
+}
+.section-page-input {
+    appearance: textfield;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 2px;
+    color: inherit;
+    cursor: text;
+    font: inherit;
+    outline: none;
+    padding: 0 2px;
+    text-align: right;
+    user-select: text;
+}
+.section-page-input:hover { border-color: var(--bg3); }
+.section-page-input:focus {
+    background: var(--bg0);
+    border-color: var(--text-headings);
+    color: var(--text-main);
+}
+.section-page-input::-webkit-inner-spin-button,
+.section-page-input::-webkit-outer-spin-button {
+    appearance: none;
+    margin: 0;
+}
+
+/* Pagination cluster: anchored to the right edge of the section header,
+   always visible (opacity is not hover-gated like the other actions). */
+.section-pagination {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+}
+.section-pagination .section-action {
+    opacity: 1;
+}
+
+/* === Metric Rect === */
+.metric-rect {
+    background: var(--bg1);
+    border-radius: 6px;
+    padding: var(--spacing-xs) var(--spacing-sm);
+    position: relative;
+    /* Keep Far placeholders equal to the mounted card at every font size. */
+    min-height: calc(var(--kymo-chart-height) + var(--spacing-xs) + var(--spacing-xs) + 1lh);
+    min-width: 0;
+    overflow: hidden;
+}
+
+.rect-header {
+    display: flex;
+    align-items: center;
+    /* no margin-bottom: the chart's own 8px top pad (uplot_chart.rs) is the title-to-plot gap */
+    /* anchor for the .rect-actions overlay */
+    position: relative;
+}
+
+.rect-title {
+    font-size: var(--font-size-15);
+    font-weight: 600;
+    color: var(--text-disabled);
+    flex: 1;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    min-width: 0;
+}
+/* Hover target grown from existing geometry: to the card edges via the padding tokens, down into the top half of the chart's 8px top pad (uplot_chart.rs). Chart cursor and reset-click unzoom go dead in the strip (renames instead), so it must not reach drawn rows; z 1 or the later-DOM chart internals win the hit-test. */
+.rect-title::before {
+    content: '';
+    position: absolute;
+    inset: calc(-1 * var(--spacing-xs)) calc(-1 * var(--spacing-sm));
+    z-index: 1;
+}
+
+.rect-title-text { min-width: 0; }
+/* Hover reveals the full title. The text stays in flow — position:fixed (the sidebar idiom) detaches from a scrolling chart — so the clips above it open instead: the fade box here and the card in the :has below. Background+z-index sit on the inner span, whose box spans the full text even while the outer clips it. */
+.rect-title:hover .rect-title-text { overflow: visible; mask-image: none; }
+.rect-title:hover .rect-title-pop {
+    position: relative;
+    background: var(--bg1);
+    /* above the actions row (55), below the chart tips (70) */
+    z-index: 60;
+}
+.metric-rect:has(.rect-title:hover) { overflow: visible; }
+
+.rect-title-input {
+    background: var(--bg0);
+    border: 1px solid var(--bg3);
+    color: var(--text-main);
+    font-size: var(--font-size-14);
+    font-weight: 600;
+    padding: 1px var(--spacing-xs);
+    flex: 1;
+}
+
+/* Corner badge on the rect's bottom-left (the rect is the positioning
+   context). pointer-events off so it never intercepts the chart cursor;
+   flex so the span shrink-wraps the 1em svg with no baseline gap below. */
+.rect-loading-indicator {
+    position: absolute;
+    left: var(--spacing-xs);
+    bottom: var(--spacing-xs);
+    display: flex;
+    color: var(--text-disabled);
+    font-size: var(--font-size-13);
+    pointer-events: none;
+}
+/* Spin the svg, not the wrapper span: SVG ink is centered in its box, so it spins in place. */
+.rect-loading-indicator .icon {
+    animation: rect-loading-spin 1s linear infinite;
+}
+
+@keyframes rect-loading-spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+
+/* Overlay, not in flow (AI-1393): hidden buttons must not steal title width; revealed ones paint over its tail. Opacity gates the container so the mask bg hides too; hover or keyboard focus reveals the row before activation. */
+.rect-actions {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    position: absolute;
+    right: 0;
+    /* no top/bottom: auto insets keep the row at its static position, already centered by the header's align-items:center (cf. the sidebar pop-out's grid note) */
+    background: var(--bg1);
+    /* above the chart, below the title hover-pop (60) */
+    z-index: 55;
+    opacity: 0;
+    transition: opacity var(--transition);
+}
+/* Fade-in band over the title tail, hung outside the row's box (right: 100%) as a pointer-events:none overlay: hover and clicks in the band fall through to the title (pop, rename) while the row itself — buttons and gaps — still hit-tests. It can't be padding on the row: padding is part of the row's hit area. */
+.rect-actions::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    right: 100%;
+    width: 16px;
+    background: linear-gradient(to right, transparent, var(--bg1));
+    pointer-events: none;
+}
+.metric-rect:hover .rect-actions,
+.metric-rect:focus-within .rect-actions { opacity: 1; }
+/* No actions while renaming: the overlay would fade bg1 over the bg0 input and steal caret clicks; Enter/Escape/blur exit anyway. display, not opacity, so the maximized always-on rule can't override. */
+.rect-header:has(.rect-title-input) .rect-actions { display: none; }
+
+.rect-action {
+    font-size: var(--font-size-16);
+    padding: 4px 6px;
+}
+.rect-action-delete:hover { color: var(--warning); }
+
+.rect-error { height: 120px; color: var(--warning); }
+
+/* Height comes from the render site: rect-level placeholders set the
+   section's chart_height inline (so charts without data still track
+   vertical resizes); placeholders nested in a sized viewer fill it. */
+.rect-loading, .rect-empty { height: 100%; }
+
+/* === uPlot overrides === */
+.u-select { background: rgba(245, 243, 194, 0.15) !important; }
+[data-theme="light"] .u-select { background: rgba(180, 160, 40, 0.2) !important; }
+.u-cursor-pt { display: none !important; }
+
+/* === Resize Handle === */
+.rect-resize-handle {
+    position: absolute;
+    bottom: 0;
+    right: 0;
+    width: 16px;
+    height: 16px;
+    cursor: nwse-resize;
+    opacity: 0;
+    transition: opacity var(--transition);
+}
+.metric-rect:hover .rect-resize-handle { opacity: 0.6; }
+.rect-resize-handle:hover { opacity: 1 !important; }
+.rect-resize-handle::before {
+    content: '';
+    position: absolute;
+    bottom: 3px;
+    right: 3px;
+    width: 8px;
+    height: 8px;
+    border-right: 2px solid var(--text-disabled);
+    border-bottom: 2px solid var(--text-disabled);
+}
+
+/* === Editor Dialogs === */
+.editor-dialog {
+    margin: auto;
+    padding: 0;
+    border: 0;
+    max-width: none;
+    max-height: none;
+    background: transparent;
+    color: inherit;
+    /* The inner panel owns scrolling; the transparent shell must not add
+       a second scroll area from the browser's dialog defaults. */
+    overflow: visible;
+}
+
+.editor-dialog::backdrop {
+    background: rgba(0, 0, 0, 0.6);
+}
+
+/* The autofocus panel is not an interactive control. */
+.editor-dialog > .modal:focus { outline: none; }
+
+.modal {
+    background: var(--bg1);
+    border: 1px solid var(--bg3);
+    padding: var(--spacing-lg);
+    width: min(480px, calc(100vw - 32px));
+    max-height: 80vh;
+    overflow-y: auto;
+}
+
+.modal h3 {
+    font-size: var(--font-size-14);
+    margin-bottom: var(--spacing-md);
+}
+
+.user-settings-modal { width: min(420px, calc(100vw - 32px)); }
+.user-settings-scope {
+    color: var(--text-disabled);
+    font-size: var(--font-size-12);
+    margin: calc(-1 * var(--spacing-sm)) 0 var(--spacing-lg);
+}
+.user-settings-field {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--spacing-md);
+}
+.user-settings-field label { color: var(--text-disabled); }
+.user-settings-font-control {
+    display: flex;
+    flex: 1;
+    align-items: center;
+    gap: var(--spacing-sm);
+    min-width: 0;
+}
+.user-settings-font-control output { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.checkbox-label.user-settings-toggle {
+    margin-top: var(--spacing-md);
+    padding: var(--spacing-xs) 0;
+    white-space: normal;
+}
+.user-settings-save-error {
+    margin-top: var(--spacing-md);
+    color: var(--warning);
+    font-size: var(--font-size-12);
+}
+.modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--spacing-sm);
+    padding-top: var(--spacing-sm);
+    border-top: 1px solid var(--bg3);
+    margin-top: var(--spacing-md);
+}
+
+/* Fixed smoothing help never reflows the editor's controls or action row. */
+.smoothing-hover-hint {
+    position: fixed;
+    left: calc(50% + 260px);
+    top: 50%;
+    z-index: 61;
+    box-sizing: border-box;
+    width: min(380px, calc(50vw - 280px));
+    margin: 0;
+    padding: var(--spacing-md);
+    background: var(--bg1);
+    border: 1px solid var(--bg3);
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+    color: var(--text-disabled);
+    font-size: var(--font-size-12);
+    line-height: 1.5;
+    white-space: pre-line;
+    pointer-events: none;
+    transform: translateY(-50%);
+    visibility: hidden;
+}
+
+.modal:has(.smoothing-select:hover) .smoothing-hover-hint {
+    visibility: visible;
+}
+
+@media (max-width: 1000px) {
+    .smoothing-hover-hint {
+        right: var(--spacing-lg);
+        top: var(--spacing-lg);
+        bottom: auto;
+        left: var(--spacing-lg);
+        width: auto;
+        transform: none;
+    }
+}
+
+.btn {
+    padding: var(--spacing-xs) var(--spacing-md);
+    font-size: var(--font-size-12);
+    cursor: pointer;
+    border: none;
+    transition: background var(--transition);
+}
+
+.btn-ghost { background: none; color: var(--text-disabled); }
+.btn-ghost:hover { color: var(--text-main); }
+
+.btn-primary {
+    background: var(--text-headings);
+    color: var(--bg0);
+    font-weight: 600;
+}
+.btn-primary:hover { background: var(--text-main); }
+
+.btn-link { color: var(--text-headings); }
+.btn-link:hover { color: var(--text-main); }
+
+/* Binding row */
+.binding-row {
+    background: var(--bg0);
+    border: 1px solid var(--bg3);
+    padding: var(--spacing-sm);
+    margin-bottom: var(--spacing-sm);
+}
+
+.binding-row-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: var(--spacing-sm);
+}
+
+.binding-label { font-size: var(--font-size-13); color: var(--text-disabled); }
+
+.binding-remove { color: var(--warning); }
+.binding-remove:hover { color: #ff9999; }
+
+.binding-fields { display: flex; flex-direction: column; gap: var(--spacing-xs); }
+
+.binding-field {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-sm);
+}
+
+.binding-field label {
+    font-size: var(--font-size-13);
+    color: var(--text-disabled);
+    width: var(--field-label-width);
+    flex-shrink: 0;
+}
+
+/* Field overridden at this cascade level (differs from the inherited
+   value): headings-yellow label + dot marker. */
+.field-overridden label {
+    color: var(--text-headings);
+}
+.field-reset-dot {
+    position: absolute;
+    top: 50%;
+    left: -10px;
+    padding: 4px;
+    border: 0;
+    background: transparent;
+    color: var(--text-headings);
+    cursor: pointer;
+    font-size: var(--font-size-7);
+    line-height: 1;
+    transform: translateY(-50%);
+}
+.field-reset-dot:hover { color: var(--text-main); }
+
+.binding-field select,
+.binding-field input[type="text"],
+.binding-field input[type="number"] {
+    flex: 1;
+    /* A select is otherwise as wide as its longest option. */
+    min-width: 0;
+    background: var(--bg1);
+    border: 1px solid var(--bg3);
+    border-radius: 0;
+    color: var(--text-main);
+    padding: var(--spacing-xs) var(--spacing-sm);
+    font-size: var(--font-size-13);
+}
+
+/* Sub-rows indent past the field labels to read as part of the field above. */
+.override-chips,
+.binding-metric-filter,
+.binding-run-list {
+    margin-left: calc(var(--field-label-width) + var(--spacing-sm));
+}
+.binding-filter-count {
+    flex-shrink: 0;
+    font-size: var(--font-size-11);
+    color: var(--text-placeholder);
+}
+.binding-run-list {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    max-height: 9.5rem;
+    overflow-y: auto;
+    padding: var(--spacing-xs) var(--spacing-sm);
+    background: var(--bg1);
+    border: 1px solid var(--bg3);
+}
+.binding-run-list .fade-overflow { min-width: 0; }
+.binding-run-empty { font-size: var(--font-size-13); color: var(--text-placeholder); }
+
+/* === uPlot Chart === */
+.chart-container {
+    width: 100%;
+    position: relative;
+    cursor: crosshair;
+    user-select: none;
+}
+
+/* === uPlot Tooltip === */
+.kymo-tip {
+    /* fixed: positioned in viewport coords beside the cursor's vertical
+       line, free to overflow the chart and any clipping ancestor */
+    position: fixed;
+    max-width: 33vw;
+    pointer-events: none;
+    z-index: 70;
+    background: var(--bg1);
+    border: 1px solid var(--bg3);
+    padding: var(--spacing-xs) var(--spacing-sm);
+    font: var(--font-size-13)/1.5 var(--font-ui);
+    color: var(--text-disabled);
+    white-space: nowrap;
+}
+
+/* The hovered (source) chart's full tooltip stacks above the compact
+   readouts the synced charts show at the same time; only it carries a
+   drop shadow — on the flat readouts the shadow read as clutter. */
+.kymo-tip-src {
+    z-index: 71;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+}
+
+.kymo-tip-step { margin-bottom: 2px; color: var(--text-disabled); }
+
+/* The run nearest the mouse on the crosshair: a dedicated dot drawn at
+   the point itself (uPlot's own cursor dots only show for series with a
+   datum at the exact hovered slot, which on the joined axis is rarely
+   the nearest run), plus a vertical bar before its tooltip row. */
+.kymo-hotpt {
+    position: absolute;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    transform: translate(-50%, -50%);
+    /* run color surround, page background inside; border color set inline */
+    border: 2.5px solid;
+    background: var(--bg0);
+    pointer-events: none;
+    z-index: 2;
+}
+/* Hot-run marker: a bar in the tip's side padding before the row's first cell, in the run's color (cells carry inline run colors — currentColor). Centered on the line box like the text itself (a full-height border read too tall). Every first cell reserves the gutter (the tip's --spacing-sm side padding, negative margin repaid exactly by padding: net-zero geometry, columns don't move) so the hot flip below is paint-only — retags never trigger layout and the tip's cached size can't change. The bar paints at the left edge, inside the opaque span of the name cell's fade mask (only its right 16px fade), so the mask can't clip it. */
+.kymo-tip-row > :first-child {
+    margin-left: calc(-1 * var(--spacing-sm));
+    padding-left: var(--spacing-sm);
+}
+.kymo-tip-row-hot > :first-child {
+    background: linear-gradient(currentColor, currentColor) left center / 4px 12px no-repeat;
+}
+/* Cells participate in the shared grid (rows are display:contents), so
+   the value columns right-align vertically across every row. */
+.kymo-tip-grid { display: grid; column-gap: 8px; }
+.kymo-tip-row { display: contents; }
+.kymo-tip-val { font-variant-numeric: tabular-nums; color: var(--text-main); text-align: right; }
+.kymo-tip-raw { font-variant-numeric: tabular-nums; color: var(--text-disabled); font-size: var(--font-size-12); text-align: right; }
+.kymo-tip-x { font-variant-numeric: tabular-nums; color: var(--text-disabled); font-size: var(--font-size-12); text-align: left; }
+
+/* === CDN Gallery === */
+.cdn-gallery {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.cdn-gallery-content {
+    flex: 1;
+    overflow-y: auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--spacing-xs);
+}
+
+.cdn-gallery-content > .cdn-image-grid {
+    flex: 1 1 0;
+    min-height: 0;
+    overflow-y: auto;
+}
+
+.cdn-gallery-empty,
+.cdn-gallery-loading,
+.cdn-gallery-pending {
+    height: 100%;
+    font-size: var(--font-size-12);
+}
+
+.cdn-gallery-pending {
+    animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 0.4; }
+    50% { opacity: 1; }
+}
+
+.cdn-step-nav {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--spacing-sm);
+    padding: var(--spacing-xs) 0;
+    font-size: var(--font-size-11);
+    color: var(--text-disabled);
+}
+
+.cdn-nav-btn {
+    background: var(--bg2);
+    border: 1px solid var(--bg3);
+    color: var(--text-main);
+    padding: 2px 8px;
+    cursor: pointer;
+    border-radius: 3px;
+    font-size: var(--font-size-11);
+    line-height: 1.3; /* numeric for .icon-button's 1lh */
+}
+
+.cdn-nav-btn:disabled {
+    opacity: 0.3;
+    cursor: default;
+}
+
+.cdn-step-slider {
+    flex: 1;
+    min-width: 60px;
+    accent-color: var(--text-headings);
+    cursor: pointer;
+}
+
+.cdn-step-label {
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+.cdn-image-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    grid-auto-rows: min-content;
+    gap: var(--spacing-xs);
+    padding: var(--spacing-xs) 0;
+    align-content: safe center;
+}
+
+.cdn-image-item {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.cdn-image-item a { display: contents; }
+.cdn-image-item img {
+    width: 100%;
+    height: auto;
+    max-height: 240px;
+    object-fit: contain;
+    cursor: pointer;
+    border-radius: 3px;
+    border: 1px solid var(--bg3);
+    transition: border-color var(--transition);
+}
+
+.cdn-image-item img:hover {
+    border-color: var(--text-headings);
+}
+
+.cdn-image-item a:focus-visible img {
+    border-color: var(--text-headings);
+    outline: 2px solid var(--text-headings);
+    outline-offset: 2px;
+}
+
+.metadata-viewer, .cdn-image-item { position: relative; }
+
+.copy-text {
+    display: block;
+    min-height: 1lh;
+    border-radius: 2px;
+    cursor: copy;
+    user-select: text;
+    -webkit-user-select: text;
+}
+
+.copy-text:hover { box-shadow: inset 0 0 0 1px var(--text-disabled); }
+.copy-text:focus-visible { outline: 2px solid var(--text-headings); outline-offset: -2px; }
+
+.cdn-caption {
+    font-size: var(--font-size-10);
+    color: var(--text-disabled);
+    text-align: center;
+}
+
+.cdn-file-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: var(--spacing-xs) 0;
+}
+
+.cdn-file-group {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    border-radius: 4px;
+    padding: var(--spacing-xs);
+}
+
+.cdn-file-group-label {
+    font-size: var(--font-size-11);
+    font-weight: 600;
+}
+
+.cdn-file-link {
+    color: var(--text-headings);
+    font-size: var(--font-size-12);
+    text-decoration: none;
+}
+
+.cdn-file-link:hover {
+    text-decoration: underline;
+}
+
+.cdn-index-nav {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-sm);
+    padding: 2px 0;
+    font-size: var(--font-size-11);
+    color: var(--text-disabled);
+}
+
+.cdn-index-label {
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+.cdn-run-label {
+    font-size: var(--font-size-10);
+    text-align: center;
+    font-weight: 600;
+}
+
+.cdn-run-group {
+    border-radius: 4px;
+    padding: var(--spacing-xs);
+    flex: 0 0 auto;
+}
+
+.cdn-run-group-label {
+    font-size: var(--font-size-11);
+    font-weight: 600;
+    margin-bottom: 4px;
+}
+
+.cdn-index-group {
+    flex: 0 0 auto;
+}
+
+.cdn-index-group-label {
+    font-size: var(--font-size-10);
+    color: var(--text-disabled);
+    margin-bottom: 2px;
+}
+
+.cdn-lightbox {
+    position: fixed;
+    inset: 0;
+    z-index: 10000;
+    background: rgba(0, 0, 0, 0.85);
+    backdrop-filter: blur(4px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+}
+
+.cdn-lightbox-img {
+    max-width: 90vw;
+    max-height: 90vh;
+    object-fit: contain;
+    border-radius: 4px;
+}
+
+/* === Not Found === */
+.not-found {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.not-found-inner { text-align: center; }
+.not-found h1 { font-size: var(--font-size-24); margin-bottom: var(--spacing-md); }
+.not-found p { color: var(--text-disabled); margin-bottom: var(--spacing-md); }
+
+.settings-error {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: var(--spacing-lg);
+}
+.settings-error-inner {
+    max-width: 560px;
+}
+.settings-error h1 {
+    font-size: var(--font-size-20);
+    margin-bottom: var(--spacing-md);
+}
+.settings-error p {
+    color: var(--text-disabled);
+    margin-bottom: var(--spacing-md);
+    line-height: 1.5;
+}
+.settings-error-pid {
+    color: var(--text-headings);
+    font-family: var(--font-mono);
+    overflow-wrap: anywhere;
+}
+.settings-error-actions {
+    display: flex;
+    gap: var(--spacing-sm);
+    align-items: center;
+    margin-top: var(--spacing-lg);
+}
+
+/* === Sidebar Filter === */
+.sidebar-filter-row {
+    padding: var(--spacing-xs) var(--spacing-md);
+    border-bottom: 1px solid var(--bg3);
+}
+
+.sidebar-filter,
+.projects-filter {
+    width: 100%;
+    background: var(--bg0);
+    border: 1px solid var(--bg3);
+    color: var(--text-main);
+    padding: var(--spacing-xs) var(--spacing-sm);
+}
+.sidebar-filter { font-size: var(--font-size-12); }
+.sidebar-trash-footer {
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--spacing-xs);
+    padding: var(--spacing-sm);
+    border-top: 1px solid var(--bg3);
+    background: var(--bg1);
+}
+.sidebar-trash-footer-meta {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--spacing-xs);
+    color: var(--text-disabled);
+    font-size: var(--font-size-10);
+}
+.sidebar-trash-footer-meta span:last-child { text-align: right; }
+.sidebar-trash-feedback {
+    color: var(--text-main);
+    font-size: var(--font-size-11);
+    line-height: 1.25;
+}
+.sidebar-trash-commit {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    min-height: 30px;
+    padding: var(--spacing-xs) var(--spacing-sm);
+    border: 0;
+    background: var(--text-headings);
+    color: var(--bg0);
+    cursor: pointer;
+    font-size: var(--font-size-12);
+    font-weight: 600;
+}
+.sidebar-trash-commit:hover:not(:disabled) { filter: brightness(1.08); }
+.sidebar-trash-commit:disabled {
+    background: var(--bg3);
+    color: var(--text-disabled);
+    cursor: default;
+}
+
+/* === Run Marker ===
+   The run-colored circle retains chart visibility in Trash mode. Deletion
+   membership can additionally fill it, with a warning halo and row treatment
+   distinguishing that state. The specific checkbox selector keeps these
+   shared declarations ahead of the app-wide and light-theme checkbox rules. */
+.run-marker,
+.sidebar input[type="checkbox"].run-marker-input {
+    width: 10px;
+    height: 10px;
+    border: 2px solid var(--run-color, var(--text-disabled));
+    border-radius: 50%;
+    background: transparent;
+    flex-shrink: 0;
+    transition: transform var(--transition);
+}
+.run-marker-filled,
+.sidebar input[type="checkbox"].run-marker-input:checked,
+.sidebar-run-trash-selected .run-marker {
+    background: var(--run-color, var(--text-disabled));
+}
+.run-marker-toggle:hover .run-marker { transform: scale(1.2); }
+
+/* Native checkbox-only behavior; its visual geometry is shared above. */
+.sidebar input[type="checkbox"].run-marker-input:checked::before { content: none; }
+
+/* Warning treatment distinguishes deletion membership from retained chart
+   visibility without replacing the run color or making color the sole signal. */
+.sidebar-run-trash-selected .run-marker {
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--warning) 70%, transparent);
+}
+
+.run-menu-color-swatch {
+    width: 9px;
+    height: 9px;
+    border: 1px solid color-mix(in srgb, currentColor 55%, transparent);
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+/* Row popovers open right of the row's ⋯ trigger (each names it via `position-anchor`), top-aligned. The insets reach the viewport edges, and a non-`normal` `place-self` enables default overflow alignment, which clamps an overflowing popover back inside, 8px from the edge; it also beats the menu's `.sidebar-run > *` centring. */
+.run-overflow-menu,
+.color-picker {
+    inset: anchor(top) 0 0 anchor(right);
+    place-self: start;
+    margin: 0 8px 8px 12px;
+}
+
+/* Native popover promotion keeps the menu out of the sidebar's clipping
+   ancestors and supplies light-dismiss, Escape, and focus restoration. */
+.run-overflow-menu {
+    width: 196px;
+    padding: var(--spacing-xs);
+    border: 1px solid var(--bg3);
+    background: var(--bg1);
+    color: var(--text-main);
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.38);
+}
+.run-overflow-menu button {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-sm);
+    padding: 6px var(--spacing-sm);
+    border: 0;
+    background: none;
+    color: var(--text-main);
+    cursor: pointer;
+    font-size: var(--font-size-12);
+    text-align: left;
+}
+.run-overflow-menu button:hover { background: var(--bg2); }
+.run-overflow-divider {
+    height: 1px;
+    margin: var(--spacing-xs) 0;
+    background: var(--bg3);
+}
+.run-overflow-menu button:disabled {
+    color: var(--text-disabled);
+    cursor: default;
+}
+.run-copy-feedback {
+    position: fixed;
+    left: var(--spacing-md);
+    bottom: var(--spacing-md);
+    z-index: 90;
+    max-width: calc(var(--kymo-sidebar-w) - 32px);
+    padding: 6px var(--spacing-sm);
+    border: 1px solid var(--bg3);
+    background: var(--bg2);
+    color: var(--text-main);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+    font-size: var(--font-size-12);
+}
+.run-copy-feedback:empty {
+    padding: 0;
+    border: 0;
+    box-shadow: none;
+}
+
+/* === Run Status Indicator (liveness state)
+   RunStatusIcon (sidebar/view.rs) draws the shape; color here carries severity. */
+.run-status svg {
+    display: block;
+    width: 10px;
+    height: 10px;
+}
+.run-status.running { color: var(--success); }
+.run-status.stuck { color: var(--caution); }
+.run-status.unresponsive {
+    color: var(--warning);
+    animation: pulse 0.6s ease-in-out infinite;
+}
+.run-status.crashed { color: var(--warning); }
+.run-status.presumed-dead,
+.run-status.finished,
+.run-status.unknown { color: var(--text-disabled); }
+
+/* === Color Picker === */
+.color-picker {
+    background: var(--bg1);
+    border: 1px solid var(--bg3);
+    padding: var(--spacing-sm) var(--spacing-md);
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+    width: 230px;
+}
+.color-picker:focus { outline: none; }
+
+.color-picker-title {
+    font-size: var(--font-size-11);
+    color: var(--text-disabled);
+    margin-bottom: var(--spacing-sm);
+}
+
+.color-picker-palette {
+    display: grid;
+    grid-template-columns: repeat(8, 1fr);
+    gap: 3px;
+    margin-bottom: var(--spacing-sm);
+}
+
+.color-swatch {
+    width: 20px;
+    height: 20px;
+    border: 2px solid transparent;
+    cursor: pointer;
+    padding: 0;
+}
+.color-swatch:hover { border-color: var(--text-main); }
+.color-swatch-active { border-color: var(--text-headings); }
+
+.color-picker-custom {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-sm);
+    padding-top: var(--spacing-xs);
+    border-top: 1px solid var(--bg3);
+}
+
+.color-picker-label {
+    font-size: var(--font-size-11);
+    color: var(--text-disabled);
+}
+
+.color-picker-custom input[type="color"] {
+    width: 28px;
+    height: 22px;
+    border: 1px solid var(--bg3);
+    background: none;
+    cursor: pointer;
+    padding: 0;
+}
+
+
+/* === Editor Sections === */
+.slider-input-row {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-sm);
+}
+
+.slider-input-row input[type="range"] {
+    flex: 1;
+    accent-color: var(--text-headings);
+}
+
+.slider-input-number {
+    width: 55px;
+    background: var(--bg0);
+    border: 1px solid var(--bg3);
+    color: var(--text-main);
+    padding: 2px 4px;
+    font-size: var(--font-size-13);
+    text-align: center;
+}
+
+.editor-section-label {
+    font-size: var(--font-size-13);
+    font-weight: 600;
+    color: var(--text-disabled);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: var(--spacing-sm);
+}
+.modal > .editor-section-label ~ .editor-section-label { margin-top: var(--spacing-md); }
+.editor-section-toggle {
+    cursor: pointer;
+    user-select: none;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+button.editor-section-toggle {
+    width: 100%;
+    padding: 0;
+    border: 0;
+    background: none;
+    text-align: left;
+}
+.editor-section-toggle:hover { color: var(--text-main); }
+button.editor-section-toggle:focus-visible {
+    outline: 2px solid var(--text-headings);
+    outline-offset: 2px;
+}
+.editor-section-arrow { font-size: var(--font-size-11); width: 1em; }
+
+.editor-options {
+    display: flex;
+    flex-direction: column;
+    gap: var(--spacing-xs);
+    margin-bottom: var(--spacing-sm);
+}
+
+/* Pins under a defaults field: one chip per overriding section (§) or chart, click = clear so it re-inherits. */
+.override-chips {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--spacing-xs);
+    font-size: var(--font-size-11);
+}
+.override-chips-label { color: var(--text-placeholder); }
+.override-chip {
+    background: var(--bg1);
+    border: 1px solid var(--bg3);
+    color: var(--text-disabled);
+    font-size: var(--font-size-11);
+    padding: 0 var(--spacing-xs);
+    cursor: pointer;
+}
+.override-chip:hover {
+    color: var(--text-main);
+    border-color: var(--warning);
+}
+.override-chip-x { color: var(--warning); margin-left: var(--spacing-xs); }
+
+.checkbox-label {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-xs);
+    font-size: var(--font-size-13);
+    color: var(--text-main);
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+/* === Navbar Actions === */
+.navbar-action {
+    flex-shrink: 0;
+    font-size: var(--font-size-16);
+    padding: 2px 8px;
+    white-space: nowrap;
+}
+/* Bordered header buttons on standalone pages (projects list). */
+.page-action {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    border: 1px solid var(--bg3);
+    background: var(--bg1);
+    color: var(--text-main);
+    cursor: pointer;
+    line-height: inherit;
+    font-size: var(--font-size-14);
+    font-weight: 600;
+    padding: 6px 10px;
+    transition: border-color var(--transition), background var(--transition), color var(--transition);
+}
+.page-action:hover {
+    border-color: var(--text-headings);
+    background: var(--bg2);
+    color: var(--text-headings);
+}
+.page-action:focus-visible {
+    outline: 2px solid var(--text-headings);
+    outline-offset: 2px;
+}
+
+/* === Navbar Panel Filter ===
+   Panel substring search; sits between the spacer and the action buttons. */
+.navbar-search {
+    display: flex;
+    flex: 0 1 220px;
+    align-items: center;
+    gap: var(--spacing-xs);
+    min-width: 80px;
+}
+.navbar-search-input {
+    flex: 1;
+    min-width: 0;
+    background: var(--bg0);
+    border: 1px solid var(--bg3);
+    color: var(--text-main);
+    font-size: var(--font-size-12);
+    padding: 2px var(--spacing-sm);
+    outline: none;
+    transition: border-color var(--transition);
+}
+.navbar-search-input:focus { border-color: var(--text-headings); }
+.navbar-search-clear {
+    font-size: var(--font-size-12);
+    padding: 0 var(--spacing-xs);
+}
+
+/* === Utility === */
+/* Seat inline SVG icons on the text baseline like a glyph, and let thickened strokes reach past the viewBox edge. */
+.icon {
+    width: 1em;
+    height: 1em;
+    vertical-align: -0.125em;
+    overflow: visible;
+}
+/* Icon-only buttons centre the icon in a one-line track, so auto-sized buttons keep their text height and fixed squares centre the track. Auto-sized hosts give a numeric line-height: with `normal`, Firefox keeps a fallback-font 1lh after a web font loads. After .page-action so this display wins. Alternatives: docs/icon-buttons.md. */
+.icon-button {
+    display: inline-grid;
+    place-items: center;
+    align-content: center;
+    grid-template-rows: 1lh;
+}
+.text-disabled { color: var(--text-disabled); }
+
+/* === Light Theme === */
+[data-theme="light"] {
+    --bg0: #F5F5F5;
+    --bg1: #FFFFFF;
+    --bg2: #FAFAFA;
+    --bg3: #E0E0E0;
+    --text-main: #1A1A1A;
+    --text-disabled: #1A1A1A99;
+    --text-placeholder: #1A1A1A55;
+    --text-headings: #5A4800;
+    --warning: #D32F2F;
+    --success: #1E9E4F;
+    --caution: #B86E00;
+    --chart-grid: #D0D0D0;
+    --chart-axis: #707070;
+    --scrollbar-thumb: #C0C0C0;
+    --scrollbar-thumb-hover: #A0A0A0;
+    color-scheme: light;
+}
+
+[data-theme="light"] input[type="checkbox"] { background: #D0D0D0; }
+[data-theme="light"] input[type="checkbox"]:checked { background: var(--text-headings); }
+
+/* === Text Stream Viewer === */
+
+.text-stream-viewer {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.text-stream-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 8px;
+    flex-shrink: 0;
+}
+
+.text-stream-search {
+    flex: 1;
+    min-width: 0;
+    background: var(--bg0);
+    border: 1px solid var(--bg3);
+    color: var(--text-main);
+    padding: 5px 8px;
+    font-family: var(--font-mono);
+    font-size: var(--font-size-11);
+}
+
+.text-stream-search-submit,
+.text-stream-search-clear {
+    border: 1px solid var(--bg3);
+    background: var(--bg2);
+    color: var(--text-disabled);
+    padding: 5px 8px;
+    font-size: var(--font-size-11);
+    cursor: pointer;
+}
+
+.text-stream-search-submit:hover,
+.text-stream-search-clear:hover {
+    background: var(--bg3);
+    color: var(--text-main);
+}
+
+.text-stream-count {
+    flex-shrink: 0;
+    color: var(--text-disabled);
+    font-size: var(--font-size-11);
+    white-space: nowrap;
+}
+
+/* Capped so the active log keeps room to fetch. */
+.text-stream-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    flex-shrink: 0;
+    max-height: 40%;
+    overflow-y: auto;
+    border-bottom: 1px solid var(--bg3);
+}
+
+.text-stream-tab {
+    flex: 1 1 8em;
+    min-width: 0;
+    max-width: 16em;
+    padding: 2px 6px;
+    border: none;
+    border-bottom: 2px solid transparent;
+    background: none;
+    color: var(--run-color);
+    font-size: var(--font-size-11);
+    text-align: left;
+    cursor: pointer;
+}
+
+.text-stream-tab:only-child {
+    max-width: none;
+}
+
+.text-stream-tab:hover {
+    background: var(--bg2);
+}
+
+.text-stream-tab[aria-selected="true"] {
+    background: var(--bg0);
+    border-bottom-color: var(--run-color);
+}
+
+.text-stream-tab:focus-visible {
+    outline: 2px solid var(--text-headings);
+    outline-offset: -2px;
+}
+
+.text-stream-log {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    overflow-anchor: none;
+    padding: 4px 0;
+    font-family: var(--font-mono);
+    font-size: var(--font-size-11);
+    line-height: var(--kymo-text-line-height);
+    background: var(--bg0);
+}
+
+.text-stream-line {
+    height: var(--kymo-text-line-height);
+    min-width: 100%;
+    width: max-content;
+    padding: 0 6px;
+    white-space: pre;
+}
+
+.text-stream-metric-label {
+    margin-right: 6px;
+}
+
+.text-stream-spacer {
+    width: 1px;
+    flex-shrink: 0;
+}
+
+/* === Metadata Viewer === */
+
+.metadata-viewer {
+    overflow: auto;
+    height: 100%;
+}
+
+.metadata-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: var(--font-size-12);
+}
+
+.metadata-table th {
+    position: sticky;
+    top: 0;
+    /* above masked (overflowing) values, which paint as their own layer */
+    z-index: 1;
+    background: var(--bg1);
+    padding: 4px 8px;
+    text-align: left;
+    font-weight: 600;
+    border-bottom: 1px solid var(--bg3);
+    white-space: nowrap;
+}
+
+.metadata-table .metadata-key-col {
+    left: 0;
+    /* Above both the sticky header row and the sticky key column. */
+    z-index: 2;
+    min-width: 160px;
+}
+
+.metadata-val-col {
+    min-width: 120px;
+}
+
+.metadata-key-cell, .metadata-val-cell {
+    padding: 2px 8px;
+    font-size: var(--font-size-11);
+    white-space: nowrap;
+}
+
+/* Sticky key column: opaque in its row's color so values scrolled under it stay hidden, and above masked values like the header. */
+.metadata-key-cell {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    background: var(--bg1);
+    color: var(--text-disabled);
+}
+
+.metadata-row:hover, .metadata-row:hover .metadata-key-cell {
+    background: var(--bg2);
+}
+
+.metadata-val-cell {
+    max-width: 300px;
+    overflow: hidden;
+}
+
+.metadata-val-cell:has(.metadata-copy-value) { padding: 0; }
+.metadata-copy-value { padding: 2px 8px; }
+
+.metadata-branch-cell {
+    color: var(--text-headings);
+    font-weight: 600;
+}
+/* Fills the cell so the whole key is the toggle's hit target. */
+.metadata-branch-toggle {
+    width: 100%;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.metadata-arrow {
+    font-size: var(--font-size-10);
+    display: inline-block;
+    width: 1.2em;
+}
+
+.metadata-empty {
+    height: 100%;
+    font-size: var(--font-size-12);
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .rect-loading-indicator .icon,
+    .cdn-gallery-pending,
+    .run-status.unresponsive {
+        animation: none;
+    }
+}

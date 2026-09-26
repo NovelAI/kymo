@@ -1,0 +1,28 @@
+[build-system]
+requires = ["maturin>=1.9.2,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "kymo-local-runtime"
+description = "Native local runtime for kymo"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE", "THIRD-PARTY-NOTICES"]
+requires-python = ">=3.10"
+dynamic = ["version"]
+classifiers = [
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Repository = "https://github.com/NovelAI/kymo"
+Issues = "https://github.com/NovelAI/kymo/issues"
+Changelog = "https://github.com/NovelAI/kymo/blob/main/CHANGELOG.md"
+
+[tool.maturin]
+bindings = "bin"
+strip = true

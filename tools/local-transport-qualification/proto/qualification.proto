@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package kymo.transport.v1;
+
+service Probe {
+  rpc Echo(Payload) returns (Payload);
+  rpc Bidi(stream Payload) returns (stream Payload);
+  rpc Slow(Payload) returns (Payload);
+}
+
+message Payload {
+  bytes data = 1;
+}

@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kymo"
+version = "0.1.0"
+description = "Experiment tracker for machine learning"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    # Keep runtime floors aligned with the checked generation toolchain below.
+    # grpcio-tools 1.81.0 emits stubs that require grpcio 1.81 and protobuf 6.
+    "grpcio>=1.81.0,<2",
+    "protobuf>=6.33.5",
+    "httpx>=0.27.0",
+    "pillow>=10.0.0",
+    # Image accepts NumPy arrays, so this is runtime rather than test-only.
+    "numpy>=1.24.0",
+]
+classifiers = [
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Repository = "https://github.com/NovelAI/kymo"
+Issues = "https://github.com/NovelAI/kymo/issues"
+Changelog = "https://github.com/NovelAI/kymo/blob/main/CHANGELOG.md"
+
+[project.scripts]
+kymo-sync = "kymo.sync:main"
+
+[project.optional-dependencies]
+dev = [
+    "grpcio-tools==1.81.0",
+    "ruff==0.15.2",
+]
+# Must equal this project's version; the release workflow asserts it.
+local = ["kymo-local-runtime==0.1.0"]
+
+[tool.ruff]
+extend-exclude = ["kymo/_generated"]
+
+[tool.ruff.lint.per-file-ignores]
+"kymo/__init__.py" = ["E402"]  # capture must install before public imports

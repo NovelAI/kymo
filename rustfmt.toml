@@ -1,0 +1,9 @@
+# Code: plain rustfmt defaults (max_width = 100). Deliberately not raised — a larger max_width makes rustfmt *join* wrapped expressions, collapsing use lists and struct literals into 200+ char lines.
+#
+# Comments are never reflowed: this repo carries long single-line comments and doc comments on purpose, and they are not word wrapped. Nothing needs to be set for that — every rustfmt option that could rewrite comment text is off by default, and all of them are nightly-only, so stable rustfmt cannot touch comment content at all. They are listed here (inert) to record the intent and to be uncommented if this workspace ever formats on nightly, where the defaults become live and settable:
+#
+# wrap_comments = false
+# comment_width = 10000
+# normalize_comments = false
+# normalize_doc_attributes = false
+# format_code_in_doc_comments = false

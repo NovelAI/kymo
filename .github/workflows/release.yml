@@ -1,0 +1,242 @@
+name: release
+
+# Every push to main (an exported snapshot) is built, tested, and gated. A commit with a Kymo-Release trailer is also published to TestPyPI, then PyPI, and tagged last.
+# Any job step can write cache entries, so a release builds what it publishes without caches, and each build job uploads its artifact before running anything else.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.meta.outputs.release }}
+      platforms: ${{ steps.meta.outputs.platforms }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: meta
+        env:
+          PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          release=$(git log -1 --format='%(trailers:key=Kymo-Release,valueonly)' | tr -d '[:space:]')
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          if [ -n "$release" ]; then
+            python3 - "$release" <<'PY'
+          import sys, tomllib
+          project = tomllib.load(open("python_client/pyproject.toml", "rb"))["project"]
+          runtime = tomllib.load(open("local-runtime/Cargo.toml", "rb"))["package"]["version"]
+          assert project["version"] == runtime == sys.argv[1], (project["version"], runtime, sys.argv[1])
+          local = project.get("optional-dependencies", {}).get("local")
+          assert local == [f"kymo-local-runtime=={runtime}"], f"the local extra must pin the runtime exactly: {local}"
+          PY
+          fi
+          platforms='{"platform":"linux-x86_64","runner":"ubuntu-latest"}'
+          # macOS runners are free only in public repos, and a release needs both wheels.
+          if [ "$PRIVATE" = false ]; then
+            platforms+=',{"platform":"macos-arm64","runner":"macos-15"}'
+          elif [ -n "$release" ]; then
+            echo "::error::release from the public repo: a private repo builds no macOS wheel"
+            exit 1
+          fi
+          echo "platforms=[$platforms]" >> "$GITHUB_OUTPUT"
+
+  ci:
+    name: ci (${{ matrix.section }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {section: root, workspace: .}
+          - {section: wasm, workspace: .}
+          - {section: local-runtime, workspace: local-runtime}
+          - {section: qualification, workspace: tools/local-transport-qualification}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
+      - run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.section }}
+          workspaces: ${{ matrix.workspace }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+      - run: scripts/ci.sh ${{ matrix.section }}
+
+  frontend:
+    needs: meta
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: dioxus-cli@0.7.9
+      # rust-cache finds only a target dir inside the workspace.
+      - if: needs.meta.outputs.release == ''
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> frontend-build/target
+      - run: scripts/build.sh frontend frontend-build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frontend
+          path: frontend-build/public
+          if-no-files-found: error
+
+  client:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+      - run: python -m pip install build twine
+      - run: python -m build --outdir dist python_client
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-client
+          path: dist
+          if-no-files-found: error
+      - run: python scripts/check_artifacts.py dist
+      - run: scripts/ci.sh client
+
+  runtime:
+    needs: [meta, frontend, client]
+    name: runtime (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.meta.outputs.platforms) }}
+    runs-on: ${{ matrix.runner }}
+    env:
+      KYMO_FRONTEND_BUNDLE_DIR: ${{ github.workspace }}/local-runtime/.frontend-bundle
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+      - uses: actions/download-artifact@v4
+        with:
+          name: frontend
+          path: local-runtime/.frontend-bundle
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-client
+          path: dist-client
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.2
+      - run: scripts/build.sh notices
+      # manylinux and docker-options apply only to the Linux container build.
+      - uses: PyO3/maturin-action@v1
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
+        with:
+          command: build
+          args: --locked --release --compatibility pypi --out dist
+          sccache: ${{ needs.meta.outputs.release == '' }}
+          manylinux: '2_28'
+          maturin-version: v1.14.1
+          working-directory: local-runtime
+          docker-options: -e KYMO_FRONTEND_BUNDLE_DIR
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-runtime-${{ matrix.platform }}
+          path: local-runtime/dist
+          if-no-files-found: error
+      - run: python -m pip install twine
+      - run: python scripts/check_artifacts.py local-runtime/dist
+      - run: scripts/smoke.sh local-runtime/dist dist-client
+
+  # One job per project and index: a pending publisher is unique per workflow and environment, so each new project needs its own environment.
+  testpypi:
+    needs: [meta, ci, runtime]
+    if: needs.meta.outputs.release != ''
+    name: testpypi (${{ matrix.project }})
+    strategy: &publish-strategy
+      # Let the other project's upload finish if one fails.
+      fail-fast: false
+      matrix:
+        include:
+          - {project: kymo, environment: pypi, artifacts: dist-client}
+          - {project: kymo-local-runtime, environment: pypi-local-runtime, artifacts: dist-runtime-*}
+    runs-on: ubuntu-latest
+    environment: ${{ matrix.environment }}
+    permissions:
+      id-token: write
+    steps:
+      - &download-dists
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ matrix.artifacts }}
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  # No publish credential here: this job installs from TestPyPI, where anyone can claim unused names.
+  testpypi-install:
+    needs: [meta, testpypi]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+      - name: Install kymo[local] from TestPyPI
+        env:
+          VERSION: ${{ needs.meta.outputs.release }}
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          pip="$RUNNER_TEMP/venv/bin/pip"
+          # Only kymo's two distributions come from TestPyPI (retrying while its index catches up); their dependencies resolve from PyPI.
+          for attempt in 1 2 3 4 5 6; do
+            "$pip" install --index-url https://test.pypi.org/simple/ --no-deps "kymo==$VERSION" "kymo-local-runtime==$VERSION" && break
+            [ "$attempt" = 6 ] && exit 1
+            sleep 30
+          done
+          "$pip" install "kymo[local]==$VERSION"
+          "$RUNNER_TEMP/venv/bin/kymo" --version
+
+  pypi:
+    needs: [meta, testpypi-install]
+    name: pypi (${{ matrix.project }})
+    strategy: *publish-strategy
+    runs-on: ubuntu-latest
+    environment: ${{ matrix.environment }}
+    permissions:
+      id-token: write
+    steps:
+      - *download-dists
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  tag:
+    needs: [meta, pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: Tag the release
+        env:
+          VERSION: ${{ needs.meta.outputs.release }}
+        run: |
+          git tag "v$VERSION"
+          git push origin "v$VERSION"

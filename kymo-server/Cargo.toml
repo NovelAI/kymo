@@ -1,0 +1,56 @@
+[package]
+name = "kymo-server"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/NovelAI/kymo"
+
+[features]
+local-bundle = []
+
+[dependencies]
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+clickhouse = { version = "0.13", features = ["inserter"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures = "0.3"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tonic-web = "0.14"
+tower-http = { version = "0.6", features = ["cors"] }
+http = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tracing", "ws"] }
+sha2 = "0.10"
+subtle = "2"
+hex = "0.4"
+mime_guess = "2"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "macros", "chrono"] }
+chrono = "0.4"
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
+libc = "0.2"
+url = "2"
+object_store = { version = "=0.14.1", features = ["gcp"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+crc32c = "0.6.8"
+base64 = "0.22"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+clickhouse = { version = "0.13", features = ["test-util"] }
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+async-trait = "0.1.92"
+
+[build-dependencies]
+protoc-bin-vendored = "3"
+sha2 = "0.10"
+tonic-prost-build = "0.14"

@@ -1,0 +1,25 @@
+syntax = "proto3";
+package kymo.local.v1;
+
+// Supervisor-only control plane. This service is mounted only on the local
+// native Unix socket and uses a credential that is never returned to clients.
+service LocalRuntimeControl {
+  rpc ShutdownLocal(ShutdownLocalRequest) returns (ShutdownLocalResponse);
+  // Relative, atomically sampled activity state for the supervisor's idle decision. The request itself is deliberately excluded from work counts.
+  rpc GetActivity(GetActivityRequest) returns (GetActivityResponse);
+}
+
+message ShutdownLocalRequest {}
+message ShutdownLocalResponse {}
+
+message GetActivityRequest {}
+
+message GetActivityResponse {
+  uint64 keepalive_idle_for_ms = 1;
+  optional uint64 last_committed_ingest_ago_ms = 2;
+  uint64 frontend_reconnect_grace_remaining_ms = 3;
+  uint32 frontend_connections = 4;
+  uint32 in_flight_work = 5;
+  bool ingest_bookkeeping_draining = 6;
+  repeated string fulfilled_hold_ids = 7;
+}

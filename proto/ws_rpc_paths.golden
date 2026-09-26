@@ -1,0 +1,14 @@
+/kymo.Kymo/ListProjects
+/kymo.Kymo/ListRuns
+/kymo.Kymo/ListMetrics
+/kymo.Kymo/ListRunSetMetrics
+/kymo.Kymo/RenameRun
+/kymo.Kymo/TrashRuns
+/kymo.Kymo/RestoreRun
+/kymo.Kymo/ListTrash
+/kymo.Kymo/GetRun
+/kymo.Kymo/QueryChart
+/kymo.Kymo/QueryCdnKeys
+/kymo.Kymo/QueryTextWindow
+/kymo.Kymo/PollVersions
+/kymo.push/control

@@ -1,0 +1,33 @@
+# Hosts the published tree and artifacts may name. `*.suffix` matches subdomains; an email passes if its host does.
+# Reserved and local
+localhost
+127.0.0.1
+*.example
+*.invalid
+*.test
+# Single-label test placeholders
+host
+dash
+unused
+prometheus
+prometheus-server
+# Public sites
+github.com
+www.apache.org
+www.postgresql.org
+clickhouse.com
+creativecommons.org
+pypi.org
+test.pypi.org
+docs.pypi.org
+scripts.sil.org
+www.adobe.com
+www.w3.org
+fonts.googleapis.com
+storage.googleapis.com
+accounts.google.com
+oauth2.googleapis.com
+docs.rs
+en.wikipedia.org
+# tonic's placeholder URI for connectors that ignore it
+tonic

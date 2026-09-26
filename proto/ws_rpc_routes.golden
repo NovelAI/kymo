@@ -1,0 +1,13 @@
+/kymo.Kymo/ListProjects|ListProjectsRequest|ListProjectsResponse|list_projects
+/kymo.Kymo/ListRuns|ListRunsRequest|ListRunsResponse|list_runs
+/kymo.Kymo/ListMetrics|ListMetricsRequest|ListMetricsResponse|list_metrics
+/kymo.Kymo/ListRunSetMetrics|ListRunSetMetricsRequest|ListMetricsResponse|list_run_set_metrics
+/kymo.Kymo/RenameRun|RenameRunRequest|RenameRunResponse|rename_run
+/kymo.Kymo/TrashRuns|TrashRunsRequest|TrashRunsResponse|trash_runs
+/kymo.Kymo/RestoreRun|RestoreRunRequest|RestoreRunResponse|restore_run
+/kymo.Kymo/ListTrash|ListTrashRequest|ListTrashResponse|list_trash
+/kymo.Kymo/GetRun|GetRunRequest|GetRunResponse|get_run
+/kymo.Kymo/QueryChart|ChartRequest|ChartResponse|query_chart
+/kymo.Kymo/QueryCdnKeys|QueryCdnKeysRequest|QueryCdnKeysResponse|query_cdn_keys
+/kymo.Kymo/QueryTextWindow|QueryTextWindowRequest|QueryTextWindowResponse|query_text_window
+/kymo.Kymo/PollVersions|PollVersionsRequest|PollVersionsResponse|poll_versions

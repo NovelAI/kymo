@@ -1,0 +1,48 @@
+[package]
+name = "kymo-local-runtime"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/NovelAI/kymo"
+publish = false
+
+[workspace]
+members = [".", "core"]
+resolver = "2"
+
+[features]
+# CI qualification only. Published wheels must retain the shared 15-minute idle threshold.
+test-idle-timeout = []
+
+[[bin]]
+name = "kymo"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+flate2 = "1"
+fs2 = "0.4"
+futures-util = "0.3"
+getrandom = "0.3"
+hyper-util = { version = "0.1", features = ["tokio"] }
+libc = "0.2"
+kymo-local-runtime-core = { path = "core" }
+kymo-server = { path = "../kymo-server", features = ["local-bundle"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+rcgen = "0.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
+tar = "0.4"
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "time"] }
+tonic = "0.14"
+tower = { version = "0.5", features = ["util"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tempfile = "3"

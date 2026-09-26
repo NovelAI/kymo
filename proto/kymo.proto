@@ -1,0 +1,666 @@
+syntax = "proto3";
+package kymo;
+
+service Kymo {
+  // --- Ingest ---
+  rpc IngestMetrics (stream MetricsBatch) returns (IngestResponse);
+  // Pipelined ingest: server acks cumulatively as bounded flush cuts commit
+  // (normally 10k rows or about 8 MiB, plus timer/half-close tails), so the
+  // cut — not the whole call — is the durability/retry unit. Unary
+  // IngestMetrics stays for CDN sends, simple callers, and kymo.sync replay.
+  rpc IngestMetricsBidi (stream MetricsBatch) returns (stream IngestAck);
+  // Ordered publication for rich CDN-backed values. Kept separate from the
+  // high-throughput stream so numeric ingest retains its acknowledgement
+  // contract.
+  rpc PublishRichMutation (PublishRichMutationRequest) returns (PublishRichMutationResponse);
+
+  // --- Run registration ---
+  rpc InitRun (InitRunRequest) returns (InitRunResponse);
+  rpc RenameRun (RenameRunRequest) returns (RenameRunResponse);
+  rpc TerminateRun (TerminateRunRequest) returns (TerminateRunResponse);
+
+  // --- Bulk import (historical replay) ---
+  // FAILED_PRECONDITION unless the server runs with KYMO_IMPORT_ENABLED=1.
+  // ImportRun backdates runs.created_at; ImportMetricsBidi has the live wire
+  // contract (cumulative position acks, ack = committed) on a private insert
+  // budget; FinalizeImportRun backdates the terminal state and registers the
+  // metric names the import actually wrote.
+  rpc ImportRun (ImportRunRequest) returns (ImportRunResponse);
+  rpc ImportMetricsBidi (stream MetricsBatch) returns (stream IngestAck);
+  rpc FinalizeImportRun (FinalizeImportRunRequest) returns (FinalizeImportRunResponse);
+
+  // --- Run lifecycle / Trash ---
+  // TrashRuns has no public batch-size limit. The server may split work into
+  // bounded internal transactions and reports an outcome for every input
+  // position, so callers can reconcile partial success safely.
+  rpc TrashRuns (TrashRunsRequest) returns (TrashRunsResponse);
+  rpc RestoreRun (RestoreRunRequest) returns (RestoreRunResponse);
+  rpc ListTrash (ListTrashRequest) returns (ListTrashResponse);
+  rpc GetRun (GetRunRequest) returns (GetRunResponse);
+
+  // --- Discovery ---
+  rpc ListProjects (ListProjectsRequest) returns (ListProjectsResponse);
+  rpc ListRuns (ListRunsRequest) returns (ListRunsResponse);
+  rpc ListMetrics (ListMetricsRequest) returns (ListMetricsResponse);
+  // Discovery for a SET of runs in one round trip: distinct metric names
+  // across run_ids, types collapsed by CDN < NUMERIC < TEXT_STREAM.
+  // Replaces the dashboard sweeping ListMetrics over every run and
+  // unioning client-side.
+  rpc ListRunSetMetrics (ListRunSetMetricsRequest) returns (ListMetricsResponse);
+
+  // --- Chart queries (replaces QueryMetrics) ---
+  rpc QueryChart (ChartRequest) returns (ChartResponse);
+
+  // --- CDN queries ---
+  rpc QueryCdnKeys (QueryCdnKeysRequest) returns (QueryCdnKeysResponse);
+
+  // Line-oriented window for virtualized log viewers.
+  rpc QueryTextWindow (QueryTextWindowRequest) returns (QueryTextWindowResponse);
+
+  // --- Change detection ---
+  rpc PollVersions (PollVersionsRequest) returns (PollVersionsResponse);
+}
+
+// === Ingest ===
+
+message MetricsBatch {
+  string project_id = 1;
+  string run_id = 2;
+  repeated MetricPoint points = 3;
+}
+
+message MetricPoint {
+  string metric_name = 1;
+  int64 step = 2;
+  oneof payload {
+    float value = 3;  // f32: metric precision beyond ~7 digits isn't meaningful here
+    string cdn_key = 4;
+    bytes text_data = 6;  // text stream chunk (stdout/stderr/custom)
+  }
+  string tag = 5;  // "" = scalar, "0"/"1"/... for tagged (bundled) metrics
+  int64 timestamp_ms = 7;  // wall-clock time in milliseconds (client-set)
+}
+
+message IngestResponse {
+  uint64 points_received = 1;  // STORED rows on the unary path
+}
+
+// Streamed as flush cuts commit. Cumulative within one RPC attempt and
+// monotone non-decreasing: client takes delta = points_acked - last and
+// deletes that many points off its buffer front. Never exceeds the positions
+// received; a successful stream completion follows a final ack covering every
+// received position. Counts input POSITIONS CONSUMED, not rows stored —
+// skipped and payload-less points advance it too, so it stays a valid prefix
+// length of what the client fed (a stored-rows count desyncs on the first skip,
+// hanging shutdown).
+message IngestAck {
+  uint64 points_acked = 1;
+}
+
+message PublishRichMutationRequest {
+  string project_id = 1;
+  string run_id = 2;
+  string metric_name = 3;
+  string tag = 4;
+  int64 step = 5;
+  int64 timestamp_ms = 6;
+  string cdn_key = 7;
+  // Absence selects legacy arrival-order behavior. Version-aware writers use
+  // (writer_epoch << 32) | mutation_seq and never send zero.
+  optional uint64 mutation_version = 8;
+}
+
+enum RichMutationDisposition {
+  RICH_MUTATION_DISPOSITION_UNSPECIFIED = 0;
+  RICH_MUTATION_ACCEPTED = 1;
+  RICH_MUTATION_IDEMPOTENT = 2;
+  RICH_MUTATION_SUPERSEDED = 3;
+}
+
+message PublishRichMutationResponse {
+  RichMutationDisposition disposition = 1;
+  // The authoritative head after comparison. Equals the request for accepted
+  // and idempotent writes; is strictly greater for superseded writes.
+  optional uint64 stored_version = 2;
+}
+
+// === Run registration ===
+
+message InitRunRequest {
+  string project_id = 1;
+  // UUID generated per logical execution. Reusing an ID resumes the same run
+  // identity and preserves its original start, ingest history, and points.
+  string run_id     = 2;
+  string run_name   = 3;  // display name; trimmed, 1..2048 UTF-8 bytes, duplicates allowed
+  // Local-only endpoint-handoff hold. Hosted servers safely ignore absence; the local supervisor clears only the exact id reported after InitRun.
+  optional string local_hold_id = 4;
+}
+
+message InitRunResponse {
+  RunInfo run = 1;  // echoes stored row; idempotent hit returns the first-write row
+  // Allocated on every successful InitRun call. Absence means the server uses
+  // the legacy rich-write contract.
+  optional uint32 writer_epoch = 2;
+}
+
+message RenameRunRequest {
+  string project_id = 1;
+  string run_id     = 2;
+  string run_name   = 3;  // same normalized display-name contract as InitRun
+}
+
+message RenameRunResponse {
+  RunInfo run = 1;  // canonical row after the rename
+}
+
+// Sent by the client at process exit (atexit hook / signal handler) to record
+// the terminal state of the run. Once received, the run leaves the
+// timestamp-derived state machine and shows as CRASHED (exit_code != 0) or
+// FINISHED (exit_code == 0).
+message TerminateRunRequest {
+  string project_id = 1;
+  string run_id     = 2;
+  int32  exit_code  = 3;
+}
+
+message TerminateRunResponse {}
+
+// === Bulk import (see the service comment; gated by KYMO_IMPORT_ENABLED) ===
+
+message ImportRunRequest {
+  string project_id = 1;
+  // Same global-ownership and idempotency contract as InitRun.run_id.
+  // Importers namespace these (e.g. "wandb_<project>_<origid>") so replayed
+  // identities can never squat an organic run ID.
+  string run_id     = 2;
+  string run_name   = 3;  // same normalized display-name contract as InitRun
+  // Historical creation time (epoch ms, required, Postgres-representable).
+  // Ordinary InitRun stamps NOW(); a replayed run carries its original start
+  // so run-list ordering and wall spans read true. On an idempotent re-import
+  // of an existing run the stored row wins and this value is ignored.
+  int64 created_at_ms = 4;
+}
+
+message ImportRunResponse {
+  RunInfo run = 1;  // canonical stored row (first-write-wins, like InitRun)
+}
+
+message FinalizeImportRunRequest {
+  string project_id = 1;
+  string run_id     = 2;
+  int32  exit_code  = 3;  // 0 => FINISHED, else CRASHED (same as TerminateRun)
+  // Historical end time (epoch ms, required). TerminateRun stamps NOW();
+  // this sets the stored terminal time directly and overwrites a previous
+  // import's value, so re-running an import converges.
+  int64 terminated_at_ms = 4;
+  reserved 5, 6, 7;
+}
+
+message FinalizeImportRunResponse {
+  reserved 1;
+}
+
+// Liveness state of a run, computed server-side on each ListRuns call.
+//
+// Timestamp-derived (non-terminal):
+//   RUNNING       — main + system metrics both within 10s of now
+//   STUCK         — main metrics > 10s old, system metrics fresh
+//   UNRESPONSIVE  — system metrics > 10s old, < 10min, no exit signal
+//   PRESUMED_DEAD — system metrics > 10min old, no exit signal
+//
+// Explicit (terminal, set by TerminateRun):
+//   CRASHED       — client signaled non-zero exit
+//   FINISHED      — client signaled zero exit
+enum RunStatus {
+  RUN_STATUS_UNKNOWN        = 0;
+  RUN_STATUS_RUNNING        = 1;
+  RUN_STATUS_STUCK          = 2;
+  RUN_STATUS_UNRESPONSIVE   = 3;
+  RUN_STATUS_PRESUMED_DEAD  = 4;
+  RUN_STATUS_CRASHED        = 5;
+  RUN_STATUS_FINISHED       = 6;
+}
+
+message RunInfo {
+  string project_id    = 1;
+  string run_id        = 2;
+  string run_name      = 3;
+  uint64 ordinal       = 4;  // per-project, stable, drives color + sort
+  int64  created_at_ms = 5;
+  RunStatus status     = 6;
+  // Server wall clock recorded after a successful ClickHouse insert containing
+  // a point for this run. It rolls forward with later inserts and, unlike the
+  // liveness timestamps, is not supplied by the logging client. Absent until
+  // the server has ingested a point.
+  optional int64 last_ingested_at_ms = 7;
+  // Server wall clock when TerminateRun recorded an explicit exit. Historical
+  // runs backfilled before explicit termination tracking use their last main-
+  // metric timestamp, falling back to creation. Absent when neither exists.
+  optional int64 terminated_at_ms = 8;
+}
+
+// === Run lifecycle / Trash ===
+
+enum RunLifecycleState {
+  RUN_LIFECYCLE_STATE_UNKNOWN = 0;
+  RUN_LIFECYCLE_STATE_ACTIVE = 1;
+  RUN_LIFECYCLE_STATE_TRASHED = 2;
+  // The seven-day recovery deadline has passed but physical cleanup has not
+  // claimed the row yet. This state is neither readable nor restorable.
+  RUN_LIFECYCLE_STATE_EXPIRED = 3;
+  RUN_LIFECYCLE_STATE_PURGING = 4;
+}
+
+// Point-addressable run metadata. Deleted records are returned only by the
+// lifecycle RPCs, never by ListRuns/project discovery.
+message RunRecord {
+  RunInfo run = 1;
+  RunLifecycleState state = 2;
+  optional int64 deleted_at_ms = 3;
+  optional int64 purge_at_ms = 4;
+}
+
+message TrashRunsRequest {
+  string project_id = 1;
+  repeated string run_ids = 2;
+}
+
+enum TrashRunOutcome {
+  TRASH_RUN_OUTCOME_UNKNOWN = 0;
+  TRASH_RUN_OUTCOME_TRASHED = 1;
+  TRASH_RUN_OUTCOME_ALREADY_TRASHED = 2;
+  TRASH_RUN_OUTCOME_NOT_FOUND = 3;
+  TRASH_RUN_OUTCOME_EXPIRED = 4;
+  // A scoped internal failure. Other requested runs may still have succeeded.
+  TRASH_RUN_OUTCOME_ERROR = 5;
+}
+
+message TrashRunResult {
+  string run_id = 1;
+  TrashRunOutcome outcome = 2;
+  string error = 4;
+  reserved 3;
+  reserved "run";
+}
+
+message TrashRunsResponse {
+  // Same length and order as request.run_ids, including duplicate positions.
+  // Duplicate positions are evaluated left-to-right: only the first position that transitions an active run reports TRASHED.
+  repeated TrashRunResult results = 1;
+  reserved 2, 3;
+  reserved "global_version", "server_now_ms";
+}
+
+message RestoreRunRequest {
+  string project_id = 1;
+  string run_id = 2;
+}
+
+enum RestoreRunOutcome {
+  RESTORE_RUN_OUTCOME_UNKNOWN = 0;
+  RESTORE_RUN_OUTCOME_RESTORED = 1;
+  RESTORE_RUN_OUTCOME_ALREADY_ACTIVE = 2;
+  RESTORE_RUN_OUTCOME_NOT_FOUND = 3;
+  RESTORE_RUN_OUTCOME_EXPIRED = 4;
+  RESTORE_RUN_OUTCOME_ERROR = 5;
+}
+
+message RestoreRunResponse {
+  RestoreRunOutcome outcome = 1;
+  string error = 3;
+  reserved 2, 4, 5;
+  reserved "run", "global_version", "server_now_ms";
+}
+
+// Global Trash pages order deleted_at_ms descending (most recent first), then
+// project_id ascending, ordinal descending, and run_id ascending. purge_at_ms
+// is the equivalent timestamp key because retention is fixed. Clients must
+// restart from the first page if global_version changes while they are paging.
+message TrashCursor {
+  int64 purge_at_ms = 1;
+  string project_id = 2;
+  uint64 ordinal = 3;
+  string run_id = 4;
+}
+
+message ListTrashRequest {
+  // Page size for the global Trash view. Zero selects the server default.
+  // The server clamps this display/transport page; it does not cap TrashRuns.
+  uint32 page_size = 1;
+  optional TrashCursor after = 2;
+
+  // When both are present, return only these identities. This is used to
+  // reconcile a lifecycle mutation without downloading the global Trash.
+  // Pagination fields are ignored in filtered mode.
+  string project_id = 3;
+  repeated string run_ids = 4;
+
+  reserved 5;
+  reserved "summary_only";
+}
+
+message ListTrashResponse {
+  repeated RunRecord runs = 1;
+  uint64 global_version = 2;
+  int64 server_now_ms = 3;
+  // Global Trash count on the first page; zero for continuation pages and
+  // identity lookups. Clients preserve the first page's value while paging.
+  uint64 total_count = 4;
+  optional TrashCursor next = 5;
+}
+
+message GetRunRequest {
+  string project_id = 1;
+  string run_id = 2;
+}
+
+message GetRunResponse {
+  RunRecord run = 1;
+  uint64 global_version = 2;
+  int64 server_now_ms = 3;
+}
+
+// === Discovery ===
+
+message ListProjectsRequest {}
+
+message ListProjectsResponse {
+  repeated string project_ids = 1;
+}
+
+message ListRunsRequest {
+  string project_id = 1;
+}
+
+message ListRunsResponse {
+  repeated RunInfo runs = 1;  // sorted by ordinal DESC (recent first)
+  // Run-list version read from the same database snapshot as runs. Absence means coverage is unavailable (an older server or an empty list): clients must retain their conservative refresh after a new version observation.
+  optional uint64 project_version = 2;
+}
+
+message ListMetricsRequest {
+  string project_id = 1;
+  string run_id = 2;
+}
+
+message ListRunSetMetricsRequest {
+  string project_id = 1;
+  // The dashboard passes its VISIBLE runs (the selected ones, or the run
+  // page's run) — a chart exists only when a visible run logged its
+  // metric. Empty => empty response.
+  repeated string run_ids = 2;
+}
+
+message ListMetricsResponse {
+  repeated MetricInfo metrics = 1;
+}
+
+message MetricInfo {
+  string metric_name = 1;
+  enum MetricType {
+    NUMERIC = 0;
+    CDN = 1;
+    TEXT_STREAM = 2;
+  }
+  MetricType metric_type = 2;
+  // Per-point statistics (min/max step, point count, tag count) removed:
+  // they required aggregating every row a run ever logged and no client
+  // ever read them. The registry serves name + type only.
+  reserved 3, 4, 5, 6;
+  reserved "min_step", "max_step", "point_count", "tag_count";
+}
+
+// === Push events (WebSocket transport only) ===
+
+// Server-initiated frame on /grpc-ws (correlation id 0, code 0): every version counter that changed since the connection's previous event, coalesced to at most one frame per second.
+// The frontend also polls once per minute to catch lost events and clock-driven run expiry.
+// Run values are effective versions: stored data versions while readable and one final generation when a run becomes terminal.
+// Old bundles drop id-0 frames by construction, making this an additive extension of the frozen framing.
+message RunVersionsEvent {
+  map<string, uint64> run_versions = 1;
+  // Projects whose run LIST metadata changed: run added, renamed,
+  // re-initialized, terminated, or liveness transitioned (the status watcher
+  // bumps these).
+  map<string, uint64> project_versions = 2;
+  // Non-zero when global discovery or Trash visibility changed.
+  uint64 global_version = 3;
+  // Runs whose metric discovery must be repeated: their registry changed
+  // (new name/type) or Restore made an existing registry readable again.
+  // Data landing on known metrics only bumps run_versions.
+  repeated string metrics_changed_runs = 4;
+  // The server lost events for this connection (broadcast lag): cached
+  // versions are stale — PollVersions once and refetch run/metric lists.
+  bool resync = 5;
+}
+
+// === Push control (WebSocket transport only) ===
+
+// Sent by the dashboard on the /grpc-ws pseudo-path "/kymo.push/control"
+// (not a service method — quiet is per connection, handled in ws_proxy's
+// socket loop; no response is sent). quiet=true mirrors a hidden tab: the
+// server suspends id-0 frames and collapses all detail to one resync marker;
+// after quiet=false the client performs an authoritative catch-up. The
+// client re-asserts its state on every (re)connect.
+message PushControlRequest {
+  bool quiet = 1;
+}
+
+// === Chart queries ===
+
+message SeriesRef {
+  string project_id = 1;
+  string run_id = 2;
+  string metric_name = 3;
+  repeated string tags = 4;  // empty = all tags (server expands for tagged metrics)
+}
+
+message SmoothingConfig {
+  enum Algorithm {
+    NONE = 0;
+    reserved 1; reserved "RUNNING_AVERAGE";  // removed; old clients sending 1 decode as NONE
+    EMA = 2;
+    GAUSSIAN = 3;
+    SAVITZKY_GOLAY = 4;
+    TRIANGULAR = 5;
+  }
+  Algorithm algorithm = 1;
+  uint32 window_size = 2;   // gaussian, savgol
+  double alpha = 3;          // EMA polyfit (0-1)
+  uint32 poly_order = 4;     // polyfit degree (0-2), all polyfits
+}
+
+message ChartRequest {
+  repeated SeriesRef y_series = 1;
+  optional SeriesRef x_series = 2;   // null = use step
+  SmoothingConfig smoothing = 3;
+  uint32 target_resolution = 4;      // 0 = no downsampling
+  optional int64 step_min = 5;
+  optional int64 step_max = 6;
+  bool use_timestamp_axis = 7;  // false = step (default), true = timestamp_ms
+  bool relative_time = 8;       // if true + use_timestamp_axis, offset each series to start from 0
+  optional ChartCacheState cache_state = 9;  // what the client already holds; unset = answer in full
+  // The panel renders a log x axis: buckets come from the log ladder (octave [2^k, 2^(k+1)) split into 2^m power-of-two buckets — chart.rs make_grid) instead of the uniform linear grid, so on-screen slot density stays even across the decades.
+  bool log_buckets = 10;
+}
+
+// Opaque continuation state echoed verbatim (versioned NUL-prefixed keys); the held-input proof and smoothing contract are documented in docs/incremental-updates.md.
+message ChartCacheState {
+  reserved 1, 2, 3, 4, 5;  // pre-deployment fingerprint scheme, never shipped
+  reserved "col_counts", "x_hashes_lo", "x_hashes_hi", "series_hashes_lo", "series_hashes_hi";
+  reserved 7; reserved "downsampled";  // pre-2026-07 echoed decision; the fixed-threshold rules made it derivable
+  map<string, int64> frontiers = 6;  // ChartResponse.frontiers of the held response, verbatim; keys beginning with NUL are versioned opaque server metadata
+  // Series count of the held response. Together with verified input lineages and shared-ref order, count equality against continuing series protects positional pairing when refs or tag groups change. A mismatch answers in full instead of shipping a delta the client cannot splice.
+  // When versioned exact-smoothing state is required, new clients send UINT32_MAX as a downgrade sentinel and the real count rides in that state. Fixed servers recover it; older servers that know this count gate deterministically answer in full during a rolling deployment. Stateless step EMA/Triangular send the literal count because no median/uniform drift can rescale their held prefix.
+  optional uint32 held_series = 8;
+}
+
+// One run's data, wire form. The MODEL both sides compute over is dense axis-length columns (chart_delta.rs DenseSeries: NaN = no data in a slot); the wire carries no filler: occupancy ships as ranges of dense column indices (seg_starts/seg_lens — "the k-th value sits at the k-th listed slot"), values are strictly finite f32 (non-finite samples ride the marker channel), and the envelope ships only where it says more than the value. The client inflates back to the model at receipt (chart_sync.rs inflate).
+message ChartSeries {
+  string label = 1;   // "run_id" or "run_id/metric_name"
+  string run_id = 2;  // owning run — clients key per-run styling on this, never on series position (series are dropped when a run lacks the metric, and tags expand 1:N)
+  // Occupancy: expand(seg_starts, seg_lens) lists this run's occupied columns of the shared ChartResponse.x_values, ascending and disjoint; `values` is parallel to that expansion. Column indices are ABSOLUTE, in delta tails too (like nan_indices).
+  repeated uint32 seg_starts = 3;
+  repeated uint32 seg_lens = 4;
+  // The exact sample at raw columns, the bucket MEAN at envelope columns (a tooltip/hover/y-range summary — never stroked; the envelope is the rendering), or the smoothed curve when smoothing (stroked). f32: metrics ingest as f32, so finer wire precision isn't meaningful; the server rounds the model before hashing (chart_delta.rs round_y) so spliced charts verify bit-exactly.
+  repeated float values = 5;
+  // Pre-smoothing samples, parallel to `values`; smoothed PASSTHROUGH charts only (downsampled ones carry raw in the envelope).
+  repeated float raw_values = 6;
+  // The min/max envelope — the raw representation of a downsampled chart — shipped only at columns where it differs from (value, value): multi-point buckets, duplicate-x spreads, and marker-won columns whose bucket still holds finite points. On any banded chart the client re-derives min == max == value at every other occupied column, so the model's envelope is DENSE over the run's occupancy and the band pinches to the line through raw columns.
+  repeated uint32 band_seg_starts = 7;
+  repeated uint32 band_seg_lens = 8;
+  repeated float band_min = 9;
+  repeated float band_max = 10;
+  // Columns where the run LOGGED a non-finite value (display as markers). For kinds 1-3 the column normally has no value entry (the non-finite sample won its slot) — EXCEPT when a duplicate x carries both a finite and a non-finite sample into one raw slot: the finite value keeps the entry and the marker rides alongside (chart.rs shared_passthrough and bucket_run raw slots deliberately skip non-finite-wins on duplicate-x collisions; inside an envelope bucket the marker still wins and the finite evidence rides the band). Kind 4 rides a finite column (see nan_kinds).
+  repeated uint32 nan_indices = 11;
+  // Parallel to nan_indices: 1 = NaN, 2 = +inf, 3 = -inf, 4 = this run's custom-x metric logged a non-finite value — the marker is carried to the run's last plottable column, which keeps its finite value (kind 4 annotates; it does not evict). Empty = all kind 1.
+  repeated uint32 nan_kinds = 12;
+  // How many of this run's samples have an unplottable x (non-finite custom-x, negative x on a log axis) — the samples behind the kind-4 markers, whose per-slot counts collapse when markers dedup. Tooltip garnish ("×N"); ships complete on every series like label, excluded from the result hashes.
+  uint32 xnan_count = 13;
+}
+
+message ChartResponse {
+  // THE shared X axis: ascending, unique, one per chart. Every ChartSeries'
+  // columns align to it (via its occupancy segments), so clients render
+  // directly against it with no per-series join. Populated for all charts
+  // (step, timestamp, custom-x); empty only when the chart has no data.
+  // Slots are a MIXTURE of raw points (the exact logged x) and downsampled
+  // buckets (x = the midpoint of the first and last point aggregated):
+  // a bucket only downsamples when it expects >= 4 points (chart.rs).
+  repeated double x_values = 1;
+  repeated ChartSeries series = 2;
+  // When true, this response continues the one whose frontiers the client echoed: the client keeps its first from_col columns; x_values, xr_*, and continuation columns hold positions [from_col..). Each series CONTINUES a held one (splice_from_cached = its index; the >= 0 entries are exactly 0,1,2,... — every held series continues, dropped refs and undecidable membership answer full instead; markers and segment starts stay absolute) or is COMPLETE (splice_from_cached -1; columns span the whole new axis). A column family the held series lacks (an all-non-finite series' first finite samples arrived) splices as NaN over the kept prefix — those samples are new, so the prefix is provably all-NaN (chart_delta.rs splice_series). Labels/run_ids always ship complete — adopt them, they can legitimately change. from_col == new column count with every series continuing means "unchanged". Never sent with from_col 0.
+  bool delta = 3;
+  uint32 from_col = 4;
+  repeated int32 splice_from_cached = 5;  // parallel to series when delta
+  // Opaque continuation state for nonempty standard-axis responses: versioned NUL-prefixed cache-lineage/cutoff stamps and exact smoothing plans. Empty and custom-x responses omit it. No ordinary ingest-watermark keys are emitted. Clients store and echo the entire map unchanged; they must not infer row membership from its values.
+  map<string, int64> frontiers = 6;
+  // Chart-level x extent of each slot's bucket, unioned across runs — the only form clients ever consumed (the tooltip's x-range header). Segment-encoded like series columns; entries exist only where a bucket aggregated a real x spread (max > min).
+  repeated uint32 xr_seg_starts = 7;
+  repeated uint32 xr_seg_lens = 8;
+  repeated double xr_min = 9;
+  repeated double xr_max = 10;
+  // True on a full answer that replaced a delta whose sampled audit FAILED (query.rs build_response): the incremental protocol was about to ship a wrong chart. The answer itself is correct — computed in full — but the failure means a protocol bug; the server logs and counts it (mkdb2_chart_delta_total{kind=audit_failed}), and the client alerts visibly (components/notice_bar.rs).
+  bool audit_failed = 11;
+  // Content hashes of the FULL model this delta reconstructs to (chart_delta.rs hash_axis/hash_series: column bit patterns + markers, labels excluded), stamped on every delta answer. The client splices, hashes the result, and compares BEFORE rendering (chart_sync splice_response): a mismatch — whatever the cause: a planner bug the sampled audit missed, a membership edge, client-side splice drift — discards the splice, refetches in full, and alerts. This is the check only the client can run: it is the one place the held view and the server's answer actually meet, and it runs on EVERY delta, so a wrong chart is never rendered (up to hash collision) rather than merely sampled for.
+  optional uint64 result_x_hash = 12;
+  repeated uint64 result_series_hashes = 13;  // parallel to the delta's series
+  // The chart carries envelopes (any bucket downsampled, or a passthrough duplicate-x collision): every series' model envelope is DENSE over its occupancy, and the client re-derives min == max == value at occupied columns the wire's band entries skip. Chart-wide because the contract is (a band-less run on a banded chart would blank under envelope rendering); it only flips alongside a full answer (numeric_delta_from_col gates band flips), so a delta's bit always matches the held response's.
+  bool banded = 14;
+}
+
+// === CDN queries ===
+
+message QueryCdnKeysRequest {
+  // One CdnSeries is returned per ref, in the same order. SeriesRef.tags is
+  // ignored for CDN queries (CDN entries are never tagged).
+  repeated SeriesRef refs = 1;
+  optional int64 step_min = 2;
+  optional int64 step_max = 3;
+}
+
+message QueryCdnKeysResponse {
+  repeated CdnSeries series = 1;
+}
+
+message CdnSeries {
+  string project_id = 1;
+  string run_id = 2;
+  string metric_name = 3;
+  repeated CdnEntry entries = 4;
+}
+
+message CdnEntry {
+  int64 step = 1;
+  string cdn_key = 2;
+}
+
+// === Text stream queries ===
+
+message QueryTextWindowRequest {
+  string project_id = 1;
+  string run_id = 2;
+  repeated string metric_names = 3;
+  uint64 line_offset = 4;
+  uint32 line_limit = 5;
+  // Case-insensitive substring filter applied by the server. Empty returns
+  // the unfiltered stream.
+  string search = 6;
+}
+
+message QueryTextWindowResponse {
+  repeated TextLine lines = 1;
+  uint64 total_lines = 2;
+  // First step in the unfiltered stream, for relative-time tooltips.
+  int64 first_step = 3;
+}
+
+message TextLine {
+  int64 step = 1;
+  string metric_name = 2;
+  uint64 line_index = 3;
+  string text = 4;
+}
+
+// === Change detection ===
+//
+// Three-level version counters, all persisted in Postgres:
+//
+// - global_version: bumped when global discovery or Trash visibility changes.
+// - project_version: bumped when the project's run LIST metadata changed: run
+//   added, renamed, re-initialized, terminated, or derived liveness status
+//   transitioned (the server-side status watcher bumps it).
+// - run_versions[run_id]: bumped when metrics are ingested and advances one final time when the run expires; its tombstone retains that generation.
+//
+// Steady-state changes reach the dashboard as pushed RunVersionsEvent frames (see above); PollVersions serves reconnect resyncs, the minute backstop, clock-driven expiry, and non-push clients.
+
+message PollVersionsRequest {
+  optional string project_id = 1;    // unset on main page; set on project/run page
+  repeated string run_ids    = 2;    // subset of runs whose versions to return
+}
+
+message PollVersionsResponse {
+  uint64 global_version  = 1;                 // always populated
+  uint64 project_version = 2;                 // 0 if project_id unset
+  map<string, uint64> run_versions = 3;       // keyed by run_id
+}
+
+// === Watchdog ===
+//
+// The kymo-watchdog service maintains a best-effort low-latency view of
+// active runs and emits state-transition hints to downstream consumers.
+// ListRuns polling is authoritative for current state; this service is not a
+// durable or exactly-once lifecycle event log.
+//
+// Server -> watchdog notifications are at-most-once, fire-and-forget hints for
+// explicit lifecycle events only (created, terminated, or restored). Trash
+// removal is reconciled from the authoritative ListRuns snapshot instead of
+// emitting one event per run in an uncapped bulk operation.
+// Derived state transitions (RUNNING -> STUCK -> UNRESPONSIVE -> PRESUMED_DEAD)
+// are NOT pushed here — the watchdog discovers those by polling ListRuns at
+// a fixed interval for the projects whose runs it is tracking.
+
+service WatchdogService {
+  rpc NotifyRunLifecycle (RunLifecycleEvent) returns (RunLifecycleAck);
+}
+
+message RunLifecycleEvent {
+  enum Kind {
+    KIND_UNKNOWN    = 0;
+    KIND_STARTED    = 1;  // InitRun inserted a NEW run row
+    KIND_TERMINATED = 2;  // TerminateRun set exit_code
+    KIND_RESTORED   = 3;  // run re-entered active discovery
+  }
+  Kind   kind        = 1;
+  string project_id  = 2;
+  string run_id      = 3;
+  string run_name    = 4;
+  // Set when a termination is reported and when Restore carries forward a
+  // historical terminal result. Absent means no terminal result is known.
+  optional int32 exit_code = 5;
+  // Effective status at the instant Restore committed. Watchdog absorbs this
+  // as a baseline instead of manufacturing a new transition for old history.
+  // RUN_STATUS_UNKNOWN for event kinds other than KIND_RESTORED.
+  RunStatus restore_baseline_status = 6;
+}
+
+message RunLifecycleAck {}
