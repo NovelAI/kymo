@@ -430,7 +430,7 @@ fn cdn_preflight() -> anyhow::Result<Option<Arc<cdn_store::GcsStore>>> {
     // must fail startup here, never fall through to ambient ADC or instance credentials.
     let credentials = env::optional_string("GOOGLE_APPLICATION_CREDENTIALS").ok_or_else(|| {
         anyhow::anyhow!(
-            "KYMO_CDN_BACKEND=gcs requires GOOGLE_APPLICATION_CREDENTIALS (a non-empty key path)"
+            "KYMO_CDN_BACKEND=gcs requires GOOGLE_APPLICATION_CREDENTIALS (a non-empty credential file path)"
         )
     })?;
     Ok(Some(Arc::new(cdn_store::GcsStore::new(

@@ -13,6 +13,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context as _;
 use axum::body::Bytes;
 use base64::Engine as _;
 use futures::StreamExt;
@@ -22,17 +23,43 @@ use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt as _};
 
 use super::{resolve_range, ByteRange, ByteStream, StoreError, StoreRead};
 
+mod external_account;
+
 pub struct GcsStore {
     reads: Arc<dyn ObjectStore>,
     uploader: Uploader,
 }
 
 impl GcsStore {
-    /// `service_account_path` is passed explicitly (never `from_env`): preflight validated it,
-    /// and an explicit path can't silently fall through to ambient ADC or instance credentials.
-    pub fn new(bucket: String, service_account_path: &str) -> anyhow::Result<Self> {
-        let store = GoogleCloudStorageBuilder::new()
-            .with_service_account_path(service_account_path)
+    /// The credential file's `type` picks the auth: `service_account` (a JSON key, the crate's native support) or `external_account` ([`external_account`]). Either way the builder gets explicit credentials (never `from_env`), so it never falls through to ambient ADC or instance credentials.
+    pub fn new(bucket: String, credentials_path: &str) -> anyhow::Result<Self> {
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum CredentialFile {
+            ServiceAccount,
+            ExternalAccount(external_account::Config),
+        }
+        let json = std::fs::read(credentials_path)
+            .with_context(|| format!("reading GCS credentials {credentials_path}"))?;
+        let file: CredentialFile = serde_json::from_slice(&json)
+            .with_context(|| format!("{credentials_path}: unsupported GCS credential file"))?;
+        let builder = match file {
+            CredentialFile::ServiceAccount => {
+                tracing::info!(credentials = "service_account", "CDN GCS credentials");
+                GoogleCloudStorageBuilder::new().with_service_account_key(String::from_utf8(json)?)
+            }
+            CredentialFile::ExternalAccount(config) => {
+                let federated = external_account::ExternalAccount::new(config)
+                    .with_context(|| format!("{credentials_path}: unsupported external_account"))?;
+                tracing::info!(
+                    credentials = "external_account",
+                    audience = federated.audience(),
+                    "CDN GCS credentials"
+                );
+                GoogleCloudStorageBuilder::new().with_credentials(Arc::new(federated))
+            }
+        };
+        let store = builder
             .with_bucket_name(&bucket)
             // FsStore has no whole-transfer deadline and neither may GCS reads: the crate's
             // default client timeout spans the ENTIRE response body, which would abort large or
@@ -44,8 +71,8 @@ impl GcsStore {
             // with an etag-pinned ranged GET (always valid under write-once; ~10 resumes/3min
             // budget), so only a consumer repeatedly stalling >60s on a large object ever sees
             // an abort, and a refetch heals it. Metadata HEADs (Suffix(0), range-rejection
-            // recovery) and the shared credential provider's token refreshes ride this same
-            // client and get the same progress bound.
+            // recovery) ride this same client and get the same progress bound; federated token
+            // exchanges have their own bounded client.
             .with_client_options(
                 object_store::ClientOptions::new()
                     .with_timeout_disabled()
@@ -58,7 +85,7 @@ impl GcsStore {
         Ok(Self {
             reads: Arc::new(store),
             uploader: Uploader::new(
-                TokenSource::Provider(credentials),
+                credentials,
                 "https://storage.googleapis.com".to_owned(),
                 bucket,
                 PROD_BACKOFF_BASE,
@@ -251,22 +278,12 @@ const PROD_BACKOFF_BASE: Duration = Duration::from_secs(2);
 const MAX_ATTEMPTS: u32 = 5;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
-enum TokenSource {
-    Provider(GcpCredentialProvider),
-    /// Tests only — a fixed bearer against a local mock endpoint.
-    #[allow(dead_code)]
-    Static(String),
-    /// Tests only — every fetch fails, pinning the token-transient retry arm.
-    #[cfg(test)]
-    FailingForTests,
-}
-
 struct Uploader {
     http: reqwest::Client,
     /// `https://storage.googleapis.com` in production; tests point this at a local mock.
     base_url: String,
     bucket: String,
-    token: TokenSource,
+    credentials: GcpCredentialProvider,
     backoff_base: Duration,
     /// The multipart boundary: 128 random bits per process. Request bodies are arbitrary
     /// client bytes, so a predictable boundary could be embedded in one and corrupt the
@@ -276,7 +293,7 @@ struct Uploader {
 
 impl Uploader {
     fn new(
-        token: TokenSource,
+        credentials: GcpCredentialProvider,
         base_url: String,
         bucket: String,
         backoff_base: Duration,
@@ -287,25 +304,18 @@ impl Uploader {
             http: reqwest::Client::builder().build()?,
             base_url,
             bucket,
-            token,
+            credentials,
             backoff_base,
             boundary_salt: hex::encode(salt),
         })
     }
 
     async fn bearer(&self) -> anyhow::Result<String> {
-        // Hard deadline: the provider's own HTTP stack has no whole-request timeout (see the
-        // read-client options), and a stalled token endpoint must not escape the write budget.
-        tokio::time::timeout(REQUEST_TIMEOUT, async {
-            match &self.token {
-                TokenSource::Provider(p) => Ok(p.get_credential().await?.bearer.clone()),
-                TokenSource::Static(t) => Ok(t.clone()),
-                #[cfg(test)]
-                TokenSource::FailingForTests => anyhow::bail!("scripted token failure"),
-            }
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("token fetch timed out"))?
+        // Hard deadline: however the provider waits, a token must not escape the write budget.
+        let credential = tokio::time::timeout(REQUEST_TIMEOUT, self.credentials.get_credential())
+            .await
+            .map_err(|_| anyhow::anyhow!("token fetch timed out"))??;
+        Ok(credential.bearer.clone())
     }
 
     async fn put_if_absent(&self, key: &str, body: Bytes) -> anyhow::Result<()> {
@@ -511,6 +521,14 @@ pub(crate) mod test_support {
     pub(crate) const EMPTY_KEY: &str =
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.gz";
 
+    pub(crate) fn static_credentials(bearer: &str) -> GcpCredentialProvider {
+        Arc::new(object_store::StaticCredentialProvider::new(
+            object_store::gcp::GcpCredential {
+                bearer: bearer.to_owned(),
+            },
+        ))
+    }
+
     pub(crate) async fn collect(read: StoreRead) -> Vec<u8> {
         use futures::TryStreamExt as _;
         read.stream
@@ -629,7 +647,7 @@ pub(crate) mod test_support {
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         Uploader::new(
-            TokenSource::Static("test-token".into()),
+            static_credentials("test-token"),
             base_url,
             "test-bucket".into(),
             backoff,
@@ -668,6 +686,22 @@ mod tests {
     use futures::TryStreamExt;
     use object_store::memory::InMemory;
     use std::sync::atomic::Ordering;
+
+    /// Every fetch fails, pinning the token-transient retry arm.
+    #[derive(Debug)]
+    struct FailingCredentials;
+
+    #[async_trait::async_trait]
+    impl object_store::CredentialProvider for FailingCredentials {
+        type Credential = object_store::gcp::GcpCredential;
+
+        async fn get_credential(&self) -> object_store::Result<Arc<Self::Credential>> {
+            Err(object_store::Error::Generic {
+                store: "GCS",
+                source: "scripted token failure".into(),
+            })
+        }
+    }
 
     fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         haystack.windows(needle.len()).position(|w| w == needle)
@@ -850,7 +884,7 @@ mod tests {
     async fn token_fetch_failures_are_transient_until_the_budget() {
         let m = mock(Vec::new(), 404);
         let mut up = mock_uploader(m.clone(), Duration::from_millis(1)).await;
-        up.token = TokenSource::FailingForTests;
+        up.credentials = Arc::new(FailingCredentials);
         let err = up
             .put_if_absent(KEY, Bytes::from_static(b"0123456789"))
             .await
@@ -1007,7 +1041,7 @@ mod tests {
         GcsStore::assemble_for_tests(
             Arc::new(ScriptedReads(head)),
             Uploader::new(
-                TokenSource::Static("unused".into()),
+                static_credentials("unused"),
                 "http://127.0.0.1:1".into(),
                 "unused".into(),
                 Duration::from_millis(1),
@@ -1092,11 +1126,56 @@ mod tests {
         assert!(err.to_string().contains("past its promised length"));
     }
 
+    #[test]
+    fn the_credential_file_type_picks_the_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str, json: serde_json::Value| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, json.to_string()).unwrap();
+            path.to_str().unwrap().to_owned()
+        };
+        // What `gcloud iam workload-identity-pools create-cred-config --credential-source-file` writes.
+        let federated = file(
+            "wif.json",
+            serde_json::json!({
+                "universe_domain": "googleapis.com",
+                "type": "external_account",
+                "audience": "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/k",
+                "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+                "token_url": "https://sts.googleapis.com/v1/token",
+                "credential_source": { "file": "/nonexistent" },
+                "token_info_url": "https://sts.googleapis.com/v1/introspect",
+            }),
+        );
+        GcsStore::new("bucket".into(), &federated).unwrap();
+        // A key file's other fields ride past the tag; `disable_oauth` spares the test a real private key.
+        let key = file(
+            "key.json",
+            serde_json::json!({
+                "type": "service_account",
+                "private_key": "unused",
+                "private_key_id": "unused",
+                "client_email": "kymo@sa.example",
+                "disable_oauth": true,
+            }),
+        );
+        GcsStore::new("bucket".into(), &key).unwrap();
+        let user = file(
+            "user.json",
+            serde_json::json!({ "type": "authorized_user" }),
+        );
+        let err = GcsStore::new("bucket".into(), &user).err().unwrap();
+        assert!(
+            format!("{err:#}").contains("unknown variant `authorized_user`"),
+            "{err:#}"
+        );
+    }
+
     fn live_store() -> GcsStore {
         let bucket = std::env::var("KYMO_GCS_LIVE_TEST_BUCKET")
             .expect("set KYMO_GCS_LIVE_TEST_BUCKET (and GOOGLE_APPLICATION_CREDENTIALS)");
         let credentials = std::env::var("GOOGLE_APPLICATION_CREDENTIALS")
-            .expect("set GOOGLE_APPLICATION_CREDENTIALS to the SA key path");
+            .expect("set GOOGLE_APPLICATION_CREDENTIALS to a credential file path");
         GcsStore::new(bucket, &credentials).unwrap()
     }
 
@@ -1109,7 +1188,7 @@ mod tests {
 
     /// The doc's live adapter matrix (docs/cdn-gcs-migration.md §Write path) plus the read
     /// contract, against the real bucket:
-    /// `GOOGLE_APPLICATION_CREDENTIALS=<sa.json> KYMO_GCS_LIVE_TEST_BUCKET=<bucket> \
+    /// `GOOGLE_APPLICATION_CREDENTIALS=<credentials.json> KYMO_GCS_LIVE_TEST_BUCKET=<bucket> \
     ///  cargo test -p kymo-server gcs_live -- --ignored`
     /// Fixed-content keys are created once ever (later runs take the dedup path); the
     /// fresh-create case uses unique content, adding one tiny genuine object per run.

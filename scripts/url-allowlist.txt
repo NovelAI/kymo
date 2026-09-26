@@ -27,6 +27,8 @@ fonts.googleapis.com
 storage.googleapis.com
 accounts.google.com
 oauth2.googleapis.com
+sts.googleapis.com
+www.googleapis.com
 docs.rs
 en.wikipedia.org
 # tonic's placeholder URI for connectors that ignore it

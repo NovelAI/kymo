@@ -43,13 +43,13 @@ object_store = { version = "=0.14.1", features = ["gcp"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 crc32c = "0.6.8"
 base64 = "0.22"
+async-trait = "0.1.92"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 clickhouse = { version = "0.13", features = ["test-util"] }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
-async-trait = "0.1.92"
 
 [build-dependencies]
 protoc-bin-vendored = "3"

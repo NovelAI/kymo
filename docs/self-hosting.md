@@ -37,7 +37,7 @@ Settings are environment variables; an unset one takes its default.
 | `KYMO_ALLOWED_ORIGINS` | `http://localhost:*,http://127.0.0.1:*` | Comma-separated browser origins allowed to use the WebSocket and `/alerts`. Must include the dashboard's origin, exactly (for example `http://kymo.example`). A `:*` port wildcard works only for loopback hosts. |
 | `KYMO_CDN_BACKEND` | `filesystem` | Media store: `filesystem` or `gcs` |
 | `KYMO_CDN_ROOT` | `/data/cdn` | Media directory for the filesystem store |
-| `KYMO_CDN_GCS_BUCKET`, `GOOGLE_APPLICATION_CREDENTIALS` | none | Bucket and service-account key file, both required for `gcs` |
+| `KYMO_CDN_GCS_BUCKET`, `GOOGLE_APPLICATION_CREDENTIALS` | none | Bucket and Google credential file (a `service_account` key or an `external_account` federation config), both required for `gcs` |
 | `KYMO_RUN_REAPER_ENABLED` | `false` | Permanently delete runs whose Trash retention expired (see below) |
 | `KYMO_PROMETHEUS_URL` | unset | Prometheus whose firing alerts the dashboard shows |
 | `RUST_LOG` | `info` | Log filter |
