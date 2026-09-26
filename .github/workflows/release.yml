@@ -10,9 +10,10 @@ on:
 permissions:
   contents: read
 
+# Queue every run in order: a newer snapshot must never replace a waiting release.
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: false
+  queue: max
 
 jobs:
   meta:
