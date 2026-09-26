@@ -1,6 +1,6 @@
 `kymo` is an experiment tracker for machine learning.
 
-![webpage screenshot](assets/screenshot.png)
+![webpage screenshot](.github/screenshot.png)
 
 - ✅ Correct graphs, unlike the other experiment trackers
 - ❌ All webpage viewers have admin access, so you can't show untrusted friends your graphs
@@ -43,7 +43,7 @@ The local stack starts when logged to and stops itself after an hour with no log
 
 The [client README](python_client/README.md) covers the `kymo` commands, remote machines, undelivered data, backups, and logging to a server.
 
-This repository is a mirror of our internal repository. See [CONTRIBUTING](CONTRIBUTING.md).
+This repository is a mirror of our internal repository. See [CONTRIBUTING](.github/CONTRIBUTING.md).
 
 "kymo" comes from [kymograph](https://en.wikipedia.org/wiki/Kymograph).
 

@@ -23,7 +23,7 @@ ALLOWED_HOME_PATHS = {f"/{home}/runner/{d}" for home in ("home", "Users") for d 
 
 
 def allowlist() -> set[str]:
-    lines = (ROOT / "url-allowlist.txt").read_text().splitlines()
+    lines = (ROOT / "scripts/url-allowlist.txt").read_text().splitlines()
     return {line.split("#", 1)[0].strip().lower() for line in lines} - {""}
 
 
@@ -54,7 +54,7 @@ def scan(name: str, data: bytes, hosts: set[str], shipped_docs: set[str]) -> lis
     # License texts and maturin's SBOM name third-party sites by design.
     urls = [] if "/licenses/" in name or name.endswith(".cyclonedx.json") else URL.finditer(text)
     binary = b"\0" in data[:8192]
-    failures = [f"{name}: URL host {m.group(1)!r} is not on url-allowlist.txt" for m in urls if not host_allowed(m.group(1), hosts, binary)]
+    failures = [f"{name}: URL host {m.group(1)!r} is not on scripts/url-allowlist.txt" for m in urls if not host_allowed(m.group(1), hosts, binary)]
     failures += [f"{name}: cites unshipped docs/{m.group(1)}" for m in DOC_PATH.finditer(text) if m.group(1) not in shipped_docs]
     failures += [f"{name}: absolute path {m.group(0)!r}" for m in HOME_PATH.finditer(text) if m.group(0) not in ALLOWED_HOME_PATHS]
     return sorted(set(failures))
