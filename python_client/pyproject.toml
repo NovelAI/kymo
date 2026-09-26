@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kymo"
-version = "0.1.0"
+version = "0.1.1"
 description = "Experiment tracker for machine learning"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
@@ -42,7 +42,7 @@ dev = [
     "ruff==0.15.2",
 ]
 # Must equal this project's version; the release workflow asserts it.
-local = ["kymo-local-runtime==0.1.0"]
+local = ["kymo-local-runtime==0.1.1"]
 
 [tool.ruff]
 extend-exclude = ["kymo/_generated"]
