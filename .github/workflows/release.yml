@@ -1,6 +1,6 @@
 name: release
 
-# Every push to main (an exported snapshot) is built, tested, and gated. A pushed commit with a Kymo-Release: YYYY.M.D trailer is also stamped with that version, published to TestPyPI, then PyPI, and tagged last; a manual run is CI only.
+# Every push to main (an exported snapshot) is built, tested, and gated. A commit with a Kymo-Release: YYYY.M.D trailer, which the export pushes already tagged vYYYY.M.D, is also stamped with that version and published to TestPyPI, then PyPI. A manual run is CI only.
 # Any job step can write cache entries, so a release builds what it publishes without caches, and each build job uploads its artifact before running anything else.
 on:
   push:
@@ -225,17 +225,3 @@ jobs:
     steps:
       - *download-dists
       - uses: pypa/gh-action-pypi-publish@release/v1
-
-  tag:
-    needs: [meta, pypi]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v6
-      - name: Tag the release
-        env:
-          VERSION: ${{ needs.meta.outputs.release }}
-        run: |
-          git tag "v$VERSION"
-          git push origin "v$VERSION"
