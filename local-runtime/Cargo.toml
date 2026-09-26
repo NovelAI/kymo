@@ -1,6 +1,6 @@
 [package]
 name = "kymo-local-runtime"
-version = "0.1.1"
+version = "0.0.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/NovelAI/kymo"
@@ -11,7 +11,7 @@ members = [".", "core"]
 resolver = "2"
 
 [features]
-# CI qualification only. Published wheels must retain the shared 15-minute idle threshold.
+# CI qualification only. Published wheels must retain the shared one-hour idle threshold.
 test-idle-timeout = []
 
 [[bin]]

@@ -37,7 +37,7 @@ if __name__ == "__main__":
 
 Keep the `if __name__ == "__main__":` guard. kymo uploads from a helper process, and on macOS that process re-imports your script.
 
-The local stack starts when logged to and stops itself after 15 minutes with no logging and no open dashboard. `kymo open` starts it again.
+The local stack starts when logged to and stops itself after an hour with no logging and no open dashboard. `kymo open` starts it again.
 
 The [client README](python_client/README.md) covers the `kymo` commands, remote machines, undelivered data, backups, and logging to a server.
 

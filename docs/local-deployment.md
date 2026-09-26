@@ -8,7 +8,7 @@ Linear: AI-1433
 
 Local mode runs the existing PostgreSQL 17, ClickHouse, and `kymo-server` implementations under one native launcher. It does not add SQLite, Docker Desktop, or a second metadata path. PostgreSQL preserves the production SQL and transaction semantics; ClickHouse remains the metric store.
 
-The launcher downloads pinned database archives on first use, starts the stack on demand, and stops it after 15 minutes (the shared presumed-dead window plus a margin) without frontend or application activity. The Python worker parks while empty and wakes the stack only for pending delivery. A data-loss response for a rich mutation quarantines the affected spool as `.rejected`, reports the loss, and advances later ordered segments rather than retrying the rejected head forever.
+The launcher downloads pinned database archives on first use, starts the stack on demand, and stops it after an hour without frontend or application activity. The Python worker parks while empty and wakes the stack only for pending delivery. A data-loss response for a rich mutation quarantines the affected spool as `.rejected`, reports the loss, and advances later ordered segments rather than retrying the rejected head forever.
 
 The supported v1 targets are exactly:
 
@@ -149,7 +149,7 @@ PostgreSQL stores run metadata and monotonic rich-mutation heads. ClickHouse sto
 
 Spool creation, retirement, and quarantine sync the affected directory entries, so on filesystems that support directory sync a power loss can neither drop a spooled segment nor resurrect a delivered one.
 
-The registry is reconciled from ClickHouse on local boot through the existing type-upgrading, canonical-run-only registration path. Physical deletion of expired runs is always enabled locally; its first pass runs a minute after boot, then hourly, because an idle-stopped stack never lives long enough for hosted's one-interval startup delay.
+The registry is reconciled from ClickHouse on local boot through the existing type-upgrading, canonical-run-only registration path. Physical deletion of expired runs is always enabled locally; its first pass runs a minute after boot, then hourly, because an idle-stopped stack may not live long enough for hosted's one-interval startup delay.
 
 ## Data locations, deletion, and backup
 

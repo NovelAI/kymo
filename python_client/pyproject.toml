@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kymo"
-version = "0.1.1"
+version = "0.0.0"
 description = "Experiment tracker for machine learning"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
@@ -31,7 +31,7 @@ classifiers = [
 [project.urls]
 Repository = "https://github.com/NovelAI/kymo"
 Issues = "https://github.com/NovelAI/kymo/issues"
-Changelog = "https://github.com/NovelAI/kymo/blob/main/CHANGELOG.md"
+Releases = "https://github.com/NovelAI/kymo/tags"
 
 [project.scripts]
 kymo-sync = "kymo.sync:main"
@@ -41,8 +41,8 @@ dev = [
     "grpcio-tools==1.81.0",
     "ruff==0.15.2",
 ]
-# Must equal this project's version; the release workflow asserts it.
-local = ["kymo-local-runtime==0.1.1"]
+# A release build stamps its version here and above (scripts/set_version.py).
+local = ["kymo-local-runtime==0.0.0"]
 
 [tool.ruff]
 extend-exclude = ["kymo/_generated"]

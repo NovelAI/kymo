@@ -21,7 +21,7 @@ use anyhow::{Context, Result};
 
 const DEFAULT_BATCH_SIZE: usize = 100;
 const REAPER_INTERVAL: Duration = Duration::from_secs(60 * 60);
-// A local stack idles out after about 15 minutes and restarts its schedule on every boot, so it cannot wait a full interval before its first pass.
+// A local stack can stop before the first hourly pass and restarts its schedule on every boot, so it cannot wait a full interval before its first pass.
 const LOCAL_FIRST_PASS_DELAY: Duration = Duration::from_secs(60);
 const WORKER_RESTART_DELAY: Duration = Duration::from_secs(5);
 const PASS_TIMEOUT: Duration = Duration::from_secs(30 * 60);

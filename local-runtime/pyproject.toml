@@ -21,7 +21,7 @@ classifiers = [
 [project.urls]
 Repository = "https://github.com/NovelAI/kymo"
 Issues = "https://github.com/NovelAI/kymo/issues"
-Changelog = "https://github.com/NovelAI/kymo/blob/main/CHANGELOG.md"
+Releases = "https://github.com/NovelAI/kymo/tags"
 
 [tool.maturin]
 bindings = "bin"

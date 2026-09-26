@@ -2525,7 +2525,7 @@ mod tests {
     #[test]
     fn clearing_remnants_records_a_newer_launcher() {
         let (_temporary, paths, mut manifest) = installed_paths();
-        manifest.launcher_version = "0.0.1".to_owned();
+        manifest.launcher_version = "0.0.0-0".to_owned();
         clear_stopped_remnants(&paths, &mut manifest).unwrap();
         assert_eq!(
             RuntimeManifest::read(&paths.manifest())
