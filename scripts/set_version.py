@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stamp a release version over both packages' 0.0.0 placeholders: python scripts/set_version.py YYYY.M.D."""
+"""Stamp a release version over both packages' 0.0.0 placeholders: scripts/set_version.py YYYY.M.D."""
 
 import re
 import sys

@@ -16,3 +16,5 @@ accepted = [
     "MPL-2.0",
     "OpenSSL",
 ]
+# kymo's own crates are not third-party.
+private = { ignore = true }

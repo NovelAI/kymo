@@ -85,10 +85,26 @@ jobs:
         with:
           workspaces: . -> frontend-build/target
       - run: scripts/build.sh frontend frontend-build
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: frontend
           path: frontend-build/public
+          if-no-files-found: error
+
+  # Both wheels ship the same notices, so one job builds them.
+  notices:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.2
+      - run: scripts/build.sh notices
+      - uses: actions/upload-artifact@v7
+        with:
+          name: notices
+          path: local-runtime/THIRD-PARTY-NOTICES
           if-no-files-found: error
 
   client:
@@ -103,19 +119,20 @@ jobs:
         if: needs.meta.outputs.release != ''
         env:
           VERSION: ${{ needs.meta.outputs.release }}
-        run: python scripts/set_version.py "$VERSION"
-      - run: python -m pip install build twine
+        run: scripts/set_version.py "$VERSION"
+      - run: python -m pip install build
       - run: python -m build --outdir dist python_client
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-client
           path: dist
           if-no-files-found: error
+      - run: python -m pip install twine
       - run: python scripts/check_artifacts.py dist
       - run: scripts/ci.sh client
 
   runtime:
-    needs: [meta, frontend, client]
+    needs: [meta, frontend, notices, client]
     name: runtime (${{ matrix.platform }})
     strategy:
       fail-fast: false
@@ -127,22 +144,19 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.10'
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: frontend
-          path: local-runtime/.frontend-bundle
-      - uses: actions/download-artifact@v4
+          path: ${{ env.KYMO_FRONTEND_BUNDLE_DIR }}
+      - uses: actions/download-artifact@v8
         with:
           name: dist-client
           path: dist-client
-      - *set-version
-      - uses: taiki-e/install-action@v2
+      - uses: actions/download-artifact@v8
         with:
-          tool: cargo-about@0.9.2
-      - run: scripts/build.sh notices
+          name: notices
+          path: local-runtime
+      - *set-version
       # manylinux and docker-options apply only to the Linux container build.
       - uses: PyO3/maturin-action@v1
         env:
@@ -155,11 +169,15 @@ jobs:
           maturin-version: v1.14.1
           working-directory: local-runtime
           docker-options: -e KYMO_FRONTEND_BUNDLE_DIR
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-runtime-${{ matrix.platform }}
           path: local-runtime/dist
           if-no-files-found: error
+      # On macOS this installs pip from PyPI, so it runs after the upload.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
       - run: python -m pip install twine
       - run: python scripts/check_artifacts.py local-runtime/dist
       - run: scripts/smoke.sh local-runtime/dist dist-client
@@ -182,7 +200,7 @@ jobs:
       id-token: write
     steps:
       - &download-dists
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: ${{ matrix.artifacts }}
           path: dist
