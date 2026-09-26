@@ -1,6 +1,6 @@
 name: release
 
-# Every push to main (an exported snapshot) is built, tested, and gated. A commit with a Kymo-Release: YYYY.M.D trailer is also stamped with that version, published to TestPyPI, then PyPI, and tagged last.
+# Every push to main (an exported snapshot) is built, tested, and gated. A pushed commit with a Kymo-Release: YYYY.M.D trailer is also stamped with that version, published to TestPyPI, then PyPI, and tagged last; a manual run is CI only.
 # Any job step can write cache entries, so a release builds what it publishes without caches, and each build job uploads its artifact before running anything else.
 on:
   push:
@@ -10,10 +10,10 @@ on:
 permissions:
   contents: read
 
-# Queue every run in order: a newer snapshot must never replace a waiting release.
+# A newer snapshot's CI cancels an older one's; a release, a re-run, or a manual run gets its own group, so nothing cancels it and it never waits.
 concurrency:
-  group: release-${{ github.ref }}
-  queue: max
+  group: release-${{ github.event_name == 'push' && github.run_attempt == 1 && !contains(github.event.head_commit.message, 'Kymo-Release:') && 'snapshot' || github.run_id }}
+  cancel-in-progress: true
 
 jobs:
   meta:
@@ -22,12 +22,13 @@ jobs:
       release: ${{ steps.meta.outputs.release }}
       platforms: ${{ steps.meta.outputs.platforms }}
     steps:
-      - uses: actions/checkout@v6
       - id: meta
         env:
           PRIVATE: ${{ github.event.repository.private }}
+          # Only a push has a head commit, so a manual run never publishes and cannot race a release's uploads.
+          MESSAGE: ${{ github.event.head_commit.message }}
         run: |
-          release=$(git log -1 --format='%(trailers:key=Kymo-Release,valueonly)' | tr -d '[:space:]')
+          release=$(git interpret-trailers --parse <<<"$MESSAGE" | sed -n 's/^Kymo-Release: *//p')
           echo "release=$release" >> "$GITHUB_OUTPUT"
           platforms='{"platform":"linux-x86_64","runner":"ubuntu-latest"}'
           # macOS runners are free only in public repos, and a release needs both wheels.
