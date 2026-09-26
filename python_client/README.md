@@ -21,9 +21,9 @@ ssh -L 24819:127.0.0.1:24819 -L 24820:127.0.0.1:24820 you@server
 
 Then open the URL that `kymo open --no-browser` prints on the server in your local browser.
 
-## If the dashboard is unavailable
+## If the backend is not available
 
-Metrics that cannot be delivered are written to a spool (`~/.cache/kymo/spool`, or `$KYMO_SPOOL_DIR`) instead of being dropped. A running script delivers them once the stack is back. Run `kymo-sync` to deliver anything left behind by a script that has already exited.
+Metrics that cannot be delivered are written to a spool (`~/.cache/kymo/spool`, or `$KYMO_SPOOL_DIR`) instead of being dropped. A running script delivers them once the backend is back. Run `kymo-sync` to deliver anything left behind by a script that has already exited.
 
 ## Remove or back up local data
 

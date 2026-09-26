@@ -1,5 +1,7 @@
 `kymo` is an experiment tracker for machine learning.
 
+![webpage screenshot](assets/screenshot.png)
+
 - ✅ Correct graphs, unlike the other experiment trackers
 - ❌ All webpage viewers have admin access, so you can't show untrusted friends your graphs
 - ❌ Vibe-coded. I can't read Rust and don't know Postgres or ClickHouse or webdev. That means I can't read your PRs
