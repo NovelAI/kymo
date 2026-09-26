@@ -10,7 +10,7 @@ Two options:
 - **Local mode** runs the backend on your machine, started on demand and stopped when idle. Works on Linux x86-64 and Apple Silicon Mac, too bad for Windows users
 - **Hosted mode** logs to your server; see [self-hosting](docs/self-hosting.md)
 
-We don't host a server for you since we're too lazy to make money.
+We don't host a server for you since I'm too lazy to make money.
 
 ## Install
 
