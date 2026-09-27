@@ -18,15 +18,14 @@ mod gcs;
 #[cfg(test)]
 pub(crate) use gcs::test_support as gcs_test_support;
 pub use gcs::GcsStore;
+pub(crate) use gcs::{count_gcs_error, credentialed_builder, Identity};
 
-/// Register the CDN error counters the alerts read, at zero, at hosted startup in both modes:
-/// `increase()` needs a prior sample, so a series born at its first increment is invisible to
-/// the rule that exists for it. The per-class last-error gauges need no registration (their only
-/// reader treats 0 and absent alike).
+/// Register the CDN counters that `increase()` reads (the GCS error classes the alerts read, and the 404 counter), at zero, at hosted startup in both modes: `increase()` needs a prior sample, so a series born at its first increment is invisible to the rule that exists for it. The per-class last-error gauges need no registration (their only reader treats 0 and absent alike).
 pub fn register_cdn_metrics() {
     for class in gcs::GCS_ERROR_CLASSES {
         metrics::counter!("mkdb2_cdn_gcs_errors_total", "class" => class).absolute(0);
     }
+    metrics::counter!("mkdb2_cdn_not_found_total").absolute(0);
 }
 
 /// RFC 9110 §14.1.2 byte-range forms. `Bounded`/`From` are unsatisfiable when start is at/past
@@ -62,6 +61,13 @@ impl From<anyhow::Error> for StoreError {
 
 pub type ByteStream = Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send>>;
 
+/// How a successful `put_if_absent` acked. `Existing` is a dedup hit: the object's creation time predates this ack, which the collector must learn from its ack log (docs/cdn-gcs-migration.md § Garbage collection).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PutOutcome {
+    Created,
+    Existing,
+}
+
 /// A satisfiable ranged read can still be empty (a non-zero `Suffix` on an empty object); 206
 /// `Content-Range` cannot express an empty window, so the Range route (`cdn.rs`) must downgrade such a
 /// read to a plain 200 — never transcribe it into a 206.
@@ -75,18 +81,16 @@ pub struct StoreRead {
     pub stream: ByteStream,
 }
 
-/// `GcsStore` sits in an `Arc` so the inventory-gauge task can hold it without borrowing the
-/// state tree.
 pub enum CdnStore {
     Fs(FsStore),
-    Gcs(std::sync::Arc<GcsStore>),
+    Gcs(GcsStore),
 }
 
 impl CdnStore {
     /// Store `body` under `key`, or ack bare if the key already exists — content-addressed keys
     /// make the existing bytes identical by construction, so dedup needs no verification read
     /// (docs/cdn-gcs-migration.md).
-    pub async fn put_if_absent(&self, key: &str, body: Bytes) -> anyhow::Result<()> {
+    pub async fn put_if_absent(&self, key: &str, body: Bytes) -> anyhow::Result<PutOutcome> {
         match self {
             CdnStore::Fs(s) => s.put_if_absent(key, &body).await,
             CdnStore::Gcs(s) => s.put_if_absent(key, body).await,
@@ -155,7 +159,7 @@ impl FsStore {
         self.root.join(&hash[..2]).join(&hash[2..4]).join(key)
     }
 
-    async fn put_if_absent(&self, key: &str, body: &[u8]) -> anyhow::Result<()> {
+    async fn put_if_absent(&self, key: &str, body: &[u8]) -> anyhow::Result<PutOutcome> {
         let path = self.path_for(key);
         // Both parents exist by construction: path_for always returns root/xx/yy/key.
         let dir = path.parent().unwrap();
@@ -179,7 +183,7 @@ impl FsStore {
         }
 
         // Dedup: if file exists, skip write
-        if !path.exists() {
+        let outcome = if !path.exists() {
             fs::create_dir_all(dir)
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to create dir: {e}"))?;
@@ -222,15 +226,17 @@ impl FsStore {
             }
             guard.0 = None; // renamed into place — nothing to clean up
             tracing::info!(key = %key, size = body.len(), "CDN resource stored");
+            PutOutcome::Created
         } else {
             tracing::debug!(key = %key, "CDN resource already exists (dedup)");
-        }
+            PutOutcome::Existing
+        };
 
         // The final name is durable only after its containing directory is synced. Do this on dedup hits too: a retry after rename succeeded but this sync failed must repair durability before it can acknowledge the resource ID.
         sync_directory(dir)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to sync CDN shard: {e}"))?;
-        Ok(())
+        Ok(outcome)
     }
 
     async fn get(&self, key: &str, range: Option<ByteRange>) -> Result<StoreRead, StoreError> {
@@ -285,12 +291,18 @@ mod tests {
     async fn fs_store_dedups_and_honors_the_shared_range_contract() {
         let root = tempfile::tempdir().unwrap();
         let store = FsStore::new(root.path().to_path_buf());
-        store.put_if_absent(KEY, b"0123456789").await.unwrap();
+        assert_eq!(
+            store.put_if_absent(KEY, b"0123456789").await.unwrap(),
+            PutOutcome::Created
+        );
         // Dedup trusts bare existence: a second put under the same key must ack without
         // touching the stored bytes (deliberately different bytes here to make an overwrite
         // visible — content-addressing forbids this input in production). The contract's full
         // read then pins that the original bytes survived.
-        store.put_if_absent(KEY, b"XXXXXXXXXX").await.unwrap();
+        assert_eq!(
+            store.put_if_absent(KEY, b"XXXXXXXXXX").await.unwrap(),
+            PutOutcome::Existing
+        );
         store.put_if_absent(EMPTY_KEY, b"").await.unwrap();
         assert_range_contract(&CdnStore::Fs(store)).await;
     }

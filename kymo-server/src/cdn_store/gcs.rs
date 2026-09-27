@@ -21,7 +21,7 @@ use object_store::gcp::{GcpCredentialProvider, GoogleCloudStorageBuilder};
 use object_store::path::Path as ObjectPath;
 use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt as _};
 
-use super::{resolve_range, ByteRange, ByteStream, StoreError, StoreRead};
+use super::{resolve_range, ByteRange, ByteStream, PutOutcome, StoreError, StoreRead};
 
 mod external_account;
 
@@ -30,35 +30,66 @@ pub struct GcsStore {
     uploader: Uploader,
 }
 
-impl GcsStore {
-    /// The credential file's `type` picks the auth: `service_account` (a JSON key, the crate's native support) or `external_account` ([`external_account`]). Either way the builder gets explicit credentials (never `from_env`), so it never falls through to ambient ADC or instance credentials.
-    pub fn new(bucket: String, credentials_path: &str) -> anyhow::Result<Self> {
-        #[derive(serde::Deserialize)]
-        #[serde(tag = "type", rename_all = "snake_case")]
-        enum CredentialFile {
-            ServiceAccount,
-            ExternalAccount(external_account::Config),
+/// Which identity a credential file serves: the store's must not impersonate and the collector's must (docs/cdn-gcs-migration.md § Credentials).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Identity {
+    Store,
+    Collector,
+}
+
+/// A builder carrying the credentials in `credentials_path`, whose `type` picks the auth: `service_account` (a JSON key, the crate's native support) or `external_account` ([`external_account`]). Either way the builder gets explicit credentials (never `from_env`), so it never falls through to ambient ADC or instance credentials.
+pub(crate) fn credentialed_builder(
+    credentials_path: &str,
+    identity: Identity,
+) -> anyhow::Result<GoogleCloudStorageBuilder> {
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum CredentialFile {
+        ServiceAccount,
+        ExternalAccount(external_account::Config),
+    }
+    let json = std::fs::read(credentials_path)
+        .with_context(|| format!("reading GCS credentials {credentials_path}"))?;
+    let file: CredentialFile = serde_json::from_slice(&json)
+        .with_context(|| format!("{credentials_path}: unsupported GCS credential file"))?;
+    let impersonates = match &file {
+        CredentialFile::ServiceAccount => false,
+        CredentialFile::ExternalAccount(config) => config.impersonates(),
+    };
+    anyhow::ensure!(
+        impersonates == (identity == Identity::Collector),
+        "{credentials_path}: {}",
+        match identity {
+            Identity::Store => "the store's credentials must not impersonate a service account",
+            Identity::Collector => "the collector's credentials must be an external_account that impersonates its delete identity",
         }
-        let json = std::fs::read(credentials_path)
-            .with_context(|| format!("reading GCS credentials {credentials_path}"))?;
-        let file: CredentialFile = serde_json::from_slice(&json)
-            .with_context(|| format!("{credentials_path}: unsupported GCS credential file"))?;
-        let builder = match file {
-            CredentialFile::ServiceAccount => {
-                tracing::info!(credentials = "service_account", "CDN GCS credentials");
-                GoogleCloudStorageBuilder::new().with_service_account_key(String::from_utf8(json)?)
-            }
-            CredentialFile::ExternalAccount(config) => {
-                let federated = external_account::ExternalAccount::new(config)
-                    .with_context(|| format!("{credentials_path}: unsupported external_account"))?;
-                tracing::info!(
-                    credentials = "external_account",
-                    audience = federated.audience(),
-                    "CDN GCS credentials"
-                );
-                GoogleCloudStorageBuilder::new().with_credentials(Arc::new(federated))
-            }
-        };
+    );
+    Ok(match file {
+        CredentialFile::ServiceAccount => {
+            tracing::info!(
+                ?identity,
+                credentials = "service_account",
+                "CDN GCS credentials"
+            );
+            GoogleCloudStorageBuilder::new().with_service_account_key(String::from_utf8(json)?)
+        }
+        CredentialFile::ExternalAccount(config) => {
+            let federated = external_account::ExternalAccount::new(config)
+                .with_context(|| format!("{credentials_path}: unsupported external_account"))?;
+            tracing::info!(
+                ?identity,
+                credentials = "external_account",
+                audience = federated.audience(),
+                "CDN GCS credentials"
+            );
+            GoogleCloudStorageBuilder::new().with_credentials(Arc::new(federated))
+        }
+    })
+}
+
+impl GcsStore {
+    pub fn new(bucket: String, credentials_path: &str) -> anyhow::Result<Self> {
+        let builder = credentialed_builder(credentials_path, Identity::Store)?;
         let store = builder
             .with_bucket_name(&bucket)
             // FsStore has no whole-transfer deadline and neither may GCS reads: the crate's
@@ -98,7 +129,7 @@ impl GcsStore {
         Self { reads, uploader }
     }
 
-    pub(crate) async fn put_if_absent(&self, key: &str, body: Bytes) -> anyhow::Result<()> {
+    pub(crate) async fn put_if_absent(&self, key: &str, body: Bytes) -> anyhow::Result<PutOutcome> {
         // The routes' grammar is the one rule (it also guarantees keys need no URL escaping
         // and no ObjectPath normalization surprises); assert so the contract is enforced, not
         // folklore.
@@ -174,17 +205,9 @@ impl GcsStore {
         }
     }
 
-    /// Full bucket inventory: `(object count, total bytes)` from one listing walk.
-    pub(crate) async fn inventory(&self) -> anyhow::Result<(u64, u64)> {
-        use futures::TryStreamExt as _;
-        self.reads
-            .list(None)
-            .try_fold((0u64, 0u64), |(objects, bytes), meta| async move {
-                Ok((objects + 1, bytes + meta.size))
-            })
-            .await
-            .inspect_err(|_| count_gcs_error("read"))
-            .map_err(anyhow::Error::from)
+    /// The read-side client (runtime identity: list + get), shared with the collector's listing and manifest reads (`cdn_gc.rs`).
+    pub(crate) fn reads(&self) -> Arc<dyn ObjectStore> {
+        self.reads.clone()
     }
 
     async fn head_len(&self, location: &ObjectPath) -> Result<u64, StoreError> {
@@ -236,7 +259,7 @@ fn exact_len_stream(
 /// `mkdb2_cdn_gcs_errors_total{class}` — every GCS error event, transient attempts included
 /// (the sustained-5xx alert needs attempt-level visibility, not just terminal outcomes; the
 /// classes are [`GCS_ERROR_CLASSES`]).
-fn count_gcs_error(class: &'static str) {
+pub(crate) fn count_gcs_error(class: &'static str) {
     metrics::gauge!("mkdb2_cdn_gcs_last_error_unixtime_seconds", "class" => class)
         .set(crate::deletion::unix_time_seconds());
     metrics::counter!("mkdb2_cdn_gcs_errors_total", "class" => class).increment(1);
@@ -318,14 +341,14 @@ impl Uploader {
         Ok(credential.bearer.clone())
     }
 
-    async fn put_if_absent(&self, key: &str, body: Bytes) -> anyhow::Result<()> {
+    async fn put_if_absent(&self, key: &str, body: Bytes) -> anyhow::Result<PutOutcome> {
         let crc = crc32c_b64(crc32c::crc32c(&body));
         self.put_with_crc(key, body, &crc).await
     }
 
     /// Split from [`Self::put_if_absent`] so the live tests can send a deliberately wrong
     /// checksum through the REAL framing path and pin GCS's reject-before-store behavior.
-    async fn put_with_crc(&self, key: &str, body: Bytes, crc: &str) -> anyhow::Result<()> {
+    async fn put_with_crc(&self, key: &str, body: Bytes, crc: &str) -> anyhow::Result<PutOutcome> {
         let boundary = format!("kymo_{}", self.boundary_salt);
         let mime = mime_guess::from_path(key)
             .first_or_octet_stream()
@@ -371,7 +394,7 @@ impl Uploader {
             .await?;
         if (200..300).contains(&status) {
             tracing::info!(key = %key, size = body.len(), backend = "gcs", "CDN resource stored");
-            return Ok(());
+            return Ok(PutOutcome::Created);
         }
         let detail = truncate(&detail, 600);
         if status == 412 {
@@ -449,7 +472,7 @@ impl Uploader {
     /// retries the whole write — never ack on ambiguity. Every failure of the check counts once
     /// as `existence_check` (a partition of events); the root cause rides the error to the
     /// caller, which logs it with the key.
-    async fn ack_if_exists(&self, key: &str, rejection: &str) -> anyhow::Result<()> {
+    async fn ack_if_exists(&self, key: &str, rejection: &str) -> anyhow::Result<PutOutcome> {
         let url = format!("{}/storage/v1/b/{}/o/{}", self.base_url, self.bucket, key);
         let failed = |detail: String| {
             count_gcs_error("existence_check");
@@ -470,7 +493,7 @@ impl Uploader {
         match response.status().as_u16() {
             200 => {
                 tracing::debug!(key = %key, backend = "gcs", "CDN resource already exists (dedup)");
-                Ok(())
+                Ok(PutOutcome::Existing)
             }
             404 => {
                 count_gcs_error("precondition_no_object");
@@ -682,6 +705,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
+    use crate::cdn::content_key;
     use crate::cdn_store::CdnStore;
     use futures::TryStreamExt;
     use object_store::memory::InMemory;
@@ -741,9 +765,12 @@ mod tests {
         const MEDIA: &[u8] = b"\x89PNG\r\n\x1a\n\x00\xff--kymo_binary\r\n\x01";
         let m = mock(vec![(200, r#"{"name":"x"}"#)], 404);
         let up = mock_uploader(m.clone(), Duration::from_millis(1)).await;
-        up.put_if_absent(KEY, Bytes::from_static(MEDIA))
-            .await
-            .unwrap();
+        assert_eq!(
+            up.put_if_absent(KEY, Bytes::from_static(MEDIA))
+                .await
+                .unwrap(),
+            PutOutcome::Created
+        );
 
         let requests = m.upload_requests.lock().unwrap();
         let (uri, headers, body) = &requests[0];
@@ -787,9 +814,12 @@ mod tests {
     async fn dedup_412_with_existing_object_acks() {
         let m = mock(vec![(412, FIXTURE_DEDUP_412)], 200);
         let up = mock_uploader(m, Duration::from_millis(1)).await;
-        up.put_if_absent(KEY, Bytes::from_static(b"0123456789"))
-            .await
-            .unwrap();
+        assert_eq!(
+            up.put_if_absent(KEY, Bytes::from_static(b"0123456789"))
+                .await
+                .unwrap(),
+            PutOutcome::Existing
+        );
     }
 
     #[tokio::test]
@@ -927,7 +957,7 @@ mod tests {
             &[(KEY, b"0123456789"), (EMPTY_KEY, b"")],
         )
         .await;
-        let store = CdnStore::Gcs(Arc::new(gcs));
+        let store = CdnStore::Gcs(gcs);
         assert_range_contract(&store).await;
     }
 
@@ -1127,7 +1157,7 @@ mod tests {
     }
 
     #[test]
-    fn the_credential_file_type_picks_the_auth() {
+    fn credential_files_pick_the_auth_and_match_their_identity() {
         let dir = tempfile::tempdir().unwrap();
         let file = |name: &str, json: serde_json::Value| {
             let path = dir.path().join(name);
@@ -1160,6 +1190,36 @@ mod tests {
             }),
         );
         GcsStore::new("bucket".into(), &key).unwrap();
+        // The store never impersonates; the collector only impersonates. What `create-cred-config --service-account` writes (it drops `token_info_url`).
+        let impersonating = file(
+            "gc.json",
+            serde_json::json!({
+                "universe_domain": "googleapis.com",
+                "type": "external_account",
+                "audience": "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/k",
+                "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+                "token_url": "https://sts.googleapis.com/v1/token",
+                "credential_source": { "file": "/nonexistent" },
+                "service_account_impersonation_url": "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/gc@sa.example:generateAccessToken",
+            }),
+        );
+        let store_err = GcsStore::new("bucket".into(), &impersonating)
+            .err()
+            .unwrap();
+        assert!(
+            format!("{store_err:#}").contains("must not impersonate"),
+            "{store_err:#}"
+        );
+        credentialed_builder(&impersonating, Identity::Collector).unwrap();
+        for direct in [&federated, &key] {
+            let err = credentialed_builder(direct, Identity::Collector)
+                .err()
+                .unwrap();
+            assert!(
+                format!("{err:#}").contains("must be an external_account that impersonates"),
+                "{err:#}"
+            );
+        }
         let user = file(
             "user.json",
             serde_json::json!({ "type": "authorized_user" }),
@@ -1179,27 +1239,21 @@ mod tests {
         GcsStore::new(bucket, &credentials).unwrap()
     }
 
-    /// Content-addressed key for a body: exactly what the upload route produces, so live-test
-    /// objects are genuine CDN objects and need no cleanup (the write-once SA cannot delete).
-    fn ca_key(body: &[u8], ext: &str) -> String {
-        use sha2::Digest as _;
-        format!("{}.{ext}", hex::encode(sha2::Sha256::digest(body)))
-    }
-
     /// The doc's live adapter matrix (docs/cdn-gcs-migration.md §Write path) plus the read
     /// contract, against the real bucket:
     /// `GOOGLE_APPLICATION_CREDENTIALS=<credentials.json> KYMO_GCS_LIVE_TEST_BUCKET=<bucket> \
     ///  cargo test -p kymo-server gcs_live -- --ignored`
-    /// Fixed-content keys are created once ever (later runs take the dedup path); the
-    /// fresh-create case uses unique content, adding one tiny genuine object per run.
+    /// Keys are content addresses, as the upload route makes them, so test objects are genuine
+    /// CDN objects: unreferenced, which the collector reclaims after its grace. Fixed-content
+    /// keys take the dedup path until then; the fresh-create case uses unique content.
     #[tokio::test]
     #[ignore]
     async fn gcs_live_round_trip() {
         let store = live_store();
 
-        // Fixed object: first run ever creates, every later run is dedup 412 + existence ack.
+        // Fixed object: dedup 412 + existence ack, or a create if it's new or was reclaimed.
         let body: &[u8] = b"kymo gcs live conformance object v1\n";
-        let key = ca_key(body, "txt");
+        let key = content_key(body, "txt");
         store
             .put_if_absent(&key, Bytes::from_static(body))
             .await
@@ -1210,13 +1264,13 @@ mod tests {
             "kymo gcs live fresh-create probe {:?}\n",
             std::time::SystemTime::now()
         );
-        let ukey = ca_key(unique.as_bytes(), "txt");
+        let ukey = content_key(unique.as_bytes(), "txt");
         let ubytes = Bytes::from(unique.into_bytes());
         store.put_if_absent(&ukey, ubytes.clone()).await.unwrap();
         store.put_if_absent(&ukey, ubytes).await.unwrap();
 
         // Zero-byte envelope edge.
-        let zkey = ca_key(b"", "gz");
+        let zkey = content_key(b"", "gz");
         store.put_if_absent(&zkey, Bytes::new()).await.unwrap();
         let zread = store.get(&zkey, None).await.unwrap();
         assert_eq!((zread.read_len, zread.total_len), (0, 0));
@@ -1224,7 +1278,7 @@ mod tests {
         // Checksum mismatch through the REAL framing path: rejected terminally, and rejected
         // BEFORE storing — the key must stay absent.
         let corrupt = b"kymo gcs live wrong-crc probe body";
-        let ckey = ca_key(corrupt, "txt");
+        let ckey = content_key(corrupt, "txt");
         let err = store
             .uploader
             .put_with_crc(&ckey, Bytes::from_static(corrupt), "AAAAAA==")
@@ -1328,7 +1382,7 @@ mod tests {
 
     /// The 256MiB envelope ceiling (docs/cdn-gcs-migration.md live matrix), separate because it
     /// moves 256MiB over the wire — run it where bandwidth allows. Deterministic content, so it
-    /// stores exactly one permanent object and later runs take the dedup path.
+    /// stores one object, which later runs dedup until the collector reclaims it.
     #[tokio::test]
     #[ignore]
     async fn gcs_live_256mib_envelope() {
@@ -1337,7 +1391,7 @@ mod tests {
             .map(|i| (i % 251) as u8)
             .collect::<Vec<u8>>()
             .into();
-        let key = ca_key(&body, "bin");
+        let key = content_key(&body, "bin");
         store.put_if_absent(&key, body.clone()).await.unwrap();
 
         let suffix = store.get(&key, Some(ByteRange::Suffix(16))).await.unwrap();

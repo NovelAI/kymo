@@ -430,6 +430,7 @@ mod tests {
         Arc::new(cdn::CdnState {
             store: crate::cdn_store::CdnStore::Fs(crate::cdn_store::FsStore::new(root.to_owned())),
             activity: crate::activity::ActivityTracker::new_local(),
+            uploads: None,
         })
     }
 

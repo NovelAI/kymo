@@ -1,7 +1,7 @@
 mod activity;
 mod alerts;
 mod cdn;
-mod cdn_migrate;
+mod cdn_gc;
 mod cdn_store;
 mod chart;
 // Wire contract shared verbatim with the frontend (lives next to kymo.proto; both crates include it by path). Each side exercises its half — the server slices, the client splices — so the other half is dead code by design.
@@ -416,8 +416,8 @@ fn cdn_backend_mode(value: Option<&std::ffi::OsStr>) -> anyhow::Result<CdnBacken
     }
 }
 
-/// Validates the whole CDN env surface up front (docs/cdn-gcs-migration.md: gcs mode with incomplete GCS config fails startup — no silent fallback to the filesystem). `None` is the filesystem store; in gcs mode the credential file is opened and decoded here, before any database work (fail closed, no ambient ADC).
-fn cdn_preflight() -> anyhow::Result<Option<Arc<cdn_store::GcsStore>>> {
+/// Validates the whole CDN env surface up front (docs/cdn-gcs-migration.md: gcs mode with incomplete GCS config fails startup — no silent fallback to the filesystem). `None` is the filesystem store; in gcs mode every credential file is opened and decoded here, before any database work (fail closed, no ambient ADC).
+fn cdn_preflight() -> anyhow::Result<Option<(cdn_store::GcsStore, cdn_gc::Config)>> {
     cdn_store::register_cdn_metrics();
     if cdn_backend_mode(std::env::var_os("KYMO_CDN_BACKEND").as_deref())?
         == CdnBackendMode::Filesystem
@@ -433,10 +433,11 @@ fn cdn_preflight() -> anyhow::Result<Option<Arc<cdn_store::GcsStore>>> {
             "KYMO_CDN_BACKEND=gcs requires GOOGLE_APPLICATION_CREDENTIALS (a non-empty credential file path)"
         )
     })?;
-    Ok(Some(Arc::new(cdn_store::GcsStore::new(
-        bucket,
-        &credentials,
-    )?)))
+    let gc_config = cdn_gc::Config::from_env(&bucket)?;
+    Ok(Some((
+        cdn_store::GcsStore::new(bucket, &credentials)?,
+        gc_config,
+    )))
 }
 
 pub async fn run() -> anyhow::Result<()> {
@@ -595,17 +596,17 @@ pub async fn run() -> anyhow::Result<()> {
     .spawn();
 
     let cdn_root = PathBuf::from(env::string_or("KYMO_CDN_ROOT", "/data/cdn"));
-    // The gcs mode has no CDN volume: nothing to create, and the disk gauge is
-    // replaced by the bucket inventory gauges (docs/cdn-gcs-migration.md observability).
-    let (cdn_store, cdn_disk) = match gcs {
+    // The gcs mode has no CDN volume: nothing to create, and the disk gauge is replaced by the collector's bucket inventory gauges (docs/cdn-gcs-migration.md § Observability).
+    let (cdn_store, cdn_disk, cdn_uploads) = match gcs {
         None => {
             tokio::fs::create_dir_all(&cdn_root).await?;
             let fs = cdn_store::FsStore::new(cdn_root.clone());
-            (cdn_store::CdnStore::Fs(fs), Some(cdn_root))
+            (cdn_store::CdnStore::Fs(fs), Some(cdn_root), None)
         }
-        Some(gcs) => {
-            cdn_migrate::spawn_inventory_gauges(gcs.clone());
-            (cdn_store::CdnStore::Gcs(gcs), None)
+        Some((gcs, gc_config)) => {
+            let (uploads, collector) = cdn_gc::start(gc_config, gcs.reads(), ch.clone()).await?;
+            collector.spawn();
+            (cdn_store::CdnStore::Gcs(gcs), None, Some(uploads))
         }
     };
 
@@ -625,6 +626,7 @@ pub async fn run() -> anyhow::Result<()> {
         Arc::new(cdn::CdnState {
             store: cdn_store,
             activity,
+            uploads: cdn_uploads,
         }),
         prom_handle,
     )

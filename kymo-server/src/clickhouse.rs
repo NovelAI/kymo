@@ -31,6 +31,12 @@ const RICH_METRICS_TABLE: &str = "mkdb2.rich_metrics";
 const REGISTRY_OUTBOX_TABLE: &str = "mkdb2.metric_registry_outbox";
 const REGISTRY_OUTBOX_VIEW: &str = "mkdb2.metric_registry_outbox_mv";
 const RICH_REGISTRY_OUTBOX_VIEW: &str = "mkdb2.rich_metric_registry_outbox_mv";
+const CDN_ACKS_TABLE: &str = "mkdb2.cdn_acks";
+const CDN_MANIFEST_CHILDREN_TABLE: &str = "mkdb2.cdn_manifest_children";
+const CDN_GC_SCRATCH_TABLE: &str = "mkdb2.cdn_gc_scratch";
+/// A dedup upload waits on this insert; its failure fails the upload into the client spool.
+const CDN_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+const CDN_GC_MAX_MEMORY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Deserialize, clickhouse::Row)]
 struct SchemaColumn {
@@ -283,6 +289,52 @@ pub struct RichMetricRow {
     pub timestamp_ms: i64,
     pub cdn_key: String,
     pub mutation_version: u64,
+}
+
+#[derive(Debug, Serialize, clickhouse::Row)]
+struct CdnAckRow {
+    key: String,
+    acked_at: u32,
+}
+
+/// A bucket listing row (`kind` is always `inventory`).
+#[derive(Debug, Serialize, clickhouse::Row)]
+pub struct CdnInventoryRow {
+    pub kind: &'static str,
+    pub key: String,
+    pub size: u64,
+    pub created: u32,
+}
+
+#[derive(Debug, Serialize, clickhouse::Row)]
+pub struct CdnManifestRow {
+    pub parent: String,
+    pub links_version: u32,
+    pub children: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, clickhouse::Row)]
+pub struct CdnGcKeySize {
+    pub key: String,
+    pub size: u64,
+}
+
+/// Field order must match `ChClient::cdn_gc_report` (the RowBinary decoder is positional).
+#[derive(Debug, Default, Deserialize, clickhouse::Row)]
+pub struct CdnGcReport {
+    pub referenced_objects: u64,
+    pub referenced_bytes: u64,
+    pub candidate_objects: u64,
+    pub candidate_bytes: u64,
+    /// Distinct referenced keys, stored or not.
+    pub references: u64,
+}
+
+impl CdnGcReport {
+    /// Referenced keys missing from the bucket.
+    pub fn dangling_references(&self) -> u64 {
+        self.references.saturating_sub(self.referenced_objects)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, clickhouse::Row)]
@@ -1746,6 +1798,288 @@ impl ChClient {
                 MAX_TEXT_WINDOW_BYTES,
             )?,
         })
+    }
+
+    // --- CDN garbage collection (docs/cdn-gcs-migration.md § Garbage collection) ---
+
+    /// The collector's tables. `cdn_acks` holds dedup acks for twice the grace, so the grace can grow without an ALTER; its `''` row is written once, when the log starts, and never expires: it is the log's start time, which delete mode waits on.
+    pub async fn ensure_cdn_gc_schema(&self, grace_days: u64, now: u32) -> Result<()> {
+        let ttl_days = 2 * grace_days;
+        self.client
+            .query(&format!(
+                "CREATE TABLE IF NOT EXISTS {CDN_ACKS_TABLE} (
+                    key      String,
+                    acked_at DateTime
+                ) ENGINE = ReplacingMergeTree(acked_at)
+                ORDER BY key
+                TTL acked_at + INTERVAL {ttl_days} DAY DELETE WHERE key != ''"
+            ))
+            .execute()
+            .await
+            .context("creating the CDN ack log")?;
+        if self.cdn_ack_log_start().await?.is_none() {
+            self.record_cdn_ack("", now).await?;
+        }
+        // One row per parsed root and links version, holding all its children (empty for a leaf). Keys are content addresses, so a root is fetched again only under a new links version. The version is in the sort key so rows of different versions never collapse into each other: an image rolled back across a bump must still find its own.
+        self.client
+            .query(&format!(
+                "CREATE TABLE IF NOT EXISTS {CDN_MANIFEST_CHILDREN_TABLE} (
+                    parent        String,
+                    links_version UInt32,
+                    children      Array(String)
+                ) ENGINE = ReplacingMergeTree
+                ORDER BY (parent, links_version)"
+            ))
+            .execute()
+            .await
+            .context("creating the CDN manifest-children cache")?;
+        // Per-pass working set, truncated at each pass start. `kind` is `inventory` (the bucket listing), `ref` (referenced keys), `unparsed` (roots awaiting a manifest parse), or `candidate` (deletable keys).
+        self.client
+            .query(&format!(
+                "CREATE TABLE IF NOT EXISTS {CDN_GC_SCRATCH_TABLE} (
+                    kind    LowCardinality(String),
+                    key     String,
+                    size    UInt64,
+                    created DateTime
+                ) ENGINE = MergeTree
+                ORDER BY (kind, key)"
+            ))
+            .execute()
+            .await
+            .context("creating the CDN collector's scratch table")?;
+        Ok(())
+    }
+
+    pub async fn record_cdn_ack(&self, key: &str, acked_at: u32) -> Result<()> {
+        let mut insert = self
+            .client
+            .insert::<CdnAckRow>(CDN_ACKS_TABLE)?
+            .with_timeouts(Some(CDN_ACK_TIMEOUT), Some(CDN_ACK_TIMEOUT));
+        insert
+            .write(&CdnAckRow {
+                key: key.to_owned(),
+                acked_at,
+            })
+            .await?;
+        insert.end().await.context("recording a CDN dedup ack")
+    }
+
+    /// When the ack log started (unix seconds): the newest `''` row, which is also the one a merge keeps.
+    pub async fn cdn_ack_log_start(&self) -> Result<Option<u32>> {
+        self.client
+            .query(&format!(
+                "SELECT toUInt32(acked_at) FROM {CDN_ACKS_TABLE} WHERE key = ''
+                 ORDER BY acked_at DESC LIMIT 1"
+            ))
+            .fetch_optional::<u32>()
+            .await
+            .context("reading the CDN ack log start")
+    }
+
+    /// The GC's heavy statements: a memory cap fails the statement rather than the server (a ClickHouse OOM takes concurrent ingest with it), and two threads keep full scans off the dashboards' cores. No server profile may shorten a result, since a short referenced set deletes reachable objects: every overflow mode throws instead of `break`, and `limit` and `offset` are 0. The scratch table's sort key would make each `IN` set be built twice, once more for index analysis that prunes nothing here, which doubles set memory. Sync inserts: scratch batches are large, one part each.
+    fn gc_client(&self) -> Client {
+        [
+            "read_overflow_mode",
+            "read_overflow_mode_leaf",
+            "set_overflow_mode",
+            "join_overflow_mode",
+            "transfer_overflow_mode",
+            "group_by_overflow_mode",
+            "distinct_overflow_mode",
+            "sort_overflow_mode",
+            "result_overflow_mode",
+            "timeout_overflow_mode",
+            "timeout_overflow_mode_leaf",
+        ]
+        .into_iter()
+        .fold(self.client.clone(), |client, mode| {
+            client.with_option(mode, "throw")
+        })
+        .with_option("limit", "0")
+        .with_option("offset", "0")
+        .with_option("use_index_for_in_with_subqueries", "0")
+        .with_option("async_insert", "0")
+        .with_option("max_memory_usage", CDN_GC_MAX_MEMORY_BYTES.to_string())
+        .with_option("max_threads", "2")
+    }
+
+    pub async fn cdn_gc_reset(&self) -> Result<()> {
+        self.gc_client()
+            .query(&format!("TRUNCATE TABLE {CDN_GC_SCRATCH_TABLE}"))
+            .execute()
+            .await
+            .context("truncating the CDN collector's scratch table")
+    }
+
+    async fn cdn_gc_insert<T: clickhouse::Row + Serialize>(
+        &self,
+        table: &str,
+        rows: &[T],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut insert = self.gc_client().insert::<T>(table)?;
+        for row in rows {
+            insert.write(row).await?;
+        }
+        Ok(insert.end().await?)
+    }
+
+    pub async fn cdn_gc_insert_inventory(&self, rows: &[CdnInventoryRow]) -> Result<()> {
+        self.cdn_gc_insert(CDN_GC_SCRATCH_TABLE, rows)
+            .await
+            .context("inserting the CDN inventory")
+    }
+
+    /// Referenced roots: every physical row's key in both metric tables — superseded and trashed-but-unpurged rows included — restricted to the hosted key grammar.
+    pub async fn cdn_gc_collect_roots(&self, key_pattern: &str) -> Result<()> {
+        self.gc_client()
+            .query(&format!(
+                "INSERT INTO {CDN_GC_SCRATCH_TABLE} (kind, key)
+                 SELECT 'ref', key FROM (
+                     SELECT assumeNotNull(cdn_key) AS key FROM {METRICS_TABLE}
+                     WHERE cdn_key IS NOT NULL
+                     UNION ALL
+                     SELECT cdn_key AS key FROM {RICH_METRICS_TABLE}
+                 )
+                 WHERE match(key, ?)
+                 GROUP BY key"
+            ))
+            .bind(key_pattern)
+            .execute()
+            .await
+            .context("collecting referenced CDN roots")
+    }
+
+    /// Stored roots with no children row under this links version, for the manifest parse.
+    pub async fn cdn_gc_collect_unparsed(&self, links_version: u32) -> Result<()> {
+        self.gc_client()
+            .query(&format!(
+                "INSERT INTO {CDN_GC_SCRATCH_TABLE} (kind, key, size)
+                 SELECT 'unparsed', key, size FROM {CDN_GC_SCRATCH_TABLE}
+                 WHERE kind = 'inventory'
+                   AND key IN (SELECT key FROM {CDN_GC_SCRATCH_TABLE} WHERE kind = 'ref')
+                   AND key NOT IN (SELECT parent FROM {CDN_MANIFEST_CHILDREN_TABLE}
+                                   WHERE links_version = ?)"
+            ))
+            .bind(links_version)
+            .execute()
+            .await
+            .context("collecting unparsed CDN roots")
+    }
+
+    pub async fn cdn_gc_insert_manifests(&self, rows: &[CdnManifestRow]) -> Result<()> {
+        self.cdn_gc_insert(CDN_MANIFEST_CHILDREN_TABLE, rows)
+            .await
+            .context("caching CDN manifest children")
+    }
+
+    /// Adds the roots' manifest children to the referenced set (one level: nothing reads a child as a manifest).
+    pub async fn cdn_gc_collect_children(&self, links_version: u32) -> Result<()> {
+        self.gc_client()
+            .query(&format!(
+                "INSERT INTO {CDN_GC_SCRATCH_TABLE} (kind, key)
+                 SELECT 'ref', arrayJoin(children) FROM {CDN_MANIFEST_CHILDREN_TABLE}
+                 WHERE links_version = ?
+                   AND parent IN (SELECT key FROM {CDN_GC_SCRATCH_TABLE} WHERE kind = 'ref')"
+            ))
+            .bind(links_version)
+            .execute()
+            .await
+            .context("collecting referenced CDN manifest children")
+    }
+
+    /// Deletable objects: unreferenced, and neither created nor dedup-acked since `cutoff`.
+    pub async fn cdn_gc_collect_candidates(&self, cutoff: u32) -> Result<()> {
+        self.gc_client()
+            .query(&format!(
+                "INSERT INTO {CDN_GC_SCRATCH_TABLE} (kind, key, size)
+                 SELECT 'candidate', key, size FROM {CDN_GC_SCRATCH_TABLE}
+                 WHERE kind = 'inventory'
+                   AND created < toDateTime(?)
+                   AND key NOT IN (SELECT key FROM {CDN_GC_SCRATCH_TABLE} WHERE kind = 'ref')
+                   AND key NOT IN (SELECT key FROM {CDN_ACKS_TABLE} WHERE acked_at >= toDateTime(?))"
+            ))
+            .bind(cutoff)
+            .bind(cutoff)
+            .execute()
+            .await
+            .context("collecting CDN deletion candidates")
+    }
+
+    pub async fn cdn_gc_report(&self) -> Result<CdnGcReport> {
+        self.gc_client()
+            .query(&format!(
+                "SELECT
+                     countIf(referenced) AS referenced_objects,
+                     sumIf(size, referenced) AS referenced_bytes,
+                     -- Scalar subqueries are Nullable, which would shift the positional decode.
+                     ifNull((SELECT count() FROM {CDN_GC_SCRATCH_TABLE} WHERE kind = 'candidate'), 0)
+                         AS candidate_objects,
+                     ifNull((SELECT sum(size) FROM {CDN_GC_SCRATCH_TABLE} WHERE kind = 'candidate'), 0)
+                         AS candidate_bytes,
+                     ifNull((SELECT uniqExact(key) FROM {CDN_GC_SCRATCH_TABLE} WHERE kind = 'ref'), 0)
+                         AS references
+                 FROM (
+                     SELECT size,
+                            key IN (SELECT key FROM {CDN_GC_SCRATCH_TABLE} WHERE kind = 'ref')
+                                AS referenced
+                     FROM {CDN_GC_SCRATCH_TABLE}
+                     WHERE kind = 'inventory'
+                 )"
+            ))
+            .fetch_one::<CdnGcReport>()
+            .await
+            .context("summarizing the CDN collector's pass")
+    }
+
+    /// One keyset page of a scratch kind, in key order.
+    pub async fn cdn_gc_page(
+        &self,
+        kind: &str,
+        after: &str,
+        limit: u64,
+    ) -> Result<Vec<CdnGcKeySize>> {
+        self.gc_client()
+            .query(&format!(
+                "SELECT key, size FROM {CDN_GC_SCRATCH_TABLE}
+                 WHERE kind = ? AND key > ?
+                 ORDER BY key
+                 LIMIT ?"
+            ))
+            .bind(kind)
+            .bind(after)
+            .bind(limit)
+            .fetch_all::<CdnGcKeySize>()
+            .await
+            .with_context(|| format!("paging the CDN collector's {kind} keys"))
+    }
+
+    /// Which of `keys` were dedup-acked since `cutoff`.
+    pub async fn cdn_gc_acked_since(
+        &self,
+        keys: &[String],
+        cutoff: u32,
+    ) -> Result<std::collections::HashSet<String>> {
+        if keys.is_empty() {
+            return Ok(Default::default());
+        }
+        let placeholders = vec!["?"; keys.len()].join(", ");
+        let mut query = self.gc_client().query(&format!(
+            "SELECT DISTINCT key FROM {CDN_ACKS_TABLE}
+             WHERE key IN ({placeholders}) AND acked_at >= toDateTime(?)"
+        ));
+        for key in keys {
+            query = query.bind(key);
+        }
+        Ok(query
+            .bind(cutoff)
+            .fetch_all::<String>()
+            .await
+            .context("rechecking CDN dedup acks")?
+            .into_iter()
+            .collect())
     }
 }
 

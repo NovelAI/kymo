@@ -50,7 +50,20 @@ fn hosted_config(origin: &str) -> Result<RuntimeConfig, String> {
 }
 
 pub(crate) fn cdn_url(key: &str) -> String {
-    format!("{}/cdn/{key}", config().cdn_origin)
+    format!("{}/cdn/{}", config().cdn_origin, cdn_path_segment(key))
+}
+
+/// The key percent-encoded whole, so the request names exactly this key. Raw, a hand-written key's `?`, `#`, `%xx`, or `/` would make the browser fetch a different object than the key names — one the server's CDN collector doesn't count as referenced. Valid keys (hex, a dot, an extension) encode to themselves.
+fn cdn_path_segment(key: &str) -> String {
+    use dioxus::prelude::dioxus_router::exports::percent_encoding::{
+        utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC,
+    };
+    const UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
+    utf8_percent_encode(key, UNRESERVED).to_string()
 }
 
 /// The server's firing-alerts proxy lives on the same listener as the CDN (see components/notice_bar.rs).
@@ -97,6 +110,24 @@ fn valid_loopback_origin(value: &str) -> bool {
         .strip_prefix("http://127.0.0.1:")
         .and_then(|port| port.parse::<u16>().ok())
         .is_some_and(|port| port >= 1024)
+}
+
+#[cfg(test)]
+mod cdn_url_tests {
+    use super::cdn_path_segment;
+
+    #[test]
+    fn keys_are_requested_exactly_as_named() {
+        let key = format!("{}.png", "ab".repeat(32));
+        assert_eq!(cdn_path_segment(&key), key);
+        assert_eq!(
+            cdn_path_segment("abcd.json?view=1#x"),
+            "abcd.json%3Fview%3D1%23x"
+        );
+        assert_eq!(cdn_path_segment("a/../abcd.png"), "a%2F..%2Fabcd.png");
+        assert_eq!(cdn_path_segment("abcd.p%6Eg\t"), "abcd.p%256Eg%09");
+        assert_eq!(cdn_path_segment("é"), "%C3%A9");
+    }
 }
 
 #[cfg(all(test, feature = "local-runtime"))]

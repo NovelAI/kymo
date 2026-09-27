@@ -3,7 +3,6 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use dioxus::prelude::*;
-use serde::Deserialize;
 
 use crate::components::copy_text::CopyText;
 use crate::components::icons::{CaretLeftIcon, CaretRightIcon};
@@ -172,27 +171,12 @@ fn gallery_presentation(
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
-struct Manifest {
-    #[serde(default)]
-    #[allow(dead_code)]
-    v: u32,
-    #[serde(default)]
-    class: String,
-    #[serde(default)]
-    items: Vec<ManifestItem>,
-    /// Metadata payload (for class == "metadata")
-    #[serde(default)]
-    data: Option<serde_json::Value>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq)]
-struct ManifestItem {
-    resource: String,
-    filename: Option<String>,
-    #[serde(default)]
-    caption: Option<String>,
-}
+// Shared with the server's CDN collector by path; its half (`LINKS_VERSION`, `resources`) is dead code here.
+#[path = "../../../shared/cdn_manifest.rs"]
+#[allow(dead_code)]
+mod cdn_manifest;
+use cdn_manifest::ManifestItem;
+type Manifest = cdn_manifest::Manifest<serde_json::Value>;
 
 impl Manifest {
     fn is_image_gallery(&self) -> bool {

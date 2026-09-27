@@ -9,6 +9,7 @@ cd -- "$script_dir/.."
 test_groups=(
   pg::live_pg_tests::
   clickhouse::registry_outbox_tests::
+  cdn_gc::tests::
   deletion::tests::
   ingest::live_tests::
 )

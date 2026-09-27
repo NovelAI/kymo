@@ -24,6 +24,7 @@ scripts.sil.org
 www.adobe.com
 www.w3.org
 fonts.googleapis.com
+iamcredentials.googleapis.com
 storage.googleapis.com
 accounts.google.com
 oauth2.googleapis.com

@@ -11,6 +11,8 @@ use crate::cdn_store::{ByteRange, CdnStore, StoreError};
 pub struct CdnState {
     pub store: CdnStore,
     pub(crate) activity: Arc<crate::activity::ActivityTracker>,
+    /// Hosted gcs mode: uploads go through the collector's fence and ack log.
+    pub(crate) uploads: Option<crate::cdn_gc::Uploads>,
 }
 
 /// The CDN upload envelope: the routes' `DefaultBodyLimit`.
@@ -38,12 +40,25 @@ pub(crate) fn validate_hosted_key(key: &str) -> bool {
     hash.len() >= 4 && hash.chars().all(|c| c.is_ascii_hexdigit()) && validate_extension(ext)
 }
 
+/// The hosted key grammar as an RE2 pattern, for ClickHouse's `match` (the CDN collector's root filter).
+pub(crate) fn hosted_key_pattern() -> String {
+    format!(
+        "^[0-9A-Fa-f]{{4,}}\\.(?i:{})$",
+        ALLOWED_EXTENSIONS.join("|")
+    )
+}
+
 /// Local raw-ID v1 refines the hosted grammar: exactly a full SHA-256 hash, nothing uppercase —
 /// so case-insensitive filesystems such as default APFS cannot alias two textual IDs to one object.
 fn validate_local_key(key: &str) -> bool {
     // A hosted-valid key has exactly one dot, so everything before the first is the hash.
     let hash_len = key.find('.').unwrap_or(key.len());
     validate_hosted_key(key) && hash_len == 64 && !key.bytes().any(|b| b.is_ascii_uppercase())
+}
+
+/// The upload route's key for `body`: its SHA-256 in hex, then the extension.
+pub(crate) fn content_key(body: &[u8], ext: &str) -> String {
+    format!("{}.{ext}", hex::encode(Sha256::digest(body)))
 }
 
 /// POST /cdn/upload
@@ -68,17 +83,16 @@ pub async fn upload(
         ));
     }
 
-    // Compute SHA-256
-    let mut hasher = Sha256::new();
-    hasher.update(&body);
-    let hash = hex::encode(hasher.finalize());
-
-    let key = format!("{hash}.{ext}");
-    // The store logs stored/dedup itself and raises user-shaped errors; this is the one log
-    // line per failed upload.
-    state.store.put_if_absent(&key, body).await.map_err(|e| {
-        tracing::warn!(key = %key, error = %e, "CDN upload failed");
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    let key = content_key(&body, &ext);
+    // The store logs stored/dedup itself; this is the one log line per failed upload.
+    let stored = match &state.uploads {
+        Some(uploads) => uploads.put(&state.store, &key, body).await,
+        None => state.store.put_if_absent(&key, body).await,
+    };
+    stored.map_err(|e| {
+        let error = format!("{e:#}");
+        tracing::warn!(key = %key, error = %error, "CDN upload failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, error)
     })?;
 
     Ok(axum::Json(serde_json::json!({ "resource_id": key })))
@@ -181,6 +195,9 @@ async fn serve_from_store(
     let read = match state.store.get(&key, range).await {
         Ok(read) => read,
         Err(StoreError::NotFound) => {
+            // The CDN collector's alarm (docs/cdn-gcs-migration.md § Garbage collection); the key is what a restore from soft delete needs.
+            metrics::counter!("mkdb2_cdn_not_found_total").increment(1);
+            tracing::info!(key = %key, "CDN object not found");
             return Err((StatusCode::NOT_FOUND, "Not found".to_string()));
         }
         Err(StoreError::RangeNotSatisfiable { total_len }) => {
@@ -251,6 +268,7 @@ mod tests {
         Arc::new(CdnState {
             store: CdnStore::Fs(FsStore::new(root.to_path_buf())),
             activity: crate::activity::ActivityTracker::disabled(),
+            uploads: None,
         })
     }
 
@@ -433,6 +451,7 @@ mod tests {
         let state = Arc::new(CdnState {
             store: CdnStore::Fs(FsStore::new(root.path().to_path_buf())),
             activity: activity.clone(),
+            uploads: None,
         });
         let key = "aabbccdd0123456789aabbccdd0123456789aabbccdd0123456789aabbccdd01.txt";
         state
