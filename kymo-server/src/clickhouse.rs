@@ -2034,6 +2034,17 @@ impl ChClient {
             .context("summarizing the CDN collector's pass")
     }
 
+    pub async fn cdn_gc_count(&self, kind: &str) -> Result<u64> {
+        self.gc_client()
+            .query(&format!(
+                "SELECT count() FROM {CDN_GC_SCRATCH_TABLE} WHERE kind = ?"
+            ))
+            .bind(kind)
+            .fetch_one::<u64>()
+            .await
+            .with_context(|| format!("counting the CDN collector's {kind} keys"))
+    }
+
     /// One keyset page of a scratch kind, in key order.
     pub async fn cdn_gc_page(
         &self,

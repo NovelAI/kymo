@@ -430,9 +430,10 @@ impl Collector {
         self.ch
             .cdn_gc_collect_unparsed(cdn_manifest::LINKS_VERSION)
             .await?;
+        let roots = self.ch.cdn_gc_count("unparsed").await?;
         let reads = self.reads.as_ref();
         let budget = &Semaphore::new(FETCH_BUDGET as usize);
-        let mut unparsed = 0u64;
+        let (mut done, mut unparsed) = (0u64, 0u64);
         let mut after = String::new();
         loop {
             let page = self.ch.cdn_gc_page("unparsed", &after, PAGE).await?;
@@ -440,6 +441,7 @@ impl Collector {
                 break;
             };
             after = last.key.clone();
+            done += page.len() as u64;
             let mut fetched = futures::stream::iter(page)
                 .map(|root| async move {
                     let children = fetch_children(reads, budget, &root).await;
@@ -471,6 +473,13 @@ impl Collector {
                 }
             }
             self.ch.cdn_gc_insert_manifests(&rows).await?;
+            // A full parse (an empty children cache, or a links-version bump) takes hours.
+            tracing::info!(
+                done,
+                roots,
+                unparsed_roots = unparsed,
+                "CDN collector manifest parse progress"
+            );
         }
         self.ch
             .cdn_gc_collect_children(cdn_manifest::LINKS_VERSION)
