@@ -37,4 +37,4 @@ Leave out `mode="local"` and pass the server's gRPC address as `server_address="
 
 ## wandb importing
 
-We have an importer, but it's not released yet; maybe I'll get around to fixing it for public release. You'll need an AI agent to use it, since wandb's APIs change over time.
+Two scripts in [tools/wandb-import](https://github.com/NovelAI/kymo/tree/main/tools/wandb-import) move wandb history into kymo: `export_wandb.py` downloads a wandb entity into a local archive, and `import_to_kymo.py` replays that archive into a kymo server with each run's original times. They are not part of the package: run them from a clone after `pip install ./python_client pyarrow wandb wandb-workspaces requests`, since the importer uses the client's internals. The importer only dry-runs until you pass `--execute --server host:port`, and the server must run with `KYMO_IMPORT_ENABLED=1` (see [self-hosting](https://github.com/NovelAI/kymo/blob/main/docs/self-hosting.md)); local mode can't import yet. You'll likely need an AI agent to use them, since wandb's APIs change over time.

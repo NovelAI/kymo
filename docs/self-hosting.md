@@ -42,6 +42,7 @@ Settings are environment variables; an unset one takes its default.
 | `KYMO_CDN_GC_CREDENTIALS` | none | Credential file for `delete`: an `external_account` config that impersonates a service account allowed to delete in the bucket |
 | `KYMO_RUN_REAPER_ENABLED` | `false` | Permanently delete runs whose Trash retention expired (see below) |
 | `KYMO_PROMETHEUS_URL` | unset | Prometheus whose firing alerts the dashboard shows |
+| `KYMO_IMPORT_ENABLED` | `false` | Accept wandb imports (`tools/wandb-import/import_to_kymo.py`). Enable it only while importing: an import can backdate and terminate any run it names. |
 | `RUST_LOG` | `info` | Log filter |
 
 Capacity knobs: `KYMO_INGEST_BYTE_CAP` (bytes of buffered ingest, default 512 MiB), `KYMO_FLUSH_CONCURRENCY` (concurrent ClickHouse inserts, default 4), `KYMO_SERIES_CACHE_MB` (chart cache, default 256), `KYMO_TEXT_INDEX_CACHE_MB` (log index cache, default 64), and `KYMO_CHART_INFLIGHT_SERIES` (concurrent chart reads, default 32).
