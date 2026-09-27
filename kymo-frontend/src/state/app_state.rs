@@ -323,7 +323,7 @@ impl DashboardState {
         store.write().retain(|key, _| live.contains(key));
     }
 
-    /// Metadata for display only. Explicit, cached, and direct records may be deleted and must never feed discovery or binding resolution, so callers use this only for presentation: names, ordinals, and colors, plus the `info/run_info` panel's server timing, which reads status and lifecycle timestamps (see `add_server_timing`).
+    /// Metadata for display only. Explicit, cached, and direct records may be deleted and must never feed discovery or binding resolution, so callers use this only for presentation: names, ordinals, and colors, plus status and lifecycle timestamps for the `info/run_info` panel's server timing (`add_server_timing`), the gallery's pending wording (`decorate_cdn_series`), and the log panel's tail-follow.
     /// See [`merge_display_sources`] for why the sources rank the way they do.
     pub fn display_runs(&self) -> Vec<RunInfo> {
         let project_id = self.project_id.read();

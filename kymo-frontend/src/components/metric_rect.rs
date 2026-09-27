@@ -6,7 +6,7 @@ use crate::components::binding_editor::BindingEditor;
 use crate::components::cdn_gallery::CdnGallery;
 use crate::components::icons::{CloseIcon, GearIcon, MaximizeIcon, SpinnerIcon};
 use crate::components::text_stream::TextStreamViewer;
-use crate::grpc::proto::{CdnSeries, SeriesRef};
+use crate::grpc::proto::{CdnSeries, RunStatus, SeriesRef};
 use crate::route::focus_chart;
 use crate::state::chart_sync::ChartCacheEntry;
 use crate::state::layout_config::{CdnDisplayMode, MetricBinding, RectOptions, RunRef};
@@ -124,6 +124,8 @@ pub struct CdnRunData {
     pub label: String, // display text (e.g. "my-run" or "my-run/loss_img")
     pub color: String, // hex color resolved by the caller
     pub keys: Vec<(i64, String)>,
+    /// The run has exited or is presumed dead, so its pending uploads are no longer in flight.
+    pub ended: bool,
 }
 
 fn decorate_cdn_series(
@@ -137,6 +139,13 @@ fn decorate_cdn_series(
         .map(|series| {
             let run_name = crate::state::run_name_for(all_runs, &series.run_id);
             let ordinal = crate::state::run_ordinal_for(all_runs, &series.run_id);
+            let ended =
+                crate::state::app_state::find_run(all_runs, &series.run_id).is_some_and(|run| {
+                    matches!(
+                        run.status(),
+                        RunStatus::Crashed | RunStatus::Finished | RunStatus::PresumedDead
+                    )
+                });
             let (label, color) = if all_same_metric {
                 (run_name, run_color(&series.run_id, ordinal))
             } else {
@@ -155,6 +164,7 @@ fn decorate_cdn_series(
                     .into_iter()
                     .map(|entry| (entry.step, entry.cdn_key))
                     .collect(),
+                ended,
             }
         })
         .collect()
@@ -1043,7 +1053,7 @@ fn TextStreamContent(
 #[cfg(test)]
 mod tests {
     use super::{cdn_cache_heap_bytes, decorate_cdn_series, normalize_rect_label};
-    use crate::grpc::proto::{CdnEntry, CdnSeries, RunInfo, SeriesRef};
+    use crate::grpc::proto::{CdnEntry, CdnSeries, RunInfo, RunStatus, SeriesRef};
 
     fn cdn_series(metric_name: &str) -> CdnSeries {
         CdnSeries {
@@ -1090,6 +1100,28 @@ mod tests {
         let mixed_b = decorate_cdn_series(series, &[run()], false, |_, _| "#222222".into());
         assert_eq!(mixed_a[0].label, "Named/images");
         assert_eq!(mixed_a[0].color, mixed_b[0].color);
+    }
+
+    #[test]
+    fn cdn_decoration_marks_ended_runs() {
+        let ended = |runs: &[RunInfo]| {
+            decorate_cdn_series(vec![cdn_series("images")], runs, true, |_, _| {
+                "#111111".into()
+            })[0]
+                .ended
+        };
+        let with = |status: RunStatus| RunInfo {
+            status: status as i32,
+            ..run()
+        };
+        assert!(!ended(&[with(RunStatus::Running)]));
+        assert!(!ended(&[with(RunStatus::Stuck)]));
+        assert!(!ended(&[with(RunStatus::Unresponsive)]));
+        assert!(ended(&[with(RunStatus::PresumedDead)]));
+        assert!(ended(&[with(RunStatus::Crashed)]));
+        assert!(ended(&[with(RunStatus::Finished)]));
+        // A run missing from the list can't be shown to have ended.
+        assert!(!ended(&[]));
     }
 
     #[test]

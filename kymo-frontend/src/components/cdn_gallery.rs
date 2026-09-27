@@ -148,7 +148,16 @@ enum GalleryPresentation {
     Empty,
     PendingOnly,
     Content,
-    PendingWithContent,
+}
+
+/// The status line for sources whose key at the step is still a placeholder: a live run's images may still arrive; an ended run's placeholder is an upload that did not finish.
+fn pending_status(live: &[&str], ended: &[&str]) -> Option<String> {
+    let clauses: Vec<String> = [("Not uploaded yet", live), ("Upload did not finish", ended)]
+        .into_iter()
+        .filter(|(_, labels)| !labels.is_empty())
+        .map(|(prefix, labels)| format!("{prefix}: {}", labels.join(", ")))
+        .collect();
+    (!clauses.is_empty()).then(|| clauses.join(" · "))
 }
 
 fn gallery_presentation(
@@ -156,11 +165,10 @@ fn gallery_presentation(
     parsed_manifest_count: Option<usize>,
 ) -> GalleryPresentation {
     match (any_pending, parsed_manifest_count) {
-        (true, Some(count)) if count > 0 => GalleryPresentation::PendingWithContent,
+        (_, Some(count)) if count > 0 => GalleryPresentation::Content,
         (true, _) => GalleryPresentation::PendingOnly,
         (false, None) => GalleryPresentation::Loading,
-        (false, Some(0)) => GalleryPresentation::Empty,
-        (false, Some(_)) => GalleryPresentation::Content,
+        (false, Some(_)) => GalleryPresentation::Empty,
     }
 }
 
@@ -404,27 +412,34 @@ pub fn CdnGallery(
         selected_step.set(Some(step));
     }
 
-    // Pair the fetch key with the manifest metadata it will populate.
-    let run_keys: Vec<ManifestFetchKey> = runs
-        .iter()
-        .filter_map(|run| {
-            run.keys.iter().find(|(s, _)| *s == step).map(|(_, key)| {
-                (
-                    RunManifest {
-                        project_id: run.project_id.clone(),
-                        run_id: run.run_id.clone(),
-                        metric_name: run.metric_name.clone(),
-                        label: run.label.clone(),
-                        color: run.color.clone(),
-                        manifest: None,
-                    },
-                    key.clone(),
-                )
-            })
-        })
-        .collect();
-
-    let any_pending = run_keys.iter().any(|(_, key)| key.starts_with("pending:"));
+    // Pair the fetch key with the manifest metadata it will populate. `ended` stays out of the key, so a status change doesn't refetch manifests.
+    let mut run_keys: Vec<ManifestFetchKey> = Vec::new();
+    let (mut pending_live, mut pending_ended) = (Vec::new(), Vec::new());
+    for run in &runs {
+        let Some((_, key)) = run.keys.iter().find(|(s, _)| *s == step) else {
+            continue;
+        };
+        if key.starts_with("pending:") {
+            let group = if run.ended {
+                &mut pending_ended
+            } else {
+                &mut pending_live
+            };
+            group.push(run.label.as_str());
+        }
+        run_keys.push((
+            RunManifest {
+                project_id: run.project_id.clone(),
+                run_id: run.run_id.clone(),
+                metric_name: run.metric_name.clone(),
+                label: run.label.clone(),
+                color: run.color.clone(),
+                manifest: None,
+            },
+            key.clone(),
+        ));
+    }
+    let status = pending_status(&pending_live, &pending_ended);
     let single_run = runs.len() <= 1;
 
     // Track keys in signal for use_resource
@@ -477,7 +492,7 @@ pub fn CdnGallery(
                 .count()
         });
         (
-            gallery_presentation(any_pending, parsed_manifest_count),
+            gallery_presentation(status.is_some(), parsed_manifest_count),
             current.map(<[RunManifest]>::to_vec).unwrap_or_default(),
         )
     };
@@ -564,19 +579,17 @@ pub fn CdnGallery(
 
             // Content
             div { class: "cdn-gallery-content",
-                match presentation {
-                    GalleryPresentation::PendingWithContent => rsx! {
-                        div { class: "cdn-gallery-pending", "Uploading..." }
-                        GalleryRenderer {
-                            run_manifests,
-                            mode: effective_mode,
-                            metadata_diff_only,
-                            persist_key: persist_key.clone(),
+                if let Some(text) = status {
+                    div {
+                        class: if pending_live.is_empty() { "cdn-gallery-pending" } else { "cdn-gallery-pending live" },
+                        title: "{text}",
+                        span { class: "fade-overflow",
+                            span { "{text}" }
                         }
-                    },
-                    GalleryPresentation::PendingOnly => rsx! {
-                        div { class: "cdn-gallery-pending", "Uploading..." }
-                    },
+                    }
+                }
+                match presentation {
+                    GalleryPresentation::PendingOnly => rsx! {},
                     GalleryPresentation::Content => rsx! {
                         GalleryRenderer {
                             run_manifests,
@@ -834,9 +847,9 @@ fn InterleavedView(run_manifests: Vec<RunManifest>, on_lightbox: EventHandler<St
 mod tests {
     use super::{
         classify_manifests, current_manifest_results, file_groups, gallery_file_link_label,
-        gallery_presentation, gallery_thumbnail_label, metadata_columns, remember_gallery_index,
-        remembered_gallery_index, selected_step_index, CdnManifestClass, GalleryPresentation,
-        Manifest, ManifestFetchKey, ManifestItem, RunManifest,
+        gallery_presentation, gallery_thumbnail_label, metadata_columns, pending_status,
+        remember_gallery_index, remembered_gallery_index, selected_step_index, CdnManifestClass,
+        GalleryPresentation, Manifest, ManifestFetchKey, ManifestItem, RunManifest,
     };
     use dioxus::html::Modifiers;
 
@@ -917,7 +930,7 @@ mod tests {
     fn pending_uploads_do_not_hide_settled_manifests() {
         assert_eq!(
             gallery_presentation(true, Some(1)),
-            GalleryPresentation::PendingWithContent
+            GalleryPresentation::Content
         );
         assert_eq!(
             gallery_presentation(true, Some(0)),
@@ -938,6 +951,23 @@ mod tests {
         assert_eq!(
             gallery_presentation(false, Some(2)),
             GalleryPresentation::Content
+        );
+    }
+
+    #[test]
+    fn pending_status_names_sources_by_run_liveness() {
+        assert_eq!(pending_status(&[], &[]), None);
+        assert_eq!(
+            pending_status(&["a", "b"], &[]).as_deref(),
+            Some("Not uploaded yet: a, b")
+        );
+        assert_eq!(
+            pending_status(&[], &["a"]).as_deref(),
+            Some("Upload did not finish: a")
+        );
+        assert_eq!(
+            pending_status(&["live"], &["old"]).as_deref(),
+            Some("Not uploaded yet: live · Upload did not finish: old")
         );
     }
 
