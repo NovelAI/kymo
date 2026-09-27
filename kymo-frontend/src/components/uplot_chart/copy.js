@@ -48,12 +48,9 @@ let currentText=function(target){
   if(!chart||!chart.over||!chart.posToIdx)return null;
   let selection=window.getSelection&&window.getSelection();
   if(selection&&!selection.isCollapsed)return null;
-  let rect=chart.over.getBoundingClientRect();
-  let left=pointerX-rect.left,top=pointerY-rect.top;
-  let width=rect.width,height=rect.height;
-  if(!(width>0&&height>0)||top<0||top>height)return null;
-  let idx=chart.posToIdx(Math.min(Math.max(left,0),width));
-  return buildText(chart,idx);
+  // The hover mapping, so copy takes exactly the column the tooltip shows.
+  let pos=window.__kymo_hp.plotPosition(chart,pointerX,pointerY);
+  return pos?buildText(chart,chart.posToIdx(pos.left)):null;
 };
 let onCopy=function(event){
   if(event.defaultPrevented)return;

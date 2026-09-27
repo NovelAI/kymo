@@ -11,9 +11,6 @@ function updateHover(u){
     return
   }
   let l=u.cursor.left,t=u.cursor.top;
-  if(l<0||(isSrc&&t<0)){
-    tip.style.display='none';hotpt.style.display='none';return
-  }
   // Hide covered charts' fixed tips immediately, before zone virtualization unmounts them. The maximized chart lives outside the locked main element.
   if(!isSrc&&el.closest('.main-content-locked')){tip.style.display='none';return}
   let bx=el.getBoundingClientRect();
@@ -50,18 +47,18 @@ function updateHover(u){
     }
   }
   if(isSrc&&hot>=0&&!isNaN(vals[hot])){
-    let px=u.valToPos(u.data[0][idx],'x'),py=u.valToPos(vals[hot],'y');
-    hotpt.style.left=px+'px';
-    hotpt.style.top=py+'px';
+    let x=u.data[0][idx],v=vals[hot],sx=u.scales.x,sy=u.scales.y;
+    hotpt.style.left=u.valToPos(x,'x')+'px';
+    hotpt.style.top=u.valToPos(v,'y')+'px';
     hotpt.style.borderColor=colors[hot];
-    // u.over does not clip children; keep offscreen endpoints readable without painting their dots into axes.
-    hotpt.style.display=px>=0&&py>=0&&px<=u.bbox.width/devicePixelRatio&&py<=u.bbox.height/devicePixelRatio?'block':'none';
+    // u.over does not clip children; keep offscreen endpoints readable without painting their dots into axes. Decided in value space, where the plot bounds are exact (bbox is rounded to half device pixels).
+    hotpt.style.display=x>=sx.min&&x<=sx.max&&v>=sy.min&&v<=sy.max?'block':'none';
   }else{
     // A NaN winner has no finite y to dot — its hollow marker is its mark.
     hotpt.style.display='none';
   }
-  // Marker-only samples also drive the shared highlight.
-  if(isSrc)window.__kymo_setHl(hot>=0?runIds[hot]:null,hot>=0?runNames[hot]:null);
+  // Marker-only samples also drive the highlight, scoped to this chart.
+  if(isSrc)window.__kymo_setHl(hot>=0?runIds[hot]:null,hot>=0?runNames[hot]:null,el.id);
   if(hit){
     if(tc.empty){tip.style.display='none';return}
   }else{

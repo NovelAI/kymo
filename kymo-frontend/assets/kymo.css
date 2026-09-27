@@ -1385,7 +1385,7 @@ input[type="checkbox"]:checked::before {
 .chart-container {
     width: 100%;
     position: relative;
-    cursor: crosshair;
+    /* No cursor here: create.js sets it per region (crosshair at plot height, ew-resize on the axis strip). */
     user-select: none;
 }
 

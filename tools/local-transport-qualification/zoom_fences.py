@@ -168,7 +168,7 @@ def selections(page: Page, identifiers: list[str]) -> list[dict[str, float]]:
             return {
                 left: chart.select.left,
                 width: chart.select.width,
-                plot_width: chart.bbox.width / devicePixelRatio,
+                plot_width: chart.over.getBoundingClientRect().width,
             };
         })""",
         identifiers,

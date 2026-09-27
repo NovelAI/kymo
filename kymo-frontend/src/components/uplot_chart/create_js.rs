@@ -490,10 +490,26 @@ mod tests {
     }
 
     #[test]
+    fn hover_cursor_publishes_to_the_sync_group() {
+        let js = build_create_js("chart-7", &minimal_config());
+        // Gutter positions and clears must reach synced readouts too (AI-1405).
+        assert!(js.contains("c.setCursor(pos||{left:-10,top:-10},true,true)"));
+        // A leaving or rebuilt source publishes its clear while it is still the source, so its hook drops the highlight and synced readouts clear.
+        assert!(js.contains(
+            "if(window.__kymo_hoversrc!=='chart-7')return;\n    let c=window.__kymo_charts['chart-7'];\n    if(c)c.setCursor({left:-10,top:-10},true,true);\n    window.__kymo_hoversrc=null;"
+        ));
+        assert!(js.contains(
+            "if(window.__kymo_hoversrc==='chart-7')prev.setCursor({left:-10,top:-10},true,true);\n  prev.destroy();"
+        ));
+    }
+
+    #[test]
     fn kymo_owns_selection_gestures_and_commits_from_one_path() {
         let js = build_create_js("chart-7", &minimal_config());
 
-        assert!(js.contains("bind:{mousedown:()=>null}"));
+        assert!(js.contains(
+            "bind:{mousedown:()=>null,mouseenter:()=>null,mousemove:()=>null,mouseleave:()=>null,dblclick:()=>null}"
+        ));
         assert!(js.contains("drag:{click:()=>{}}"));
         assert!(!js.contains("setSelect:["));
         assert!(!js.contains("__kymo_dragpx"));

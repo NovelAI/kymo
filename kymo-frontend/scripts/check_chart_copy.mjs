@@ -128,6 +128,10 @@ function keyEvent(overrides = {}) {
   };
 }
 
+const hoverPointsUrl = new URL("../src/components/uplot_chart/hover_points.js", import.meta.url);
+vm.runInThisContext(readFileSync(fileURLToPath(hoverPointsUrl), "utf8"), {
+  filename: fileURLToPath(hoverPointsUrl),
+});
 vm.runInThisContext(readFileSync(fileURLToPath(helperUrl), "utf8"), {
   filename: fileURLToPath(helperUrl),
 });
@@ -216,6 +220,14 @@ event = copyEvent();
 copyListener(event);
 assert.equal(lastPos, 0, "copy clamps a side-gutter hover to the first point");
 
+for (const [clientX, pos] of [[120.6, 0], [219.5, 100]]) {
+  mousemoveListener({ clientX, clientY: 80 });
+  lastPos = null;
+  event = copyEvent();
+  copyListener(event);
+  assert.equal(lastPos, pos, "copy snaps the outer pixel of the plot to its bound, like the hover cursor");
+}
+
 mousemoveListener({ clientX: 150, clientY: 111 });
 copiedText = null;
 event = copyEvent();
@@ -237,7 +249,7 @@ copiedText = null;
 window.__kymo_hoversrc = null;
 event = copyEvent();
 copyListener(event);
-assert.equal(copiedText, expected, "the physical chart is copyable before delayed mouseenter");
+assert.equal(copiedText, expected, "the physical chart is copyable without a hover source");
 assert.equal(event.defaultPrevented, true);
 window.__kymo_hoversrc = "chart";
 

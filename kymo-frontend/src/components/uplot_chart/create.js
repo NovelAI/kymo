@@ -5,7 +5,7 @@ __KYMO_ZOOM_MATH__
 window.__kymo_zm=KYMO_ZOOM_MATH;
 }
 let {AXIS_LINEAR,AXIS_LOG,AXIS_LOG1P,buildFrozenSupports,buildFrozenSourceMap,mapSourcePageX,expandWholeBuckets}=window.__kymo_zm;
-let {createHoverPointLookup}=window.__kymo_hp;
+let {createHoverPointLookup,plotPosition}=window.__kymo_hp;
 if(!window.__kymo_charts) window.__kymo_charts={};
 let el=document.getElementById('__KYMO_ID__');
 if(!el)return'chart container is missing';
@@ -38,6 +38,8 @@ if(prev){
   // slot snapshot. Peer rebuilds are harmless and repaint after registration.
   let zg=window.__kymo_zg;
   if(zg&&zg.srcId==='__KYMO_ID__'&&zg.cancel)zg.cancel();
+  // A rebuilt hover source clears through the normal path first, so synced readouts don't outlive the old instance.
+  if(window.__kymo_hoversrc==='__KYMO_ID__')prev.setCursor({left:-10,top:-10},true,true);
   prev.destroy();
   delete window.__kymo_charts['__KYMO_ID__'];
 }
@@ -67,14 +69,9 @@ let isWallTime=__KYMO_IS_WALL__;
 // Tooltip
 let tip=el.querySelector('.kymo-tip');
 if(!tip){tip=document.createElement('div');tip.className='kymo-tip';el.appendChild(tip);}
-// A fresh instance has no cursor yet but fires no event either — hide any
-// tooltip left over from the previous instance (live-data rebuild under a
-// resting mouse) until the next real cursor move.
+// Hidden until this instance's hover hook shows it on the next move or synced update, so a failed rebuild leaves no stale tooltip.
 tip.style.display='none';
 el.style.position='relative';
-if(!el.__kymo_ml){el.__kymo_ml=true;el.addEventListener('mouseleave',function(){
-  let t=el.querySelector('.kymo-tip');if(t)t.style.display='none';
-});}
 let xShift=__KYMO_X_SHIFT__;
 let readoutXShift=__KYMO_READOUT_X_SHIFT__;
 // Value formatter for Y and step X. Zero is just "0": fixed-precision formatting rendered step 0 as "0.00" (AI-1385).
@@ -160,16 +157,6 @@ let fmtX=function(v){
   if(!zoomRefetch)return v.toPrecision(4);
   return v.toLocaleString(undefined,{maximumFractionDigits:2});
 };
-// Which chart the mouse is physically over: the cursor-sync group fires
-// setCursor on every chart in it, and only the source builds the full
-// tooltip / drives the highlight; the rest show compact value readouts.
-if(!el.__kymo_hoversrc){
-  el.__kymo_hoversrc=true;
-  el.addEventListener('mouseenter',function(){window.__kymo_hoversrc='__KYMO_ID__';});
-  el.addEventListener('mouseleave',function(){
-    if(window.__kymo_hoversrc==='__KYMO_ID__')window.__kymo_hoversrc=null;
-  });
-}
 // Nearest-point marker, drawn by the setCursor hook.
 let hotpt=document.createElement('div');
 hotpt.className='kymo-hotpt';
@@ -256,11 +243,11 @@ let u=new uPlot({
   // kymo owns zoom gestures. Leaving uPlot's native drag armed gives every
   // synced chart an independent pixel-space drag state, which lets a peer
   // revive the source selection and makes every peer commit on mouseup.
-  // Unbind only mousedown; ordinary cursor/readout sync remains.
+  // Unbind mousedown for that, the overlay's hover listeners because the container hover block below maps every move, and dblclick because kymo's reset below is the only reset; cursor/readout sync remains.
   // The no-op drag.click is required because uPlot's capture-phase click
   // handler otherwise compares against an unset native mousedown coordinate
   // and suppresses every click over the plot.
-  cursor:{points:{show:false},y:false,bind:{mousedown:()=>null},drag:{click:()=>{}},sync:{key:'kymo-__KYMO_SYNC_KEY__',scales:['__KYMO_SYNC_SCALE_KEY__',null]}},
+  cursor:{points:{show:false},y:false,bind:{mousedown:()=>null,mouseenter:()=>null,mousemove:()=>null,mouseleave:()=>null,dblclick:()=>null},drag:{click:()=>{}},sync:{key:'kymo-__KYMO_SYNC_KEY__',scales:['__KYMO_SYNC_SCALE_KEY__',null]}},
   hooks:{
     draw:[function(u){
       if(!nanCols)return;
@@ -412,44 +399,33 @@ if(!el.__kymo_unzoomclick){
     if(!singleClickUnzoom())resetZoom();
   });
 }
-// Edge-hover tolerance (AI-1279): hovering a bit off the plot's left or
-// right edge (the y-axis gutter, the right padding) clamps the cursor to
-// the nearest in-plot column instead of dropping it, so the tooltip and
-// hover points stay live on the first/last visible point. Only sideways
-// near-misses at plot height — above/below (title, axis strip) stays
-// inert, and a held button defers to kymo's page-global selection gesture.
-// setCursor's third arg publishes to the cursor-sync group (AI-1405):
-// uPlot only pubs real mousemoves on its own, so without it a gutter
-// hover lit this chart's tooltip while every synced chart went blank —
-// and the clears must pub too, or those readouts outlive the hover.
-if(!el.__kymo_edgehover){
-  el.__kymo_edgehover=true;
-  let clearCursor=function(){
-    let c=window.__kymo_charts['__KYMO_ID__'];
-    if(c)c.setCursor({left:-10,top:-10},true,true);
-  };
+// The axis-pull strip, measured from the plot overlay like plotPosition, so it starts exactly where the hover band ends.
+let strip=function(c,ev){
+  let r=el.getBoundingClientRect(),o=c.over.getBoundingClientRect();
+  let left=o.left-r.left,w=o.width,px=ev.clientX-r.left;
+  return {left:left,w:w,px:px,inside:w>0&&ev.clientY-o.top>o.height&&ev.clientY<=r.bottom&&px>=left-10&&px<=left+w+10};
+};
+// kymo owns hover: this one container listener maps every move through plotPosition, so the plot and its side gutters share one rule. The y-axis gutter and right padding stay live on the first/last column (AI-1279); above/below the plot band (title, axis strip) clears.
+// The source (window.__kymo_hoversrc) is the chart the mouse moves over: only it builds the full tooltip and drives the highlight; synced charts show compact readouts.
+// setCursor's third arg publishes to the cursor-sync group (AI-1405), so synced readouts follow the cursor and its clears.
+if(!el.__kymo_hover){
+  el.__kymo_hover=true;
   el.addEventListener('mousemove',function(ev){
     let c=window.__kymo_charts['__KYMO_ID__'];
-    if(!c||ev.buttons!==0)return;
-    let r=el.getBoundingClientRect();
-    let dpr=devicePixelRatio;
-    let left=c.bbox.left/dpr,top=c.bbox.top/dpr,w=c.bbox.width/dpr,h=c.bbox.height/dpr;
-    let px=ev.clientX-r.left,py=ev.clientY-r.top;
-    if(w<=0)return;
-    if(py<top||py>top+h){
-      // Above/below the plot band (title, axis strip): a cursor set from
-      // the gutter must not linger there.
-      clearCursor();
-      return;
-    }
-    // Strict < on the right: element hit regions are half-open [left, left+w), so a pointer at exactly left+w targets the element UNDER the plot's over div — uPlot never sees it. A <= here early-returned that column of pixels into a dead zone between uPlot and this fallback (no cursor at all).
-    if(px>=left&&px<left+w)return; // over the plot: uPlot handles it
-    // Snap to the exact edge: posToVal(0|w) is precisely the scale bound, so the nearest column is the first/last one at any point density. An inset (this used w-0.01) is a real x offset — it selects a near-end point instead once samples pack denser than 0.02px.
-    c.setCursor({left:px<left?0:w,top:py-top},true,true);
+    if(!c)return;
+    let pos=plotPosition(c,ev.clientX,ev.clientY),zg=window.__kymo_zg;
+    // The pointer shows the live gesture's own pointer, else what a press would do: crosshair where hover and zoom-select are live, ew-resize on the axis strip, the default arrow elsewhere.
+    el.style.cursor=zg?zg.cursor:pos?'crosshair':strip(c,ev).inside?'ew-resize':'';
+    window.__kymo_hoversrc='__KYMO_ID__';
+    c.setCursor(pos||{left:-10,top:-10},true,true);
   });
-  // uPlot only clears the cursor when leaving the plot area proper; a
-  // cursor set from the gutter outlives that, so clear on element exit.
-  el.addEventListener('mouseleave',clearCursor);
+  // Only the source clears what it published, as on rebuild and unmount: clearing while it is still the source lets updateHover hide the tooltip and drop the highlight.
+  el.addEventListener('mouseleave',function(){
+    if(window.__kymo_hoversrc!=='__KYMO_ID__')return;
+    let c=window.__kymo_charts['__KYMO_ID__'];
+    if(c)c.setCursor({left:-10,top:-10},true,true);
+    window.__kymo_hoversrc=null;
+  });
 }
 let stepSupports=function(c,m){
   if(!m||!m.zr)return null;
@@ -471,10 +447,9 @@ if(!el.__kymo_zoomselect){
       let lo=Math.max(range.lo,realLo),hi=Math.min(range.hi,realHi);
       if(!(Number.isFinite(lo)&&Number.isFinite(hi)&&hi>lo)){c.setSelect(hide,false);return;}
       let p0=c.valToPos(lo+m.xShift,'x'),p1=c.valToPos(hi+m.xShift,'x');
-      let w=c.bbox.width/devicePixelRatio,h=c.bbox.height/devicePixelRatio;
-      if(!(Number.isFinite(p0)&&Number.isFinite(p1)&&w>0)){c.setSelect(hide,false);return;}
-      let a=Math.min(Math.max(Math.min(p0,p1),0),w),b=Math.min(Math.max(Math.max(p0,p1),0),w);
-      c.setSelect({left:a,width:b-a,top:0,height:h},false);
+      if(!(Number.isFinite(p0)&&Number.isFinite(p1))){c.setSelect(hide,false);return;}
+      // lo/hi are already clamped to this peer's visible range, so the box lands on its plot up to float error: no pixel clamp, and no layout read in this write loop. Height is drawing geometry.
+      c.setSelect({left:p0,width:p1-p0,top:0,height:c.bbox.height/devicePixelRatio},false);
     });
   };
   let snapshot=function(c){
@@ -485,10 +460,10 @@ if(!el.__kymo_zoomselect){
     // already-plotted domain (including relative log-time's folded +1ms).
     let supports=stepSupports(c,m);
     if(m.zr&&!supports)return null;
-    let r=el.getBoundingClientRect(),dpr=devicePixelRatio,w=c.bbox.width/dpr;
+    let o=c.over.getBoundingClientRect();
     let visualLo=c.scales.x.min-m.xShift,visualHi=c.scales.x.max-m.xShift;
     let coverageLo=m.zr?supports.coverage.lo:visualLo,coverageHi=m.zr?supports.coverage.hi:visualHi;
-    let map=buildFrozenSourceMap({axis:m.axis,plotLeft:r.left+window.scrollX+c.bbox.left/dpr,width:w,visualLo:visualLo,visualHi:visualHi,coverageLo:coverageLo,coverageHi:coverageHi});
+    let map=buildFrozenSourceMap({axis:m.axis,plotLeft:o.left+window.scrollX,width:o.width,visualLo:visualLo,visualHi:visualHi,coverageLo:coverageLo,coverageHi:coverageHi});
     return map?{source:c,srcId:'__KYMO_ID__',sync:c.cursor.sync.key,zr:m.zr,supports:supports,map:map}:null;
   };
   let endpoint=function(s,x){
@@ -521,10 +496,8 @@ if(!el.__kymo_zoomselect){
     if(window.__kymo_zg)return;
     let c=window.__kymo_charts['__KYMO_ID__'];
     if(!c)return;
-    let r=el.getBoundingClientRect(),dpr=devicePixelRatio;
-    let left=c.bbox.left/dpr,top=c.bbox.top/dpr,w=c.bbox.width/dpr,h=c.bbox.height/dpr;
-    let px=ev.clientX-r.left,py=ev.clientY-r.top;
-    if(w<=0||py<top||py>top+h)return; // axis strip belongs to axis-pull below
+    // Presses where hover is live (plot height, gutters included) select; the axis strip below belongs to axis-pull.
+    if(!plotPosition(c,ev.clientX,ev.clientY))return;
     let s=snapshot(c);
     if(!s)return;
     s.downX=s.lastX=ev.pageX;
@@ -563,7 +536,7 @@ if(!el.__kymo_zoomselect){
     };
     let onup=function(e2){if(e2.button===0){suppressDragClick(ev,e2);finish(e2.pageX);}};
     let onkey=function(e2){if(e2.key==='Escape')cleanup();};
-    s.cancel=cleanup;s.paint=paint;
+    s.cancel=cleanup;s.paint=paint;s.cursor='crosshair';
     window.__kymo_zg=s;
     ev.preventDefault();
     window.addEventListener('mousemove',onmove);
@@ -583,14 +556,6 @@ if(!el.__kymo_zoomselect){
 // refetch on step axes). Listeners are registered once per element and look the live chart up by id, surviving chart recreations.
 if(!el.__kymo_axisdrag){
   el.__kymo_axisdrag=true;
-  let ad=null;
-  let strip=function(c,ev){
-    let r=el.getBoundingClientRect();
-    let dpr=devicePixelRatio;
-    let left=c.bbox.left/dpr,top=c.bbox.top/dpr,w=c.bbox.width/dpr,h=c.bbox.height/dpr;
-    let px=ev.clientX-r.left,py=ev.clientY-r.top;
-    return {left:left,w:w,px:px,inside:w>0&&py>top+h&&py<=r.height&&px>=left-10&&px<=left+w+10};
-  };
   el.addEventListener('mousedown',function(ev){
     let c=window.__kymo_charts['__KYMO_ID__'];
     if(!c||ev.button!==0||window.__kymo_zg)return;
@@ -616,7 +581,7 @@ if(!el.__kymo_axisdrag){
     let zm=c.__kymo_zoom,frozen=stepSupports(c,zm);
     if(zm&&zm.zr&&!frozen)return;
     let lim=isLog?690:1e300;
-    ad={which:p0<st.w/2?'min':'max',mn:mn,mx:mx,v0:mn+p0/st.w*(mx-mn),p0:p0,left:st.left,w:st.w,moved:false,inv:isLog?Math.exp:function(v){return v},blo:-lim,bhi:lim,coverage:frozen&&frozen.coverage,userzoom:!!c.__kymo_userzoom};
+    let ad={which:p0<st.w/2?'min':'max',mn:mn,mx:mx,v0:mn+p0/st.w*(mx-mn),p0:p0,left:st.left,w:st.w,moved:false,inv:isLog?Math.exp:function(v){return v},blo:-lim,bhi:lim,coverage:frozen&&frozen.coverage,userzoom:!!c.__kymo_userzoom};
     ev.preventDefault();
     // Window listeners live only for the duration of the drag — idle
     // charts add no per-mousemove work and hold no references.
@@ -682,20 +647,12 @@ if(!el.__kymo_axisdrag){
       // Client-side charts have no release refetch: the pulled window is the new view and must survive live refreshes.
       if(!c2.__kymo_zoom.zr)c2.__kymo_userzoom=true;
     };
-    owner={srcId:'__KYMO_ID__',cancel:oncancel};
+    owner={srcId:'__KYMO_ID__',cancel:oncancel,cursor:'ew-resize'};
     window.__kymo_zg=owner;
     window.addEventListener('mousemove',onmove);
     window.addEventListener('mouseup',onup);
     window.addEventListener('blur',oncancel);
     window.addEventListener('keydown',onkey);
-  });
-  // Affordance: resize cursor while hovering the draggable strip.
-  el.addEventListener('mousemove',function(ev){
-    if(ad)return;
-    if(window.__kymo_zg){el.style.cursor='';return;}
-    let c=window.__kymo_charts['__KYMO_ID__'];
-    if(!c)return;
-    el.style.cursor=strip(c,ev).inside?'ew-resize':'';
   });
 }
 return'';

@@ -112,17 +112,14 @@ if(window.__kymo_ro&&window.__kymo_ro['{id}']){{
 }}
 if(window.__kymo_zg&&window.__kymo_zg.srcId==='{id}'&&window.__kymo_zg.cancel)window.__kymo_zg.cancel();
 if(window.__kymo_charts&&window.__kymo_charts['{id}']){{
+  // An unmounting hover source gets no mouseleave: clear its cursor through the normal path so synced readouts and the highlight go with it.
+  if(window.__kymo_hoversrc==='{id}')window.__kymo_charts['{id}'].setCursor({{left:-10,top:-10}},true,true);
   window.__kymo_charts['{id}'].destroy();
   delete window.__kymo_charts['{id}'];
 }}
+if(window.__kymo_hoversrc==='{id}')window.__kymo_hoversrc=null;
 if(window.__kymo_cfghash) delete window.__kymo_cfghash['{id}'];
 if(window.__kymo_data) delete window.__kymo_data['{id}'];
-// If this chart was the hover source when it unmounted, mouseleave never
-// fired — clear the source and the cross-chart highlight it was driving.
-if(window.__kymo_hoversrc==='{id}'){{
-  window.__kymo_hoversrc=null;
-  window.__kymo_setHl(null);
-}}
 }})();"#,
         id = id,
     )
@@ -594,6 +591,10 @@ mod tests {
         assert!(destroy.contains("delete window.__kymo_data['__KYMO_ID__']"));
         assert!(destroy.contains("window.__kymo_zg.srcId==='__KYMO_ID__'"));
         assert!(destroy.contains("window.__kymo_zg.cancel()"));
+        // An unmounting hover source publishes its clear before destroy, so synced readouts don't outlive it.
+        assert!(destroy.contains(
+            "if(window.__kymo_hoversrc==='__KYMO_ID__')window.__kymo_charts['__KYMO_ID__'].setCursor({left:-10,top:-10},true,true);\n  window.__kymo_charts['__KYMO_ID__'].destroy();"
+        ));
     }
 
     #[test]

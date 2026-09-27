@@ -116,7 +116,7 @@ function fixture(setting, initialSidebar = []) {
   };
 }
 
-function assertHighlight(chart, focused, active = true) {
+function assertHighlight(chart, focused, active = true, hot = active ? focused : []) {
   const { n, rs, nan } = chart.__kymo_hl;
   const lineBase = 1 + n * rs;
   for (let i = 0; i < n; i++) {
@@ -127,7 +127,7 @@ function assertHighlight(chart, focused, active = true) {
       assert.equal(chart.series[column]._focus, focus, `series ${column} focus`);
     }
     if (nan) assert.equal(chart.series[lineBase + n + i].alpha, alpha, `run ${i} marker alpha`);
-    assert.equal(chart.rows[i].classList.contains("kymo-tip-row-hot"), focus, `run ${i} tooltip`);
+    assert.equal(chart.rows[i].classList.contains("kymo-tip-row-hot"), hot.includes(i), `run ${i} tooltip`);
   }
 }
 
@@ -453,6 +453,60 @@ test("coalesced A to B to A flips retag a tooltip rebuilt during the intermediat
   f.flush();
   assert.equal(chart.redraws, 1);
   assertHighlight(chart, [0]);
+});
+
+test("chart hover dims and lifts only in the hovered chart, repainting only charts it enters or leaves, while tooltip and sidebar rows follow the run everywhere", () => {
+  const f = fixture("false");
+  f.sidebar.push(row({ id: "a", name: "x" }), row({ id: "b", name: "y" }));
+  const charts = ["one", "two", "three"].map((name) => f.chart(name, ["a", "b"], ["x", "y"]));
+  const [one, two] = charts;
+  const redraws = () => charts.map((chart) => chart.redraws);
+  f.window.__kymo_setHl("a", "x", "one");
+  f.flush();
+  f.window.__kymo_setHl("b", "y", "one");
+  f.flush();
+  assert.deepEqual(redraws(), [2, 0, 0]);
+  assert.deepEqual(f.sidebar.map((node) => node.classList.contains("sidebar-run-hl")), [false, true]);
+  f.window.__kymo_setHl("b", "y", "two");
+  f.flush();
+  assert.deepEqual(redraws(), [3, 1, 0]);
+  assertHighlight(one, [], false, [1]);
+  assertHighlight(two, [1]);
+  f.window.__kymo_setHl(null);
+  f.flush();
+  assert.deepEqual(redraws(), [3, 2, 0]);
+  assertHighlight(two, [], false);
+});
+
+test("sidebar hover lifts lines in every chart, including after a scoped chart hover", () => {
+  const f = fixture("true");
+  const one = f.chart("one", ["a", "b"], ["x", "y"]);
+  const two = f.chart("two", ["c", "b"], ["x", "y"]);
+  f.window.__kymo_setHl("a", "x", "one");
+  f.flush();
+  assertHighlight(two, [], false, [0]);
+  f.window.__kymo_setHl("a", "x");
+  f.flush();
+  assertHighlight(one, [0]);
+  assertHighlight(two, [0]);
+});
+
+test("sidebar re-renders and setting flips during a chart hover keep dimming and lifting in the hovered chart", () => {
+  const f = fixture("false");
+  const one = f.chart("one", ["a", "b", "c"], ["x", "x", "y"]);
+  const peer = f.chart("peer", ["a", "c"], ["x", "y"]);
+  f.window.__kymo_setHl("a", "x", "one");
+  f.flush();
+  f.window.__kymo_refreshHl();
+  f.flush();
+  assertHighlight(one, [0]);
+  assertHighlight(peer, [], false, [0]);
+  f.attributes.set("data-kymo-highlight-same-name", "true");
+  f.window.__kymo_refreshHl();
+  f.flush();
+  assertHighlight(one, [0, 1]);
+  assertHighlight(peer, [], false, [0]);
+  assert.equal(peer.redraws, 0);
 });
 
 console.log(`chart highlight: ${passed} checks passed`);

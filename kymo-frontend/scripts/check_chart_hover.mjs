@@ -12,22 +12,33 @@ function installHoverPoints(context) {
   hoverScript.runInContext(context);
   return context.window.__kymo_hp;
 }
-const { createHoverPointLookup } = installHoverPoints(vm.createContext({ window: {} }));
+const { createHoverPointLookup, plotPosition } = installHoverPoints(vm.createContext({ window: {} }));
 let passed = 0;
 function test(name, run) {
   run();
   console.log(`ok ${++passed} - ${name}`);
 }
 
-test("browser startup exposes only the namespaced lookup and preserves it on reload", () => {
+test("browser startup exposes only the namespaced helpers and preserves them on reload", () => {
   const context = vm.createContext({ window: {} });
   const helper = installHoverPoints(context);
   assert.equal(typeof helper.createHoverPointLookup, "function");
-  for (const name of ["hasHoverPoint", "createHoverPointLookup", "KYMO_HOVER_POINTS"]) {
+  for (const name of ["hasHoverPoint", "createHoverPointLookup", "plotPosition", "KYMO_HOVER_POINTS"]) {
     assert.equal(vm.runInContext(`typeof ${name}`, context), "undefined", `${name} stays out of the global scope`);
   }
   assert.equal(installHoverPoints(context), helper);
   assert.equal(installHoverPoints(context).createHoverPointLookup, helper.createHoverPointLookup);
+});
+
+test("the shared pointer mapping reads the live overlay rect, snaps the outer pixel to exact bounds, and rejects moves outside the plot band", () => {
+  const chart = { over: { getBoundingClientRect: () => ({ left: 100.25, top: 50, width: 235.390625, height: 200 }) } };
+  const inside = plotPosition(chart, 150.25, 60);
+  assert.deepEqual([inside.left, inside.top], [50, 10]);
+  for (const x of [80, 100.25, 101.25]) assert.equal(plotPosition(chart, x, 60).left, 0, `x ${x} maps to the first column`);
+  for (const x of [334.640625, 335.640625, 400]) assert.equal(plotPosition(chart, x, 60).left, 235.390625, `x ${x} maps to the last column`);
+  assert.equal(plotPosition(chart, 150, 49.9), null, "above the plot band");
+  assert.equal(plotPosition(chart, 150, 250.1), null, "below the plot band");
+  assert.equal(plotPosition({ over: { getBoundingClientRect: () => ({ left: 0, top: 0, width: 0, height: 200 }) } }, 0, 10), null, "an unsized plot");
 });
 
 test("nearest is opt-in, measured by x, and keeps exact-column samples", () => {
@@ -111,7 +122,7 @@ function fixture(overrides = {}) {
   };
   const window = {
     innerWidth: 1000, innerHeight: 800, __kymo_hoversrc: el.id,
-    __kymo_setHl(run, name) { this.hot = { run, name }; },
+    __kymo_setHl(run, name, chartId) { this.hot = { run, name, chartId }; },
     __kymo_retagRows() {},
   };
   const context = {
@@ -129,6 +140,7 @@ function fixture(overrides = {}) {
     data: [[0, 10, 20], [100, 100, 100], [5, null, 8]],
     cursor: { idx: 1, left: 10, top: 5 },
     bbox: { left: 0, top: 0, width: 500, height: 200 },
+    scales: { x: { min: 0, max: 500 }, y: { min: 0, max: 200 } },
     valToPos: value => value,
   };
   return {
@@ -144,6 +156,7 @@ test("nearest readouts do not change the highlighted run or marker", () => {
   f.run();
   assert.ok(!f.tip.innerHTML.includes("sparse"));
   assert.equal(f.window.hot.run, "dense-run");
+  assert.equal(f.window.hot.chartId, "chart-fixture", "chart hover scopes line highlighting to the hovered chart");
   f.enable();
   f.run();
   assert.equal(tooltipCell(f.tip, 1, "val").text, "5.000");
@@ -423,6 +436,16 @@ test("exact-column values outside the plot stay readable without painting into a
   assert.equal(tooltipCell(f.tip, 0, "val").text, "500.0");
   assert.equal(f.hotpt.style.top, "500px");
   assert.equal(f.hotpt.style.display, "none");
+});
+
+test("the hot dot shows on a sample exactly at the plot's edge even when bbox rounds below it", () => {
+  const f = fixture();
+  f.chart.scales = { x: { min: 0, max: 20 }, y: { min: 0, max: 200 } };
+  f.chart.bbox = { left: 0, top: 0, width: 19.75, height: 200 };
+  f.chart.cursor = { idx: 2, left: 20, top: 100 };
+  f.run();
+  assert.equal(f.window.hot.run, "dense-run");
+  assert.equal(f.hotpt.style.display, "block");
 });
 
 console.log(`chart hover: ${passed} checks passed`);

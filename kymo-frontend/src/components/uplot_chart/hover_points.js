@@ -42,5 +42,13 @@
     };
   }
 
-  window.__kymo_hp = { createHoverPointLookup };
+  // The one pointer mapping for hover, copy, the zoom-select press, and the pointer style: offsets from the plot overlay's live rect (uPlot's cached one misses layout shifts without a scroll or resize), null outside the plot band, and x within 1px of a side or beyond it snapped to exactly 0 or the plot width, where posToVal is the scale bound. The overlay's layout width is uPlot's plot width; bbox is rounded to half device pixels.
+  function plotPosition(chart, clientX, clientY) {
+    const rect = chart.over.getBoundingClientRect();
+    const left = clientX - rect.left, top = clientY - rect.top;
+    if (!(rect.width > 0 && rect.height > 0) || top < 0 || top > rect.height) return null;
+    return { left: left <= 1 ? 0 : left >= rect.width - 1 ? rect.width : left, top };
+  }
+
+  window.__kymo_hp = { createHoverPointLookup, plotPosition };
 })();
