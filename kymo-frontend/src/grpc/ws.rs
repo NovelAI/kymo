@@ -33,7 +33,7 @@
 //! (/grpc-ws2) beside this one and pointing the frontend at it once the
 //! server is live.
 //!
-//! The URL carries `?rev=FRONTEND_WIRE_REVISION`; a server whose floor is above it refuses every request with RELOAD_REQUIRED, and [`connection_task`] then stops connecting for good and reloads the page once if the server had ever served it.
+//! The URL carries `?rev=FRONTEND_WIRE_REVISION`; a server whose floor is above it refuses every request with RELOAD_REQUIRED, and [`connection_task`] then stops connecting for good while the notice bar asks the user to reload.
 
 use std::collections::{hash_map::Entry, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -661,7 +661,8 @@ impl WsClient {
                     body: body.clone(),
                     resp: resp_tx,
                 })
-                .map_err(|_| Status::unavailable("ws transport task gone"))?;
+                // The connection task ends only when the server refused this bundle.
+                .map_err(|_| Status::unavailable(super::ws_rpc::RELOAD_REQUIRED))?;
             let mut resp_rx = resp_rx.fuse();
             select! {
                 r = resp_rx => match r {
@@ -671,6 +672,10 @@ impl WsClient {
                     }
                     Ok(Err(status)) => return Err(status),
                     Err(_connection_dropped) if replay_on_disconnect => {}
+                    // A refused socket dispatches nothing, so the refusal leaves no unknown outcome.
+                    Err(_connection_dropped) if is_stale() => {
+                        return Err(Status::unavailable(super::ws_rpc::RELOAD_REQUIRED));
+                    }
                     Err(_connection_dropped) => {
                         return Err(Status::unavailable(
                             "connection lost; mutation outcome is unknown",
@@ -721,8 +726,6 @@ fn decode_response(mut buf: Vec<u8>) -> Option<(u32, Result<Vec<u8>, Status>)> {
 
 async fn connection_task(mut requests: mpsc::UnboundedReceiver<Pending>) {
     let mut next_id: u32 = 0;
-    // Whether the server answered any request with something other than the refusal. A page refused from its first answer was just served the too-old bundle, so reloading it again would loop.
-    let mut served = false;
     let url = format!(
         "{}?rev={}",
         crate::runtime::config().websocket_url,
@@ -824,9 +827,11 @@ async fn connection_task(mut requests: mpsc::UnboundedReceiver<Pending>) {
                     match msg {
                         Some(Ok(Message::Bytes(buf))) => {
                             if let Some((id, result)) = decode_response(buf) {
-                                // Any request can carry the refusal, push control included (a hidden tab's first frame).
-                                let refused = matches!(&result, Err(s) if s.code() == tonic::Code::InvalidArgument && s.message() == super::ws_rpc::RELOAD_REQUIRED);
-                                served |= id != 0 && !refused;
+                                // The refusal ends the transport instead of answering its request, so callers only ever see Unavailable, which every view retries while keeping what it shows, whatever code the server sent. Any request can carry it, push control included (a hidden tab's first frame).
+                                if matches!(&result, Err(s) if s.message() == super::ws_rpc::RELOAD_REQUIRED) {
+                                    STALE.store(true, Ordering::Relaxed);
+                                    break;
+                                }
                                 if id == 0 {
                                     // Server push (see ws_proxy.rs): id 0
                                     // carries a RunVersionsEvent, never a
@@ -844,10 +849,6 @@ async fn connection_task(mut requests: mpsc::UnboundedReceiver<Pending>) {
                                 } else if let Some(tx) = inflight.remove(&id) {
                                     let _ = tx.send(result);
                                 }
-                                if refused {
-                                    STALE.store(true, Ordering::Relaxed);
-                                    break;
-                                }
                             }
                         }
                         Some(Ok(Message::Text(_))) => {}
@@ -863,12 +864,7 @@ async fn connection_task(mut requests: mpsc::UnboundedReceiver<Pending>) {
             changed
         });
         if is_stale() {
-            // Stop for good: dropping `requests` fails every waiting and later call at once, and the notice bar asks for a reload.
-            if served {
-                if let Some(window) = web_sys::window() {
-                    let _ = window.location().reload();
-                }
-            }
+            // Stop for good, never reload by ourselves: dropping `requests` fails every waiting and later call at once, and the notice bar asks the user to reload.
             return;
         }
         gloo_timers::future::sleep(std::time::Duration::from_millis(RECONNECT_DELAY_MS as u64))

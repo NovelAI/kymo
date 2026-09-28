@@ -26,7 +26,7 @@ pub const FRONTEND_WIRE_REVISION: u32 = 2;
 pub const MIN_FRONTEND_WIRE_REVISION: u32 = 2;
 // A server must serve the bundle built from its own commit.
 const _: () = assert!(MIN_FRONTEND_WIRE_REVISION <= FRONTEND_WIRE_REVISION);
-/// Sent with InvalidArgument to frontends below the floor, which stop connecting and reload. Frozen: shipped bundles match it exactly.
+/// Frozen: current bundles match this exact message, stop connecting and show it. Sent as Unavailable to every request from a frontend below the floor; older bundles retry that and keep what they show. Never send it as InvalidArgument: dashboards 20260928-67e9241 through 20260928-a7ae00e reload on that, and pre-`?rev=` bundles replace charts and logs with it.
 pub const RELOAD_REQUIRED: &str = "kymo was updated; reload this tab";
 
 pub const ALL_FROZEN_WIRE_PATHS: &[&str] = &[

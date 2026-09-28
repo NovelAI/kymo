@@ -29,7 +29,7 @@
 //! counters that changed; logging rate cannot inflate this (versions bump
 //! per ingest flush, ~2s per active run, not per point).
 //!
-//! The socket URL carries the dashboard's wire revision as `?rev=` (none counts as 1). Below MIN_FRONTEND_WIRE_REVISION every request frame is answered with InvalidArgument(RELOAD_REQUIRED) and nothing is dispatched (ws_rpc.rs).
+//! The socket URL carries the dashboard's wire revision as `?rev=` (none counts as 1). Below MIN_FRONTEND_WIRE_REVISION every request frame is answered with Unavailable(RELOAD_REQUIRED), nothing is dispatched and nothing is pushed (ws_rpc.rs).
 
 use std::sync::Arc;
 
@@ -394,9 +394,9 @@ async fn handle_socket(socket: WebSocket, svc: Arc<KymoService>, keepalive: bool
                     tracing::warn!("ws: dropping malformed frame ({} bytes)", buf.len());
                     continue;
                 };
-                // Refuse push control too: it may be a hidden tab's first frame. Pushes still flow, so an old bundle's live panels refetch and show the refusal.
+                // Refuse push control too: it may be a hidden tab's first frame.
                 if refused {
-                    let refusal = Err(Status::invalid_argument(crate::ws_rpc::RELOAD_REQUIRED));
+                    let refusal = Err(Status::unavailable(crate::ws_rpc::RELOAD_REQUIRED));
                     if tx.send(encode_response(id, &refusal)).await.is_err() {
                         break;
                     }
@@ -442,7 +442,7 @@ async fn handle_socket(socket: WebSocket, svc: Arc<KymoService>, keepalive: bool
             // Reap finished dispatches; the `Some` pattern idles this arm
             // while the set is empty.
             Some(_) = tasks.join_next() => {}
-            ev = events.recv() => {
+            ev = events.recv(), if !refused => {
                 match ev {
                     Ok(ev) => {
                         if quiet {

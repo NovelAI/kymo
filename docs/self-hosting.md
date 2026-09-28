@@ -89,7 +89,7 @@ docker run -d --name kymo-dashboard -p 80:80 kymo-dashboard
 
 Serve the dashboard at the root of its host. Another web server works if it answers unknown paths with `index.html`, as the image's nginx does. A dashboard served over HTTPS needs an `https://` server origin, for example through a TLS proxy in front of port 8080.
 
-Upgrade the dashboard before the server. Tabs left open on a dashboard the server no longer supports reload themselves; reload by hand any tab that stops updating.
+Upgrade the server and the dashboard together. A tab left open on a dashboard the server no longer supports keeps what it shows but stops updating; reload it.
 
 ## Clients
 
