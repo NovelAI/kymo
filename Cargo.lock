@@ -1120,7 +1120,7 @@ dependencies = [
 [[package]]
 name = "dioxus-router-macro"
 version = "0.7.9"
-source = "git+https://github.com/ad8e/dioxus?rev=fec64a2d503b40c0d7c95fd6e9f4328a6fd965a5#fec64a2d503b40c0d7c95fd6e9f4328a6fd965a5"
+source = "git+https://github.com/ad8e/dioxus?tag=kymo-v0.7.9-1#fec64a2d503b40c0d7c95fd6e9f4328a6fd965a5"
 dependencies = [
  "base16",
  "digest",

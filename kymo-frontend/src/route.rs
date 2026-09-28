@@ -10,7 +10,7 @@ use crate::pages::trash_page::TrashPage;
 /// The dashboard's sole query parameter. Dioxus decodes a query before it
 /// splits named arguments, so a full-query field is required for valid chart
 /// ids containing `&` or a literal percent escape.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ChartQuery(Option<String>);
 
 impl ChartQuery {
@@ -164,7 +164,7 @@ fn NotFound(segments: Vec<String>) -> Element {
 mod route_tests {
     use std::str::FromStr;
 
-    use super::{ChartQuery, Route};
+    use super::Route;
 
     #[test]
     fn trash_route_reserves_the_trash_project_id() {
@@ -208,19 +208,12 @@ mod route_tests {
             run_id: "r".to_string(),
             chart: None.into(),
         };
-        assert_eq!(project.to_string(), "/p/");
-        assert_eq!(run.to_string(), "/p/r");
-        assert_eq!(
-            Route::ProjectPage {
-                project_id: "p".to_string(),
-                chart: Some("x".to_string()).into(),
-            }
-            .to_string(),
-            "/p/?chart=x"
-        );
-        // Older links end in a bare `?` and must open the same page.
-        assert_eq!(Route::from_str("/p/?").unwrap(), project);
-        assert_eq!(Route::from_str("/p/r?").unwrap(), run);
+        for (route, url) in [(project, "/p/"), (run, "/p/r")] {
+            assert_eq!(route.to_string(), url);
+            assert_eq!(Route::from_str(url).unwrap(), route);
+            // Older links end in a bare `?` and must open the same page.
+            assert_eq!(Route::from_str(&format!("{url}?")).unwrap(), route);
+        }
     }
 
     #[test]
@@ -249,15 +242,6 @@ mod route_tests {
                 assert_eq!(decoded.chart_param().as_deref(), Some(value), "{encoded}");
             }
         }
-
-        let none = Route::ProjectPage {
-            project_id: "project".to_string(),
-            chart: ChartQuery::default(),
-        };
-        assert_eq!(
-            Route::from_str(&none.to_string()).unwrap().chart_param(),
-            None
-        );
 
         assert_eq!(
             Route::from_str("/project?chart=loss%26aux")
