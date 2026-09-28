@@ -4,20 +4,12 @@ use std::hash::Hash;
 
 use dioxus::prelude::*;
 use serde_json::Value;
-use wasm_bindgen::JsValue;
 
 use crate::components::copy_text::CopyText;
 use crate::components::icons::{CaretDownIcon, CaretRightIcon};
 use crate::grpc::proto::{RunInfo, RunStatus};
 use crate::state::trash::compact_duration;
-use crate::util::primary;
-
-fn local_time(ms: i64) -> String {
-    js_sys::Date::new(&JsValue::from_f64(ms as f64))
-        .to_locale_string("en-US", &JsValue::UNDEFINED)
-        .as_string()
-        .unwrap_or_else(|| ms.to_string())
-}
+use crate::util::{local_time, primary};
 
 /// Augment the client-authored `info/run_info` document with a distinct set of
 /// authoritative server timings, formatted in the viewer's local timezone.

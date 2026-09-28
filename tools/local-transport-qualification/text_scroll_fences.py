@@ -424,7 +424,7 @@ def font_roundtrip(page: Page, expected: dict[str, dict]) -> None:
         set_font_size(page, pixels)
         page.get_by_role("button", name="Save", exact=True).click()
         expect(page.get_by_role("dialog", name="Settings")).to_have_count(0)
-        page.locator(".project-card").filter(has_text=PROJECT).click()
+        page.locator(".project-row").filter(has_text=PROJECT).click()
         for run in active_last(page, expected):
             activate(page, run)
             saved = expected[run]

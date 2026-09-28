@@ -150,6 +150,22 @@ fn remove_owned_legacy_run_selections(project_id: &str) {
     }
 }
 
+/// Warns, never blocks (docs/run-deletion-ui.md).
+fn live_trash_warning(runs: &[RunInfo], pending: &HashSet<String>) -> String {
+    let live = runs
+        .iter()
+        .filter(|run| {
+            pending.contains(&run.run_id)
+                && matches!(run.status(), RunStatus::Running | RunStatus::Stuck)
+        })
+        .count();
+    match live {
+        0 => String::new(),
+        1 => "1 selected run is still logging; its new points will be dropped.".to_string(),
+        n => format!("{n} selected runs are still logging; their new points will be dropped."),
+    }
+}
+
 fn result_failure(result: &TrashRunResult) -> String {
     if !result.error.is_empty() {
         return result.error.clone();
@@ -194,6 +210,13 @@ fn summarize_trash_results(
         succeeded,
         failed,
         first_failure,
+    }
+}
+
+/// A project whose runs have all gone to Trash keeps no saved selection, so runs restored or logged to it later show like a first visit instead of restoring an empty "show nothing".
+fn forget_run_selection(project_id: &str) {
+    if local_storage::remove(&selected_runs_key(project_id)) {
+        remove_owned_legacy_run_selections(project_id);
     }
 }
 
@@ -845,15 +868,45 @@ const SIDEBAR_RESIZE_JS: &str = r#"(function(){
 mod selection_pick_tests {
     use std::{collections::HashSet, rc::Rc};
 
-    use crate::grpc::proto::{RunInfo, TrashRunOutcome, TrashRunResult};
+    use crate::grpc::proto::{RunInfo, RunStatus, TrashRunOutcome, TrashRunResult};
 
     use super::{
         all_or_none_selection, apply_rename_if_current, continue_selection_paint,
         is_json_run_selection, legacy_selected_runs_v1_key, legacy_selected_runs_v2_key,
-        persisted_run_selection, rename_failure_message, restored_json_run_selection,
-        restored_run_selection, run_list_empty_message, selected_runs_key, selection_action_label,
-        sidebar_needs_run_ordinals, sidebar_run_label, summarize_trash_results, SelectionPaint,
+        live_trash_warning, persisted_run_selection, rename_failure_message,
+        restored_json_run_selection, restored_run_selection, run_list_empty_message,
+        selected_runs_key, selection_action_label, sidebar_needs_run_ordinals, sidebar_run_label,
+        summarize_trash_results, SelectionPaint,
     };
+
+    #[test]
+    fn live_trash_warning_counts_selected_running_and_stuck_runs() {
+        let run = |run_id: &str, status: RunStatus| RunInfo {
+            run_id: run_id.to_string(),
+            status: status as i32,
+            ..Default::default()
+        };
+        let runs = [
+            run("running", RunStatus::Running),
+            run("stuck", RunStatus::Stuck),
+            run("unresponsive", RunStatus::Unresponsive),
+            run("finished", RunStatus::Finished),
+            run("unselected", RunStatus::Running),
+        ];
+        let pick = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<HashSet<_>>();
+        assert_eq!(
+            live_trash_warning(&runs, &pick(&["unresponsive", "finished"])),
+            ""
+        );
+        assert_eq!(
+            live_trash_warning(&runs, &pick(&["stuck", "finished"])),
+            "1 selected run is still logging; its new points will be dropped."
+        );
+        assert_eq!(
+            live_trash_warning(&runs, &pick(&["running", "stuck", "unresponsive"])),
+            "2 selected runs are still logging; their new points will be dropped."
+        );
+    }
 
     #[test]
     fn branded_selection_keys_do_not_own_colliding_projects() {

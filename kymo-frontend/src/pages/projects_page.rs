@@ -5,13 +5,43 @@ use crate::components::theme_toggle::ThemeToggle;
 use crate::components::user_settings::UserSettingsButton;
 use crate::grpc::GrpcClient;
 use crate::route::Route;
+use crate::util::{local_storage, local_time, primary};
+
+const SORT_KEY: &str = "kymo_projects_sort";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sort {
+    Name,
+    LastLogged,
+}
+
+/// Coarse on purpose: the row's tooltip has the exact time. Counted in clock minutes, the Last-logged sort's grid, so a label never contradicts the order.
+fn last_logged_label(at_ms: Option<i64>, now_ms: i64) -> String {
+    let Some(at_ms) = at_ms else {
+        return "—".to_string();
+    };
+    let minutes = now_ms.div_euclid(60_000) - at_ms.div_euclid(60_000);
+    // A month is a twelfth of a year, so "12mo" never shows.
+    for (size, unit) in [
+        (525_600, "y"),
+        (43_800, "mo"),
+        (1_440, "d"),
+        (60, "h"),
+        (1, "m"),
+    ] {
+        if minutes >= size {
+            return format!("{}{unit} ago", minutes / size);
+        }
+    }
+    "just now".to_string()
+}
 
 #[component]
 pub fn ProjectsPage() -> Element {
     // Generation counter bumped when the pushed global version moves or the
     // connection resynced — forces `projects` use_resource to re-run. Trash
-    // lifecycle changes also move this shared generation, so some refetches
-    // are intentionally no-ops for the projects list.
+    // lifecycle changes also move this shared generation; most leave the
+    // projects list unchanged.
     let mut generation = use_signal(|| 0u64);
 
     use_future(move || async move {
@@ -41,6 +71,25 @@ pub fn ProjectsPage() -> Element {
     });
 
     let mut filter = use_signal(String::new);
+    let mut sort = use_signal(|| match local_storage::get(SORT_KEY).as_deref() {
+        Some("name") => Sort::Name,
+        _ => Sort::LastLogged,
+    });
+    let sort_button = move |label: &'static str, by: Sort| {
+        rsx! {
+            button {
+                class: "project-sort",
+                r#type: "button",
+                aria_label: "Sort by {label}",
+                aria_pressed: *sort.read() == by,
+                onmousedown: primary(move |_| {
+                    sort.set(by);
+                    local_storage::set(SORT_KEY, if by == Sort::Name { "name" } else { "last_logged" });
+                }),
+                "{label}"
+            }
+        }
+    };
 
     rsx! {
         // Restore the default title (document.title persists across SPA
@@ -65,14 +114,22 @@ pub fn ProjectsPage() -> Element {
                 }
 
                 match &*projects.read() {
-                    Some(ids) if ids.is_empty() => rsx! {
+                    Some(listing) if listing.project_ids.is_empty() => rsx! {
                         p { class: "text-disabled", "No projects found. Ingest some metrics to get started." }
                     },
-                    Some(ids) => {
+                    Some(listing) => {
                         let query = filter.read().trim().to_owned();
                         let needle = query.to_lowercase();
-                        let shown: Vec<&String> =
-                            ids.iter().filter(|pid| pid.to_lowercase().contains(&needle)).collect();
+                        let mut shown: Vec<(&String, Option<i64>)> = listing
+                            .project_ids
+                            .iter()
+                            .filter(|pid| pid.to_lowercase().contains(&needle))
+                            .map(|pid| (pid, listing.last_logged_at_ms.get(pid).copied()))
+                            .collect();
+                        // Newest clock minute first, stable over the server's name order: live runs flushing within one minute keep name order, and never-logged projects go last.
+                        if *sort.read() == Sort::LastLogged {
+                            shown.sort_by_key(|&(_, at)| std::cmp::Reverse(at.map(|at| at.div_euclid(60_000))));
+                        }
                         rsx! {
                             input {
                                 class: "projects-filter",
@@ -89,13 +146,24 @@ pub fn ProjectsPage() -> Element {
                             }
                             if shown.is_empty() {
                                 p { class: "text-disabled", "No projects match \"{query}\"." }
-                            }
-                            div { class: "project-list",
-                                for pid in shown {
-                                    Link {
-                                        to: Route::ProjectPage { project_id: pid.clone(), chart: None.into() },
-                                        class: "project-card",
-                                        div { class: "project-card-name", "{pid}" }
+                            } else {
+                                div { class: "project-list",
+                                    div { class: "project-list-header",
+                                        {sort_button("Project", Sort::Name)}
+                                        {sort_button("Last logged", Sort::LastLogged)}
+                                    }
+                                    for (pid, at) in shown {
+                                        Link {
+                                            key: "{pid}",
+                                            to: Route::ProjectPage { project_id: pid.clone(), chart: None.into() },
+                                            class: "project-row",
+                                            span { class: "project-row-name", "{pid}" }
+                                            span {
+                                                class: "project-row-logged",
+                                                title: at.map(local_time),
+                                                {last_logged_label(at, listing.server_now_ms)}
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -107,5 +175,35 @@ pub fn ProjectsPage() -> Element {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::last_logged_label;
+
+    #[test]
+    fn last_logged_label_keeps_one_coarse_unit() {
+        const DAY: i64 = 86_400_000;
+        let now = 1_000 * DAY;
+        assert_eq!(last_logged_label(None, now), "—");
+        assert_eq!(last_logged_label(Some(now + 5_000), now), "just now");
+        assert_eq!(last_logged_label(Some(now + 120_000), now), "just now");
+        // Same clock minute, same label, whatever the elapsed seconds.
+        assert_eq!(
+            last_logged_label(Some(now + 10_000), now + 80_000),
+            "1m ago"
+        );
+        assert_eq!(
+            last_logged_label(Some(now + 50_000), now + 80_000),
+            "1m ago"
+        );
+        assert_eq!(last_logged_label(Some(now - 59 * 60_000), now), "59m ago");
+        assert_eq!(last_logged_label(Some(now - 3_600_000), now), "1h ago");
+        assert_eq!(last_logged_label(Some(now - 29 * DAY), now), "29d ago");
+        assert_eq!(last_logged_label(Some(now - 30 * DAY), now), "30d ago");
+        assert_eq!(last_logged_label(Some(now - 45 * DAY), now), "1mo ago");
+        assert_eq!(last_logged_label(Some(now - 364 * DAY), now), "11mo ago");
+        assert_eq!(last_logged_label(Some(now - 400 * DAY), now), "1y ago");
     }
 }

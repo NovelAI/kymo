@@ -165,7 +165,7 @@ def run_fences(page: Page, origin: str) -> None:
 
     # Settings live on the project list; the first save migrates the key.
     page.goto(origin, wait_until="domcontentloaded")
-    page.locator(".project-card").first.wait_for(timeout=20_000)
+    page.locator(".project-row").first.wait_for(timeout=20_000)
     wait_font(page, 20)
     open_settings(page)
     set_font_size(page, 18)

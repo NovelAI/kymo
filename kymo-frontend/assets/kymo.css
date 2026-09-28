@@ -129,7 +129,7 @@ input[type="range"]:focus::-moz-range-thumb {
 /* === Shared Controls === */
 /* Bare action buttons that brighten on hover; size, padding, and opacity gating are per-site. */
 .navbar-action, .section-action, .rect-action, .navbar-search-clear,
-.sidebar-trash-trigger, .sidebar-trash-cancel, .run-overflow-trigger {
+.sidebar-trash-trigger, .sidebar-trash-cancel, .run-overflow-trigger, .project-sort {
     background: none;
     border: none;
     color: var(--text-disabled);
@@ -560,7 +560,10 @@ input[type="checkbox"]:checked::before {
 .projects-page h1 { font-size: var(--font-size-24); margin-bottom: var(--spacing-lg); }
 
 .projects-filter { margin-bottom: var(--spacing-md); font-size: var(--font-size-14); }
-.project-list { display: flex; flex-direction: column; gap: var(--spacing-sm); }
+.project-list {
+    border: 1px solid var(--bg3);
+    background: var(--bg1);
+}
 
 .projects-title-row {
     display: flex;
@@ -577,18 +580,46 @@ input[type="checkbox"]:checked::before {
     align-items: center;
     gap: var(--spacing-md);
 }
-.project-card {
-    display: block;
+.project-list-header,
+.project-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: var(--spacing-md);
+    align-items: baseline;
     padding: var(--spacing-sm) var(--spacing-md);
-    background: var(--bg1);
-    border: 1px solid var(--bg3);
-    transition: border-color var(--transition);
 }
-.project-card:hover { border-color: var(--text-headings); }
-.project-card-name {
+.project-list-header { padding-block: var(--spacing-xs); }
+.project-sort {
+    justify-self: start;
+    padding: 0;
+    font-size: var(--font-size-13);
+    line-height: inherit;
+}
+.project-sort:hover { color: var(--text-main); }
+.project-sort[aria-pressed="true"] {
+    color: var(--text-headings);
+    font-weight: 600;
+}
+.project-sort:focus-visible {
+    outline: 2px solid var(--text-headings);
+    outline-offset: 2px;
+}
+.project-list > * + * { border-top: 1px solid var(--bg3); }
+.project-row { transition: background var(--transition); }
+.project-row:hover { background: var(--bg2); }
+.project-row:focus-visible {
+    outline: 2px solid var(--text-headings);
+    outline-offset: -2px;
+}
+.project-row-name {
     font-weight: 600;
     color: var(--text-main);
     overflow-wrap: anywhere;
+}
+.project-row-logged {
+    color: var(--text-disabled);
+    font-size: var(--font-size-14);
+    white-space: nowrap;
 }
 
 /* === Trash Page === */
@@ -1751,11 +1782,15 @@ input[type="checkbox"]:checked::before {
     font-size: var(--font-size-10);
 }
 .sidebar-trash-footer-meta span:last-child { text-align: right; }
+.sidebar-trash-warning,
 .sidebar-trash-feedback {
-    color: var(--text-main);
     font-size: var(--font-size-11);
     line-height: 1.25;
 }
+.sidebar-trash-warning { color: var(--caution); }
+/* Cancel the footer gap while there is nothing to say. */
+.sidebar-trash-warning:empty { margin-top: calc(-1 * var(--spacing-xs)); }
+.sidebar-trash-feedback { color: var(--text-main); }
 .sidebar-trash-commit {
     display: inline-flex;
     align-items: center;

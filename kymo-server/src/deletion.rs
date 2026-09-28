@@ -771,11 +771,12 @@ impl DeletionReaper {
             !batch.is_empty(),
             "project finalization batch cannot be empty"
         );
+        let run_ids: Vec<&str> = batch.iter().map(|key| key.run_id.as_str()).collect();
         let finalize_started = std::time::Instant::now();
         let finalization = timed(
             PG_TIMEOUT,
             "finalizing a purged project batch",
-            self.pg.finalize_purged_runs(&batch),
+            self.pg.finalize_purged_runs(&batch[0].project_id, &run_ids),
         )
         .await;
         metrics::histogram!(

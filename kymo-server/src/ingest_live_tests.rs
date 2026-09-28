@@ -72,7 +72,7 @@ impl Fixture {
             }
             let mut tx = self.pg.test_pool().begin().await?;
             // Production's foreign keys cascade registry and rich-mutation rows.
-            for table in ["runs", "run_ids", "purged_runs", "projects"] {
+            for table in ["runs", "run_ids", "purged_runs", "project_activity", "projects"] {
                 sqlx::query(&format!("DELETE FROM {table} WHERE project_id = $1"))
                     .bind(&self.project)
                     .execute(&mut *tx)

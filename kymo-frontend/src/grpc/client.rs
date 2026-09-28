@@ -17,12 +17,10 @@ impl GrpcClient {
         }
     }
 
-    pub async fn list_projects(&self) -> Result<Vec<String>, tonic::Status> {
-        let resp: ListProjectsResponse = self
-            .ws
+    pub async fn list_projects(&self) -> Result<ListProjectsResponse, tonic::Status> {
+        self.ws
             .unary_route(routes::LIST_PROJECTS, ListProjectsRequest {})
-            .await?;
-        Ok(resp.project_ids)
+            .await
     }
 
     pub async fn list_runs(&self, project_id: &str) -> Result<ListRunsResponse, tonic::Status> {

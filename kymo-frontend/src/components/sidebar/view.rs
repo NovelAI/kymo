@@ -141,6 +141,16 @@ pub fn Sidebar() -> Element {
         }
     }
 
+    // Once the list has loaded, an empty project forgets its saved selection, however its runs left (this tab, another tab, or before this visit).
+    use_effect({
+        let project_id = project_id.clone();
+        move || {
+            if *state.runs_loaded.read() && state.runs.read().is_empty() {
+                forget_run_selection(&project_id);
+            }
+        }
+    });
+
     // Persist selected runs to localStorage on change (only after initial load)
     use_effect({
         let project_id = project_id.clone();
@@ -153,6 +163,10 @@ pub fn Sidebar() -> Element {
             // change so an ordinary visit leaves rollback state untouched.
             if *skip_initial_persist.peek() {
                 skip_initial_persist.set(false);
+                return;
+            }
+            // An empty project keeps no saved selection (the effect above).
+            if state.runs.peek().is_empty() {
                 return;
             }
             let key = selected_runs_key(&project_id);
@@ -227,6 +241,7 @@ pub fn Sidebar() -> Element {
         .iter()
         .filter(|run| pending_trash.contains(&run.run_id))
         .count();
+    let live_warning = live_trash_warning(&runs, &pending_trash);
     rsx! {
         div {
             class: if in_trash_mode && *trash_busy.read() {
@@ -694,6 +709,8 @@ pub fn Sidebar() -> Element {
                             span { "{pending_count - pending_shown} selected outside filter" }
                         }
                     }
+                    // Always mounted so the live region exists before its text changes.
+                    div { class: "sidebar-trash-warning", role: "status", "{live_warning}" }
                     if !trash_feedback_text.is_empty() {
                         div {
                             class: "sidebar-trash-feedback",

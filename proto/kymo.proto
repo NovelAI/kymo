@@ -365,7 +365,12 @@ message GetRunResponse {
 message ListProjectsRequest {}
 
 message ListProjectsResponse {
+  // Projects with at least one run, in Trash or not; a project leaves the list when its last run is purged.
   repeated string project_ids = 1;
+  // Newest logging activity recorded per project, keyed by project_id. A run's activity is its last_ingested_at_ms capped at its terminated_at_ms, or its terminated_at_ms when it has no ingest clock (runs predating it): data drained after the end was logged before it, and imported runs carry an import-time ingest clock but their archived end. The ingest heartbeat rolls it forward at most once per clock minute; trashing runs does not lower it, and runs imported after the server first seeded it are not reflected. Absent when nothing was recorded.
+  map<string, int64> last_logged_at_ms = 2;
+  // Database clock read in the same statement, for relative display; zero when no project is listed.
+  int64 server_now_ms = 3;
 }
 
 message ListRunsRequest {

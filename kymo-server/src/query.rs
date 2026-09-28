@@ -3755,16 +3755,25 @@ impl QueryService {
         &self,
         _request: Request<proto::ListProjectsRequest>,
     ) -> Result<Response<proto::ListProjectsResponse>, Status> {
-        let mut ids = self
+        let listing = self
             .pg
             .list_metric_projects()
             .await
             .map_err(|e| Status::internal(format!("ListProjects failed: {e}")))?;
-        ids.retain(|project_id| !is_reserved_project_id(project_id));
-
-        Ok(Response::new(proto::ListProjectsResponse {
-            project_ids: ids,
-        }))
+        let mut response = proto::ListProjectsResponse {
+            server_now_ms: listing.server_now_ms,
+            ..Default::default()
+        };
+        for (project_id, last_logged_at_ms) in listing.projects {
+            if is_reserved_project_id(&project_id) {
+                continue;
+            }
+            if let Some(at) = last_logged_at_ms {
+                response.last_logged_at_ms.insert(project_id.clone(), at);
+            }
+            response.project_ids.push(project_id);
+        }
+        Ok(Response::new(response))
     }
 
     #[instrument(skip(self))]

@@ -14,6 +14,14 @@ use dioxus::prelude::{Event, Modifiers, ModifiersInteraction, MouseData, Pointer
 
 pub(crate) const TOP_LAYER_SELECTOR: &str = ":popover-open, dialog:modal";
 
+/// Format epoch milliseconds in the viewer's local timezone.
+pub fn local_time(ms: i64) -> String {
+    js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms as f64))
+        .to_locale_string("en-US", &wasm_bindgen::JsValue::UNDEFINED)
+        .as_string()
+        .unwrap_or_else(|| ms.to_string())
+}
+
 /// Compare two strings "naturally": maximal runs of ASCII digits compare by
 /// numeric value, everything else byte-for-byte (which, for UTF-8, equals
 /// Unicode scalar order). So `block_2` sorts before `block_10`, where plain

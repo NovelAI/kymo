@@ -13,7 +13,7 @@ use crate::state::trash::{
     clock_wait_ms, compact_duration, effective_lifecycle, extrapolated_now_ms, lookup_trashed_runs,
     monotonic_now_ms, moved_ago,
 };
-use crate::util::primary;
+use crate::util::{local_time, primary};
 
 const TRASH_PAGE_SIZE: u32 = 100;
 
@@ -29,17 +29,15 @@ fn record_is(record: &RunRecord, project_id: &str, run_id: &str) -> bool {
         .is_some_and(|run| run.project_id == project_id && run.run_id == run_id)
 }
 
-fn local_time(ms: Option<i64>) -> (String, String) {
+fn expiry_time(ms: Option<i64>) -> (String, String) {
     let Some(ms) = ms else {
         return ("Scheduled".to_string(), String::new());
     };
-    let date = js_sys::Date::new(&JsValue::from_f64(ms as f64));
-    let label = date
-        .to_locale_string("en-US", &JsValue::UNDEFINED)
+    let datetime = js_sys::Date::new(&JsValue::from_f64(ms as f64))
+        .to_iso_string()
         .as_string()
-        .unwrap_or_else(|| "Scheduled".to_string());
-    let datetime = date.to_iso_string().as_string().unwrap_or_default();
-    (label, datetime)
+        .unwrap_or_default();
+    (local_time(ms), datetime)
 }
 
 fn restore_failure(outcome: RestoreRunOutcome, detail: &str) -> String {
@@ -481,7 +479,7 @@ fn trash_row(
         RunLifecycleState::Expired | RunLifecycleState::Purging
     );
     let moved = moved_ago(record.deleted_at_ms, now_ms);
-    let (expires_at, expires_datetime) = local_time(record.purge_at_ms);
+    let (expires_at, expires_datetime) = expiry_time(record.purge_at_ms);
     let expires_in = if is_expired {
         "Recovery expired — deleting…".to_string()
     } else {

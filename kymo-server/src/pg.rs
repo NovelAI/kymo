@@ -87,6 +87,12 @@ pub struct TimedRunRows {
     pub server_now_ms: i64,
 }
 
+pub struct ProjectListing {
+    /// `(project_id, last_logged_at_ms)`, ordered by project_id.
+    pub projects: Vec<(String, Option<i64>)>,
+    pub server_now_ms: i64,
+}
+
 pub struct ListRunsSnapshot {
     pub rows: Vec<RunInfoRow>,
     pub server_now_ms: i64,
@@ -387,7 +393,7 @@ pub struct InitRunOutcome {
     /// Ordering namespace allocated for this successful InitRun call.
     pub writer_epoch: u32,
     pub server_now_ms: i64,
-    /// New global_seq version — Some only when the project itself was created.
+    /// New global_seq version — Some only when this run made its project listed (see init_run).
     pub bumped_global: Option<u64>,
     /// New projects.version — bumped on every InitRun (see the body).
     pub bumped_project: u64,
@@ -675,6 +681,27 @@ impl PgStore {
             .execute(&self.pool)
             .await?;
 
+        // Per-project summary behind ListProjects (docs/run-project-deletion.md). run_rows is maintained next to the only two statements that insert or delete runs. Writers lock this row after their run locks and before global_seq, the same order everywhere, so it cannot join a lock cycle; a foreign key to projects would lock that row from here and invert TerminateRun's project -> run order, and projects rows are never deleted anyway.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS project_activity (
+                project_id     TEXT PRIMARY KEY,
+                run_rows       BIGINT NOT NULL DEFAULT 0,
+                last_logged_at TIMESTAMPTZ
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Seed an empty table from the runs it summarizes; emptying it reseeds at the next boot (the rollback step in docs/run-project-deletion.md).
+        sqlx::query(
+            "INSERT INTO project_activity (project_id, run_rows, last_logged_at)
+             SELECT project_id, COUNT(*), MAX(LEAST(last_ingested_at, terminated_at))
+             FROM runs
+             WHERE NOT EXISTS (SELECT 1 FROM project_activity)
+             GROUP BY project_id",
+        )
+        .execute(&self.pool)
+        .await?;
+
         // Migrate ordinal allocation from MAX(surviving rows)+1 to a durable
         // high-water mark. The predicate makes repeated boots read-only once
         // every project has caught up, while a retained high-water mark still
@@ -863,28 +890,12 @@ impl PgStore {
     ) -> std::result::Result<InitRunOutcome, InitRunError> {
         let mut tx = self.pool.begin().await?;
 
-        // Upsert project. ON CONFLICT DO NOTHING means a pre-existing row
-        // produces no RETURNING row — we detect creation that way.
-        let project_created: Option<(String,)> = sqlx::query_as(
-            "INSERT INTO projects (project_id) VALUES ($1)
-             ON CONFLICT (project_id) DO NOTHING
-             RETURNING project_id",
+        sqlx::query(
+            "INSERT INTO projects (project_id) VALUES ($1) ON CONFLICT (project_id) DO NOTHING",
         )
         .bind(project_id)
-        .fetch_optional(&mut *tx)
+        .execute(&mut *tx)
         .await?;
-
-        let bumped_global: Option<i64> = if project_created.is_some() {
-            Some(
-                sqlx::query_scalar(
-                    "UPDATE global_seq SET version = version + 1 WHERE id = 1 RETURNING version",
-                )
-                .fetch_one(&mut *tx)
-                .await?,
-            )
-        } else {
-            None
-        };
 
         // Lock before reading `runs`: concurrent InitRun calls for the same
         // new identity serialize here, so the follower observes the leader's
@@ -1000,6 +1011,28 @@ impl PgStore {
         };
 
         let newly_created = inserted_ordinal.is_some();
+        // A project is listed while it has any runs row, so discovery changes when this insert gives it its only one.
+        let mut bumped_global: Option<i64> = None;
+        if newly_created {
+            let run_rows: i64 = sqlx::query_scalar(
+                "INSERT INTO project_activity (project_id, run_rows) VALUES ($1, 1)
+                 ON CONFLICT (project_id)
+                 DO UPDATE SET run_rows = project_activity.run_rows + 1
+                 RETURNING run_rows",
+            )
+            .bind(project_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if run_rows == 1 {
+                bumped_global = Some(
+                    sqlx::query_scalar(
+                        "UPDATE global_seq SET version = version + 1 WHERE id = 1 RETURNING version",
+                    )
+                    .fetch_one(&mut *tx)
+                    .await?,
+                );
+            }
+        }
         let mut bumped_run: Option<i64> = None;
         if !newly_created && import_created_at_ms.is_none() {
             // Re-init of an existing run (rare retry workflow). Clear the
@@ -1399,8 +1432,10 @@ impl PgStore {
         let sys_ms: Vec<Option<i64>> = touched.iter().map(|t| t.max_system_metric_at_ms).collect();
         let ingested_ms: Vec<i64> = touched.iter().map(|t| t.last_ingested_at_ms).collect();
 
+        // The same statement rolls project_activity.last_logged_at forward (rule on ListProjectsResponse.last_logged_at_ms), at most once per clock minute per project, the display's grid. InitRun or the boot seed created each project's row before its runs could log.
         let rows: Vec<(String, String, i64, bool)> = sqlx::query_as(
-            "UPDATE runs SET
+            "WITH bumped AS (
+             UPDATE runs SET
                 version = version + 1,
                 last_main_metric_at = GREATEST(
                     runs.last_main_metric_at,
@@ -1423,7 +1458,19 @@ impl PgStore {
                AND runs.run_id = touched.run_id
                AND runs.deleted_at IS NULL
              RETURNING runs.project_id, runs.run_id, runs.version,
-                       runs.exit_code IS NOT NULL AS needs_project_refresh",
+                       runs.exit_code IS NOT NULL AS needs_project_refresh,
+                       LEAST(runs.last_ingested_at, runs.terminated_at) AS logged_at
+             ), logged AS (
+                SELECT project_id, MAX(logged_at) AS at FROM bumped GROUP BY project_id
+             ), rolled_forward AS (
+                UPDATE project_activity SET last_logged_at = logged.at
+                FROM logged
+                WHERE project_activity.project_id = logged.project_id
+                  AND (project_activity.last_logged_at IS NULL
+                       OR logged.at >= date_trunc('minute', project_activity.last_logged_at)
+                                       + INTERVAL '1 minute')
+             )
+             SELECT project_id, run_id, version, needs_project_refresh FROM bumped",
         )
         .bind(&pids)
         .bind(&rids)
@@ -1552,17 +1599,23 @@ impl PgStore {
         Ok(rows)
     }
 
-    /// Every known project. `projects` is the authoritative source: rows appear at InitRun, which is also when the global bump fires (reading run_metrics alone left a just-initialized project invisible to that bump's refetch, and nothing re-announced it once its first metric registered).
-    ///
-    /// This used to `UNION SELECT project_id FROM run_metrics` to keep pre-registry projects whose `projects` row may never have been created. That made a 201-project listing scan every row of run_metrics — 6.7M rows, 12.9s — to dedup down to 201 strings, on every frontend projects page and every 300s watchdog reconcile sweep. The surviving pre-registry ids were backfilled into `projects` once, so the union is gone and this is a 201-row index-only scan (0.4ms).
-    ///
-    /// Divergence after the backfill is benign: run_metrics rows only outlive their `projects` row when a delete/purge leaks them, and those orphans reference runs that no longer exist — not listing them is the wanted behavior, not a regression.
-    pub async fn list_metric_projects(&self) -> Result<Vec<String>> {
-        let rows: Vec<(String,)> =
-            sqlx::query_as("SELECT project_id FROM projects ORDER BY project_id")
-                .fetch_all(&self.pool)
-                .await?;
-        Ok(rows.into_iter().map(|r| r.0).collect())
+    /// Projects with at least one runs row, in Trash or not, ordered by id.
+    pub async fn list_metric_projects(&self) -> Result<ProjectListing> {
+        let rows: Vec<(String, Option<i64>, i64)> = sqlx::query_as(
+            "SELECT project_id,
+                    (EXTRACT(EPOCH FROM last_logged_at) * 1000)::BIGINT,
+                    (EXTRACT(EPOCH FROM statement_timestamp()) * 1000)::BIGINT
+             FROM project_activity
+             WHERE run_rows > 0
+             ORDER BY project_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let server_now_ms = rows.first().map(|r| r.2).unwrap_or_default();
+        Ok(ProjectListing {
+            projects: rows.into_iter().map(|(id, at, _)| (id, at)).collect(),
+            server_now_ms,
+        })
     }
 
     /// Classify run identities against the canonical rows and permanent
@@ -2242,43 +2295,48 @@ impl PgStore {
         Ok(())
     }
 
-    pub async fn finalize_purged_runs(&self, keys: &[RunKey]) -> Result<Option<u64>> {
-        if keys.is_empty() {
+    /// One project's batch: the reaper groups claimed runs by project.
+    pub async fn finalize_purged_runs(
+        &self,
+        project_id: &str,
+        run_ids: &[&str],
+    ) -> Result<Option<u64>> {
+        if run_ids.is_empty() {
             return Ok(None);
         }
-        let project_ids: Vec<&str> = keys.iter().map(|key| key.project_id.as_str()).collect();
-        let run_ids: Vec<&str> = keys.iter().map(|key| key.run_id.as_str()).collect();
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO purged_runs (project_id, run_id, terminal_version)
-             SELECT runs.project_id, runs.run_id,
-                    LEAST(runs.version, $3) + 1
+             SELECT project_id, run_id, LEAST(version, $3) + 1
              FROM runs
-             JOIN UNNEST($1::TEXT[], $2::TEXT[]) AS wanted(project_id, run_id)
-               ON runs.project_id = wanted.project_id AND runs.run_id = wanted.run_id
-             WHERE runs.purging_at IS NOT NULL
+             WHERE project_id = $1 AND run_id = ANY($2) AND purging_at IS NOT NULL
              ON CONFLICT (project_id, run_id) DO NOTHING",
         )
-        .bind(&project_ids)
-        .bind(&run_ids)
+        .bind(project_id)
+        .bind(run_ids)
         .bind(MAX_PRE_TERMINAL_RUN_VERSION)
         .execute(&mut *tx)
         .await?;
         let deleted = sqlx::query(
             "DELETE FROM runs
-             USING UNNEST($1::TEXT[], $2::TEXT[]) AS wanted(project_id, run_id)
-             WHERE runs.project_id = wanted.project_id
-               AND runs.run_id = wanted.run_id
-               AND runs.purging_at IS NOT NULL",
+             WHERE project_id = $1 AND run_id = ANY($2) AND purging_at IS NOT NULL",
         )
-        .bind(&project_ids)
-        .bind(&run_ids)
+        .bind(project_id)
+        .bind(run_ids)
         .execute(&mut *tx)
         .await?
         .rows_affected();
         let bumped_global = if deleted == 0 {
             None
         } else {
+            // After the DELETE and its foreign-key cascades, so the project_activity row is locked only once the runs are gone.
+            sqlx::query(
+                "UPDATE project_activity SET run_rows = run_rows - $2 WHERE project_id = $1",
+            )
+            .bind(project_id)
+            .bind(deleted as i64)
+            .execute(&mut *tx)
+            .await?;
             let version: i64 = sqlx::query_scalar(
                 "UPDATE global_seq SET version = version + 1 WHERE id = 1 RETURNING version",
             )
@@ -2937,7 +2995,7 @@ mod live_pg_tests {
             .await?;
             anyhow::ensure!(
                 store
-                    .finalize_purged_runs(&[RunKey::new(owner_project, &run_id)])
+                    .finalize_purged_runs(owner_project, &[run_id.as_str()])
                     .await?
                     .is_some(),
                 "fixture purge was not finalized"
@@ -3503,10 +3561,164 @@ mod live_pg_tests {
                 .bind(&project_id)
                 .execute(&store.pool)
                 .await?;
+            sqlx::query("DELETE FROM project_activity WHERE project_id = $1")
+                .bind(&project_id)
+                .execute(&store.pool)
+                .await?;
             sqlx::query("DELETE FROM projects WHERE project_id = $1")
                 .bind(&project_id)
                 .execute(&store.pool)
                 .await?;
+            Ok(())
+        }
+        .await;
+        test_result?;
+        cleanup_result?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL"]
+    async fn live_project_listing_tracks_run_rows_and_last_logged() -> Result<()> {
+        // What the reaper does to one expired run: trash, claim, finalize.
+        async fn purge(store: &PgStore, project_id: &str, run_id: &str) -> Result<Option<u64>> {
+            sqlx::query(
+                "UPDATE runs SET deleted_at = COALESCE(deleted_at, clock_timestamp()),
+                                 purging_at = clock_timestamp()
+                 WHERE project_id = $1 AND run_id = $2",
+            )
+            .bind(project_id)
+            .bind(run_id)
+            .execute(&store.pool)
+            .await?;
+            store.finalize_purged_runs(project_id, &[run_id]).await
+        }
+        let _suite_guard = live_database_suite_gate().lock().await;
+        let pg_url = std::env::var("KYMO_LIVE_TEST_DATABASE_URL")
+            .map_err(|_| anyhow::anyhow!("KYMO_LIVE_TEST_DATABASE_URL is required"))?;
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let live = format!("last-logged-live-{suffix}");
+        let imported = format!("last-logged-imported-{suffix}");
+        let silent = format!("last-logged-silent-{suffix}");
+        let projects = vec![live.clone(), imported.clone(), silent.clone()];
+        let live_id = format!("live-{suffix}");
+        let silent_id = format!("silent-{suffix}");
+        let imported_id = format!("imported-{suffix}");
+        let store = PgStore::connect(&pg_url).await?;
+
+        // Whole seconds so EXTRACT(EPOCH)*1000::BIGINT reads back exactly.
+        const LIVE_MS: i64 = 1_700_000_100_000;
+        const ARCHIVED_END_MS: i64 = 1_680_003_700_000;
+        const IMPORT_INGEST_MS: i64 = 1_700_000_000_000;
+
+        let test_result: Result<()> = async {
+            let listed = |listing: &ProjectListing, project: &str| {
+                listing
+                    .projects
+                    .iter()
+                    .find(|(id, _)| id == project)
+                    .map(|(_, at)| *at)
+            };
+            let beat = |project: &str, run_id: &str, ingested_ms: i64| TouchedRun {
+                project_id: project.to_string(),
+                run_id: run_id.to_string(),
+                max_main_metric_at_ms: None,
+                max_system_metric_at_ms: None,
+                last_ingested_at_ms: ingested_ms,
+            };
+            store.init_run(&live, &live_id, "live", None).await?;
+            store
+                .init_run(&imported, &imported_id, "imported", Some(1_680_000_000_000))
+                .await?;
+            store.init_run(&silent, &silent_id, "silent", None).await?;
+
+            // The first heartbeat records; the rest of its clock minute writes nothing; the next clock minute rolls forward, even under 60 s later.
+            for (ingested_ms, expected_ms) in [
+                (LIVE_MS + 50_000, LIVE_MS + 50_000),
+                (LIVE_MS + 55_000, LIVE_MS + 50_000),
+                (LIVE_MS + 70_000, LIVE_MS + 70_000),
+            ] {
+                store
+                    .bump_run_versions(&[beat(&live, &live_id, ingested_ms)])
+                    .await?;
+                let listing = store.list_metric_projects().await?;
+                anyhow::ensure!(listed(&listing, &live) == Some(Some(expected_ms)));
+            }
+            // Trash keeps the project listed with its value; purging its last run delists it with a global bump; a new run relists it.
+            store
+                .trash_runs_chunk(&live, std::slice::from_ref(&live_id), &HashMap::new())
+                .await?;
+            let listing = store.list_metric_projects().await?;
+            anyhow::ensure!(listed(&listing, &live) == Some(Some(LIVE_MS + 70_000)));
+            anyhow::ensure!(purge(&store, &live, &live_id).await?.is_some());
+            let listing = store.list_metric_projects().await?;
+            anyhow::ensure!(listed(&listing, &live).is_none());
+            let relisted = store
+                .init_run(&live, &format!("live-again-{suffix}"), "live again", None)
+                .await?;
+            anyhow::ensure!(relisted.bumped_global.is_some());
+            let listing = store.list_metric_projects().await?;
+            anyhow::ensure!(listed(&listing, &live) == Some(Some(LIVE_MS + 70_000)));
+            let third = format!("live-third-{suffix}");
+            anyhow::ensure!(store
+                .init_run(&live, &third, "live third", None)
+                .await?
+                .bumped_global
+                .is_none());
+            // Purging one of two runs keeps the project listed.
+            anyhow::ensure!(purge(&store, &live, &third).await?.is_some());
+            let listing = store.list_metric_projects().await?;
+            anyhow::ensure!(listed(&listing, &live) == Some(Some(LIVE_MS + 70_000)));
+
+            // A terminated run's import-time ingest clock is capped at its archived end.
+            store
+                .terminate_run(&imported, &imported_id, 0, None, Some(ARCHIVED_END_MS))
+                .await?
+                .context("finalize should find the imported run")?;
+            store
+                .bump_run_versions(&[beat(&imported, &imported_id, IMPORT_INGEST_MS)])
+                .await?;
+            let listing = store.list_metric_projects().await?;
+            anyhow::ensure!(listing.server_now_ms > LIVE_MS);
+            anyhow::ensure!(listed(&listing, &imported) == Some(Some(ARCHIVED_END_MS)));
+            anyhow::ensure!(listed(&listing, &silent) == Some(None));
+
+            // An empty table is seeded at boot from every runs row, Trash included (the disposable live-test database's table is emptied for this).
+            store
+                .trash_runs_chunk(&silent, std::slice::from_ref(&silent_id), &HashMap::new())
+                .await?;
+            sqlx::query("DELETE FROM project_activity")
+                .execute(&store.pool)
+                .await?;
+            let reseeded = PgStore::connect(&pg_url).await?;
+            let listing = reseeded.list_metric_projects().await?;
+            anyhow::ensure!(listed(&listing, &imported) == Some(Some(ARCHIVED_END_MS)));
+            anyhow::ensure!(listed(&listing, &live) == Some(None));
+            anyhow::ensure!(listed(&listing, &silent) == Some(None));
+            Ok(())
+        }
+        .await;
+
+        let cleanup_result: Result<()> = async {
+            for table in [
+                "runs",
+                "run_ids",
+                "purged_runs",
+                "project_activity",
+                "projects",
+            ] {
+                sqlx::query(&format!("DELETE FROM {table} WHERE project_id = ANY($1)"))
+                    .bind(&projects)
+                    .execute(&store.pool)
+                    .await?;
+            }
             Ok(())
         }
         .await;

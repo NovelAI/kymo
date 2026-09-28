@@ -340,7 +340,7 @@ pub fn BindingEditor(
         let grpc = state.grpc.read().clone();
         async move {
             crate::state::visibility::retry_visible("binding projects", async || {
-                grpc.list_projects().await
+                grpc.list_projects().await.map(|resp| resp.project_ids)
             })
             .await
         }

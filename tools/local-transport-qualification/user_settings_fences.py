@@ -178,7 +178,7 @@ def set_font_size(page: Page, pixels: int) -> None:
 def reset(page: Page) -> None:
     page.evaluate(f"localStorage.removeItem({STORAGE_KEY!r})")
     page.reload(wait_until="domcontentloaded")
-    page.locator(".project-card").first.wait_for(timeout=20_000)
+    page.locator(".project-row").first.wait_for(timeout=20_000)
     wait_font(page, 16)
     expect_single_click(page, True)
     expect_hover_settings(page)
@@ -303,7 +303,7 @@ def run_fences(page: Page, *, dashboard_path: str | None = None) -> None:
     set_font_size(page, 18)
     if stored_config(page) is not None:
         raise AssertionError("font preview wrote localStorage before Save")
-    expect(page.locator(".project-card-name").first).to_have_css("font-size", "18px")
+    expect(page.locator(".project-row-name").first).to_have_css("font-size", "18px")
     assert_settings_focus(page, save_enabled=True)
     page.get_by_role("button", name="Cancel").press("Space")
     wait_font(page, 16)
@@ -340,7 +340,7 @@ def run_fences(page: Page, *, dashboard_path: str | None = None) -> None:
         raise AssertionError("route-unmounted preview persisted unexpectedly")
 
     page.goto(origin, wait_until="domcontentloaded")
-    page.locator(".project-card").first.wait_for(timeout=20_000)
+    page.locator(".project-row").first.wait_for(timeout=20_000)
 
     # A denied localStorage write keeps the draft open for a retry rather
     # than reporting a session-only preview as saved.
@@ -375,7 +375,7 @@ def run_fences(page: Page, *, dashboard_path: str | None = None) -> None:
     page.get_by_role("checkbox", name="Single-click to exit chart zoom").uncheck()
     page.get_by_role("button", name="Save").click()
     page.reload(wait_until="domcontentloaded")
-    page.locator(".project-card").first.wait_for(timeout=20_000)
+    page.locator(".project-row").first.wait_for(timeout=20_000)
     wait_font(page, 18)
     expect_single_click(page, False)
     expect_hover_settings(page, nearest=True, same_name=True)
