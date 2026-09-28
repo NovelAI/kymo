@@ -61,11 +61,7 @@ enum TextFormat {
 }
 
 pub(super) struct ExternalAccount {
-    audience: String,
-    subject_token_type: String,
-    token_url: String,
-    subject_token_file: String,
-    impersonation_url: Option<String>,
+    config: Config,
     http: reqwest::Client,
     cached: Mutex<Option<(Arc<GcpCredential>, Instant)>>,
     /// Held across an exchange; holds the last failed one.
@@ -76,7 +72,7 @@ pub(super) struct ExternalAccount {
 impl std::fmt::Debug for ExternalAccount {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExternalAccount")
-            .field("audience", &self.audience)
+            .field("audience", &self.config.audience)
             .finish_non_exhaustive()
     }
 }
@@ -105,11 +101,7 @@ impl ExternalAccount {
             );
         }
         Ok(Self {
-            audience: config.audience,
-            subject_token_type: config.subject_token_type,
-            token_url: config.token_url,
-            subject_token_file: config.credential_source.file,
-            impersonation_url: config.service_account_impersonation_url,
+            config,
             // A redirect would re-send the form (with the subject token) or the bearer elsewhere.
             http: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
@@ -122,7 +114,7 @@ impl ExternalAccount {
     }
 
     pub(super) fn audience(&self) -> &str {
-        &self.audience
+        &self.config.audience
     }
 
     fn cached_with(&self, margin: Duration) -> Option<Arc<GcpCredential>> {
@@ -132,15 +124,12 @@ impl ExternalAccount {
     }
 
     async fn exchange(&self) -> anyhow::Result<(Arc<GcpCredential>, Instant)> {
-        let subject = tokio::fs::read_to_string(&self.subject_token_file)
+        let file = &self.config.credential_source.file;
+        let subject = tokio::fs::read_to_string(file)
             .await
-            .with_context(|| format!("reading subject token {}", self.subject_token_file))?;
+            .with_context(|| format!("reading subject token {file}"))?;
         let subject = subject.trim();
-        anyhow::ensure!(
-            !subject.is_empty(),
-            "subject token {} is empty",
-            self.subject_token_file
-        );
+        anyhow::ensure!(!subject.is_empty(), "subject token {file} is empty");
         // Lifetimes count from before the STS call, so the cache retires a token early rather than late.
         let requested_at = Instant::now();
         #[derive(serde::Deserialize)]
@@ -150,15 +139,15 @@ impl ExternalAccount {
         }
         let federated: Federated = call(
             "STS",
-            self.http.post(&self.token_url).form(&[
+            self.http.post(&self.config.token_url).form(&[
                 (
                     "grant_type",
                     "urn:ietf:params:oauth:grant-type:token-exchange",
                 ),
-                ("audience", &self.audience),
+                ("audience", &self.config.audience),
                 (
                     "scope",
-                    match self.impersonation_url {
+                    match self.config.service_account_impersonation_url {
                         Some(_) => CLOUD_PLATFORM_SCOPE,
                         None => STORAGE_SCOPE,
                     },
@@ -167,12 +156,12 @@ impl ExternalAccount {
                     "requested_token_type",
                     "urn:ietf:params:oauth:token-type:access_token",
                 ),
-                ("subject_token_type", &self.subject_token_type),
+                ("subject_token_type", &self.config.subject_token_type),
                 ("subject_token", subject),
             ]),
         )
         .await?;
-        let (bearer, lifetime) = match &self.impersonation_url {
+        let (bearer, lifetime) = match &self.config.service_account_impersonation_url {
             None => (
                 federated.access_token,
                 Duration::from_secs(federated.expires_in),
@@ -360,10 +349,11 @@ mod tests {
     /// A provider parsed from `file`, then pointed at the mock `origin`: the file itself must name Google's endpoints.
     fn retargeted(origin: &str, file: &serde_json::Value) -> ExternalAccount {
         let mut provider = parse(file).unwrap();
-        provider.token_url = provider
+        provider.config.token_url = provider
+            .config
             .token_url
             .replace("https://sts.googleapis.com", origin);
-        if let Some(url) = &mut provider.impersonation_url {
+        if let Some(url) = &mut provider.config.service_account_impersonation_url {
             *url = url.replace("https://iamcredentials.googleapis.com", origin);
         }
         provider

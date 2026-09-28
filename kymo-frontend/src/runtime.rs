@@ -49,6 +49,7 @@ fn hosted_config(origin: &str) -> Result<RuntimeConfig, String> {
     })
 }
 
+/// Every CDN request goes through here. The collector keeps metric-row roots and the manifest items `resources()` yields (kymo/shared/cdn_manifest.rs); any other kind of link needs a matching collector change, plus a `LINKS_VERSION` bump if it comes from a manifest, or the collector may delete what it links.
 pub(crate) fn cdn_url(key: &str) -> String {
     format!("{}/cdn/{}", config().cdn_origin, cdn_path_segment(key))
 }

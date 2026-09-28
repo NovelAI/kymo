@@ -40,6 +40,7 @@ Settings are environment variables; an unset one takes its default.
 | `KYMO_CDN_GCS_BUCKET`, `GOOGLE_APPLICATION_CREDENTIALS` | none | Bucket and Google credential file (a `service_account` key, or an `external_account` federation config without impersonation), both required for `gcs` |
 | `KYMO_CDN_GC` | `report` | Media garbage collector for the `gcs` store: `off`, `report` (counts only), or `delete` |
 | `KYMO_CDN_GC_CREDENTIALS` | none | Credential file for `delete`: an `external_account` config that impersonates a service account allowed to delete in the bucket |
+| `KYMO_CDN_GC_MAX_CANDIDATES` | the larger of 1% of referenced objects and 10,000 | With `delete`, a pass with more candidates deletes nothing; raise it for a deliberate large purge, then unset it |
 | `KYMO_RUN_REAPER_ENABLED` | `false` | Permanently delete runs whose Trash retention expired (see below) |
 | `KYMO_PROMETHEUS_URL` | unset | Prometheus whose firing alerts the dashboard shows |
 | `KYMO_IMPORT_ENABLED` | `false` | Accept wandb imports (`tools/wandb-import/import_to_kymo.py`). Enable it only while importing: an import can backdate and terminate any run it names. |
@@ -53,7 +54,9 @@ The filesystem store keeps each logged image or file once, named by its content 
 
 With the `gcs` store, a garbage collector lists the bucket every few hours and publishes how much media nothing references. By default it only reports. With `KYMO_CDN_GC=delete` it also deletes objects that are unreferenced and weren't uploaded (even as a duplicate) in the last 30 days, and deletes nothing until its upload log covers those 30 days. A `gcs` server records each upload of already-stored media in ClickHouse before acknowledging it, so while ClickHouse is down those uploads fail and wait in the client's spool.
 
-Back up PostgreSQL and ClickHouse together, with the server stopped, and with the filesystem store the media directory too. With `gcs`, the bucket holds the media; if the collector deletes, the bucket's soft delete is the only undo. With `delete`, restoring ClickHouse from a backup or running a server older than the collector loses upload-log entries; afterwards run `ALTER TABLE mkdb2.cdn_acks DELETE WHERE key = '' SETTINGS mutations_sync = 1` and restart, so deletion waits a fresh 30 days. A database backup can also reference media the collector deleted after it was taken, so with `delete`, keep the bucket's soft-delete retention at least as long as the age of any backup you might restore.
+Back up PostgreSQL and ClickHouse together, with the server stopped, and with the filesystem store the media directory too. With `gcs`, the bucket holds the media; if the collector deletes, the bucket's soft delete is the only undo. A database backup can also reference media the collector deleted after it was taken, so with `delete`, keep the bucket's soft-delete retention at least as long as the age of any backup you might restore.
+
+With `gcs`, restoring ClickHouse from a backup or running a server older than the collector loses upload-log entries, which a later `delete` would then trust. Afterwards, once a server with the collector is running again, run `INSERT INTO mkdb2.cdn_acks VALUES ('', now())`, so deletion waits a fresh 30 days.
 
 ## Run exactly one server
 

@@ -1802,7 +1802,7 @@ impl ChClient {
 
     // --- CDN garbage collection (docs/cdn-gcs-migration.md § Garbage collection) ---
 
-    /// The collector's tables. `cdn_acks` holds dedup acks for twice the grace, so the grace can grow without an ALTER; its `''` row is written once, when the log starts, and never expires: it is the log's start time, which delete mode waits on.
+    /// The collector's tables. `cdn_acks` holds dedup acks for twice the grace, so the grace can grow without an ALTER; `''` rows never expire: the newest is the log's start time, which delete mode waits on, and boot writes one only if none exists.
     pub async fn ensure_cdn_gc_schema(&self, grace_days: u64, now: u32) -> Result<()> {
         let ttl_days = 2 * grace_days;
         self.client
@@ -2065,6 +2065,22 @@ impl ChClient {
             .fetch_all::<CdnGcKeySize>()
             .await
             .with_context(|| format!("paging the CDN collector's {kind} keys"))
+    }
+
+    /// Referenced keys missing from the bucket, the first `limit` in key order.
+    pub async fn cdn_gc_dangling(&self, limit: u64) -> Result<Vec<String>> {
+        self.gc_client()
+            .query(&format!(
+                "SELECT DISTINCT key FROM {CDN_GC_SCRATCH_TABLE}
+                 WHERE kind = 'ref'
+                   AND key NOT IN (SELECT key FROM {CDN_GC_SCRATCH_TABLE} WHERE kind = 'inventory')
+                 ORDER BY key
+                 LIMIT ?"
+            ))
+            .bind(limit)
+            .fetch_all::<String>()
+            .await
+            .context("sampling dangling CDN references")
     }
 
     /// Which of `keys` were dedup-acked since `cutoff`.

@@ -40,6 +40,12 @@ const DELETE_BATCH: u64 = 1_000;
 const DELETE_CONCURRENCY: usize = 16;
 /// How long a claim outlives a delete that didn't finish definitively: a DELETE that failed client-side can still land at GCS.
 const DELETE_SETTLE: Duration = Duration::from_secs(2 * 60);
+/// The ack recheck runs under a claim, and uploads of the claimed keys wait for it.
+const RECHECK_TIMEOUT: Duration = Duration::from_secs(60);
+/// Delete mode's ceiling is the larger of 1% of the referenced objects and this (docs § Garbage collection).
+const CEILING_FLOOR: u64 = 10_000;
+/// Dangling keys a pass checks with a HEAD.
+const DANGLING_SAMPLE: u64 = 100;
 const STAGES: [&str; 6] = [
     "inventory",
     "references",
@@ -75,12 +81,13 @@ impl Mode {
 pub struct Config {
     mode: Mode,
     deletes: Option<Arc<dyn ObjectStore>>,
+    max_candidates: Option<u64>,
 }
 
 impl Config {
     pub fn from_env(bucket: &str) -> Result<Self> {
         let mode = Mode::parse(&crate::env::required_string_or("KYMO_CDN_GC", "report")?)?;
-        let deletes = match mode {
+        let (deletes, max_candidates) = match mode {
             Mode::Delete => {
                 let credentials = crate::env::required_optional_string("KYMO_CDN_GC_CREDENTIALS")?
                     .context("KYMO_CDN_GC=delete requires KYMO_CDN_GC_CREDENTIALS (an external_account file that impersonates the delete identity)")?;
@@ -92,11 +99,26 @@ impl Config {
                         ..Default::default()
                     })
                     .build()?;
-                Some(Arc::new(store) as Arc<dyn ObjectStore>)
+                let max_candidates =
+                    crate::env::required_optional_string("KYMO_CDN_GC_MAX_CANDIDATES")?
+                        .map(|raw| {
+                            raw.trim().parse::<u64>().with_context(|| {
+                                format!("KYMO_CDN_GC_MAX_CANDIDATES={raw:?} is not a count")
+                            })
+                        })
+                        .transpose()?;
+                (
+                    Some(Arc::new(store) as Arc<dyn ObjectStore>),
+                    max_candidates,
+                )
             }
-            Mode::Off | Mode::Report => None,
+            Mode::Off | Mode::Report => (None, None),
         };
-        Ok(Self { mode, deletes })
+        Ok(Self {
+            mode,
+            deletes,
+            max_candidates,
+        })
     }
 }
 
@@ -221,6 +243,7 @@ pub struct Collector {
     fence: Arc<Fence>,
     reads: Arc<dyn ObjectStore>,
     deletes: Option<Arc<dyn ObjectStore>>,
+    max_candidates: Option<u64>,
 }
 
 /// Builds both halves. The ack log's schema must exist before the upload route serves.
@@ -246,6 +269,7 @@ pub async fn start(
             fence,
             reads,
             deletes: config.deletes,
+            max_candidates: config.max_candidates,
         },
     ))
 }
@@ -338,7 +362,11 @@ impl Collector {
                     Err(error) => {
                         metrics::gauge!("mkdb2_cdn_gc_last_failure_unixtime_seconds")
                             .set(unix_time_seconds());
-                        tracing::error!(error = format!("{error:#}"), "CDN collector pass failed");
+                        tracing::error!(
+                            error = format!("{error:#}"),
+                            seconds = started.elapsed().as_secs(),
+                            "CDN collector pass failed"
+                        );
                     }
                 }
                 tokio::time::sleep(PASS_INTERVAL).await;
@@ -360,11 +388,20 @@ impl Collector {
         metrics::gauge!("mkdb2_cdn_gcs_bytes").set(bytes);
         let inventory = inventory.inspect_err(|_| publish_classes(None))?;
         let classified = self.classify(cutoff).await;
-        publish_classes(classified.as_ref().ok().map(|(r, u)| (&inventory, r, *u)));
-        let (report, unparsed) = classified?;
+        publish_classes(
+            classified
+                .as_ref()
+                .ok()
+                .map(|(r, u, m)| (&inventory, r, *u, *m)),
+        );
+        let (report, unparsed, _) = classified?;
         let deleted = match &self.deletes {
             Some(deletes) => {
-                stage("delete", self.delete_if_safe(deletes, cutoff, unparsed)).await?
+                stage(
+                    "delete",
+                    self.delete_if_safe(deletes, cutoff, unparsed, &report),
+                )
+                .await?
             }
             None => Deleted::default(),
         };
@@ -376,8 +413,8 @@ impl Collector {
         })
     }
 
-    /// Referenced keys, then candidates, then the report; returns it with the unparsed-root count.
-    async fn classify(&self, cutoff: u32) -> Result<(CdnGcReport, u64)> {
+    /// Referenced keys, then candidates, then the report; returns it with the unparsed-root and confirmed-missing counts.
+    async fn classify(&self, cutoff: u32) -> Result<(CdnGcReport, u64, u64)> {
         stage(
             "references",
             self.ch.cdn_gc_collect_roots(&hosted_key_pattern()),
@@ -385,7 +422,38 @@ impl Collector {
         .await?;
         let unparsed = stage("manifests", self.parse_manifests()).await?;
         stage("candidates", self.ch.cdn_gc_collect_candidates(cutoff)).await?;
-        Ok((stage("report", self.ch.cdn_gc_report()).await?, unparsed))
+        let (report, missing) = stage("report", async {
+            let report = self.ch.cdn_gc_report().await?;
+            let missing = match report.dangling_references() {
+                0 => Vec::new(),
+                _ => self.missing_references().await?,
+            };
+            if !missing.is_empty() {
+                tracing::warn!(
+                    dangling = report.dangling_references(),
+                    ?missing,
+                    "CDN collector found referenced keys missing from the bucket"
+                );
+            }
+            Ok((report, missing.len() as u64))
+        })
+        .await?;
+        Ok((report, unparsed, missing))
+    }
+
+    /// The sampled dangling keys still missing now: an upload that landed after the listing exists by the time of its HEAD. Its failures stay uncounted, like the manifest fetches.
+    async fn missing_references(&self) -> Result<Vec<String>> {
+        let mut missing = Vec::new();
+        for key in self.ch.cdn_gc_dangling(DANGLING_SAMPLE).await? {
+            match self.reads.head(&ObjectPath::from(key.as_str())).await {
+                Err(object_store::Error::NotFound { .. }) => missing.push(key),
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(key = %key, error = format!("{error:#}"), "CDN collector could not check a dangling key")
+                }
+            }
+        }
+        Ok(missing)
     }
 
     /// Lists the bucket into the scratch table; objects outside the key grammar are counted but never collected.
@@ -411,7 +479,7 @@ impl Collector {
                 kind: "inventory",
                 key: key.to_owned(),
                 size: meta.size,
-                // GCS objects here are never updated, so last-modified is the creation time.
+                // Last-modified (GCS `updated`): objects are never rewritten, and a later metadata change only delays collection.
                 created: unix_seconds(meta.last_modified.into()),
             });
             if batch.len() == INSERT_ROWS {
@@ -419,9 +487,7 @@ impl Collector {
                 batch.clear();
             }
         }
-        if !batch.is_empty() {
-            self.ch.cdn_gc_insert_inventory(&batch).await?;
-        }
+        self.ch.cdn_gc_insert_inventory(&batch).await?;
         Ok(inventory)
     }
 
@@ -492,16 +558,25 @@ impl Collector {
         deletes: &dyn ObjectStore,
         cutoff: u32,
         unparsed: u64,
+        report: &CdnGcReport,
     ) -> Result<Deleted> {
+        let ceiling = self
+            .max_candidates
+            .unwrap_or((report.referenced_objects / 100).max(CEILING_FLOOR));
+        metrics::gauge!("mkdb2_cdn_gc_delete_ceiling").set(ceiling as f64);
         // A dedup ack from before the log began is invisible, so the log must span the grace.
         let log_start = self.ch.cdn_ack_log_start().await?;
-        let armed = unparsed == 0 && log_start.is_some_and(|start| start <= cutoff);
+        let armed = unparsed == 0
+            && log_start.is_some_and(|start| start <= cutoff)
+            && report.candidate_objects <= ceiling;
         metrics::gauge!("mkdb2_cdn_gc_delete_armed").set(if armed { 1.0 } else { 0.0 });
         if !armed {
             tracing::warn!(
                 unparsed_roots = unparsed,
                 ack_log_start = ?log_start,
-                "CDN collector delete mode is disarmed this pass (unparsed roots, or an ack log younger than the grace)"
+                candidates = report.candidate_objects,
+                ceiling,
+                "CDN collector delete mode is disarmed this pass"
             );
             return Ok(Deleted::default());
         }
@@ -525,7 +600,10 @@ impl Collector {
             let mut claim = self.fence.claim(batch);
             // Acks logged between the candidate query and the claim.
             let keys: Vec<_> = claim.keys.iter().map(|c| c.key.clone()).collect();
-            let acked = self.ch.cdn_gc_acked_since(&keys, cutoff).await?;
+            let acked =
+                tokio::time::timeout(RECHECK_TIMEOUT, self.ch.cdn_gc_acked_since(&keys, cutoff))
+                    .await
+                    .context("rechecking CDN dedup acks timed out")??;
             let doomed: Vec<_> = claim
                 .keys
                 .iter()
@@ -564,10 +642,10 @@ impl Collector {
 }
 
 /// Classes partition the bucket: foreign (outside the key grammar, never collected), referenced, candidate, and grace (unreferenced but recently created or acked). `None` (a failed pass) blanks them rather than leaving a previous pass's split beside fresh size gauges.
-fn publish_classes(pass: Option<(&Inventory, &CdnGcReport, u64)>) {
+fn publish_classes(pass: Option<(&Inventory, &CdnGcReport, u64, u64)>) {
     let value = |n: u64| pass.map_or(f64::NAN, |_| n as f64);
     let blank = (Inventory::default(), CdnGcReport::default());
-    let (inventory, report, unparsed) = pass.unwrap_or((&blank.0, &blank.1, 0));
+    let (inventory, report, unparsed, missing) = pass.unwrap_or((&blank.0, &blank.1, 0, 0));
     let valid_objects = inventory.objects - inventory.foreign_objects;
     let valid_bytes = inventory.bytes - inventory.foreign_bytes;
     for (class, objects, bytes) in [
@@ -597,6 +675,7 @@ fn publish_classes(pass: Option<(&Inventory, &CdnGcReport, u64)>) {
     }
     metrics::gauge!("mkdb2_cdn_gc_dangling_references").set(value(report.dangling_references()));
     metrics::gauge!("mkdb2_cdn_gc_unparsed_roots").set(value(unparsed));
+    metrics::gauge!("mkdb2_cdn_gc_missing_references").set(value(missing));
 }
 
 /// A root's children, or `None` if the object is gone. Its failures stay out of the store's GCS error counters, whose `read` class drives a user-facing alert.
@@ -991,6 +1070,7 @@ mod tests {
         let config = Config {
             mode: Mode::Delete,
             deletes: Some(bucket.clone()),
+            max_candidates: None,
         };
         let (uploads, collector) = start(config, bucket.clone(), ch.clone()).await?;
 
@@ -1024,6 +1104,11 @@ mod tests {
             bucket.head(&ObjectPath::from(kept.as_str())).await?;
         }
 
+        // A dangling key uploaded since the listing is no longer missing.
+        assert!(collector.missing_references().await?.contains(&dangling));
+        put(format!("never uploaded {run}"), "png").await?;
+        assert!(!collector.missing_references().await?.contains(&dangling));
+
         // A links-version bump re-parses every root.
         ch.cdn_gc_collect_unparsed(cdn_manifest::LINKS_VERSION + 1)
             .await?;
@@ -1043,15 +1128,24 @@ mod tests {
         let latest = later + GRACE + Duration::from_secs(24 * 3600);
         let cutoff = unix_seconds(latest) - GRACE.as_secs() as u32;
         collector.inventory().await?;
-        collector.classify(cutoff).await?;
+        let (report, _, _) = collector.classify(cutoff).await?;
         let log_start = ch.cdn_ack_log_start().await?.context("no ack log")?;
-        for (cutoff, unparsed) in [(cutoff, 1), (log_start - 1, 0)] {
+        let over_ceiling = CdnGcReport {
+            candidate_objects: CEILING_FLOOR + 1,
+            ..Default::default()
+        };
+        for (cutoff, unparsed, report) in [
+            (cutoff, 1, &report),
+            (log_start - 1, 0, &report),
+            (cutoff, 0, &over_ceiling),
+        ] {
             let deleted = collector
-                .delete_if_safe(bucket.as_ref(), cutoff, unparsed)
+                .delete_if_safe(bucket.as_ref(), cutoff, unparsed, report)
                 .await?;
             assert_eq!(
                 deleted.objects, 0,
-                "armed at {cutoff} with {unparsed} unparsed"
+                "armed at {cutoff} with {unparsed} unparsed and {} candidates",
+                report.candidate_objects
             );
         }
         // After the candidate query, `late_acked` is acked and `uploading` held: both are spared, and only `acked` goes.
@@ -1119,6 +1213,11 @@ mod tests {
             .cdn_gc_acked_since(std::slice::from_ref(&uploaded), cutoff)
             .await?
             .contains(&uploaded));
+
+        // A newer start row restarts the log (the documented reset after a gap); one second later keeps later runs armed.
+        let start = ch.cdn_ack_log_start().await?.context("no ack log")?;
+        ch.record_cdn_ack("", start + 1).await?;
+        assert_eq!(ch.cdn_ack_log_start().await?, Some(start + 1));
 
         for table in [
             "mkdb2.metrics",
