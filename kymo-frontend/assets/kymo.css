@@ -41,7 +41,6 @@
     --font-size-15: 1rem;
     --font-size-16: 1.0667rem;
     --font-size-17: 1.1333rem;
-    --font-size-20: 1.3333rem;
     --font-size-24: 1.6rem;
     --spacing-xs: 4px;
     --spacing-sm: 8px;
@@ -73,6 +72,8 @@ h1, h2, h3, h4, h5, h6 {
     color: var(--text-headings);
     font-weight: 600;
 }
+/* Every h1 is a page title, including main.rs's unstyled fatal-error page. */
+h1 { font-size: var(--font-size-24); }
 
 /* === Scrollbar === */
 ::-webkit-scrollbar { width: 8px; height: 8px; }
@@ -556,8 +557,6 @@ input[type="checkbox"]:checked::before {
     padding: var(--spacing-xl) var(--spacing-md);
 }
 
-.projects-page h1 { font-size: var(--font-size-24); margin-bottom: var(--spacing-lg); }
-
 .projects-filter { margin-bottom: var(--spacing-md); }
 .project-list {
     border: 1px solid var(--bg3);
@@ -572,7 +571,6 @@ input[type="checkbox"]:checked::before {
     justify-content: space-between;
     margin-bottom: var(--spacing-lg);
 }
-.projects-page .projects-title-row h1 { margin-bottom: 0; }
 .projects-page-actions {
     display: flex;
     flex-wrap: wrap;
@@ -634,8 +632,6 @@ input[type="checkbox"]:checked::before {
     color: var(--text-disabled);
     font-size: var(--font-size-14);
 }
-.trash-back-link:hover { color: var(--text-main); }
-.trash-heading h1 { font-size: var(--font-size-24); }
 .trash-description {
     margin-top: var(--spacing-xs);
     color: var(--text-disabled);
@@ -1712,7 +1708,7 @@ input[type="checkbox"]:checked::before {
 }
 
 .not-found-inner { text-align: center; }
-.not-found h1 { font-size: var(--font-size-24); margin-bottom: var(--spacing-md); }
+.not-found h1 { margin-bottom: var(--spacing-md); }
 .not-found p { color: var(--text-disabled); margin-bottom: var(--spacing-md); }
 
 .settings-error {
@@ -1725,10 +1721,7 @@ input[type="checkbox"]:checked::before {
 .settings-error-inner {
     max-width: 560px;
 }
-.settings-error h1 {
-    font-size: var(--font-size-20);
-    margin-bottom: var(--spacing-md);
-}
+.settings-error h1 { margin-bottom: var(--spacing-md); }
 .settings-error p {
     color: var(--text-disabled);
     margin-bottom: var(--spacing-md);
@@ -1799,7 +1792,7 @@ input[type="checkbox"]:checked::before {
     background: var(--text-headings);
     color: var(--bg0);
     cursor: pointer;
-    font-size: var(--font-size-12);
+    font-size: var(--font-size-14);
     font-weight: 600;
 }
 .sidebar-trash-commit:hover:not(:disabled) { filter: brightness(1.08); }

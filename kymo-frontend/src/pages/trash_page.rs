@@ -305,12 +305,10 @@ pub fn TrashPage() -> Element {
         main { class: "trash-page",
             div { class: "trash-page-inner",
                 header { class: "trash-header",
-                    div { class: "trash-heading",
-                        Link { to: Route::ProjectsPage {}, class: "trash-back-link", "← Projects" }
-                        h1 { "Trash" }
-                        p { class: "trash-description",
-                            "Runs remain recoverable for 7 days. After that, they can no longer be viewed or restored."
-                        }
+                    Link { to: Route::ProjectsPage {}, class: "trash-back-link", "← Projects" }
+                    h1 { "Trash" }
+                    p { class: "trash-description",
+                        "Runs remain recoverable for 7 days. After that, they can no longer be viewed or restored."
                     }
                 }
 
