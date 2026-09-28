@@ -261,13 +261,14 @@ input[type="checkbox"]:checked::before {
     flex-shrink: 0;
 }
 
-.navbar-brand { color: var(--text-disabled); font-size: var(--font-size-14); }
+/* The breadcrumb is the page title: the navbar actions' size, one step above .section-name. */
+.navbar-brand, .navbar-sep, .navbar-current { font-size: var(--font-size-16); }
+.navbar-brand { color: var(--text-disabled); }
 .navbar-brand:hover { color: var(--text-main); }
 .navbar-sep { color: var(--bg3); }
 .navbar-current {
     color: var(--text-main);
     font-weight: 600;
-    font-size: var(--font-size-14);
     min-width: 0;
 }
 .navbar-spacer { flex: 1; }
@@ -2083,7 +2084,8 @@ button.editor-section-toggle:focus-visible {
 .navbar-action {
     flex-shrink: 0;
     font-size: var(--font-size-16);
-    padding: 2px 8px;
+    /* Same as .section-action: at the default font, icon buttons come out about square, and adjacent icon boxes sit 16px apart (4 + 8px gap + 4). */
+    padding: 2px 4px;
     white-space: nowrap;
 }
 .navbar-action:disabled { color: var(--text-disabled); cursor: default; opacity: 0.45; }
