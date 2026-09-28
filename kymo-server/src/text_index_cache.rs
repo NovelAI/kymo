@@ -9,13 +9,11 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde::Deserialize;
 
-use crate::series_cache::{VISIBILITY_MARGIN_MS, WATERMARK_OVERLAP_MS};
-
-const FRESH_WINDOW: Duration = Duration::from_millis(250);
+use crate::series_cache::{is_fresh, VISIBILITY_MARGIN_MS, WATERMARK_OVERLAP_MS};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct TextIndexKey {
@@ -250,7 +248,6 @@ fn index_bytes(index: &TextStreamIndex) -> usize {
 struct Entry {
     index: Arc<TextStreamIndex>,
     started: Instant,
-    checked: Instant,
     generation: u64,
     last_access: Instant,
     bytes: usize,
@@ -323,9 +320,7 @@ impl TextIndexCache {
             None => Lookup::Miss,
             Some(entry) => {
                 entry.last_access = Instant::now();
-                if entry.checked.elapsed() < FRESH_WINDOW
-                    && last_bump.is_none_or(|bump| entry.started >= bump)
-                {
+                if is_fresh(last_bump, entry.started) {
                     Lookup::Fresh(entry.index.clone())
                 } else {
                     Lookup::Stale {
@@ -378,7 +373,6 @@ impl TextIndexCache {
             }
             if increment.is_empty() {
                 entry.started = entry.started.max(fetch_started);
-                entry.checked = Instant::now();
                 return Ok(entry.index.clone());
             }
             entry.index.clone()
@@ -464,7 +458,6 @@ fn store_locked(
         Entry {
             index: index.clone(),
             started: fetch_started,
-            checked: Instant::now(),
             generation,
             last_access: Instant::now(),
             bytes,

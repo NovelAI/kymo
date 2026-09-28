@@ -749,15 +749,11 @@ impl DeletionReaper {
                 // Cache entries cannot serve useful data once ClickHouse has
                 // confirmed the physical delete. Evict before the Postgres
                 // finalization await, whose commit acknowledgement can be lost.
-                let cache_entries_purged = self.ch.series_cache().purge_runs(
-                    batch
-                        .iter()
-                        .map(|key| (key.project_id.as_str(), key.run_id.as_str())),
-                ) + self.ch.purge_text_index_runs(
-                    batch
-                        .iter()
-                        .map(|key| (key.project_id.as_str(), key.run_id.as_str())),
-                );
+                let runs: Vec<_> = batch
+                    .iter()
+                    .map(|key| (key.project_id.as_str(), key.run_id.as_str()))
+                    .collect();
+                let cache_entries_purged = self.ch.purge_run_caches(&runs);
                 Ok(RunMutationOutcome::Deleted {
                     cache_entries_purged,
                 })

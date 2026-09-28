@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
+use std::rc::Rc;
 
 use dioxus::prelude::*;
 
@@ -6,7 +7,7 @@ use crate::grpc::proto::{RunInfo, RunRecord};
 use crate::grpc::GrpcClient;
 use crate::route::Route;
 use crate::state::layout_config::{
-    cascade_options, LayoutDiff, LoadResult, RectConfig, RectOptions, SectionConfig,
+    cascade_options, LayoutDiff, LoadResult, RectConfig, RectOptions, SectionConfig, ViewContext,
 };
 use crate::state::section_order::SectionGap;
 use crate::state::LayoutConfig;
@@ -253,21 +254,65 @@ pub struct DashboardState {
     /// so the whole state struct is Copy and handlers can capture it
     /// without a clone per closure.
     pub grpc: CopyValue<GrpcClient>,
+    /// [`Self::display_runs()`]'s merge, computed once per change of its sources rather than once per reading panel. Readers subscribe to the merged list alone, so a source write that leaves it equal re-renders nothing.
+    display_runs: Memo<Rc<Vec<RunInfo>>>,
+    /// [`Self::view_context()`], built once per change of the page, selection or run list rather than once per resolving panel, and equal contexts notify no one.
+    view_context: Memo<Rc<ViewContext>>,
 }
 
 impl DashboardState {
     pub fn new(project_id: String) -> Self {
+        let project_id = Signal::new(project_id);
+        let runs = Signal::new(Vec::new());
+        let display_run_cache = Signal::new(Vec::new());
+        let explicit_run_metadata = Signal::new(BTreeMap::new());
+        let direct_run = Signal::new(DirectRunLoad::Idle);
+        let selected_runs = Signal::new(HashSet::new());
+        let current_run = Signal::new(None);
+        let display_runs = Memo::new(move || {
+            let project_id = project_id.read();
+            let direct = match &*direct_run.read() {
+                DirectRunLoad::Loaded(view) => view
+                    .record
+                    .run
+                    .as_ref()
+                    .filter(|run| run.project_id == *project_id)
+                    .cloned(),
+                _ => None,
+            };
+            Rc::new(merge_display_sources(
+                &runs.read(),
+                explicit_run_metadata
+                    .read()
+                    .values()
+                    .filter_map(|entry| match entry {
+                        ExplicitRunMetadata::Present { run, .. } => Some(run.clone()),
+                        ExplicitRunMetadata::Absent { .. } => None,
+                    }),
+                direct.as_ref(),
+                &display_run_cache.read(),
+            ))
+        });
         Self {
-            project_id: Signal::new(project_id),
-            runs: Signal::new(Vec::new()),
-            display_run_cache: Signal::new(Vec::new()),
-            explicit_run_metadata: Signal::new(BTreeMap::new()),
+            project_id,
+            runs,
+            display_run_cache,
+            explicit_run_metadata,
+            display_runs,
+            view_context: Memo::new(move || {
+                Rc::new(ViewContext::new(
+                    project_id.read().clone(),
+                    current_run.read().clone(),
+                    &selected_runs.read(),
+                    runs.read().iter().map(|r| r.run_id.clone()).collect(),
+                ))
+            }),
             runs_loaded: Signal::new(false),
             runs_project_version: CopyValue::new(None),
             resync_gen: Signal::new(0),
-            selected_runs: Signal::new(HashSet::new()),
-            current_run: Signal::new(None),
-            direct_run: Signal::new(DirectRunLoad::Idle),
+            selected_runs,
+            current_run,
+            direct_run,
             direct_run_refresh: Signal::new(0),
             runs_refresh: Signal::new(0),
             run_versions: Signal::new(std::collections::HashMap::new()),
@@ -328,29 +373,13 @@ impl DashboardState {
 
     /// Metadata for display only. Explicit, cached, and direct records may be deleted and must never feed discovery or binding resolution, so callers use this only for presentation: names, ordinals, and colors, plus status and lifecycle timestamps for the `info/run_info` panel's server timing (`add_server_timing`), the gallery's pending wording (`decorate_cdn_series`), and the log panel's tail-follow.
     /// See [`merge_display_sources`] for why the sources rank the way they do.
-    pub fn display_runs(&self) -> Vec<RunInfo> {
-        let project_id = self.project_id.read();
-        let direct = match &*self.direct_run.read() {
-            DirectRunLoad::Loaded(view) => view
-                .record
-                .run
-                .as_ref()
-                .filter(|run| run.project_id == *project_id)
-                .cloned(),
-            _ => None,
-        };
-        merge_display_sources(
-            &self.runs.read(),
-            self.explicit_run_metadata
-                .read()
-                .values()
-                .filter_map(|entry| match entry {
-                    ExplicitRunMetadata::Present { run, .. } => Some(run.clone()),
-                    ExplicitRunMetadata::Absent { .. } => None,
-                }),
-            direct.as_ref(),
-            &self.display_run_cache.read(),
-        )
+    pub fn display_runs(&self) -> Rc<Vec<RunInfo>> {
+        self.display_runs.read().clone()
+    }
+
+    /// What bindings resolve against: the page's project, its direct run, the sidebar selection and the active run ids. Subscribes the caller.
+    pub fn view_context(&self) -> Rc<ViewContext> {
+        self.view_context.read().clone()
     }
 
     /// The panel filter in the form panels match it against: trimmed, lowercased, empty for no filter.

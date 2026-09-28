@@ -5,9 +5,7 @@ use dioxus::prelude::*;
 use gloo_timers::future::sleep;
 
 use crate::grpc::proto::RunLifecycleState;
-use crate::state::layout_config::{
-    resolve_binding, MetricBinding, ProjectRef, RunRef, ViewContext,
-};
+use crate::state::layout_config::{run_ref_ids, RunRef, ViewContext};
 use crate::state::visibility::retry_visible;
 use crate::state::{DashboardState, DirectRunLoad, LayoutConfig};
 
@@ -20,45 +18,63 @@ fn refresh_direct_run(mut state: DashboardState) {
     }
 }
 
-/// Run ids for the version catch-up polls, grouped by project (the server answers for one project per call). Scopes come from `resolve_binding` itself, so what gets polled is exactly what charts can render — All-bound charts (every run regardless of selection) and cross-project Specific refs included. Any of these can hold a run that terminated while no connection existed and will never push again.
+/// Run ids for the version catch-up polls, grouped by project (the server answers for one project per call). Scopes expand each binding's runs with `run_ref_ids`, as chart resolution does, so what gets polled is exactly what charts can render — All-bound charts (every run regardless of selection) and cross-project Specific refs included. Any of these can hold a run that terminated while no connection existed and will never push again.
 fn poll_scopes(state: &DashboardState) -> Vec<(String, Vec<String>)> {
-    let current_project = state.project_id.peek().clone();
-    let ctx = ViewContext {
-        current_project: current_project.clone(),
-        current_run: state.current_run.peek().clone(),
-        selected_runs: state.selected_runs.peek().clone(),
-        all_runs: state.runs.peek().iter().map(|r| r.run_id.clone()).collect(),
-    };
-    // The page's own runs poll even when no binding references them — they ride the normal resolution as the (Current, Selected) binding they are.
-    let page = MetricBinding {
-        project: ProjectRef::Current,
-        runs: RunRef::Selected,
-        metric_name: String::new(),
-    };
-    let layout = state.layout_config.peek();
+    // Built from peeks, not the dashboard's shared context: this must not subscribe, and a dirty Memo::peek is not authoritative.
+    let ctx = ViewContext::new(
+        state.project_id.peek().clone(),
+        state.current_run.peek().clone(),
+        &state.selected_runs.peek(),
+        state.runs.peek().iter().map(|r| r.run_id.clone()).collect(),
+    );
+    scopes_for(&ctx, state.layout_config.peek().as_ref())
+}
+
+/// Which of a project's run sources some binding references.
+#[derive(Default)]
+struct RunSources<'a> {
+    selected: bool,
+    all: bool,
+    listed: Vec<&'a String>,
+}
+
+fn scopes_for(ctx: &ViewContext, layout: Option<&LayoutConfig>) -> Vec<(String, Vec<String>)> {
     let bindings = layout
-        .as_ref()
         .into_iter()
         .flat_map(|l| &l.sections)
         .flat_map(|s| &s.rects)
         .flat_map(|r| &r.bindings);
-    let mut buckets: HashMap<String, Vec<String>> = HashMap::new();
-    // Keep the current project in the version poll even when it has no active
-    // runs, so an outcome-unknown Restore can make its first run discoverable.
-    if !current_project.is_empty() {
-        buckets.entry(current_project).or_default();
-    }
-    for b in std::iter::once(&page).chain(bindings) {
-        for r in resolve_binding(b, &ctx) {
-            buckets.entry(r.project_id).or_default().push(r.run_id);
+    // Every panel bound to a project's Shown or All runs shares one expansion, so each source expands once per project rather than once per panel.
+    let mut sources: HashMap<&str, RunSources> = HashMap::new();
+    // The page's own runs poll even when no binding references them.
+    sources.entry(&ctx.current_project).or_default().selected = true;
+    for b in bindings {
+        let entry = sources
+            .entry(b.project.id(&ctx.current_project))
+            .or_default();
+        match &b.runs {
+            RunRef::Selected => entry.selected = true,
+            RunRef::All => entry.all = true,
+            RunRef::Specific(ids) => entry.listed.extend(ids),
         }
     }
-    buckets
+    sources
         .into_iter()
-        .filter_map(|(p, mut ids)| {
+        .filter_map(|(project, source)| {
+            let mut ids = source.listed;
+            if source.selected {
+                ids.extend(run_ref_ids(&RunRef::Selected, ctx));
+            }
+            if source.all {
+                ids.extend(run_ref_ids(&RunRef::All, ctx));
+            }
+            // Other projects enter the poll only through a run; the current one (always a source) polls even with no active runs, so an outcome-unknown Restore can make its first run discoverable.
+            if project.is_empty() || (ids.is_empty() && project != ctx.current_project) {
+                return None;
+            }
             ids.sort_unstable();
             ids.dedup();
-            (!p.is_empty()).then_some((p, ids))
+            Some((project.to_string(), ids.into_iter().cloned().collect()))
         })
         .collect()
 }
@@ -185,10 +201,7 @@ fn layout_project_scope(current_project: &str, layout: Option<&LayoutConfig>) ->
         .flat_map(|section| &section.rects)
         .flat_map(|rect| &rect.bindings)
     {
-        let project = match &binding.project {
-            ProjectRef::Current => current_project,
-            ProjectRef::Specific(project) => project,
-        };
+        let project = binding.project.id(current_project);
         if !project.is_empty() {
             scope.insert(project.to_string());
         }
@@ -333,13 +346,88 @@ pub fn PushBridge() -> Element {
 mod tests {
     use super::{
         entry_rises, layout_project_scope, merge_project_versions, merge_scoped_versions,
-        ProjectObservation, ProjectVersionChanges,
+        scopes_for, ProjectObservation, ProjectVersionChanges,
     };
+    use crate::state::layout_config::binding_resolution_tests::Sweep;
     use crate::state::layout_config::{
-        DisplayType, LayoutConfig, MetricBinding, ProjectRef, RectConfig, RectOptions, RunRef,
-        SectionConfig,
+        resolve_capped_bindings, DisplayType, LayoutConfig, MetricBinding, ProjectRef, RectConfig,
+        RectOptions, RunRef, SectionConfig, ViewContext,
     };
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{BTreeMap, HashMap, HashSet};
+
+    /// The per-binding resolution `scopes_for` replaces, as its oracle.
+    fn scopes_by_resolving(
+        ctx: &ViewContext,
+        layout: Option<&LayoutConfig>,
+    ) -> BTreeMap<String, Vec<String>> {
+        let page = MetricBinding {
+            project: ProjectRef::Current,
+            runs: RunRef::Selected,
+            metric_name: String::new(),
+        };
+        let bindings = layout
+            .into_iter()
+            .flat_map(|l| &l.sections)
+            .flat_map(|s| &s.rects)
+            .flat_map(|r| &r.bindings);
+        let mut buckets: HashMap<String, Vec<String>> = HashMap::new();
+        if !ctx.current_project.is_empty() {
+            buckets.entry(ctx.current_project.clone()).or_default();
+        }
+        for b in std::iter::once(&page).chain(bindings) {
+            for r in resolve_capped_bindings(std::slice::from_ref(b), ctx, 0) {
+                buckets.entry(r.project_id).or_default().push(r.run_id);
+            }
+        }
+        buckets
+            .into_iter()
+            .filter_map(|(p, mut ids)| {
+                ids.sort_unstable();
+                ids.dedup();
+                (!p.is_empty()).then_some((p, ids))
+            })
+            .collect()
+    }
+
+    fn scopes(ctx: &ViewContext, layout: Option<&LayoutConfig>) -> BTreeMap<String, Vec<String>> {
+        let scopes = scopes_for(ctx, layout);
+        let by_project = scopes.iter().cloned().collect::<BTreeMap<_, _>>();
+        assert_eq!(by_project.len(), scopes.len(), "a project polled twice");
+        by_project
+    }
+
+    fn rect(id: &str, bindings: Vec<MetricBinding>) -> RectConfig {
+        RectConfig {
+            id: id.to_string(),
+            label: String::new(),
+            bindings,
+            display_type: DisplayType::Numeric,
+            options: RectOptions::default(),
+        }
+    }
+
+    #[test]
+    fn poll_scopes_match_per_binding_resolution() {
+        let mut sweep = Sweep(0xD1B5_4A32_D192_ED03);
+        for case in 0..2_000 {
+            let ctx = sweep.context();
+            let layout = (case % 4 != 0).then(|| LayoutConfig {
+                sections: (0..sweep.below(3))
+                    .map(|s| {
+                        let rects = (0..sweep.below(4))
+                            .map(|r| rect(&format!("{s}-{r}"), sweep.bindings(3)))
+                            .collect();
+                        SectionConfig::auto(format!("section-{s}"), rects)
+                    })
+                    .collect(),
+            });
+            assert_eq!(
+                scopes(&ctx, layout.as_ref()),
+                scopes_by_resolving(&ctx, layout.as_ref()),
+                "layout={layout:?}"
+            );
+        }
+    }
 
     #[test]
     fn resync_project_scope_tracks_layout_projects_without_run_resolution() {

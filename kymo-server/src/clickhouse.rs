@@ -36,7 +36,6 @@ const CDN_MANIFEST_CHILDREN_TABLE: &str = "mkdb2.cdn_manifest_children";
 const CDN_GC_SCRATCH_TABLE: &str = "mkdb2.cdn_gc_scratch";
 /// A dedup upload waits on this insert; its failure fails the upload into the client spool.
 const CDN_ACK_TIMEOUT: Duration = Duration::from_secs(30);
-const CDN_GC_MAX_MEMORY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Deserialize, clickhouse::Row)]
 struct SchemaColumn {
@@ -586,16 +585,15 @@ impl ChClient {
         })
     }
 
-    /// Shared handle for the bump publisher (ingest::BumpCoalescer), which must note a run's data bumps in the cache before announcing them.
-    pub fn series_cache(&self) -> std::sync::Arc<crate::series_cache::SeriesCache> {
-        self.series_cache.clone()
+    /// Evicts these (project, run) identities from both chart caches; returns the entries removed.
+    pub fn purge_run_caches(&self, runs: &[(&str, &str)]) -> usize {
+        self.series_cache.purge_runs(runs.iter().copied())
+            + self.text_index_cache.purge_runs(runs.iter().copied())
     }
 
-    pub fn purge_text_index_runs<'a>(
-        &self,
-        runs: impl IntoIterator<Item = (&'a str, &'a str)>,
-    ) -> usize {
-        self.text_index_cache.purge_runs(runs)
+    #[cfg(test)]
+    pub(crate) fn series_cache(&self) -> &crate::series_cache::SeriesCache {
+        &self.series_cache
     }
 
     pub async fn ensure_schema(&self) -> Result<()> {
@@ -648,7 +646,8 @@ impl ChClient {
                     cdn_key      Nullable(String) CODEC(ZSTD(3)),
                     text_data    Nullable(String) CODEC(ZSTD(3)),
                     inserted_at  DateTime64(3) DEFAULT now64(3) CODEC(DoubleDelta, ZSTD(1)),
-                    INDEX idx_inserted_at inserted_at TYPE minmax GRANULARITY 1
+                    INDEX idx_inserted_at inserted_at TYPE minmax GRANULARITY 1,
+                    INDEX idx_cdn_key cdn_key TYPE minmax GRANULARITY 1
                 ) ENGINE = ReplacingMergeTree(inserted_at)
                 ORDER BY (project_id, run_id, metric_name, tag, step)
                 PARTITION BY project_id
@@ -664,17 +663,7 @@ impl ChClient {
         // alone covers only parts written afterwards; the MATERIALIZE
         // mutation indexes the existing ones, async and only enqueued on
         // the boot that adds the index).
-        let index_exists = !self
-            .client
-            .query(
-                "SELECT name AS val FROM system.data_skipping_indices
-                 WHERE database = 'mkdb2' AND table = 'metrics'
-                   AND name = 'idx_inserted_at'",
-            )
-            .fetch_all::<SingleString>()
-            .await?
-            .is_empty();
-        if !index_exists {
+        if !self.metrics_skip_index_exists("idx_inserted_at").await? {
             self.client
                 .query(
                     "ALTER TABLE mkdb2.metrics ADD INDEX IF NOT EXISTS
@@ -709,6 +698,7 @@ impl ChClient {
         // ClickHouse versions.
         self.migrate_to_tagged_schema().await?;
         self.validate_metrics_schema().await?;
+        self.ensure_cdn_key_index().await?;
         self.ensure_rich_metrics_schema().await?;
 
         // Durable cross-store outbox for metric discovery. The materialized
@@ -820,6 +810,43 @@ impl ChClient {
             .execute()
             .await
             .context("adding mkdb2.metrics.text_data")?;
+        Ok(())
+    }
+
+    async fn metrics_skip_index_exists(&self, name: &str) -> Result<bool> {
+        Ok(!self
+            .client
+            .query(
+                "SELECT name AS val FROM system.data_skipping_indices
+                 WHERE database = 'mkdb2' AND table = 'metrics' AND name = ?",
+            )
+            .bind(name)
+            .fetch_all::<SingleString>()
+            .await?
+            .is_empty())
+    }
+
+    /// The CDN root-scan index (docs/cdn-gcs-migration.md § Root scan index). Boot never MATERIALIZEs it: that mutation reads every part and holds off reaper deletions, so it is an operator step. It is only an optimization, so a rejected ADD warns instead of refusing to start.
+    async fn ensure_cdn_key_index(&self) -> Result<()> {
+        if self.metrics_skip_index_exists("idx_cdn_key").await? {
+            return Ok(());
+        }
+        match self
+            .client
+            .query(
+                "ALTER TABLE mkdb2.metrics ADD INDEX IF NOT EXISTS
+                 idx_cdn_key cdn_key TYPE minmax GRANULARITY 1",
+            )
+            .execute()
+            .await
+        {
+            Ok(()) => tracing::info!(
+                "added idx_cdn_key to mkdb2.metrics; parts written before it stay unindexed until an operator runs MATERIALIZE INDEX (docs/cdn-gcs-migration.md)"
+            ),
+            Err(e) => tracing::warn!(
+                "adding idx_cdn_key to mkdb2.metrics failed; the CDN collector keeps reading every part: {e}"
+            ),
+        }
         Ok(())
     }
 
@@ -1051,7 +1078,8 @@ impl ChClient {
                     cdn_key      Nullable(String) CODEC(ZSTD(3)),
                     text_data    Nullable(String) CODEC(ZSTD(3)),
                     inserted_at  DateTime64(3) DEFAULT now64(3) CODEC(DoubleDelta, ZSTD(1)),
-                    INDEX idx_inserted_at inserted_at TYPE minmax GRANULARITY 1
+                    INDEX idx_inserted_at inserted_at TYPE minmax GRANULARITY 1,
+                    INDEX idx_cdn_key cdn_key TYPE minmax GRANULARITY 1
                 ) ENGINE = ReplacingMergeTree(inserted_at)
                 ORDER BY (project_id, run_id, metric_name, tag, step)
                 PARTITION BY project_id
@@ -1128,16 +1156,32 @@ impl ChClient {
         } else {
             &self.client
         };
-        let mut insert = client
-            .insert(METRICS_TABLE)?
-            .with_timeouts(Some(io_timeout), Some(io_timeout));
-        for row in rows {
-            insert.write(row).await?;
+        let result = async {
+            let mut insert = client
+                .insert(METRICS_TABLE)?
+                .with_timeouts(Some(io_timeout), Some(io_timeout));
+            for row in rows {
+                insert.write(row).await?;
+            }
+            insert.end().await
         }
-        insert.end().await?;
+        .await;
 
-        tracing::debug!("Flushed {} rows to ClickHouse", rows.len());
-        Ok(())
+        // Note before returning, so the ack and any version announcing these rows follow the note (SeriesCache::note_bumps). A failed insert may still commit — the error can follow the commit, or ClickHouse can finish a request we gave up on — so it is noted again once that would long be over; the window bounds any later commit.
+        let runs: std::collections::HashSet<&str> =
+            rows.iter().map(|row| row.run_id.as_str()).collect();
+        self.series_cache.note_bumps(runs.iter().copied());
+        if result.is_ok() {
+            tracing::debug!("Flushed {} rows to ClickHouse", rows.len());
+        } else {
+            let cache = self.series_cache.clone();
+            let runs: Vec<String> = runs.into_iter().map(str::to_owned).collect();
+            tokio::spawn(async move {
+                tokio::time::sleep(2 * io_timeout).await;
+                cache.note_bumps(runs.iter().map(String::as_str));
+            });
+        }
+        result
     }
 
     pub async fn insert_rich_mutation(
@@ -1470,6 +1514,8 @@ impl ChClient {
     /// covers every (project_id, run_id, metric_name) tuple in `refs`. Rows
     /// come back interleaved; the caller partitions them back into per-ref
     /// buckets.
+    /// `use_skip_indexes_if_final = 0` keeps `idx_cdn_key` out of the FINAL read, where pruning by it could hide the newer row that supersedes a media row.
+    /// That is 25.3's default, pinned so a profile or version change can't flip it.
     pub async fn query_cdn_keys_batch(
         &self,
         refs: &[(String, String, String)],
@@ -1504,7 +1550,8 @@ impl ChClient {
                    AND step >= ? AND step <= ?
              )
              GROUP BY project_id, run_id, metric_name, tag, step
-             ORDER BY project_id, run_id, metric_name, step"
+             ORDER BY project_id, run_id, metric_name, step
+             SETTINGS use_skip_indexes_if_final = 0"
         );
         let mut q = self.client.query(&sql);
         for (p, r, m) in refs {
@@ -1876,31 +1923,13 @@ impl ChClient {
             .context("reading the CDN ack log start")
     }
 
-    /// The GC's heavy statements: a memory cap fails the statement rather than the server (a ClickHouse OOM takes concurrent ingest with it), and two threads keep full scans off the dashboards' cores. No server profile may shorten a result, since a short referenced set deletes reachable objects: every overflow mode throws instead of `break`, and `limit` and `offset` are 0. The scratch table's sort key would make each `IN` set be built twice, once more for index analysis that prunes nothing here, which doubles set memory. Sync inserts: scratch batches are large, one part each.
+    /// A client for the GC's heavy statements, carrying [`CDN_GC_SETTINGS`].
     fn gc_client(&self) -> Client {
-        [
-            "read_overflow_mode",
-            "read_overflow_mode_leaf",
-            "set_overflow_mode",
-            "join_overflow_mode",
-            "transfer_overflow_mode",
-            "group_by_overflow_mode",
-            "distinct_overflow_mode",
-            "sort_overflow_mode",
-            "result_overflow_mode",
-            "timeout_overflow_mode",
-            "timeout_overflow_mode_leaf",
-        ]
-        .into_iter()
-        .fold(self.client.clone(), |client, mode| {
-            client.with_option(mode, "throw")
-        })
-        .with_option("limit", "0")
-        .with_option("offset", "0")
-        .with_option("use_index_for_in_with_subqueries", "0")
-        .with_option("async_insert", "0")
-        .with_option("max_memory_usage", CDN_GC_MAX_MEMORY_BYTES.to_string())
-        .with_option("max_threads", "2")
+        CDN_GC_SETTINGS
+            .into_iter()
+            .fold(self.client.clone(), |client, (name, value)| {
+                client.with_option(name, value)
+            })
     }
 
     pub async fn cdn_gc_reset(&self) -> Result<()> {
@@ -1936,15 +1965,8 @@ impl ChClient {
     pub async fn cdn_gc_collect_roots(&self, key_pattern: &str) -> Result<()> {
         self.gc_client()
             .query(&format!(
-                "INSERT INTO {CDN_GC_SCRATCH_TABLE} (kind, key)
-                 SELECT 'ref', key FROM (
-                     SELECT assumeNotNull(cdn_key) AS key FROM {METRICS_TABLE}
-                     WHERE cdn_key IS NOT NULL
-                     UNION ALL
-                     SELECT cdn_key AS key FROM {RICH_METRICS_TABLE}
-                 )
-                 WHERE match(key, ?)
-                 GROUP BY key"
+                "INSERT INTO {CDN_GC_SCRATCH_TABLE} (kind, key) {}",
+                cdn_gc_roots_select()
             ))
             .bind(key_pattern)
             .execute()
@@ -2108,6 +2130,41 @@ impl ChClient {
             .into_iter()
             .collect())
     }
+}
+
+/// The GC's heavy statements: a memory cap fails the statement rather than the server (a ClickHouse OOM takes concurrent ingest with it), and two threads keep full scans off the dashboards' cores. No server profile may shorten a result, since a short referenced set deletes reachable objects: every overflow mode throws instead of `break`, and `limit` and `offset` are 0. The scratch table's sort key would make each `IN` set be built twice, once more for index analysis that prunes nothing here, which doubles set memory. Sync inserts: scratch batches are large, one part each.
+pub(crate) const CDN_GC_SETTINGS: [(&str, &str); 17] = [
+    ("read_overflow_mode", "throw"),
+    ("read_overflow_mode_leaf", "throw"),
+    ("set_overflow_mode", "throw"),
+    ("join_overflow_mode", "throw"),
+    ("transfer_overflow_mode", "throw"),
+    ("group_by_overflow_mode", "throw"),
+    ("distinct_overflow_mode", "throw"),
+    ("sort_overflow_mode", "throw"),
+    ("result_overflow_mode", "throw"),
+    ("timeout_overflow_mode", "throw"),
+    ("timeout_overflow_mode_leaf", "throw"),
+    ("limit", "0"),
+    ("offset", "0"),
+    ("use_index_for_in_with_subqueries", "0"),
+    ("async_insert", "0"),
+    ("max_memory_usage", "4294967296"), // 4 GiB
+    ("max_threads", "2"),
+];
+
+/// The CDN collector's referenced-roots SELECT; `?` is the hosted key pattern. `idx_cdn_key` limits its metrics half to granules holding a non-NULL `cdn_key`, and ClickHouse reads a part without the index whole, so the key set is the same with or without it. Deliberately no `force_data_skipping_indices`: ClickHouse 25.3 accepts it while no part has the index materialized, so it cannot catch the unmaterialized case, and it fails the statement once the index is missing from the table definition, which would block every pass over an optimization.
+pub(crate) fn cdn_gc_roots_select() -> String {
+    format!(
+        "SELECT 'ref', key FROM (
+             SELECT assumeNotNull(cdn_key) AS key FROM {METRICS_TABLE}
+             WHERE cdn_key IS NOT NULL
+             UNION ALL
+             SELECT cdn_key AS key FROM {RICH_METRICS_TABLE}
+         )
+         WHERE match(key, ?)
+         GROUP BY key"
+    )
 }
 
 fn validate_local_url(url: &str) -> Result<()> {
@@ -2698,6 +2755,83 @@ mod schema_tests {
         assert!(!copy_query.contains("metrics FINAL"));
         assert!(rename.query().await.contains("RENAME TABLE"));
         assert!(drop_old.query().await.contains("DROP TABLE"));
+    }
+
+    // The mock fails its drop on any request beyond the installed handlers, so each case also proves that ensure_cdn_key_index never issues MATERIALIZE INDEX.
+    #[tokio::test]
+    async fn missing_cdn_key_index_is_added_without_materializing() {
+        let mock = ::clickhouse::test::Mock::new();
+        mock.add(::clickhouse::test::handlers::provide(
+            Vec::<SingleString>::new(),
+        ));
+        let add = mock.add(::clickhouse::test::handlers::record_ddl());
+        let client = ChClient::new(mock.url()).unwrap();
+
+        client.ensure_cdn_key_index().await.unwrap();
+
+        let add = add.query().await;
+        assert!(add.contains("ADD INDEX IF NOT EXISTS"));
+        assert!(add.contains("idx_cdn_key cdn_key TYPE minmax GRANULARITY 1"));
+    }
+
+    #[tokio::test]
+    async fn rejected_cdn_key_index_does_not_block_startup() {
+        let mock = ::clickhouse::test::Mock::new();
+        mock.add(::clickhouse::test::handlers::provide(
+            Vec::<SingleString>::new(),
+        ));
+        mock.add(::clickhouse::test::handlers::failure(
+            ::clickhouse::test::status::BAD_REQUEST,
+        ));
+        let client = ChClient::new(mock.url()).unwrap();
+
+        client.ensure_cdn_key_index().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn inserts_note_their_runs_in_the_series_cache() {
+        use crate::series_cache::Lookup;
+        use std::time::Instant;
+        let mock = ::clickhouse::test::Mock::new();
+        let client = ChClient::new(mock.url()).unwrap();
+        let cache = client.series_cache();
+        let key = ("p".to_string(), "r".to_string(), "m".to_string());
+        let rows = [MetricRow {
+            project_id: "p".into(),
+            run_id: "r".into(),
+            metric_name: "m".into(),
+            tag: String::new(),
+            step: 1,
+            timestamp_ms: 0,
+            value: Some(1.0),
+            cdn_key: None,
+            text_data: None,
+        }];
+        let io_timeout = Duration::from_millis(50);
+
+        // An acked insert closes entries fetched before it: the ack, and any version announcing the rows, follow the note.
+        cache.insert_full(key.clone(), Vec::new(), Instant::now());
+        mock.add(::clickhouse::test::handlers::record_ddl());
+        client
+            .insert_batch(&rows, Duration::from_secs(10), false)
+            .await
+            .unwrap();
+        assert!(matches!(cache.lookup(&key), Lookup::Stale { .. }));
+
+        // A failed insert may still commit: it closes them at once, and again once a late commit would be over.
+        cache.insert_full(key.clone(), Vec::new(), Instant::now());
+        mock.add(::clickhouse::test::handlers::failure(
+            ::clickhouse::test::status::BAD_REQUEST,
+        ));
+        client
+            .insert_batch(&rows, io_timeout, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(cache.lookup(&key), Lookup::Stale { .. }));
+        cache.insert_full(key.clone(), Vec::new(), Instant::now());
+        assert!(matches!(cache.lookup(&key), Lookup::Fresh(_)));
+        tokio::time::sleep(3 * io_timeout).await;
+        assert!(matches!(cache.lookup(&key), Lookup::Stale { .. }));
     }
 }
 

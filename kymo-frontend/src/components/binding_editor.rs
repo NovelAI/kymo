@@ -3,13 +3,12 @@ use std::collections::{HashMap, HashSet};
 use dioxus::prelude::*;
 
 use crate::components::editor_dialog::EditorDialog;
-use crate::components::metric_rect::build_view_context;
 use crate::components::options_editor::{AxisFields, EditorSection, SmoothingFields};
 use crate::components::sidebar::{sidebar_needs_run_ordinals, sidebar_run_label};
 use crate::grpc::proto::{metric_info::MetricType, MetricInfo, RunInfo};
 use crate::state::layout_config::{
-    resolve_all_bindings, CdnDisplayMode, DisplayType, MetricBinding, ProjectRef, RectOptions,
-    RunRef, ViewContext,
+    run_ref_ids, CdnDisplayMode, DisplayType, MetricBinding, ProjectRef, RectOptions, RunRef,
+    ViewContext,
 };
 use crate::util::{primary, use_live_apply};
 
@@ -20,10 +19,13 @@ fn x_metric_discovery_source(
     bindings: &[MetricBinding],
     context: &ViewContext,
 ) -> Option<XMetricSource> {
-    resolve_all_bindings(bindings, context)
-        .into_iter()
-        .next()
-        .map(|resolved| (resolved.project_id, resolved.run_id))
+    bindings.iter().find_map(|binding| {
+        let run_id = run_ref_ids(&binding.runs, context).first()?;
+        Some((
+            binding.project.id(&context.current_project).to_string(),
+            run_id.clone(),
+        ))
+    })
 }
 
 fn x_metric_names(metrics: Vec<MetricInfo>) -> Vec<String> {
@@ -111,7 +113,7 @@ fn checked_run_ids(runs: &RunRef) -> &[String] {
     }
 }
 
-/// Checking appends, so the stored order (which `cap_runs` keeps) is pick order.
+/// Checking appends, so the stored order (which the run cap keeps) is pick order.
 fn toggle_specific_run(runs: &RunRef, run_id: &str, checked: bool) -> RunRef {
     let mut run_ids = checked_run_ids(runs).to_vec();
     run_ids.retain(|id| id != run_id);
@@ -347,7 +349,7 @@ pub fn BindingEditor(
     });
 
     let x_metric_source =
-        use_memo(move || x_metric_discovery_source(&draft.read(), &build_view_context(&state)));
+        use_memo(move || x_metric_discovery_source(&draft.read(), &state.view_context()));
     let current_x_metric_source = x_metric_source.read().clone();
     let x_metric_version = crate::state::versions_key(
         *state.resync_gen.read(),
@@ -602,12 +604,12 @@ mod tests {
     use super::*;
 
     fn context(current_run: Option<&str>) -> ViewContext {
-        ViewContext {
-            current_project: "current-project".into(),
-            current_run: current_run.map(str::to_string),
-            selected_runs: ["run-a".to_string()].into_iter().collect(),
-            all_runs: vec!["run-a".into(), "run-b".into()],
-        }
+        ViewContext::new(
+            "current-project".into(),
+            current_run.map(str::to_string),
+            &["run-a".to_string()].into_iter().collect(),
+            vec!["run-a".into(), "run-b".into()],
+        )
     }
 
     #[test]
@@ -1067,10 +1069,7 @@ fn BindingRow(
     on_remove: EventHandler<()>,
 ) -> Element {
     let state = use_context::<crate::state::DashboardState>();
-    let effective_project = match &binding.project {
-        ProjectRef::Current => state.project_id.read().clone(),
-        ProjectRef::Specific(p) => p.clone(),
-    };
+    let effective_project = binding.project.id(&state.project_id.read()).to_string();
     let mut metric_filter = use_signal(String::new);
 
     let runs_version = state
@@ -1212,7 +1211,7 @@ fn BindingRow(
                         onchange: {
                             let binding = binding.clone();
                             move |e: Event<FormData>| {
-                                let seed = build_view_context(&state).selected_run_ids();
+                                let seed = run_ref_ids(&RunRef::Selected, &state.view_context()).to_vec();
                                 let Some(new_runs) = parse_runs_select_value(&e.value(), seed) else {
                                     return;
                                 };

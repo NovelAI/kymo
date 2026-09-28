@@ -15,6 +15,5 @@ pub use app_state::{
 };
 pub use layout_config::{
     resolve_capped_bindings, DisplayType, LayoutConfig, LayoutDiff, RectConfig, SectionConfig,
-    ViewContext,
 };
 pub use user_config::{use_os_theme, FontSize, UserConfig, UserConfigState};

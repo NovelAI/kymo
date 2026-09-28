@@ -980,6 +980,143 @@ mod tests {
         Ok(())
     }
 
+    /// The operator's root-set check (docs/cdn-gcs-migration.md § Enabling deletes): the collector's roots SELECT verbatim under the collector's settings, with `?` still the hosted key pattern, reduced to a count and a key-hash sum. Runs with `use_skip_indexes` on and off must return the same row.
+    fn root_set_check(use_skip_indexes: bool) -> String {
+        let settings: Vec<String> = crate::clickhouse::CDN_GC_SETTINGS
+            .into_iter()
+            .map(|(name, value)| match value.parse::<u64>() {
+                Ok(_) => format!("{name} = {value}"),
+                Err(_) => format!("{name} = '{value}'"),
+            })
+            .collect();
+        format!(
+            "SELECT count() AS refs, sum(cityHash64(key)) AS key_hash FROM ({}) SETTINGS {}, use_skip_indexes = {}",
+            crate::clickhouse::cdn_gc_roots_select(),
+            settings.join(", "),
+            u8::from(use_skip_indexes)
+        )
+    }
+
+    /// Deletion safety under `idx_cdn_key` on this ClickHouse version: the root scan's predicate still matches the index, the Nullable minmax index prunes an all-NULL granule, and the operator's root-set check (docs/cdn-gcs-migration.md § Enabling deletes) matches with and without it.
+    #[tokio::test]
+    #[ignore = "requires KYMO_LIVE_TEST_CLICKHOUSE_URL"]
+    async fn live_root_scan_uses_the_cdn_key_index() -> Result<()> {
+        #[derive(Debug, PartialEq, serde::Deserialize, ::clickhouse::Row)]
+        struct RootSet {
+            refs: u64,
+            key_hash: u64,
+        }
+
+        let _suite_guard = crate::pg::live_database_suite_gate().lock().await;
+        let url = std::env::var("KYMO_LIVE_TEST_CLICKHOUSE_URL")
+            .context("KYMO_LIVE_TEST_CLICKHOUSE_URL is required")?;
+        let ch = ChClient::new(&url)?;
+        ch.ensure_schema().await?;
+        let run = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        );
+        let project_id = format!("cdn key index live {run}");
+        let row =
+            |metric_name: &str, step: i64, cdn_key: Option<String>| crate::clickhouse::MetricRow {
+                project_id: project_id.clone(),
+                run_id: "r".to_owned(),
+                metric_name: metric_name.to_owned(),
+                tag: String::new(),
+                step,
+                timestamp_ms: 0,
+                value: cdn_key.is_none().then_some(1.0),
+                cdn_key,
+                text_data: None,
+            };
+        // One sync insert is one part in its own partition. The 16,384 NULL-key rows sort before the keyed row, so granule 0 is all NULL whichever granule the last row joins.
+        let mut rows: Vec<_> = (0..16_384)
+            .map(|step| row("a/numeric", step, None))
+            .collect();
+        rows.push(row(
+            "b/gallery",
+            0,
+            Some(content_key(run.as_bytes(), "png")),
+        ));
+        ch.insert_batch(&rows, Duration::from_secs(30), true)
+            .await?;
+
+        // JSON rather than text EXPLAIN: the text layout differs across versions (26.7 draws a tree), while these keys hold from 25.3 on.
+        let plan = ch
+            .test_client()
+            .query(&format!(
+                "EXPLAIN json = 1, indexes = 1 {}",
+                crate::clickhouse::cdn_gc_roots_select()
+            ))
+            .bind(hosted_key_pattern())
+            .fetch_all::<String>()
+            .await?
+            .concat();
+        let mut root_sets = Vec::new();
+        for use_skip_indexes in [true, false] {
+            root_sets.push(
+                ch.test_client()
+                    .query(&root_set_check(use_skip_indexes))
+                    .bind(hosted_key_pattern())
+                    .fetch_one::<RootSet>()
+                    .await?,
+            );
+        }
+        for table in ["mkdb2.metrics", "mkdb2.metric_registry_outbox"] {
+            ch.test_client()
+                .query(&format!(
+                    "ALTER TABLE {table} DELETE WHERE project_id = ? SETTINGS mutations_sync = 2"
+                ))
+                .bind(&project_id)
+                .execute()
+                .await?;
+        }
+
+        fn cdn_key_index_granules(node: &serde_json::Value) -> Option<(u64, u64)> {
+            match node {
+                serde_json::Value::Object(fields) => {
+                    if fields.get("Type") == Some(&json!("Skip"))
+                        && fields.get("Name") == Some(&json!("idx_cdn_key"))
+                    {
+                        return Some((
+                            fields.get("Selected Granules")?.as_u64()?,
+                            fields.get("Initial Granules")?.as_u64()?,
+                        ));
+                    }
+                    fields.values().find_map(cdn_key_index_granules)
+                }
+                serde_json::Value::Array(items) => items.iter().find_map(cdn_key_index_granules),
+                _ => None,
+            }
+        }
+        let granules = cdn_key_index_granules(&serde_json::from_str(&plan)?);
+        assert!(
+            matches!(granules, Some((selected, total)) if selected < total),
+            "{plan}"
+        );
+        assert!(root_sets[0].refs >= 1, "{root_sets:?}");
+        assert_eq!(root_sets[0], root_sets[1]);
+        Ok(())
+    }
+
+    /// Prints this commit's root-set check for `clickhouse-client` (docs/cdn-gcs-migration.md § Enabling deletes), with the hosted key pattern inlined as a SQL literal.
+    #[test]
+    #[ignore = "operator helper: prints SQL"]
+    fn print_root_set_check() {
+        let pattern = format!(
+            "'{}'",
+            hosted_key_pattern()
+                .replace('\\', "\\\\")
+                .replace('\'', "\\'")
+        );
+        for use_skip_indexes in [true, false] {
+            // One line per statement, so the doc's `grep '^SELECT'` extracts it whole; the pattern holds no whitespace.
+            let sql = root_set_check(use_skip_indexes).replacen('?', &pattern, 1);
+            println!("{};", sql.split_whitespace().collect::<Vec<_>>().join(" "));
+        }
+    }
+
     /// Delete-mode passes inside and past the grace, the guards between classification and a DELETE, and an upload's dedup ack, against an in-memory bucket and a throwaway ClickHouse (docs/live-database-tests.md).
     #[tokio::test]
     #[ignore = "requires KYMO_LIVE_TEST_CLICKHOUSE_URL"]

@@ -222,19 +222,20 @@ fn unix_ms_now() -> i64 {
         .unwrap_or(0)
 }
 
-/// Within this window an entry can be served without even the incremental
-/// query, so a burst of chart queries (page load, one pushed bump fanning
-/// out to many charts sharing a series) costs one ClickHouse round trip
-/// per series.
-/// The window is a DEDUP knob, not the safety mechanism. Correctness — a push-triggered refetch must never see data from before the insert the push announced, or a run's FINAL flush (no later bump heals it) permanently truncates the chart — comes from the bump gate in [`SeriesCache::lookup_untracked`]: Fresh additionally requires the entry's fetch START ([`Entry::started`], so query duration can't fake safety) to postdate the run's last [`SeriesCache::note_bumps`], which is recorded before the event is published. The window itself dates from store COMPLETION ([`Entry::checked`]) so slow reads aren't born stale. Wall-clock spacing arguments were tried here twice and are unsound: bump publications can bunch at coalescer tick phase boundaries, and sockets' pushes are spaced per connection, not against each other, while this cache is shared by all of them.
-const FRESH_WINDOW: Duration = Duration::from_millis(250);
+/// How long an entry serves without even the incremental query, counted from its fetch START. Long because each expiry costs a ClickHouse round trip per series, held under the chart request's admission units.
+/// Safety comes from the bump gate ([`SeriesCache::note_bumps`]), not the window. The window alone bounds writes nothing notes that stamp a fresh `inserted_at` (the incremental read's key): a manual INSERT, a failed insert that commits after its late re-note, or a legacy unversioned rich publish cancelled mid-insert. One that keeps old stamps (an in-place ALTER UPDATE/DELETE, an INSERT copying `inserted_at`) reaches a retained entry only through a full read: eviction or a restart.
+const FRESH_WINDOW: Duration = Duration::from_secs(30 * 60);
 
-/// How long a bump note must survive: LONGER THAN ANY CLICKHOUSE READ CAN RUN. A fetch that started before an insert can store its pre-insert snapshot long after — with the dedup window dating from store completion, that entry is wall-clock fresh, and only its bump note keeps the gate closed; pruning the note first would serve those rows as Fresh. (Pruning at FRESH_WINDOW was sound only while the window dated from fetch START.) Request-bound reads sit under the chart deadline; detached refreshes are bounded by [`DETACHED_REFRESH_TIMEOUT`]. One hour leaves ample margin over both.
+/// How long a note must survive: LONGER THAN ANY ROWS FETCHED BEFORE IT CAN STILL SERVE, which [`is_fresh`] bounds at [`FRESH_WINDOW`] after their fetch start; pruning the note sooner would serve rows that may predate it.
 const BUMP_RETENTION: Duration = Duration::from_secs(3600);
+const _: () = assert!(FRESH_WINDOW.as_secs() < BUMP_RETENTION.as_secs());
 
-/// Whole-task bound for a detached chart refresh (docs/admission-control.md Stage R). Detached tasks have no enclosing request deadline, so this is what keeps every read inside [`BUMP_RETENTION`].
+/// Pruning scans every note and every insert notes, so it runs at most this often; retention is only a lower bound.
+const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Whole-task bound for a detached chart refresh (docs/admission-control.md Stage R). Detached tasks have no enclosing request deadline, so this is what frees a hung scan's admission unit and refresh slot; it sits inside [`FRESH_WINDOW`] so a finished scan's rows can still serve.
 const DETACHED_REFRESH_TIMEOUT: Duration = Duration::from_secs(300);
-const _: () = assert!(DETACHED_REFRESH_TIMEOUT.as_secs() * 4 <= BUMP_RETENTION.as_secs());
+const _: () = assert!(DETACHED_REFRESH_TIMEOUT.as_secs() < FRESH_WINDOW.as_secs());
 
 /// A failure is never published: the caller that receives it surfaces the error, and later arrivals elect a fresh attempt.
 #[derive(Debug)]
@@ -246,10 +247,9 @@ pub(crate) enum RefreshError {
 
 pub(crate) type RefreshOutcome = Result<Arc<SeriesSnapshot>, RefreshError>;
 
-/// The bump gate's one authoritative direction: rows are servable only when
-/// their fetch STARTED at or after the run's last announced bump.
-fn postdates_last_bump(last_bump: Option<Instant>, started: Instant) -> bool {
-    last_bump.is_none_or(|bump| started >= bump)
+/// The one freshness rule for cached and shared rows: their fetch STARTED within [`FRESH_WINDOW`] and at or after the run's last note.
+pub(crate) fn is_fresh(last_bump: Option<Instant>, started: Instant) -> bool {
+    started.elapsed() < FRESH_WINDOW && last_bump.is_none_or(|bump| started >= bump)
 }
 
 impl std::fmt::Display for RefreshError {
@@ -288,10 +288,8 @@ fn entry_bytes(rows: &[VersionedRawPoint]) -> usize {
 pub struct Entry {
     pub rows: Arc<SeriesSnapshot>,
     pub max_inserted_ms: i64,
-    /// When the fetch that produced these rows STARTED — the bump-gate stamp (safety): a bump noted after this instant means the rows may predate the announced insert. Start, not completion, so query duration can't fake safety.
+    /// When the fetch that produced these rows STARTED — the bump-gate stamp (a note after this instant means the rows may predate a write) and the start of the [`FRESH_WINDOW`]. Start, not completion, so query duration can't fake safety.
     started: Instant,
-    /// When the rows were STORED — the FRESH_WINDOW stamp (dedup). Completion, not start: dating the window from fetch start made any ≥250ms query stale on arrival, evaporating the dedup exactly during IO-pressure periods (chart-miss storms are how this server has OOMed). Costs only unannounced-data staleness of query-duration+window; announced data is still forced through the bump gate.
-    checked: Instant,
     /// Identity of this store, unique per insert_full. An incremental fetch is computed against ONE base's watermark; if a concurrent full fetch replaces the entry before the increment applies, merging into the replacement can leave rows missing BELOW the merged watermark — a hole no later incremental re-reads. apply_increment refuses a stale generation and the caller full-rebuilds.
     gen: u64,
     last_access: Instant,
@@ -303,8 +301,9 @@ struct Inner {
     map: HashMap<SeriesKey, Entry>,
     evicted: HashMap<SeriesKey, EvictedLineage>,
     total_bytes: usize,
-    /// run_id → Instant of the run's most recent announced data bump (see [`SeriesCache::note_bumps`]). Notes must outlive any fetch that started before them (see [`BUMP_RETENTION`]); the 1024 threshold is a soft prune trigger, not a cap — the map self-bounds at "runs bumped in the last hour".
+    /// run_id → the run's latest note ([`SeriesCache::note_bumps`]). Notes must outlive any fetch that started before them (see [`BUMP_RETENTION`]); pruned every [`PRUNE_INTERVAL`], the map self-bounds at "runs written in the last hour".
     bumps: HashMap<String, Instant>,
+    last_prune: Option<Instant>,
     /// Source of [`Entry::gen`] values.
     next_gen: u64,
 }
@@ -389,7 +388,7 @@ impl SeriesRefreshLocks {
             // Attach deliveries are bump-gated (docs/admission-control.md
             // goal 4): a snapshot whose fetch predates a bump this caller's
             // consult postdates falls through to a fresh election instead.
-            if postdates_last_bump(cache.last_bump(&key.1), done.started) {
+            if is_fresh(cache.last_bump(&key.1), done.started) {
                 state.published = Some(done.clone());
                 SeriesCache::record_lookup_result("fresh");
                 SeriesCache::record_shared("running");
@@ -407,15 +406,12 @@ impl SeriesRefreshLocks {
             }
             needs_refresh => {
                 // An oversized result is deliberately absent from the LRU.
-                // Existing waiters can nevertheless use the leader's Arc, as
-                // long as no announced bump landed after that fetch started.
+                // Existing waiters can nevertheless use the leader's Arc while it is fresh.
                 if matches!(needs_refresh, Lookup::Miss) {
                     if let Some(rows) = state
                         .published
                         .as_ref()
-                        .filter(|result| {
-                            postdates_last_bump(cache.last_bump(&key.1), result.started)
-                        })
+                        .filter(|result| is_fresh(cache.last_bump(&key.1), result.started))
                         .map(|result| result.rows.clone())
                     {
                         SeriesCache::record_lookup_result("fresh");
@@ -527,19 +523,24 @@ impl SeriesCache {
         }
     }
 
-    /// Record that data bumps for these runs are about to be exposed. Called BEFORE the Postgres version commit — the note must predate EVERY channel that can reveal the new version (the push frame, but also PollVersions/resync polls, which can observe it the instant the commit lands): entries whose fetch STARTED before the note may predate the announced insert and must not serve Fresh. The first post-bump lookup goes Stale (one cheap incremental), re-stamps past the note, and the rest of the burst dedups as before. Takes the whole frame at once: one lock, one prune — a per-run prune rescans an all-young map for every insert past the cap, quadratic in frame size.
+    /// Record that these runs just gained rows. [`crate::clickhouse::ChClient::insert_batch`] calls this when an insert returns, before its ack, so the note predates EVERY channel that can reveal a version including the rows (the push frame, PollVersions/resync polls, TerminateRun): entries whose fetch STARTED before it may predate the rows and must not serve Fresh. Without that, a run's final flush would permanently truncate its chart. The first lookup after a note goes Stale (one cheap incremental), re-stamps past it, and the rest of the burst serves Fresh.
     pub fn note_bumps<'a>(&self, run_ids: impl Iterator<Item = &'a str>) {
         let mut inner = self.inner.lock().unwrap();
-        if inner.bumps.len() >= 1024 {
+        if inner
+            .last_prune
+            .is_none_or(|pruned| pruned.elapsed() >= PRUNE_INTERVAL)
+        {
             inner.bumps.retain(|_, t| t.elapsed() < BUMP_RETENTION);
+            inner.last_prune = Some(Instant::now());
         }
+        // Stamped under the lock, so a run's note only ever moves later.
         let now = Instant::now();
         for run_id in run_ids {
             inner.bumps.insert(run_id.to_string(), now);
         }
     }
 
-    /// Latest announced data bump for a run. Other caches use the same
+    /// Latest note for a run. Other caches use the same
     /// start-before-bump gate as the raw-series cache so a response triggered
     /// by a pushed version cannot reuse metadata from before that insert.
     pub fn last_bump(&self, run_id: &str) -> Option<Instant> {
@@ -557,8 +558,7 @@ impl SeriesCache {
             None => Lookup::Miss,
             Some(e) => {
                 e.last_access = Instant::now();
-                // Fresh needs BOTH: stored recently (dedup window, completion-stamped) AND fetch-started after the run's last announced bump — wall-clock spacing alone cannot make a pre-insert entry safe (bumps can bunch across coalescer phase boundaries, and the cache is shared across sockets whose pushes aren't spaced against each other).
-                if e.checked.elapsed() < FRESH_WINDOW && last_bump.is_none_or(|b| e.started >= b) {
+                if is_fresh(last_bump, e.started) {
                     Lookup::Fresh(e.rows.clone())
                 } else {
                     Lookup::Stale {
@@ -604,7 +604,7 @@ impl SeriesCache {
         self.insert_full_with_origin(key, rows, fetch_started, LineageOrigin::Miss)
     }
 
-    /// Store a full fetch. `fetch_started` feeds the bump gate; storage time starts the dedup window. An LRU victim can recover its lineage only from a matching, single-use eviction record.
+    /// Store a full fetch. `fetch_started` feeds the bump gate and starts the fresh window. An LRU victim can recover its lineage only from a matching, single-use eviction record.
     pub(crate) fn insert_full_with_origin(
         &self,
         key: SeriesKey,
@@ -623,7 +623,7 @@ impl SeriesCache {
         let mut inner = self.inner.lock().unwrap();
         // A concurrent fetch may have published and evicted a different lineage while this one was hashing. That record must not survive this replacement.
         inner.evicted.remove(&key);
-        // Concurrent full fetches race their stores; last writer wins, even if its snapshot is older (local start order can't order ClickHouse snapshots anyway). Safe without an ordering guard: an announced insert is protected by the bump gate in lookup regardless of which racer won, and an unannounced regression is wall-clock stale within FRESH_WINDOW and heals on the next incremental.
+        // Concurrent full fetches race their stores; last writer wins, even if its snapshot is older (local start order can't order ClickHouse snapshots anyway). Safe without an ordering guard: a noted insert is protected by the bump gate in lookup regardless of which racer won, and a regression past a write nothing notes heals on the first incremental after FRESH_WINDOW.
         if let Some(old) = inner.map.remove(&key) {
             inner.total_bytes -= old.bytes;
         }
@@ -642,7 +642,6 @@ impl SeriesCache {
                 rows: rows.clone(),
                 max_inserted_ms,
                 started: fetch_started,
-                checked: Instant::now(),
                 gen,
                 last_access: Instant::now(),
                 bytes,
@@ -655,7 +654,7 @@ impl SeriesCache {
     /// Fold an incremental fetch into the cached entry. `Ok(rows)` is the
     /// merged series; `Err(())` means the increment rewrites history and
     /// the caller must do a full fetch + [`Self::insert_full_with_origin`].
-    /// `fetch_started` is the fetch START, as in [`Self::insert_full_with_origin`]; it only ever advances `started` (a concurrent later-started query may have stamped first). The dedup window restamps from now — the rows are verified current as of this store. `gen` is the [`Lookup::Stale`] generation the increment's watermark came from.
+    /// `fetch_started` is the fetch START, as in [`Self::insert_full_with_origin`]; it only ever advances `started` (a concurrent later-started query may have stamped first), which restarts the fresh window: the rows are verified current as of that fetch. `gen` is the [`Lookup::Stale`] generation the increment's watermark came from.
     pub fn apply_increment(
         &self,
         key: &SeriesKey,
@@ -675,7 +674,6 @@ impl SeriesCache {
         }
         if increment.is_empty() {
             e.started = e.started.max(fetch_started);
-            e.checked = Instant::now();
             return Ok(e.rows.clone());
         }
         let Some(merged) = e.rows.merge(&increment) else {
@@ -706,7 +704,6 @@ impl SeriesCache {
         e.max_inserted_ms = new_wm;
         e.bytes = new_bytes;
         e.started = e.started.max(fetch_started);
-        e.checked = Instant::now();
         let rows = e.rows.clone();
         Self::settle(&mut inner, self.budget_bytes);
         Ok(rows)
@@ -714,7 +711,7 @@ impl SeriesCache {
 
     /// Remove every cached metric for the exact `(project_id, run_id)` identities. The full identity matches the cache/storage key and keeps this eviction defensively project-scoped, even though admission now permanently reserves each run ID to one project.
     ///
-    /// Bump notes follow a separate safety lifetime: they must outlive any fetch that started before the announced insert (see [`BUMP_RETENTION`]). They hold no series rows and age out on their existing retention schedule.
+    /// Bump notes follow a separate safety lifetime: they must outlive any fetch that started before the insert they note (see [`BUMP_RETENTION`]). They hold no series rows and age out on their existing retention schedule.
     pub fn purge_runs<'a>(&self, runs: impl IntoIterator<Item = (&'a str, &'a str)>) -> usize {
         let runs = runs.into_iter().collect::<HashSet<_>>();
         let mut inner = self.inner.lock().unwrap();
@@ -1561,7 +1558,7 @@ mod tests {
         let k = ("p".into(), "r".into(), "m".into());
         cache.insert_full(k.clone(), vec![row("", 1, 1.0, 100)], Instant::now());
         assert!(matches!(cache.lookup(&k), Lookup::Fresh(_)));
-        // An announced bump for the run invalidates entries stamped before
+        // A note for the run invalidates entries stamped before
         // it, even though they are well inside FRESH_WINDOW...
         cache.note_bumps(std::iter::once("r"));
         assert!(matches!(cache.lookup(&k), Lookup::Stale { .. }));
@@ -1614,7 +1611,7 @@ mod tests {
             budget_bytes: entry_bytes(&vec![row("", 0, 0.0, 0); 8]),
         };
         let k = ("p".into(), "r".into(), "m".into());
-        // A bump noted seconds ago (well past FRESH_WINDOW) while a slow
+        // A bump noted seconds ago while a slow
         // fetch is still in flight. Backdate it directly; note_bumps always
         // stamps now. (10s, not minutes: Instant subtraction panics if it
         // would predate the platform's Instant epoch on a fresh boot.)
@@ -1625,14 +1622,9 @@ mod tests {
             .unwrap()
             .bumps
             .insert("r".to_string(), bump_at);
-        // Enough traffic to trigger the ≥1024 prune repeatedly.
-        for i in 0..1100 {
-            let id = format!("other-{i}");
-            cache.note_bumps(std::iter::once(id.as_str()));
-        }
-        // The slow fetch (started before the bump) finally stores. Its
-        // completion-dated window is fresh — only the surviving note may
-        // keep the gate closed. Pruning at FRESH_WINDOW dropped it here.
+        // The first note of a fresh cache prunes.
+        cache.note_bumps(std::iter::once("other"));
+        // The slow fetch (started before the bump) finally stores, well inside its window — only the surviving note may keep the gate closed.
         let started = bump_at - Duration::from_secs(1);
         cache.insert_full(k.clone(), vec![row("", 1, 1.0, 100)], started);
         assert!(matches!(cache.lookup(&k), Lookup::Stale { .. }));
@@ -1640,34 +1632,27 @@ mod tests {
         // get pruned.
         if let Some(ancient) = Instant::now().checked_sub(BUMP_RETENTION + Duration::from_secs(60))
         {
-            cache
-                .inner
-                .lock()
-                .unwrap()
-                .bumps
-                .insert("ancient".to_string(), ancient);
+            let mut inner = cache.inner.lock().unwrap();
+            inner.bumps.insert("ancient".to_string(), ancient);
+            inner.last_prune = None;
+            drop(inner);
             cache.note_bumps(std::iter::once("trigger"));
             assert!(!cache.inner.lock().unwrap().bumps.contains_key("ancient"));
         }
     }
 
     #[test]
-    fn slow_fetch_is_fresh_on_arrival_but_still_bump_gated() {
+    fn fresh_window_counts_from_fetch_start() {
         let cache = SeriesCache {
             inner: std::sync::Mutex::new(Inner::default()),
             budget_bytes: entry_bytes(&vec![row("", 0, 0.0, 0); 8]),
         };
-        let k = ("p".into(), "r".into(), "m".into());
-        // A read that took 1s (IO pressure) — the window dates from store
-        // completion, so it is NOT born stale (start-dated freshness
-        // evaporated the dedup exactly during slow periods).
-        let started = Instant::now() - Duration::from_secs(1);
-        cache.insert_full(k.clone(), vec![row("", 1, 1.0, 100)], started);
-        assert!(matches!(cache.lookup(&k), Lookup::Fresh(_)));
-        // ...but the bump gate keys on the START: an insert announced after
-        // this fetch began may be missing from its rows.
-        cache.note_bumps(std::iter::once("r"));
-        assert!(matches!(cache.lookup(&k), Lookup::Stale { .. }));
+        // A fetch that started a whole window ago is stale on arrival, however recently it stored.
+        if let Some(started) = Instant::now().checked_sub(FRESH_WINDOW + Duration::from_secs(1)) {
+            let k = ("p".into(), "r".into(), "m".into());
+            cache.insert_full(k.clone(), vec![row("", 1, 1.0, 100)], started);
+            assert!(matches!(cache.lookup(&k), Lookup::Stale { .. }));
+        }
     }
 
     #[test]

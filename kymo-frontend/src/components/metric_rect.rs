@@ -13,7 +13,7 @@ use crate::state::layout_config::{CdnDisplayMode, MetricBinding, RectOptions, Ru
 use crate::state::panel_cache::{panel_key, Store};
 use crate::state::visibility::{self, Zone};
 use crate::state::zones::ZoneRegistry;
-use crate::state::{resolve_capped_bindings, DashboardState, DisplayType, RectConfig, ViewContext};
+use crate::state::{resolve_capped_bindings, DashboardState, DisplayType, RectConfig};
 use crate::util::{editor_trigger_id, focus_on_mount, is_app_escape, primary};
 
 fn normalize_rect_label(label: String) -> String {
@@ -170,25 +170,16 @@ fn decorate_cdn_series(
         .collect()
 }
 
-pub(crate) fn build_view_context(state: &DashboardState) -> ViewContext {
-    ViewContext {
-        current_project: state.project_id.read().clone(),
-        current_run: state.current_run.read().clone(),
-        selected_runs: state.selected_runs.read().clone(),
-        all_runs: state.runs.read().iter().map(|r| r.run_id.clone()).collect(),
-    }
-}
-
 /// Sorted, deduped run ids the bindings resolve to. Its own memo so the
 /// version-hash memos downstream recompute cheaply on every pushed event
-/// without re-resolving bindings (which clones the whole view context).
+/// without re-resolving bindings.
 fn use_bound_run_ids(
     bindings: Signal<Vec<MetricBinding>>,
     max_runs: Signal<u32>,
 ) -> Memo<Vec<String>> {
     let state = use_context::<DashboardState>();
     use_memo(move || {
-        let ctx = build_view_context(&state);
+        let ctx = state.view_context();
         let mut ids: Vec<String> =
             resolve_capped_bindings(&bindings.read(), &ctx, *max_runs.read())
                 .into_iter()
@@ -690,9 +681,8 @@ fn AutoContent(
         let cache_key = cache_key.clone();
         move || {
             let grpc = state.grpc.read().clone();
-            let ctx = build_view_context(&state);
+            let ctx = state.view_context();
             let mg = *my_metrics_gen.read();
-            let _selected = state.selected_runs.read().clone();
             let bindings = bindings_signal.read().clone();
             let max_runs = *max_runs_signal.read();
             let allowed = *type_allowed.read();
@@ -890,9 +880,8 @@ fn CdnContent(
         move || {
             let cache_key = cache_key.clone();
             let grpc = state.grpc.read().clone();
-            let ctx = build_view_context(&state);
+            let ctx = state.view_context();
             let ds = *data_seq.read();
-            let _selected = state.selected_runs.read().clone();
             let bindings = bindings_signal.read().clone();
             let max_runs = *max_runs_signal.read();
             let all_runs = state.display_runs();
@@ -1019,7 +1008,7 @@ fn TextStreamContent(
     cache_key: String,
 ) -> Element {
     let state = use_context::<DashboardState>();
-    let ctx = build_view_context(&state);
+    let ctx = state.view_context();
     let refs = resolve_capped_bindings(&bindings, &ctx, max_runs);
 
     if refs.is_empty() {

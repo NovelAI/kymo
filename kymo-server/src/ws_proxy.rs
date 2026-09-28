@@ -328,7 +328,6 @@ const MAX_IN_FLIGHT: usize = 64;
 /// Floor between push frames on one connection. Bumps arrive per ingest
 /// flush (~2s cadence per active run); this only matters when several
 /// runs' flushes stagger inside a second — they merge into one frame.
-/// series_cache::FRESH_WINDOW must stay well BELOW this (see its doc).
 const EVENT_COALESCE_MS: u64 = 1_000;
 
 /// Local sockets hold the stack up, so a peer that vanished without a close (a dropped SSH tunnel, a sleeping laptop) must be noticed. Browsers answer pings natively, even for hidden tabs.

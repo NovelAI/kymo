@@ -106,6 +106,7 @@ def _upload_worker(
         _next_connect_retry_delay,
         _process_cdn_batch,
         _publish_rich_mutation,
+        _queue_item_size,
         _recovery_retry_delay,
         _retire_rejected_worker_spools,
         _send_unary_point,
@@ -252,6 +253,7 @@ def _upload_worker(
     total_sent = 0
     spilled = 0
     spool_failed = 0  # points that reached neither the server nor the spool
+    undecodable = 0  # queued points dropped because their snapshot would not unpickle; kept out of spool_failed, which also stops spill() from writing
     drain_incomplete = False
     terminal_rejected = False
     terminal_reason = ""
@@ -548,13 +550,26 @@ def _upload_worker(
         replay_attempt = _ThreadAttempt(segment, replay, name="kymo-spool-replay")
 
     def retain_queue_item(item) -> None:
-        nonlocal spilled
-        point_tuples = _decode_queue_item(item)
+        nonlocal spilled, undecodable
         if terminal_rejected:
             resolve_points(
-                len(point_tuples),
+                _queue_item_size(item),
                 failure=_WORKER_EXIT_RUN_DELETED,
             )
+            return
+        try:
+            point_tuples = _decode_queue_item(item)
+        except Exception as error:
+            # Like parent salvage, drop just this item: a snapshot that only unpickles in the trainer (a non-tensor CUDA object, or a class the worker cannot import) must not stop every later delivery. It is lost, so it fails delivery with the spool-failure code.
+            count = _queue_item_size(item)
+            if not undecodable:
+                _log.error(
+                    "failed to decode a queued rich item — dropping %d point(s); later decode losses are summarized at exit: %s",
+                    count,
+                    error,
+                )
+            undecodable += count
+            resolve_points(count, failure=_WORKER_EXIT_SPOOL_FAILED)
             return
         pending_spill: list[tuple] = []
         serialized_bytes = (
@@ -1513,10 +1528,13 @@ def _upload_worker(
             "segments remained eligible for delivery: %s",
             ", ".join(quarantined_spool_paths),
         )
-    if spool_failed:
+    if spool_failed or undecodable:
         _log.error(
-            "%d points reached neither the server nor the spool (disk full?) — LOST",
+            "%d points reached neither the server nor the spool (%d unspoolable "
+            "— disk full? — and %d undecodable) — LOST",
+            spool_failed + undecodable,
             spool_failed,
+            undecodable,
         )
         sys.exit(_WORKER_EXIT_SPOOL_FAILED)
     if terminal_rejected:

@@ -489,8 +489,6 @@ pub struct BumpCoalescer {
     /// Set by SIGTERM or the local self-fence RPC: flushes refuse new work so the shutdown drain can quiesce instead of racing arriving marks (see spawn).
     draining: std::sync::atomic::AtomicBool,
     shutdown: tokio::sync::Notify,
-    /// Told about each run's data bump BEFORE its event is published (see write_dirty): the cache refuses Fresh to entries stamped before the note, so a push-driven refetch can never be served pre-insert rows.
-    series_cache: Arc<crate::series_cache::SeriesCache>,
     activity: Arc<crate::activity::ActivityTracker>,
 }
 
@@ -581,15 +579,11 @@ impl CoalescerState {
 }
 
 impl BumpCoalescer {
-    fn new(
-        series_cache: Arc<crate::series_cache::SeriesCache>,
-        activity: Arc<crate::activity::ActivityTracker>,
-    ) -> Self {
+    fn new(activity: Arc<crate::activity::ActivityTracker>) -> Self {
         Self {
             state: std::sync::Mutex::new(CoalescerState::default()),
             draining: std::sync::atomic::AtomicBool::new(false),
             shutdown: tokio::sync::Notify::new(),
-            series_cache,
             activity,
         }
     }
@@ -618,10 +612,7 @@ impl BumpCoalescer {
 
     #[cfg(test)]
     pub(crate) fn empty_for_test() -> Arc<Self> {
-        Arc::new(Self::new(
-            Arc::new(crate::series_cache::SeriesCache::new()),
-            crate::activity::ActivityTracker::new_local(),
-        ))
+        Arc::new(Self::new(crate::activity::ActivityTracker::new_local()))
     }
 
     /// Enter the one-way admission fence and wake the existing bounded drain.
@@ -644,10 +635,9 @@ impl BumpCoalescer {
     pub fn spawn(
         pg: Arc<PgStore>,
         events: crate::events::EventSender,
-        series_cache: Arc<crate::series_cache::SeriesCache>,
         activity: Arc<crate::activity::ActivityTracker>,
     ) -> Arc<Self> {
-        let this = Arc::new(Self::new(series_cache, activity));
+        let this = Arc::new(Self::new(activity));
         let coalescer = this.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(BUMP_INTERVAL);
@@ -776,9 +766,6 @@ impl BumpCoalescer {
             })
             .collect();
         if !touched.is_empty() {
-            // Arm the cache's bump gate BEFORE Postgres exposes the new versions: the instant bump_run_versions commits, a version poll (resync, page load) can observe them and refetch — up to REG_TIMEOUT before the push below would have armed the gate — and since that push carries the SAME versions, the frontend's monotonic merge would never refetch again. ClickHouse has already committed (marks are made post-ACK), so the notes are never premature; notes for a bump that then fails cost one spurious incremental each.
-            self.series_cache
-                .note_bumps(touched.iter().map(|run| run.run_id.as_str()));
             let start = Instant::now();
             let result = pg.bump_run_versions(&touched).await;
             // Recorded on failure too — a slow-then-erroring Postgres must show up here, not vanish from the histogram.
@@ -858,7 +845,6 @@ impl BumpCoalescer {
             }
         };
         if !ev.is_empty() {
-            // Cache bump notes were installed BEFORE the version commit above — they must predate every exposure channel (poll and push), not just this send.
             // Err just means no dashboard is connected right now.
             let _ = events.send(ev);
         }

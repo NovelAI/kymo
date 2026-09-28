@@ -32,10 +32,7 @@ impl Fixture {
         pg.ensure_run_metrics_run_fk().await?;
         let ch = Arc::new(ChClient::new(ch_url)?);
         tokio::time::timeout(Duration::from_secs(60), ch.ensure_schema()).await??;
-        let bumps = Arc::new(BumpCoalescer::new(
-            ch.series_cache(),
-            crate::activity::ActivityTracker::new_local(),
-        ));
+        let bumps = BumpCoalescer::empty_for_test();
         let gates = LifecycleGates::new();
         let (events, received) = tokio::sync::broadcast::channel(32);
         let query = crate::query::QueryService::new(

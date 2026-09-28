@@ -4057,14 +4057,8 @@ impl QueryService {
         // read gate across fetch AND store (read_many_keyed / RefreshDetach in
         // query_chart_admitted), so nothing can re-install a pre-eviction
         // snapshot; same gate-claim-then-purge shape as the deletion reaper.
-        self.ch.series_cache().purge_runs(std::iter::once((
-            req.project_id.as_str(),
-            req.run_id.as_str(),
-        )));
-        self.ch.purge_text_index_runs(std::iter::once((
-            req.project_id.as_str(),
-            req.run_id.as_str(),
-        )));
+        self.ch
+            .purge_run_caches(&[(req.project_id.as_str(), req.run_id.as_str())]);
 
         // `last_ingested_at` keeps its server-clock meaning (the import inserted
         // rows just now); the terminal time is the archive's.

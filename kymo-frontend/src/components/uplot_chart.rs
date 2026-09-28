@@ -141,7 +141,7 @@ try{{
 let u=window.__kymo_charts&&window.__kymo_charts['{id}'];
 let data=window.__kymo_data&&window.__kymo_data['{id}'];
 if(!u||!u.root||!u.root.isConnected||!data||!data.length)return false;
-data=data.map((c,i)=>i==0?c:Array.from(c,v=>v!==v?null:v));
+data=data.map((c,i)=>{{if(i==0)return c;let n=c.length,o=new Array(n);for(let j=0;j<n;j++){{let v=c[j];o[j]=v!==v?null:v;}}return o;}});
 u.setData(data);
 return true;
 }}catch(_error){{

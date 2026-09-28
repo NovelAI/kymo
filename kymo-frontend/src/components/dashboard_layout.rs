@@ -12,7 +12,7 @@ use crate::components::uplot_chart::ZoomBridge;
 use crate::grpc::proto::{MetricInfo, RunLifecycleState};
 use crate::route::{focus_chart, Route};
 use crate::state::app_state::{ExplicitRunKey, ExplicitRunMetadata};
-use crate::state::layout_config::{resolve_rect_locally, ProjectRef, RectConfig, RunRef};
+use crate::state::layout_config::{resolve_rect_locally, RectConfig, RunRef};
 use crate::state::push::PushBridge;
 use crate::state::visibility::{
     is_terminal_run_status, retry_visible, retry_visible_run, visible_attempt,
@@ -63,13 +63,9 @@ fn explicit_run_keys(layout: &LayoutConfig, current_project: &str) -> Vec<(Strin
         .flat_map(|section| &section.rects)
         .flat_map(|rect| &rect.bindings)
         .filter_map(|binding| match &binding.runs {
-            RunRef::Specific(run_ids) => Some((
-                match &binding.project {
-                    ProjectRef::Current => current_project.to_string(),
-                    ProjectRef::Specific(project_id) => project_id.clone(),
-                },
-                run_ids,
-            )),
+            RunRef::Specific(run_ids) => {
+                Some((binding.project.id(current_project).to_string(), run_ids))
+            }
             _ => None,
         })
         .flat_map(|(project_id, run_ids)| {

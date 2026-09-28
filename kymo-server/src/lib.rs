@@ -529,12 +529,7 @@ pub async fn run() -> anyhow::Result<()> {
     // Coalesces ingest-driven version/liveness bumps and first-seen metric
     // registrations into batched Postgres writes per interval, off the
     // ingest ACK path.
-    let bumps = ingest::BumpCoalescer::spawn(
-        pg.clone(),
-        run_events.clone(),
-        ch.series_cache(),
-        activity.clone(),
-    );
+    let bumps = ingest::BumpCoalescer::spawn(pg.clone(), run_events.clone(), activity.clone());
     let shutdown_bumps = bumps.clone();
 
     // Arc-shared between the native gRPC server and the browser-only WebSocket proxy listener.

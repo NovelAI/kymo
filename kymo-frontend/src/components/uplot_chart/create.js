@@ -17,7 +17,8 @@ if(!data||!data.length)return'chart data is missing';
 // decade with line segments plunging to it, painting a false "fill"
 // under log-y lines. Convert gap slots in one JS pass; x (data[0]) has
 // no gaps and stays typed.
-data=data.map((c,i)=>i==0?c:Array.from(c,v=>v!==v?null:v));
+// An indexed loop, not Array.from(c,fn): the callback form costs ~7x more on typed arrays (set_data_js repeats this).
+data=data.map((c,i)=>{if(i==0)return c;let n=c.length,o=new Array(n);for(let j=0;j<n;j++){let v=c[j];o[j]=v!==v?null:v;}return o;});
 let w=el.getBoundingClientRect().width||600;
 if(!window.__kymo_cfghash) window.__kymo_cfghash={};
 let prev=window.__kymo_charts['__KYMO_ID__'];

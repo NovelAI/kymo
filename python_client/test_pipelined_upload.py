@@ -96,6 +96,27 @@ class _StringSubclass(str):
         raise RuntimeError("caller-owned string reached Queue serialization")
 
 
+class _StubTensor:
+    """Stands in for torch.Tensor (CI has no torch); refuses to pickle while on a device."""
+
+    def __init__(self, device, values):
+        self.device = types.SimpleNamespace(type=device)
+        self.values = values
+
+    def detach(self):
+        return self
+
+    def cpu(self):
+        if self.device.type == "meta":
+            raise NotImplementedError("Cannot copy out of meta tensor; no data!")
+        return _StubTensor("cpu", list(self.values))
+
+    def __reduce__(self):
+        if self.device.type not in ("cpu", "meta"):
+            raise RuntimeError("a device tensor reached the snapshot pickle")
+        return _StubTensor, (self.device.type, self.values)
+
+
 class CaptureWriterTests(unittest.TestCase):
     def writer(self):
         original = io.StringIO()
@@ -1290,6 +1311,52 @@ class AccountingTests(unittest.TestCase):
         self.assertEqual(_OneShotReducible.calls, 1)
         self.assertEqual(status.value, 2)
 
+    def _log(self, metrics):
+        target = mock.Mock()
+        with (
+            mock.patch.object(client_module, "_is_initialized", True),
+            mock.patch.object(client_module, "_metric_queue", target),
+            mock.patch.object(client_module, "_queue_status", _QueueStatus()),
+            mock.patch.object(client_module, "_last_log_duration_ms", 0.0),
+            mock.patch("kymo._capture.drain_buffers", return_value=("", "")),
+            mock.patch.dict(
+                sys.modules, {"torch": types.SimpleNamespace(Tensor=_StubTensor)}
+            ),
+        ):
+            client_module.log(metrics, step=1)
+        return [call.args[0] for call in target.put.call_args_list]
+
+    def test_rich_snapshot_copies_only_accelerator_tensors_to_host(self):
+        for device, pickled in (("cuda", "cpu"), ("cpu", "cpu"), ("meta", "meta")):
+            with self.subTest(device=device):
+                tensor = _StubTensor(device, [1, 2, 3])
+                (queued,) = self._log({"demo/gallery": [Image(tensor)]})
+                snapshot = client_module._decode_queue_item(queued)[0][3][0].data
+                self.assertEqual(snapshot.device.type, pickled)
+                self.assertEqual(snapshot.values, [1, 2, 3])
+                self.assertEqual(tensor.device.type, device)
+
+    def test_metadata_snapshot_is_frozen_to_its_rendered_json(self):
+        data = {"stats": _StubTensor("cuda", [1]), "shape": (2, 3), 5: None}
+        manifest = client_module.metadata_manifest(data)
+        for batch in (
+            ("metadata_batch", "demo/meta", 1, Metadata(data)),
+            ("metadata_batch_mutation", "demo/meta", 1, Metadata(data), 7, 9),
+        ):
+            with self.subTest(kind=batch[0]):
+                # No torch in sys.modules: the stub tensor would refuse to pickle if it reached the payload.
+                with mock.patch.dict(sys.modules, {"torch": None}):
+                    ((_, _, payload),) = client_module._snapshot_rich_queue_items(
+                        [batch]
+                    )
+                (decoded,) = client_module._decode_queue_item(
+                    (client_module._SERIALIZED_RICH_QUEUE_ITEM, 1, payload)
+                )
+                self.assertEqual(decoded[:3] + decoded[4:], batch[:3] + batch[4:])
+                self.assertEqual(
+                    client_module.metadata_manifest(decoded[3].data), manifest
+                )
+
     def test_unpicklable_rich_payload_fails_before_capture_or_publication(self):
         class Target:
             items = []
@@ -1541,6 +1608,75 @@ class AccountingTests(unittest.TestCase):
                     self.assertEqual(point.value, 3.4028234663852886e38)
                 else:
                     self.assertEqual(point.value, value)
+
+    def test_log_fast_path_publishes_what_the_full_checks_publish(self):
+        class FloatSubclass(float):
+            pass
+
+        above = math.nextafter(wire_module._F32_OVERFLOW, 0)
+        accepted = [
+            {
+                "train/loss": 1.0,
+                "é/name": 1.0,
+                "x" * 2048: 1.0,
+                "é" * 1024: 1.0,
+            },
+            {
+                f"v/{index}": value
+                for index, value in enumerate(
+                    [
+                        1.5,
+                        -0.0,
+                        5e-324,
+                        1e-50,
+                        3.4028234663852886e38,
+                        -3.4028234663852886e38,
+                        above,
+                        float("nan"),
+                        float("inf"),
+                        float("-inf"),
+                        True,
+                        7,
+                        np.float32(1.25),
+                        np.float64(2.5),
+                        FloatSubclass(3.5),
+                    ]
+                )
+            },
+        ]
+        rejected = [
+            ({"x" * 2049: 1.0}, ValueError),
+            ({"é" * 1025: 1.0}, ValueError),
+            ({"a\x00b": 1.0}, ValueError),
+            ({"\udc80": 1.0}, UnicodeEncodeError),
+            ({5: 1.0}, TypeError),
+            ({"v": wire_module._F32_OVERFLOW}, OverflowError),
+            ({"v": -wire_module._F32_OVERFLOW}, OverflowError),
+        ]
+
+        def shape(point):
+            return point[:3] + (repr(point[3]), type(point[1]), type(point[3]))
+
+        for metrics in accepted:
+            (batch,) = self._log(metrics)
+            expected = [
+                (
+                    "numeric_ts",
+                    client_module._normalize_metric_name(name),
+                    1,
+                    client_module._normalize_numeric_value(value),
+                )
+                for name, value in metrics.items()
+            ]
+            self.assertEqual(
+                [shape(point) for point in batch],
+                [shape(point) for point in expected],
+            )
+
+        for metrics, error in rejected:
+            with self.subTest(metrics=metrics), self.assertRaises(error) as raised:
+                self._log(metrics)
+            self.assertIs(type(raised.exception), error)
 
     def test_public_step_and_string_subclasses_are_frozen_to_wire_primitives(self):
         class Target:
@@ -4298,6 +4434,53 @@ class WorkerResponsivenessTests(unittest.TestCase):
             ["manifest.json", "manifest.json", "metadata.json", "metadata.json"],
         )
         self.assertEqual(status.value, 0)
+
+    def test_undecodable_queue_item_is_dropped_as_lost_and_later_items_deliver(self):
+        fed = []
+        undecodable = (
+            client_module._SERIALIZED_RICH_QUEUE_ITEM,
+            1,
+            b"not a pickle",
+        )
+        source = queue.Queue()
+        for item in ([numeric(1)], undecodable, [numeric(2)], None):
+            source.put(item)
+        status = _QueueStatus(3)
+        failure = _QueueStatus()
+        with tempfile.TemporaryDirectory() as spool_dir:
+            with (
+                mock.patch.object(
+                    client_module,
+                    "_connect",
+                    return_value=_ImmediateConnectionAttempt(self._Channel(), object()),
+                ),
+                mock.patch.object(
+                    client_module,
+                    "_BidiStream",
+                    self._immediate_stream_class(
+                        lambda batch: fed.extend(point.step for point in batch.points)
+                    ),
+                ),
+                self.assertLogs("kymo", level="ERROR") as logs,
+                self.assertRaises(SystemExit) as exited,
+            ):
+                client_module._upload_worker(
+                    "unused",
+                    "p",
+                    "r",
+                    source,
+                    status,
+                    shutdown_deadline=_DeadlineValue(),
+                    spool_path=os.path.join(spool_dir, "undecodable.mkspool"),
+                    upload_failure=failure,
+                )
+            self.assertEqual(os.listdir(spool_dir), [])
+
+        self.assertEqual(fed, [1, 2])
+        self.assertEqual(status.value, 0)
+        self.assertEqual(failure.value, client_module._WORKER_EXIT_SPOOL_FAILED)
+        self.assertEqual(exited.exception.code, client_module._WORKER_EXIT_SPOOL_FAILED)
+        self.assertIn("failed to decode", "\n".join(logs.output))
 
     def test_stream_construction_failure_retries_without_losing_buffer(self):
         fed = []

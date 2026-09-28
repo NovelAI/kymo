@@ -19,6 +19,16 @@ pub enum ProjectRef {
     Specific(String),
 }
 
+impl ProjectRef {
+    /// The project this names: `current_project` for `Current`.
+    pub fn id<'a>(&'a self, current_project: &'a str) -> &'a str {
+        match self {
+            ProjectRef::Current => current_project,
+            ProjectRef::Specific(project_id) => project_id,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum RunRef {
     Selected,
@@ -42,102 +52,105 @@ pub struct ResolvedRef {
     pub metric_name: String,
 }
 
+/// What bindings resolve against.
+#[derive(PartialEq)]
 pub struct ViewContext {
     pub current_project: String,
-    pub current_run: Option<String>,
-    pub selected_runs: HashSet<String>,
-    pub all_runs: Vec<String>,
+    all_runs: Vec<String>,
+    /// Shown Runs: the run page's run, else the selected runs in run-list order (not the HashSet's: the run cap picks survivors by this order). A run page ignores the selection, so selection changes there leave the context equal.
+    shown: Vec<String>,
 }
 
 impl ViewContext {
-    /// The runs "Shown Runs" resolves to: the direct run, else the sidebar selection.
-    pub fn selected_run_ids(&self) -> Vec<String> {
-        match &self.current_run {
-            Some(r) => vec![r.clone()],
-            None => {
-                // Walk `all_runs`, not the HashSet, for the server's deterministic order (cap_runs picks survivors by it).
-                self.all_runs
-                    .iter()
-                    .filter(|id| self.selected_runs.contains(*id))
-                    .cloned()
-                    .collect()
-            }
+    pub fn new(
+        current_project: String,
+        current_run: Option<String>,
+        selected_runs: &HashSet<String>,
+        all_runs: Vec<String>,
+    ) -> Self {
+        let shown = match current_run {
+            Some(run) => vec![run],
+            None => all_runs
+                .iter()
+                .filter(|id| selected_runs.contains(*id))
+                .cloned()
+                .collect(),
+        };
+        Self {
+            current_project,
+            all_runs,
+            shown,
         }
     }
 }
 
-pub fn resolve_binding(binding: &MetricBinding, ctx: &ViewContext) -> Vec<ResolvedRef> {
-    let project_id = match &binding.project {
-        ProjectRef::Current => ctx.current_project.clone(),
-        ProjectRef::Specific(p) => p.clone(),
-    };
-
-    let run_ids: Vec<String> = match &binding.runs {
-        RunRef::Selected => ctx.selected_run_ids(),
-        RunRef::All => ctx.all_runs.clone(),
-        RunRef::Specific(runs) => runs.clone(),
-    };
-
-    run_ids
-        .into_iter()
-        .map(|run_id| ResolvedRef {
-            project_id: project_id.clone(),
-            run_id,
-            metric_name: binding.metric_name.clone(),
-        })
-        .collect()
+/// The run ids `runs` resolves to, in resolution order.
+pub fn run_ref_ids<'a>(runs: &'a RunRef, ctx: &'a ViewContext) -> &'a [String] {
+    match runs {
+        RunRef::Selected => &ctx.shown,
+        RunRef::All => &ctx.all_runs,
+        RunRef::Specific(runs) => runs,
+    }
 }
 
-pub fn resolve_all_bindings(bindings: &[MetricBinding], ctx: &ViewContext) -> Vec<ResolvedRef> {
-    let mut seen = HashSet::new();
-    bindings
-        .iter()
-        .flat_map(|b| resolve_binding(b, ctx))
-        // Bindings carry no per-source style or alias, so exact duplicates have no distinct presentation. Keep the first occurrence/order and avoid duplicate chart series, CDN columns, and server reads.
-        .filter(|resolved| seen.insert(resolved.clone()))
-        .collect()
-}
-
-/// Cap `refs` to at most `max_runs` distinct runs (0 = unlimited). Multiple
+/// Resolve `bindings` capped to at most `max_runs` distinct runs (0 = unlimited). Multiple
 /// metrics on the same run count as one run. Survivors are the first
 /// `max_runs` distinct runs in resolution order, which is deterministic —
-/// `resolve_binding` emits Selected and All in run-list order, Specific in
+/// `run_ref_ids` emits Selected and All in run-list order, Specific in
 /// stored order — so the subset is stable across renders.
-pub fn cap_runs(refs: Vec<ResolvedRef>, max_runs: u32) -> Vec<ResolvedRef> {
-    // 0 means unlimited — and without this return the filter below would admit nothing.
-    if max_runs == 0 {
-        return refs;
-    }
-    let mut keep: HashSet<String> = HashSet::new();
-    refs.into_iter()
-        .filter(|r| {
-            if keep.len() < max_runs as usize {
-                keep.insert(r.run_id.clone());
-            }
-            keep.contains(&r.run_id)
-        })
-        .collect()
-}
-
+///
+/// The cap applies while expanding: a run past it is skipped without a copy, and each binding stops once it has resolved every kept run.
 pub fn resolve_capped_bindings(
     bindings: &[MetricBinding],
     ctx: &ViewContext,
     max_runs: u32,
 ) -> Vec<ResolvedRef> {
-    cap_runs(resolve_all_bindings(bindings, ctx), max_runs)
+    let max_runs = if max_runs == 0 {
+        usize::MAX
+    } else {
+        max_runs as usize
+    };
+    let mut keep: HashSet<&str> = HashSet::new();
+    let mut seen = HashSet::new();
+    let mut refs = Vec::new();
+    for binding in bindings {
+        let project_id = binding.project.id(&ctx.current_project);
+        // Kept runs this binding has resolved: once it holds all of them, its remaining runs are capped out or repeats.
+        let mut reached: HashSet<&str> = HashSet::new();
+        for run_id in run_ref_ids(&binding.runs, ctx) {
+            if reached.len() == max_runs {
+                break;
+            }
+            if keep.len() < max_runs {
+                keep.insert(run_id.as_str());
+            } else if !keep.contains(run_id.as_str()) {
+                continue;
+            }
+            reached.insert(run_id.as_str());
+            // Bindings carry no per-source style or alias, so exact duplicates have no distinct presentation. Keep the first occurrence/order and avoid duplicate chart series, CDN columns, and server reads.
+            if seen.insert((project_id, run_id.as_str(), binding.metric_name.as_str())) {
+                refs.push(ResolvedRef {
+                    project_id: project_id.to_string(),
+                    run_id: run_id.clone(),
+                    metric_name: binding.metric_name.clone(),
+                });
+            }
+        }
+    }
+    refs
 }
 
 #[cfg(test)]
-mod binding_resolution_tests {
+pub(crate) mod binding_resolution_tests {
     use super::*;
 
     fn context() -> ViewContext {
-        ViewContext {
-            current_project: "project".to_string(),
-            current_run: None,
-            selected_runs: HashSet::from(["run-a".to_string(), "run-b".to_string()]),
-            all_runs: vec!["run-a".to_string(), "run-b".to_string()],
-        }
+        ViewContext::new(
+            "project".to_string(),
+            None,
+            &HashSet::from(["run-a".to_string(), "run-b".to_string()]),
+            vec!["run-a".to_string(), "run-b".to_string()],
+        )
     }
 
     fn binding(runs: RunRef, metric_name: &str) -> MetricBinding {
@@ -150,7 +163,7 @@ mod binding_resolution_tests {
 
     #[test]
     fn exact_binding_overlaps_resolve_once_in_first_seen_order() {
-        let refs = resolve_all_bindings(
+        let refs = resolve_capped_bindings(
             &[
                 binding(RunRef::Selected, "loss"),
                 binding(RunRef::Specific(vec!["run-a".to_string()]), "loss"),
@@ -162,6 +175,7 @@ mod binding_resolution_tests {
                 },
             ],
             &context(),
+            0,
         );
 
         assert_eq!(
@@ -217,6 +231,101 @@ mod binding_resolution_tests {
             vec![("run-a", "loss"), ("run-a", "accuracy")]
         );
         assert_eq!(resolve_capped_bindings(&bindings, &context(), 0).len(), 4);
+    }
+
+    /// The cap as a filter over the complete resolution, which capping while expanding must reproduce.
+    fn capped_after_resolving(
+        bindings: &[MetricBinding],
+        ctx: &ViewContext,
+        max_runs: u32,
+    ) -> Vec<ResolvedRef> {
+        let refs = resolve_capped_bindings(bindings, ctx, 0);
+        if max_runs == 0 {
+            return refs;
+        }
+        let mut keep = HashSet::new();
+        refs.into_iter()
+            .filter(|r| {
+                if keep.len() < max_runs as usize {
+                    keep.insert(r.run_id.clone());
+                }
+                keep.contains(&r.run_id)
+            })
+            .collect()
+    }
+
+    /// xorshift64: a deterministic sweep without a test dependency.
+    pub(crate) struct Sweep(pub(crate) u64);
+
+    impl Sweep {
+        pub(crate) fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n as u64) as usize
+        }
+
+        /// Up to `max` ids from a small pool, repeats included.
+        pub(crate) fn ids(&mut self, max: usize) -> Vec<String> {
+            const POOL: [&str; 6] = ["a", "b", "c", "d", "e", "f"];
+            (0..self.below(max + 1))
+                .map(|_| POOL[self.below(POOL.len())].to_string())
+                .collect()
+        }
+
+        pub(crate) fn context(&mut self) -> ViewContext {
+            ViewContext::new(
+                ["", "project"][self.below(2)].to_string(),
+                self.ids(1).pop().filter(|_| self.below(3) == 0),
+                &self.ids(4).into_iter().collect(),
+                self.ids(6),
+            )
+        }
+
+        pub(crate) fn bindings(&mut self, max: usize) -> Vec<MetricBinding> {
+            (0..self.below(max + 1))
+                .map(|_| MetricBinding {
+                    project: match self.below(4) {
+                        0 => ProjectRef::Current,
+                        1 => ProjectRef::Specific("other".to_string()),
+                        2 => ProjectRef::Specific(String::new()),
+                        _ => ProjectRef::Specific("project".to_string()),
+                    },
+                    runs: match self.below(3) {
+                        0 => RunRef::Selected,
+                        1 => RunRef::All,
+                        _ => RunRef::Specific(self.ids(4)),
+                    },
+                    metric_name: ["loss", "accuracy"][self.below(2)].to_string(),
+                })
+                .collect()
+        }
+    }
+
+    #[test]
+    fn shown_runs_follow_the_run_list_else_the_run_page() {
+        let selection = HashSet::from(["c".to_string(), "a".to_string()]);
+        let list = vec!["c".to_string(), "b".into(), "a".into()];
+        let ctx = ViewContext::new("project".into(), None, &selection, list.clone());
+        assert_eq!(run_ref_ids(&RunRef::Selected, &ctx), ["c", "a"]);
+        let run_page = ViewContext::new("project".into(), Some("x".into()), &selection, list);
+        assert_eq!(run_ref_ids(&RunRef::Selected, &run_page), ["x"]);
+    }
+
+    #[test]
+    fn capping_while_expanding_matches_capping_the_full_resolution() {
+        let mut sweep = Sweep(0x9E37_79B9_7F4A_7C15);
+        for _ in 0..2_000 {
+            let ctx = sweep.context();
+            let bindings = sweep.bindings(4);
+            for max_runs in 0..=7 {
+                assert_eq!(
+                    resolve_capped_bindings(&bindings, &ctx, max_runs),
+                    capped_after_resolving(&bindings, &ctx, max_runs),
+                    "bindings={bindings:?} max_runs={max_runs}"
+                );
+            }
+        }
     }
 }
 
@@ -462,7 +571,7 @@ pub struct RectOptions {
     #[serde(default = "default_metadata_diff_only")]
     pub metadata_diff_only: bool,
     /// Max distinct runs shown in this panel; runs beyond the first
-    /// `max_runs` resolved are dropped before querying (see [`cap_runs`]).
+    /// `max_runs` resolved are dropped before querying (see [`resolve_capped_bindings`]).
     /// 0 = unlimited.
     #[serde(default = "default_max_runs")]
     pub max_runs: u32,
@@ -961,6 +1070,10 @@ fn merge_apply(target: &mut Value, patch: &Value) {
 /// patch applies after these via [`ConfigPatch::apply_to`], like any other
 /// rect edit — the finest level always wins.
 pub fn cascade_options(base: &RectOptions, patches: &[&Value]) -> RectOptions {
+    // Nothing to merge: skip the serde round trip, which would return `base` unchanged (`apply` runs this for every rect on every edit).
+    if !patches.iter().any(|patch| patch.is_object()) {
+        return base.clone();
+    }
     let Ok(mut value) = serde_json::to_value(base) else {
         return base.clone();
     };
@@ -2347,6 +2460,11 @@ impl LayoutDiff {
             }
         }
         let deleted_rects: HashSet<&str> = self.deleted_rects.iter().map(String::as_str).collect();
+        // First override per key, as a linear `find` would pick.
+        let mut rect_overrides: HashMap<&str, &ConfigPatch> = HashMap::new();
+        for ov in &self.rect_overrides {
+            rect_overrides.entry(ov.key.as_str()).or_insert(ov);
+        }
         for s in &mut layout.sections {
             s.rects.retain(|r| !deleted_rects.contains(r.id.as_str()));
             let section_defaults = s.chart_defaults.clone();
@@ -2358,7 +2476,7 @@ impl LayoutDiff {
                     &r.options,
                     &[&self.project_chart_defaults, &section_defaults],
                 );
-                if let Some(ov) = self.rect_overrides.iter().find(|o| o.key == r.id) {
+                if let Some(ov) = rect_overrides.get(r.id.as_str()) {
                     ov.apply_to(r);
                 }
             }

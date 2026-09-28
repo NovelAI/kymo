@@ -620,7 +620,7 @@ fn GalleryRenderer(
             {
                 state.display_runs()
             } else {
-                Vec::new()
+                Default::default()
             };
             let metadata_columns = metadata_columns(&run_manifests, &display_runs);
             rsx! {

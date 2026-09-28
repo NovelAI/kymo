@@ -50,6 +50,7 @@ from kymo._cdn import gallery_item, gallery_manifest, metadata_manifest
 from kymo._log import logger as _log
 from kymo._wire import (
     _CDN_RPC_TIMEOUT,
+    _F32_OVERFLOW,
     _MAX_ID_BYTES,
     _MAX_METRIC_NAME_BYTES,
     _MAX_POINTS_PER_MSG,
@@ -117,6 +118,7 @@ _RUN_NAME_TRIM_CHARS = "\t\n\v\f\r \u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2
 
 
 def _normalize_metric_name(name) -> str:
+    # log() inlines a fast path that skips this; it must admit only names this returns unchanged.
     if not isinstance(name, str):
         raise TypeError(f"metric name must be str, got {type(name).__name__}")
     normalized = str(name)
@@ -673,8 +675,17 @@ def log(metrics: dict, step: int) -> None:
     cdn_batches = []
 
     for name, value in all_metrics.items():
-        name = _normalize_metric_name(name)
-        if isinstance(value, (int, float)):
+        # Per-point validation dominates a large log(): exact ASCII str names and exact floats below ±_F32_OVERFLOW skip it, since the full checks return them unchanged.
+        if not (
+            type(name) is str
+            and name.isascii()
+            and len(name) <= _MAX_METRIC_NAME_BYTES
+            and "\x00" not in name
+        ):
+            name = _normalize_metric_name(name)
+        if type(value) is float and -_F32_OVERFLOW < value < _F32_OVERFLOW:
+            numeric_points.append(("numeric_ts", name, step, value, now_ms))
+        elif isinstance(value, (int, float)):
             numeric_points.append(
                 ("numeric_ts", name, step, _normalize_numeric_value(value), now_ms)
             )
@@ -773,23 +784,47 @@ _STATUS_LOCK_TIMEOUT = 1.0
 _SERIALIZED_RICH_QUEUE_ITEM = "__kymo_serialized_rich_v1__"
 
 
+class _HostTensorPickler(pickle.Pickler):
+    """Snapshot pickler that copies accelerator tensors to host memory.
+
+    Torch pickles a device tensor with its device, so the upload worker would unpickle it onto the accelerator: a forked worker cannot initialize CUDA and would drop the item as lost, and one that can opens its own context. Pickling copies the data to host anyway. Everything else, CPU tensors included, pickles exactly as pickle.dumps would.
+    """
+
+    def reducer_override(self, obj):
+        # Never imports torch: a tensor can only exist once it is loaded.
+        # A stub or half-imported torch has no Tensor type; pickle normally then.
+        tensor = getattr(sys.modules.get("torch"), "Tensor", None)
+        if (
+            isinstance(tensor, type)
+            and isinstance(obj, tensor)
+            # A meta tensor has no data to copy; it pickles as before and the worker drops it.
+            and obj.device.type not in ("cpu", "meta")
+        ):
+            return obj.detach().cpu().__reduce_ex__(pickle.HIGHEST_PROTOCOL)
+        return NotImplemented
+
+
 def _snapshot_rich_queue_items(cdn_batches: list[tuple]) -> list[tuple]:
     """Return queue-safe immutable snapshots of public rich metric batches."""
     snapshots = []
     for batch in cdn_batches:
         if batch[0] in ("metadata_batch", "metadata_batch_mutation"):
             try:
-                metadata_manifest(batch[3].data)
+                manifest = metadata_manifest(batch[3].data)
             except (TypeError, ValueError) as error:
                 raise ValueError(
                     f"metadata metric {batch[1]!r} must contain finite "
                     "JSON-serializable values"
                 ) from error
+            # Freeze metadata to its rendered JSON, as _snapshot_config does, so the payload never carries tensors or other objects the worker might fail to unpickle.
+            batch = (*batch[:3], Metadata(json.loads(manifest)["data"]), *batch[4:])
         try:
             # Standard pickle copies array/tensor storage into this byte string;
             # multiprocessing reducers may instead publish shared storage whose
             # later mutation would violate log()'s snapshot semantics.
-            payload = pickle.dumps([batch], protocol=pickle.HIGHEST_PROTOCOL)
+            buffer = io.BytesIO()
+            _HostTensorPickler(buffer, protocol=pickle.HIGHEST_PROTOCOL).dump([batch])
+            payload = buffer.getvalue()
         except Exception as error:
             raise TypeError(
                 f"rich metric {batch[1]!r} cannot be sent to the upload worker: "
@@ -1056,7 +1091,8 @@ def wait_for_upload(timeout: Optional[float] = None) -> bool:
                 )
             raise RuntimeError(
                 "kymo upload worker could not spool one or more undelivered "
-                "points; delivery failed (disk full or spool unavailable)"
+                "points; delivery failed (disk full, spool unavailable, or a "
+                "queued item the worker could not decode; see its log)"
             )
         if spooled:
             _log.warning(
@@ -2416,7 +2452,7 @@ _CONNECT_POLL_TIMEOUT = 0.25
 _RECOVERY_MAX_DELAY = 60.0
 # Attempts on one CDN batch before it's spooled for kymo.sync (exponential backoff, 2s..60s — a few minutes of outage total). Permanent rejections (server 400s the content) also land here rather than wedging the queue head forever.
 _CDN_MAX_ATTEMPTS = 8
-# Worker exit code: some points reached neither the server nor the spool (spool writes failed — disk full?). finish() must not report success.
+# Worker exit code: some points reached neither the server nor the spool (a spool write failed, e.g. disk full, or a queued snapshot would not unpickle in the worker). finish() must not report success.
 _WORKER_EXIT_SPOOL_FAILED = 2
 # The worker stopped without observing the owner's shutdown marker. The parent
 # must run its fenced salvage path before delivery can be claimed.

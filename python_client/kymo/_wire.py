@@ -1,7 +1,6 @@
 """Shared validation and wire helpers for live upload and spool replay."""
 
 import math
-import struct
 import time
 from typing import Optional
 
@@ -124,6 +123,7 @@ def _publish_rich_mutation(
 
 
 def _validate_ident(what: str, value: str, max_bytes: int) -> None:
+    # log()'s inlined metric-name fast path mirrors these checks for ASCII names; keep the two in step.
     if "\x00" in value:
         raise ValueError(f"{what} contains a NUL byte: {value!r}")
     if len(value.encode("utf-8")) > max_bytes:
@@ -165,18 +165,15 @@ def _is_permanent_upload_error(error: Exception) -> bool:
     return status is not None and 400 <= status < 500 and status not in (408, 425, 429)
 
 
+# Finite doubles at or beyond this magnitude round to float32 infinity (halfway from FLT_MAX to 2**128).
+_F32_OVERFLOW = 2.0**128 - 2.0**103
+
+
 def _normalize_numeric_value(value) -> float:
     """Preserve intentional markers, but reject finite values f32 would overflow."""
+    # log() inlines a fast path that skips this; it must admit only floats this returns unchanged.
     numeric = float(value)
-    try:
-        encoded = struct.unpack("<f", struct.pack("<f", numeric))[0]
-    except OverflowError:
-        if math.isfinite(numeric):
-            raise OverflowError(
-                f"finite numeric metric value {numeric!r} exceeds protobuf float32 range"
-            ) from None
-        raise
-    if math.isfinite(numeric) and not math.isfinite(encoded):
+    if math.isfinite(numeric) and abs(numeric) >= _F32_OVERFLOW:
         raise OverflowError(
             f"finite numeric metric value {numeric!r} exceeds protobuf float32 range"
         )

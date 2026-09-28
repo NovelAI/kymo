@@ -4,9 +4,7 @@ use std::rc::Rc;
 
 use dioxus::prelude::*;
 
-use super::{
-    build_view_context, evict_panel_caches, next_data_seq, use_bound_run_ids, CHART_CACHE,
-};
+use super::{evict_panel_caches, next_data_seq, use_bound_run_ids, CHART_CACHE};
 use crate::components::uplot_chart::UPlotChart;
 use crate::grpc::chart_delta::DenseChart;
 use crate::grpc::proto::{ChartRequest, SeriesRef, SmoothingConfig};
@@ -443,10 +441,9 @@ pub(super) fn NumericContent(
         move || {
             let cache_key = cache_key.clone();
             let grpc = state.grpc.read().clone();
-            let ctx = build_view_context(&state);
+            let ctx = state.view_context();
             // The refresh heartbeat: version-bump propagations (floored and gated in use_version_bridge) restart this resource through it. Only the subscription matters — entry validity is decided against snapshots (fresh_for), not the key.
             let _refresh = *data_seq.read();
-            let _selected = state.selected_runs.read().clone();
             let bindings = bindings_signal.read().clone();
             let opts = options_signal.read().clone();
             // Subscribe to the shared zoom only on step-axis charts — the read
@@ -584,7 +581,7 @@ pub(super) fn NumericContent(
 
                 // Transient errors retry until success (with the token released between attempts), keeping the last good chart rendered. A terminal lifecycle or validation error settles unavailable with its explanation instead of retrying.
                 loading.set(true);
-                // Freshness snapshots peek just before the (ultimately successful) attempt sends: the fetch never subscribes to raw bumps, and an event pushed mid-flight — whose data the response may predate — invalidates instead of being absorbed. Snapshot-at-send is sound because a version reaches the client only after its data is queryable: pushes publish after the CH insert acks (ingest.rs write_dirty) and arrive ≥1s later (ws_proxy coalesce), far past the server cache's 250ms FRESH_WINDOW. Poll-learned versions (resync / minute backstop) skip the coalesce delay but carry exactly the exposure the trigger path always had.
+                // Freshness snapshots peek just before the (ultimately successful) attempt sends: the fetch never subscribes to raw bumps, and an event pushed mid-flight — whose data the response may predate — invalidates instead of being absorbed. Snapshot-at-send is sound because the server notes each insert's runs in its series cache before acking it (ChClient::insert_batch), so every version bump the client can learn postdates that note, and a query sent afterwards is never answered from rows cached before it.
                 let response = visibility::retry_visible_chart("chart query", async || {
                     let _hi = visibility::admit_fetch(|| *zone.peek(), first_paint).await;
                     let epoch = *state.resync_gen.peek();
