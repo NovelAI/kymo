@@ -533,8 +533,6 @@ pub(super) fn NumericContent(
                     smoothing: Some(SmoothingConfig {
                         algorithm: algo,
                         window_size: opts.smoothing_window,
-                        // alpha too, until no server predates time_constant.
-                        alpha: opts.smoothing_alpha,
                         poly_order: opts.smoothing_poly_order,
                         time_constant: ema_time_constant(opts.smoothing_alpha),
                     }),

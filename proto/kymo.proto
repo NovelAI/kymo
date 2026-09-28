@@ -469,9 +469,9 @@ message SmoothingConfig {
   }
   Algorithm algorithm = 1;
   uint32 window_size = 2;   // savgol
-  double alpha = 3;          // EMA, from clients that predate time_constant: 1 - exp(-1 / time_constant)
+  reserved 3; reserved "alpha";  // superseded by time_constant
   uint32 poly_order = 4;     // polyfit degree (0-2), all polyfits
-  double time_constant = 5;  // EMA: e-folding length in steps (step axis) or median sample gaps (time axis), finite and > 0; wins over alpha
+  double time_constant = 5;  // EMA: e-folding length in steps (step axis) or median sample gaps (time axis), finite and > 0
 }
 
 message ChartRequest {
@@ -495,7 +495,6 @@ message ChartCacheState {
   reserved 7; reserved "downsampled";  // pre-2026-07 echoed decision; the fixed-threshold rules made it derivable
   map<string, int64> frontiers = 6;  // ChartResponse.frontiers of the held response, verbatim; keys beginning with NUL are versioned opaque server metadata
   // Series count of the held response. Together with verified input lineages and shared-ref order, count equality against continuing series protects positional pairing when refs or tag groups change. A mismatch answers in full instead of shipping a delta the client cannot splice.
-  // Dashboards before wire revision 2 send UINT32_MAX instead when versioned exact-smoothing state is required; the server recovers the real count from that state.
   optional uint32 held_series = 8;
 }
 

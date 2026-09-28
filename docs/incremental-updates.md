@@ -28,7 +28,7 @@ Step EMA/Triangular still use each local x gap; “none” means only that they 
 
 The live preparation path derives this semantic plan once and reuses it for smoothing, Savitzky–Golay reach marking, exact state stamping, and comparison on the next request. The sampled old-only audit receives the already-proven current plans paired with stable request/tag identities. It reuses them positionally only after proving the complete old-only identity sequence matches; client-controlled count or membership mismatches answer in full before a plan can be consumed. The reconstruction therefore performs no local uniform scan or median sort. `NoState` remains an explicit sequence entry when all-marker and margin-only series interleave.
 
-The opaque frontier map uses a version and response-series count plus one word per output series: `0 = NoState`, `1 = Uniform`, otherwise positive-finite median `f64` bits. Clients send the literal held-series count; dashboards before wire revision 2 send `UINT32_MAX` when this exact state is required, and the server recovers the real count from the state.
+The opaque frontier map uses a version and response-series count plus one word per output series: `0 = NoState`, `1 = Uniform`, otherwise positive-finite median `f64` bits. Clients send the literal held-series count.
 
 A server rejects unsupported lineage state and seeds one full response. Frontend epoch changes suppress stale echoes after reconnect; the keyed stamp also invalidates pre-restart state.
 

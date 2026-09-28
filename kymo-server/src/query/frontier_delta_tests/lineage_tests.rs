@@ -34,7 +34,6 @@ fn recovered_evicted_lineages_keep_real_wire_deltas_for_every_smoother() {
             window_size: 3,
             time_constant: std::f64::consts::LOG2_E,
             poly_order: 1,
-            ..Default::default()
         });
         let held =
             super::super::build_response(&request, std::slice::from_ref(&original), None, false)
@@ -264,7 +263,6 @@ fn held_timestamp_rewrites_are_detected_for_every_smoother() {
             window_size: 3,
             time_constant: std::f64::consts::LOG2_E,
             poly_order: 1,
-            ..Default::default()
         });
         let held = build(&request, &[a.clone(), b.clone()]);
         assert_eq!(inflate_full(&held).series[0].values[0], 42.0);
@@ -487,7 +485,6 @@ fn backfill_starts_a_new_lineage_including_relative_time_for_every_smoother() {
                 window_size: 3,
                 time_constant: std::f64::consts::LOG2_E,
                 poly_order: 1,
-                ..Default::default()
             });
             let old = rows_at(&[(2, 1.0), (3, 3.0), (4, 4.0)]);
             let held = build(&request, std::slice::from_ref(&old));

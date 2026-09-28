@@ -7,8 +7,7 @@ use tracing::instrument;
 
 use crate::chart;
 use crate::chart_delta::{
-    self, EXACT_STATE_HELD_SERIES, SMOOTHING_STATE_SERIES_KEY, SMOOTHING_STATE_VERSION,
-    SMOOTHING_STATE_VERSION_KEY,
+    self, SMOOTHING_STATE_SERIES_KEY, SMOOTHING_STATE_VERSION, SMOOTHING_STATE_VERSION_KEY,
 };
 use crate::clickhouse::{CdnKeyBatchRow, ChClient, VersionedRawPoint};
 use crate::ingest::{
@@ -82,11 +81,6 @@ fn canonicalize_chart_request(request: &mut proto::ChartRequest) -> Result<(), S
                 smoothing.algorithm
             )));
         }
-        // Clients that predate time_constant send alpha; nothing past this point reads it.
-        if smoothing.time_constant == 0.0 {
-            smoothing.time_constant = -1.0 / (-smoothing.alpha).ln_1p();
-        }
-        smoothing.alpha = 0.0;
         let tau = smoothing.time_constant;
         if smoothing.algorithm() == Algorithm::Ema && !(tau.is_finite() && tau > 0.0) {
             return Err(Status::invalid_argument(
@@ -840,19 +834,6 @@ fn read_smoothing_state(
     (0..series)
         .map(|index| decode_smoothing_plan(*frontiers.get(&smoothing_state_key(index))?))
         .collect()
-}
-
-/// Dashboards below wire revision 2 send an impossible held-series count when exact smoothing state is present; recover the real count from the versioned opaque state. Current clients send the literal count.
-fn held_series_count(cache: &proto::ChartCacheState, allow_exact_state: bool) -> Option<usize> {
-    match cache.held_series? {
-        EXACT_STATE_HELD_SERIES if allow_exact_state => {
-            (cache.frontiers.get(SMOOTHING_STATE_VERSION_KEY) == Some(&SMOOTHING_STATE_VERSION))
-                .then_some(())?;
-            usize::try_from(*cache.frontiers.get(SMOOTHING_STATE_SERIES_KEY)?).ok()
-        }
-        EXACT_STATE_HELD_SERIES => None,
-        count => Some(count as usize),
-    }
 }
 
 /// Request-derived knobs shared by the live build, the delta planner, and the audit reconstruction.
@@ -1699,8 +1680,8 @@ fn build_response(
         let membership_matches = req
             .cache_state
             .as_ref()
-            .and_then(|cs| held_series_count(cs, p.exact_smoothing_state))
-            .is_some_and(|held| held == continuing);
+            .and_then(|cs| cs.held_series)
+            .is_some_and(|held| held as usize == continuing);
         // Appends can change a global smoothing plan even with verified held inputs; the audit reuses the exact matched plan.
         let deltable = held_rows
             .is_some_and(|f| !p.relative || relative_offsets_stable(req, &p, &all_rows, f))
@@ -2055,30 +2036,20 @@ mod frontier_delta_tests {
     }
 
     #[test]
-    fn ema_takes_time_constant_or_the_one_alpha_implies_and_rejects_non_finite() {
-        let ema = |alpha: f64, time_constant: f64| {
+    fn ema_rejects_a_time_constant_that_is_not_finite_and_positive() {
+        let ema = |time_constant: f64| {
             let mut request = req(&["a"], 300);
             request.smoothing = Some(proto::SmoothingConfig {
                 algorithm: Algorithm::Ema as i32,
-                alpha,
                 time_constant,
                 ..Default::default()
             });
             canonicalize_chart_request(&mut request)
-                .map(|()| request.smoothing.unwrap().time_constant)
         };
-        assert!((ema(0.5, 0.0).unwrap() - std::f64::consts::LOG2_E).abs() < 1e-12);
-        assert_eq!(ema(0.5, 7.0).unwrap(), 7.0);
-        for (alpha, time_constant) in [
-            (f64::NAN, 0.0),
-            (0.0, 0.0),
-            (1.0, 0.0),
-            (0.5, f64::NAN),
-            (0.5, -1.0),
-            (0.5, f64::INFINITY),
-        ] {
+        assert!(ema(7.0).is_ok());
+        for time_constant in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             assert_eq!(
-                ema(alpha, time_constant).unwrap_err().code(),
+                ema(time_constant).unwrap_err().code(),
                 tonic::Code::InvalidArgument
             );
         }
@@ -2532,7 +2503,6 @@ mod frontier_delta_tests {
                 window_size: 10,
                 time_constant: std::f64::consts::LOG2_E,
                 poly_order: 1,
-                ..Default::default()
             });
             let held = build(&r, &[held_a.clone(), b.clone()]);
             assert_eq!(inflate_full(&held).x_values, vec![3.5, 11.5, 19.5, 27.5]);
@@ -2605,7 +2575,6 @@ mod frontier_delta_tests {
                 window_size: 10,
                 time_constant: std::f64::consts::LOG2_E,
                 poly_order: 1,
-                ..Default::default()
             });
             let held = build(&r, &[held_a.clone(), b.clone()]);
             let held_model = inflate_full(&held);
@@ -2822,7 +2791,6 @@ mod frontier_delta_tests {
         continued.cache_state = echo(&held);
         continued.cache_state.as_mut().unwrap().held_series = None;
         assert!(verified_inputs(&continued, &current, &held.frontiers).is_some());
-        assert!(held_series_count(continued.cache_state.as_ref().unwrap(), false).is_none());
         let truth = inflate_full(&held);
         for audit in [false, true] {
             let out = build_response(&continued, &current, None, audit).unwrap();
@@ -2893,7 +2861,6 @@ mod frontier_delta_tests {
                 window_size: 9,
                 time_constant: std::f64::consts::LOG2_E,
                 poly_order: 1,
-                ..Default::default()
             });
             let out = counted(expected, || {
                 build_response(&r, &[shaped(uniform)], None, false).unwrap()
@@ -3081,7 +3048,6 @@ mod frontier_delta_tests {
                 window_size: 3,
                 time_constant: 100.0,
                 poly_order: 1,
-                ..Default::default()
             });
             let held_rows = [
                 shaped(
@@ -3154,18 +3120,6 @@ mod frontier_delta_tests {
             ));
             assert!(out.x_values.len() < truth.x_values.len() / 2);
 
-            // A tab below wire revision 2 echoes the sentinel instead; the server recovers the count from the exact state.
-            let mut old_client_state = echo(&held).unwrap();
-            old_client_state.held_series = Some(EXACT_STATE_HELD_SERIES);
-            let mut old_client_req = r.clone();
-            old_client_req.cache_state = Some(old_client_state);
-            let old_client_out = build(&old_client_req, &grown);
-            assert!(old_client_out.delta);
-            assert!(eq(
-                &splice(&inflate_full(&held), &old_client_out),
-                &inflate_full(&truth)
-            ));
-
             // Rolling out the server against a response created before the exact keys existed costs one full answer, then reseeds them.
             let mut legacy_state = echo(&held).unwrap();
             legacy_state
@@ -3217,7 +3171,6 @@ mod frontier_delta_tests {
                 window_size: 3,
                 time_constant: std::f64::consts::LOG2_E,
                 poly_order: 1,
-                ..Default::default()
             });
             let held_rows = [shaped(
                 &[0, 2, 4, 6, 7, 8, 9, 10],
@@ -3610,7 +3563,7 @@ mod frontier_delta_tests {
             }
             r.cache_state = Some(proto::ChartCacheState {
                 frontiers,
-                held_series: Some(EXACT_STATE_HELD_SERIES),
+                held_series: Some(series_key as u32),
             });
             // audit forced on (build_response ..., true, ...): the audit is where the misalignment struck.
             let out = build_response(&r, &rows, None, true).unwrap();
@@ -3695,7 +3648,6 @@ mod frontier_delta_tests {
                     window_size: 10,
                     time_constant: 100.0,
                     poly_order: 1,
-                    ..Default::default()
                 });
             }
             let held = build(&r, &held_rows);

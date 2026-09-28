@@ -23,7 +23,7 @@ pub const PUSH_CONTROL: &str = "/kymo.push/control";
 /// Sent as `?rev=` on the socket URL. Bump it in the frontend change that stops using a wire shape the server will later drop.
 pub const FRONTEND_WIRE_REVISION: u32 = 2;
 /// Oldest frontend revision the server serves. Raise it only after every served frontend has reached that revision.
-pub const MIN_FRONTEND_WIRE_REVISION: u32 = 1;
+pub const MIN_FRONTEND_WIRE_REVISION: u32 = 2;
 // A server must serve the bundle built from its own commit.
 const _: () = assert!(MIN_FRONTEND_WIRE_REVISION <= FRONTEND_WIRE_REVISION);
 /// Sent with InvalidArgument to frontends below the floor, which stop connecting and reload. Frozen: shipped bundles match it exactly.

@@ -6,7 +6,6 @@
 pub const SMOOTHING_STATE_VERSION_KEY: &str = "\0kymo:smoothing-version";
 pub const SMOOTHING_STATE_VERSION: i64 = 2;
 pub const SMOOTHING_STATE_SERIES_KEY: &str = "\0kymo:smoothing-series";
-pub const EXACT_STATE_HELD_SERIES: u32 = u32::MAX;
 
 /// One run's columns, aligned to the chart's shared axis (same length, NaN where the run has no data in a slot).
 /// `values`: the exact sample at raw slots, the bucket mean at envelope slots (never stroked unsmoothed), or the smoothed curve. `raw_values`: pre-smoothing samples, smoothed passthrough charts only. `min_values`/`max_values`: the envelope — DENSE over the run's occupied slots on any banded chart (min == max behind a single sample, so the band pinches to the line through raw slots), absent entirely on band-less charts and for runs with no finite sample. `nan_indices`/`nan_kinds`: slots where the run logged a non-finite value (1 NaN, 2 +inf, 3 -inf, 4 unplottable x). `xnan_count`: how many samples sit behind the kind-4 markers (tooltip "×N"); whole-series display metadata like `label` — ships complete, adopted on splice, unhashed.

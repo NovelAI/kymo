@@ -13,7 +13,6 @@ fn settled_negative_log_markers_keep_polls_and_appends_small() {
                 window_size: 20,
                 time_constant: std::f64::consts::LOG2_E,
                 poly_order: 1,
-                ..Default::default()
             });
             let held_rows = shaped(2_001);
             let held = build(&request, std::slice::from_ref(&held_rows));
@@ -271,7 +270,6 @@ fn smoothers_bound_new_negative_timestamps_with_an_unchanged_plan() {
                 window_size: 5,
                 time_constant: std::f64::consts::LOG2_E,
                 poly_order: 1,
-                ..Default::default()
             });
             let held = build(&request, &[samples(60), other.clone()]);
             let current = [samples(61), other];

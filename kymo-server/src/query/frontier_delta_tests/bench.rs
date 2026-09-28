@@ -53,7 +53,6 @@ fn response_builder_benchmark() {
                 window_size: 20,
                 time_constant: std::f64::consts::LOG2_E,
                 poly_order: 1,
-                ..Default::default()
             });
             let held = response(&req, &old_inputs);
             let mut continued = req.clone();
