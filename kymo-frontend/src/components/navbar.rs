@@ -5,7 +5,7 @@ use crate::components::options_editor::ProjectDefaultsEditor;
 use crate::components::theme_toggle::ThemeToggle;
 use crate::route::Route;
 use crate::state::{DashboardState, DirectRunLoad, SectionConfig, UserConfigState};
-use crate::util::{editor_trigger_id, primary, unique_id};
+use crate::util::{editor_trigger_id, is_app_escape, primary, unique_id};
 
 #[component]
 pub fn Navbar() -> Element {
@@ -83,8 +83,8 @@ pub fn Navbar() -> Element {
                     oninput: move |e: Event<FormData>| panel_filter.set(e.value()),
                     onkeydown: move |e: Event<KeyboardData>| {
                         // Esc clears, matching the maximize/dialog dismissal idiom. Consumed only while there's a filter to clear, so one Esc doesn't also close a maximized chart; on an empty filter it falls through untouched — Signal::set notifies subscribers even on equal values, so an unconditional clear would re-render them for nothing.
-                        if e.key() == Key::Escape && !panel_filter.peek().is_empty() {
-                            e.stop_propagation();
+                        if is_app_escape(&e) && !panel_filter.peek().is_empty() {
+                            e.prevent_default();
                             panel_filter.set(String::new());
                         }
                     },

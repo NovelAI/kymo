@@ -1,5 +1,5 @@
 use super::*;
-use crate::util::{js_bridge::js_string, TOP_LAYER_SELECTOR};
+use crate::util::{focus_on_mount, is_app_escape, js_bridge::js_string, TOP_LAYER_SELECTOR};
 
 /// A run's liveness glyph: shape tells the kind of state, CSS color its severity.
 #[component]
@@ -99,21 +99,17 @@ pub fn Sidebar() -> Element {
         let _ = js_sys::eval("window.__kymo_refreshHl()");
     });
 
-    use_future({
-        let bridge = sidebar_pick_bridge.clone();
-        move || {
-            let bridge = bridge.clone();
-            async move {
-                let js = bridge
-                    .script(SIDEBAR_PICK_BRIDGE_JS)
-                    .replace("__TOP_LAYER_SELECTOR__", &js_string(TOP_LAYER_SELECTOR));
-                let mut eval = document::eval(&js);
-                while let Ok(action) = eval.recv::<String>().await {
-                    end_paint_if_active(paint);
-                    if action == "cancel" && trash_pick.peek().is_some() && !*trash_busy.peek() {
-                        trash_feedback.set(String::new());
-                        close_trash_picker(trash_pick, paint);
-                    }
+    use_future(move || {
+        let js = sidebar_pick_bridge
+            .script(SIDEBAR_PICK_BRIDGE_JS)
+            .replace("__TOP_LAYER_SELECTOR__", &js_string(TOP_LAYER_SELECTOR));
+        async move {
+            let mut eval = document::eval(&js);
+            while let Ok(action) = eval.recv::<String>().await {
+                end_paint_if_active(paint);
+                if action == "cancel" && trash_pick.peek().is_some() && !*trash_busy.peek() {
+                    trash_feedback.set(String::new());
+                    close_trash_picker(trash_pick, paint);
                 }
             }
         }
@@ -252,18 +248,6 @@ pub fn Sidebar() -> Element {
                 "sidebar"
             },
             onmouseleave: move |_| end_paint_if_active(paint),
-            onkeydown: move |e: Event<KeyboardData>| {
-                // Bulk-mode Escape is window-scoped by SIDEBAR_PICK_BRIDGE_JS.
-                // Outside bulk mode, retain the existing clear-filter behavior.
-                if e.key() == Key::Escape
-                    && trash_pick.peek().is_none()
-                    && !filter.peek().is_empty()
-                {
-                    e.stop_propagation();
-                    end_paint_if_active(paint);
-                    filter.set(String::new());
-                }
-            },
             div { class: "sidebar-actions",
                 button {
                     class: "btn-link",
@@ -297,11 +281,7 @@ pub fn Sidebar() -> Element {
                             disabled: *trash_busy.read(),
                             title: "Cancel trash selection",
                             aria_label: "Cancel trash selection",
-                            onmounted: move |e| {
-                                spawn(async move {
-                                    let _ = e.data().set_focus(true).await;
-                                });
-                            },
+                            onmounted: focus_on_mount,
                             onmousedown: primary(move |_| {
                                 trash_feedback.set(String::new());
                                 close_trash_picker(trash_pick, paint);
@@ -338,6 +318,14 @@ pub fn Sidebar() -> Element {
                     oninput: move |e: Event<FormData>| {
                         end_paint_if_active(paint);
                         filter.set(e.value());
+                    },
+                    // Esc clears, like the navbar filter.
+                    onkeydown: move |e: Event<KeyboardData>| {
+                        if is_app_escape(&e) && !filter.peek().is_empty() {
+                            e.prevent_default();
+                            end_paint_if_active(paint);
+                            filter.set(String::new());
+                        }
                     },
                 }
             }

@@ -1698,6 +1698,8 @@ input[type="checkbox"]:checked::before {
     align-items: center;
     justify-content: center;
     cursor: pointer;
+    /* Focused on mount so its Esc handler gets the key; a focus ring would outline the whole viewport. */
+    outline: none;
 }
 
 .cdn-lightbox-img {

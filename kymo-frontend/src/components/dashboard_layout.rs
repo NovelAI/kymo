@@ -21,7 +21,7 @@ use crate::state::zones::{ZoneBridge, ZoneRegistry};
 use crate::state::{
     load_diff_or_route, DashboardState, DirectRunLoad, DirectRunView, LayoutConfig, MaximizedRect,
 };
-use crate::util::{primary, TOP_LAYER_SELECTOR};
+use crate::util::{focus_on_mount, js_bridge::js_string, primary, TOP_LAYER_SELECTOR};
 
 const EXPLICIT_METADATA_CONCURRENCY: usize = 16;
 /// Backoff between retry passes over keys whose lookup failed transiently.
@@ -49,12 +49,12 @@ window.__kymo_bridges.mount(__BRIDGE_NAME__,__BRIDGE_OWNER__,()=>{clearTimeout(t
 ro.observe(el);
 })()"#;
 
-fn has_open_top_layer() -> bool {
-    web_sys::window()
-        .and_then(|window| window.document())
-        .and_then(|document| document.query_selector(TOP_LAYER_SELECTOR).ok().flatten())
-        .is_some()
-}
+/// Esc closes the maximized chart wherever focus is, including `<body>` and the notice bar outside the app shell. On `window` it runs after the in-app handlers and bulk mode's `document` listener, and skips Esc they consumed (`defaultPrevented`), IME composition Esc, and Esc an open native dialog or popover will close.
+const MAXIMIZE_ESCAPE_JS: &str = r#"(()=>{
+function key(e){if(e.key==='Escape'&&!e.isComposing&&!e.defaultPrevented&&!document.querySelector(__TOP_LAYER_SELECTOR__)){try{dioxus.send(true);}catch(_){td();}}}
+const td=window.__kymo_bridges.mount(__BRIDGE_NAME__,__BRIDGE_OWNER__,()=>window.removeEventListener('keydown',key));
+window.addEventListener('keydown',key);
+})()"#;
 
 fn explicit_run_keys(layout: &LayoutConfig, current_project: &str) -> Vec<(String, String)> {
     let mut keys = layout
@@ -611,17 +611,6 @@ pub fn DashboardLayout(project_id: String) -> Element {
                     }
                 });
             },
-            // Handle Esc from app descendants, including sidebar/navbar links outside the maximize overlay.
-            // Native dialogs and popovers dismiss after keydown bubbles, so
-            // leave Escape to the top layer. Panel filters consume their own key.
-            onkeydown: move |e: Event<KeyboardData>| {
-                if e.key() == Key::Escape
-                    && state.maximized.peek().is_some()
-                    && !has_open_top_layer()
-                {
-                    focus_chart(None);
-                }
-            },
             Navbar {}
             div { class: "content-row",
                 if state.current_run.read().is_none() {
@@ -660,18 +649,19 @@ fn MaximizeOverlay() -> Element {
     let state = use_context::<DashboardState>();
     let mut maximized_signal = state.maximized;
 
-    // Reclaim focus when the page under the overlay changes: the clicked sidebar/navbar link unmounts on navigation, dropping focus to <body>, whose keydowns bypass the app-shell Esc handler.
-    // onmounted can't cover this — the overlay itself never remounts. With the overlay closed the selector matches nothing and this is a no-op.
-    let route = use_route::<Route>();
-    let mut route_signal = use_signal(|| route.clone());
-    if *route_signal.peek() != route {
-        route_signal.set(route);
-    }
-    use_effect(move || {
-        let _ = route_signal.read();
-        spawn(async move {
-            let _ = document::eval("document.querySelector('.maximize-overlay')?.focus()").await;
-        });
+    let escape_bridge = crate::util::js_bridge::use_bridge("maximize_escape");
+    use_future(move || {
+        let js = escape_bridge
+            .script(MAXIMIZE_ESCAPE_JS)
+            .replace("__TOP_LAYER_SELECTOR__", &js_string(TOP_LAYER_SELECTOR));
+        async move {
+            let mut eval = document::eval(&js);
+            while eval.recv::<bool>().await.is_ok() {
+                if maximized_signal.peek().is_some() {
+                    focus_chart(None);
+                }
+            }
+        }
     });
 
     let view = match maximized_signal.read().clone() {
@@ -694,14 +684,10 @@ fn MaximizeOverlay() -> Element {
     rsx! {
         div {
             class: "maximize-overlay",
-            // Dismiss on click (mouseup) can be annoying if you drag the x-axis and release in the border.
-            // Focus on mount, so Esc works when the overlay opens with focus still on <body> (e.g. a direct `?chart=` link) — body keydowns never reach the app-shell div.
+            // Focus on mount so keyboard navigation starts inside the overlay, not on the grid control (e.g. the Maximize button) left focused beneath it.
             tabindex: "-1",
-            onmounted: move |e| {
-                spawn(async move {
-                    let _ = e.data().set_focus(true).await;
-                });
-            },
+            onmounted: focus_on_mount,
+            // Dismiss on click (mouseup) can be annoying if you drag the x-axis and release in the border.
             onmousedown: primary(move |_| focus_chart(None)),
             div {
                 class: "maximize-content",
@@ -758,6 +744,11 @@ mod tests {
     #[test]
     fn maximize_resize_uses_the_shared_lifecycle() {
         crate::util::js_bridge::validate_template(super::MAXIMIZE_RESIZE_JS);
+    }
+
+    #[test]
+    fn maximize_escape_uses_the_shared_lifecycle() {
+        crate::util::js_bridge::validate_template(super::MAXIMIZE_ESCAPE_JS);
     }
 
     fn explicit_layout() -> LayoutConfig {

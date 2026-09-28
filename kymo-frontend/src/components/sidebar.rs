@@ -18,7 +18,7 @@ use crate::grpc::GrpcClient;
 use crate::route::Route;
 use crate::state::trash::lookup_trashed_runs;
 use crate::state::DashboardState;
-use crate::util::{local_storage, primary};
+use crate::util::{is_app_escape, local_storage, primary};
 
 /// A transport cut, not a product limit. Arbitrarily large selections are
 /// sent sequentially so one WebSocket frame and one response stay modest.
@@ -498,9 +498,9 @@ let armed=false;
 function arm(e){if(e.button===0&&e.target.closest&&e.target.closest('.sidebar-run'))armed=true;}
 function end(e){if(e.type==='mouseup'&&e.button!==0)return;if(!armed)return;armed=false;send('end');}
 function key(e){
-  // Leave Escape to a native dialog or popover before cancelling bulk mode.
-  if(e.key==='Escape'&&!document.querySelector(__TOP_LAYER_SELECTOR__)&&document.querySelector('.sidebar-trash-mode:not(.sidebar-trash-busy)')){
-    e.preventDefault();e.stopPropagation();send('cancel');
+  // Bulk mode is a page-level Esc layer: it takes Esc that no in-app layer consumed, no IME composition is using, and no native dialog or popover will close. On `document` it runs before the maximized chart's `window` listener.
+  if(e.key==='Escape'&&!e.isComposing&&!e.defaultPrevented&&!document.querySelector(__TOP_LAYER_SELECTOR__)&&document.querySelector('.sidebar-trash-mode:not(.sidebar-trash-busy)')){
+    e.preventDefault();send('cancel');
   }
 }
 function cleanup(){
@@ -508,14 +508,14 @@ function cleanup(){
   window.removeEventListener('mouseup',end,true);
   window.removeEventListener('pointercancel',end,true);
   window.removeEventListener('blur',end);
-  window.removeEventListener('keydown',key,true);
+  document.removeEventListener('keydown',key);
 }
 const td=window.__kymo_bridges.mount(__BRIDGE_NAME__,__BRIDGE_OWNER__,cleanup);
 window.addEventListener('mousedown',arm,true);
 window.addEventListener('mouseup',end,true);
 window.addEventListener('pointercancel',end,true);
 window.addEventListener('blur',end);
-window.addEventListener('keydown',key,true);
+document.addEventListener('keydown',key);
 })()"#;
 
 /// Peek before writing: an unconditional `set` would dirty the signal and
@@ -740,7 +740,6 @@ fn InlineRunRename(
                 },
                 r#type: "text",
                 value: "{draft}",
-                autofocus: true,
                 readonly: *busy.read(),
                 aria_label: "Rename {target.display_label}",
                 aria_invalid: (!validation_error.is_empty()).then_some("true"),
@@ -769,13 +768,11 @@ fn InlineRunRename(
                 onkeydown: {
                     let mut submit = submit.clone();
                     move |e: Event<KeyboardData>| {
-                        if e.key() == Key::Enter {
+                        if e.key() == Key::Enter && !e.is_composing() {
                             e.prevent_default();
-                            e.stop_propagation();
                             submit(true);
-                        } else if e.key() == Key::Escape {
+                        } else if is_app_escape(&e) {
                             e.prevent_default();
-                            e.stop_propagation();
                             if !*busy.peek() {
                                 on_close.call(true);
                             }

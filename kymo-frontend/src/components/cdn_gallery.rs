@@ -10,7 +10,7 @@ use crate::components::metric_rect::CdnRunData;
 use crate::state::layout_config::CdnDisplayMode;
 use crate::state::panel_cache::Store;
 use crate::state::visibility::retry_visible;
-use crate::util::primary;
+use crate::util::{focus_on_mount, is_app_escape, primary};
 
 thread_local! {
     /// persist_key -> the step the user navigated to, so a gallery scrolled out of the band (its panel body unmounts, see metric_rect.rs) comes back on the same step. Only explicit navigation writes it — an untouched gallery keeps the default jump-to-latest on remount.
@@ -692,14 +692,10 @@ fn GalleryRenderer(
                         onmousedown: primary(move |_| lightbox_src.set(None)),
                         // Esc dismisses too. Focus on mount so the key lands here (the opening click may leave focus on the thumbnail link or <body>, whose keydowns never reach this div); consume it so an enclosing Esc layer (e.g. the maximize overlay) doesn't also dismiss.
                         tabindex: "-1",
-                        onmounted: move |e| {
-                            spawn(async move {
-                                let _ = e.data().set_focus(true).await;
-                            });
-                        },
+                        onmounted: focus_on_mount,
                         onkeydown: move |e: Event<KeyboardData>| {
-                            if e.key() == Key::Escape {
-                                e.stop_propagation();
+                            if is_app_escape(&e) {
+                                e.prevent_default();
                                 lightbox_src.set(None);
                             }
                         },

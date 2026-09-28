@@ -14,7 +14,7 @@ use crate::state::panel_cache::{panel_key, Store};
 use crate::state::visibility::{self, Zone};
 use crate::state::zones::ZoneRegistry;
 use crate::state::{resolve_capped_bindings, DashboardState, DisplayType, RectConfig, ViewContext};
-use crate::util::{editor_trigger_id, primary};
+use crate::util::{editor_trigger_id, focus_on_mount, is_app_escape, primary};
 
 fn normalize_rect_label(label: String) -> String {
     if label.trim().is_empty() {
@@ -393,41 +393,38 @@ fn MetricRectBody(
             div { class: "rect-header",
                 if *renaming.read() {
                     {
-                        let config_for_rename = config.clone();
-                        let on_update_rename = on_update;
+                        let mut commit_rename = {
+                            let config = config.clone();
+                            move || {
+                                renaming.set(false);
+                                let mut updated = config.clone();
+                                updated.label = normalize_rect_label(rename_value.read().clone());
+                                on_update.call(updated);
+                            }
+                        };
                         rsx! {
                             input {
                                 class: "rect-title-input",
                                 value: "{rename_value}",
-                                autofocus: true,
+                                // Not `autofocus`: browsers honour it once per document, and only while nothing else (e.g. the maximize overlay) has focus.
+                                onmounted: focus_on_mount,
                                 placeholder: "Label (empty = auto)",
                                 oninput: move |e: Event<FormData>| {
                                     rename_value.set(e.value());
                                 },
-                                onkeydown: move |e: Event<KeyboardData>| {
-                                    if e.key() == Key::Enter {
-                                        renaming.set(false);
-                                        let mut updated = config_for_rename.clone();
-                                        updated.label =
-                                            normalize_rect_label(rename_value.read().clone());
-                                        on_update_rename.call(updated);
-                                    } else if e.key() == Key::Escape {
-                                        // Consume the key so cancelling a rename inside a maximized chart doesn't also close the overlay.
-                                        e.stop_propagation();
-                                        renaming.set(false);
+                                onkeydown: {
+                                    let mut commit_rename = commit_rename.clone();
+                                    move |e: Event<KeyboardData>| {
+                                        if e.key() == Key::Enter && !e.is_composing() {
+                                            commit_rename();
+                                        } else if is_app_escape(&e) {
+                                            // Consume the key so cancelling a rename inside a maximized chart doesn't also close the overlay.
+                                            e.prevent_default();
+                                            renaming.set(false);
+                                        }
                                     }
                                 },
-                                onblur: {
-                                    let config_for_blur = config.clone();
-                                    let on_update_blur = on_update;
-                                    move |_| {
-                                        renaming.set(false);
-                                        let mut updated = config_for_blur.clone();
-                                        updated.label =
-                                            normalize_rect_label(rename_value.read().clone());
-                                        on_update_blur.call(updated);
-                                    }
-                                },
+                                onblur: move |_| commit_rename(),
                             }
                         }
                     }

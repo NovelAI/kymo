@@ -10,7 +10,10 @@ use std::cmp::Ordering;
 use std::fmt::Write as _;
 
 use dioxus::html::input_data::MouseButton;
-use dioxus::prelude::{Event, Modifiers, ModifiersInteraction, MouseData, PointerInteraction};
+use dioxus::prelude::{
+    spawn, Event, Key, KeyboardData, Modifiers, ModifiersInteraction, MountedEvent, MouseData,
+    PointerInteraction,
+};
 
 pub(crate) const TOP_LAYER_SELECTOR: &str = ":popover-open, dialog:modal";
 
@@ -20,6 +23,16 @@ pub fn local_time(ms: i64) -> String {
         .to_locale_string("en-US", &wasm_bindgen::JsValue::UNDEFINED)
         .as_string()
         .unwrap_or_else(|| ms.to_string())
+}
+
+/// Esc that an in-app layer may consume, marking it handled with `prevent_default`: Dioxus applies that to the native event, where the page-level Esc layers check it, while `stop_propagation` never leaves Dioxus. Esc cancelling an IME composition, or one that an open native dialog or popover closes on after keydown, is left alone; `prevent_default` would cancel that close.
+pub(crate) fn is_app_escape(e: &Event<KeyboardData>) -> bool {
+    e.key() == Key::Escape
+        && !e.is_composing()
+        && web_sys::window()
+            .and_then(|window| window.document())
+            .and_then(|document| document.query_selector(TOP_LAYER_SELECTOR).ok().flatten())
+            .is_none()
 }
 
 /// Compare two strings "naturally": maximal runs of ASCII digits compare by
@@ -110,6 +123,15 @@ pub fn editor_trigger_id(kind: &str, identity: &str) -> String {
         write!(id, "{byte:02x}").expect("writing to a String cannot fail");
     }
     id
+}
+
+/// `onmounted` handler that focuses its element at once, so keys typed right after the mount land in it (Chromium runs queued input before timers), and again one task later, because an element mounted by a mousedown handler loses focus to that press's default focus action.
+pub fn focus_on_mount(e: MountedEvent) {
+    spawn(async move {
+        let _ = e.data().set_focus(true).await;
+        gloo_timers::future::TimeoutFuture::new(0).await;
+        let _ = e.data().set_focus(true).await;
+    });
 }
 
 /// Instant actions run on primary press (AI-1418), excluding right/middle buttons and macOS Control-click context menus.

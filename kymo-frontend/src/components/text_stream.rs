@@ -20,7 +20,7 @@ use crate::state::app_state::find_run;
 use crate::state::layout_config::XAxisMode;
 use crate::state::visibility::{self, Zone};
 use crate::state::{run_ordinal_for, DashboardState, UserConfigState};
-use crate::util::primary;
+use crate::util::{is_app_escape, primary};
 
 /// Format a step value based on the X-axis mode.
 fn format_step(step: i64, first_step: i64, mode: &XAxisMode) -> String {
@@ -140,6 +140,10 @@ pub fn TextStreamViewer(
     let mut search = use_signal(|| initial.committed.clone());
     let mut chosen_tab = use_signal(|| initial.tab.clone());
     let mut search_revision = use_signal(|| 0u64);
+    let mut clear_search = move || {
+        search_draft.set(String::new());
+        search.set(String::new());
+    };
     use_drop({
         let persist_key = persist_key.clone();
         move || {
@@ -218,24 +222,33 @@ pub fn TextStreamViewer(
                     let next_revision = search_revision.peek().wrapping_add(1);
                     search_revision.set(next_revision);
                 },
+                // Not `type=search`: its built-in clear button and Esc clear empty only the box and leave an applied search applied.
                 input {
-                    r#type: "search",
+                    r#type: "text",
+                    role: "searchbox",
                     class: "text-stream-search",
                     placeholder: "Search logs",
+                    aria_label: "Search logs",
                     title: "Search is performed on the server",
                     maxlength: 128,
                     value: "{search_draft}",
                     oninput: move |event| search_draft.set(event.value()),
+                    // Esc does what Clear does while there's something to clear, consuming the key so a maximized chart stays open.
+                    onkeydown: move |e: Event<KeyboardData>| {
+                        if is_app_escape(&e)
+                            && !(search_draft.peek().is_empty() && search.peek().is_empty())
+                        {
+                            e.prevent_default();
+                            clear_search();
+                        }
+                    },
                 }
                 button { r#type: "submit", class: "text-stream-search-submit", "Search" }
                 if !committed_search.is_empty() {
                     button {
                         r#type: "button",
                         class: "text-stream-search-clear",
-                        onmousedown: primary(move |_| {
-                            search_draft.set(String::new());
-                            search.set(String::new());
-                        }),
+                        onmousedown: primary(move |_| clear_search()),
                         "Clear"
                     }
                 }

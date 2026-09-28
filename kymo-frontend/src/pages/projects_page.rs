@@ -5,7 +5,7 @@ use crate::components::theme_toggle::ThemeToggle;
 use crate::components::user_settings::UserSettingsButton;
 use crate::grpc::GrpcClient;
 use crate::route::Route;
-use crate::util::{local_storage, local_time, primary};
+use crate::util::{is_app_escape, local_storage, local_time, primary};
 
 const SORT_KEY: &str = "kymo_projects_sort";
 
@@ -139,7 +139,8 @@ pub fn ProjectsPage() -> Element {
                                 value: "{filter}",
                                 oninput: move |e: Event<FormData>| filter.set(e.value()),
                                 onkeydown: move |e: Event<KeyboardData>| {
-                                    if e.key() == Key::Escape && !filter.peek().is_empty() {
+                                    if is_app_escape(&e) && !filter.peek().is_empty() {
+                                        e.prevent_default();
                                         filter.set(String::new());
                                     }
                                 },
