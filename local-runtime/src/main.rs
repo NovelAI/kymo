@@ -73,12 +73,7 @@ enum Command {
         json: bool,
     },
     #[command(name = "__supervise", hide = true)]
-    Supervise {
-        #[arg(long)]
-        lock_fd: i32,
-        #[arg(long)]
-        ready_fd: i32,
-    },
+    Supervise,
 }
 
 #[derive(Debug, Eq, PartialEq, Serialize)]
@@ -126,6 +121,7 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<()> {
+    supervisor::close_inherited_descriptors_on_exec()?;
     validate_environment_namespace()?;
     let allow_install = matches!(
         &cli.command,
@@ -215,9 +211,7 @@ async fn run(cli: Cli) -> Result<()> {
             print_doctor(output, json)?;
             anyhow::ensure!(healthy, "local runtime has failed checks");
         }
-        Command::Supervise { lock_fd, ready_fd } => {
-            supervisor::run(&paths, lock_fd, ready_fd).await?;
-        }
+        Command::Supervise => supervisor::run(&paths).await?,
     }
     Ok(())
 }

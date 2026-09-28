@@ -3,15 +3,19 @@
 
 Dry-run by default: walks the archive and estimates what would be sent
 (point counts, media items/bytes, unsupported leftovers) without touching any
-server. Pass --execute together with an explicit --server to actually import.
+server. Pass --execute together with an explicit --server, or --local for this
+machine's kymo local mode, to actually import.
 
 Usage (needs pyarrow and this checkout's kymo client, installed from its
-python_client/ directory, whose internals the script uses):
+python_client/ directory, whose internals the script uses; --local also needs
+the runtime of the same release: pip install kymo-local-runtime==X when the
+checkout is at tag vX):
     python import_to_kymo.py --archive A --entity E --projects P  # dry-run
     python import_to_kymo.py --archive A --entity E --all         # everything
     python import_to_kymo.py --archive A --entity E --projects P \
         --execute --server HOST:50051
     ... --execute --server HOST:50051 --limit-runs 1              # pilot
+    ... --execute --local                                         # local mode
 
 Mapping (wandb -> kymo):
     project "foo bar"        -> project_id "wandb_foo_bar" (archive dir slug)
@@ -36,21 +40,23 @@ Mapping (wandb -> kymo):
     state                    -> FinalizeImportRun (finished=0, else nonzero)
 
 Data flows over the server's bulk-import lane (ImportRun / ImportMetricsBidi /
-FinalizeImportRun, requires KYMO_IMPORT_ENABLED=1 server-side): backdated
-created_at/terminated_at, big synchronous inserts with a private admission
-budget, no liveness churn. There is no fallback for servers without those
-RPCs — a server that returns UNIMPLEMENTED must be updated.
+FinalizeImportRun, requires KYMO_IMPORT_ENABLED=1 server-side, always on in
+local mode): backdated created_at/terminated_at, big synchronous inserts with
+a private admission budget, no liveness churn. There is no fallback for
+servers without those RPCs — a server that returns UNIMPLEMENTED must be
+updated.
 
 Retry is per run: a failed stream fails only its run (its bookkeeping stays
 incomplete) and the next invocation replays that run from the start —
 ClickHouse dedups on (project,run,metric,tag,step), the CDN is
 content-addressed, ImportRun and FinalizeImportRun converge. Per-run
 bookkeeping (_mkdb2_import.json, keyed by importer version + server + project
-+ run) skips completed runs unless --force. It records the export's
++ run) skips completed runs unless --force; a local installation keeps its own
+_kymo_import_local_<installation>.json beside it. It records the export's
 exported_at, and a completed run exported again since is reported
 (export_changed), not re-imported: a replay cannot remove rows it no longer
 writes (see below), so a re-import is deliberate — delete the run's
-_mkdb2_import.json, or --force the whole selection.
+bookkeeping file, or --force the whole selection.
 
 Runs whose export has not settled are deferred (counted as deferred_<reason>)
 unless --allow-partial-export: no or an incomplete _export.json, recorded
@@ -84,6 +90,9 @@ Known limitations:
 - --prefix renames projects, not runs: run ids stay wandb_<slug>_<id>, which
   keeps imported runs apart from a server's own, and run ids are global, so
   the same runs cannot be imported under two prefixes.
+- Bookkeeping records what was sent, not what the target still holds: after
+  the target is restored from a backup, or a local installation is copied,
+  runs it lacks still skip (--force them).
 - A worker holds up to --media-workers whole media files and a run's whole
   console log in memory. If the OS kills one (out of memory), the invocation
   stops, and a rerun resumes.
@@ -113,6 +122,7 @@ import pyarrow.parquet as pq
 
 from kymo._cdn import content_id, gallery_item, gallery_manifest, metadata_manifest
 from kymo._generated import kymo_pb2, kymo_pb2_grpc
+from kymo._local_runtime import ensure_local_endpoint, grpc_channel, http_client
 from kymo._wire import (
     _MAX_POINTS_PER_MSG,
     _chunk_tuples,
@@ -292,7 +302,7 @@ def run_id_for(proj_slug: str, orig_id: str) -> str:
 
 
 class ImportAborted(RuntimeError):
-    """The server cannot take imports at all; every run would fail the same way."""
+    """Every run would fail the same way (the server refuses imports, or the local stack cannot start), so the invocation ends."""
 
 
 class Counters(collections.Counter):
@@ -432,21 +442,43 @@ class Sender:
         self._galleries = collections.deque()
         self._max_inflight = 2 * cfg.media_workers
         if not self.dry:
-            self.channel = grpc.insecure_channel(cfg.server)
-            self.stub = kymo_pb2_grpc.KymoStub(self.channel)
-            limits = httpx.Limits(
-                max_connections=cfg.media_workers + 4,
-                max_keepalive_connections=cfg.media_workers + 4,
-            )
-            self.http = httpx.Client(timeout=120, limits=limits)
-            self.cdn_url = cfg.cdn or f"http://{cfg.server.rsplit(':', 1)[0]}:8080"
+            # --local connects in refresh_local.
+            self.generation = self.channel = None
+            if not cfg.installation:
+                self.channel = grpc.insecure_channel(cfg.server)
+                self.stub = kymo_pb2_grpc.KymoStub(self.channel)
+                limits = httpx.Limits(
+                    max_connections=cfg.media_workers + 4,
+                    max_keepalive_connections=cfg.media_workers + 4,
+                )
+                self.http = httpx.Client(timeout=120, limits=limits)
+                self.cdn_url = cfg.cdn or f"http://{cfg.server.rsplit(':', 1)[0]}:8080"
             self.pool = ThreadPoolExecutor(cfg.media_workers)
+
+    def refresh_local(self):
+        """--local: wake the stack after any stop, and reconnect when it restarted (a new generation: sockets and bearer). A stack that cannot start ends the invocation rather than each run starting it again."""
+        try:
+            endpoint = ensure_local_endpoint(
+                expected_installation_uuid=self.cfg.installation
+            )
+        except RuntimeError as e:
+            raise ImportAborted(str(e)) from e
+        if endpoint.endpoint_generation == self.generation:
+            return
+        if self.channel is not None:
+            self.http.close()
+            self.channel.close()
+        self.channel = grpc_channel(endpoint)
+        self.stub = kymo_pb2_grpc.KymoStub(self.channel)
+        self.http = http_client(endpoint, timeout=120)
+        self.cdn_url = endpoint.upload_origin
+        self.generation = endpoint.endpoint_generation
 
     # ---- runs
     def init_run(self, project_id, run_id, run_name, created_at_ms, attempts=4):
-        """`attempts` is the transient-error budget: the parent's registration
-        pass uses a large one so a server roll (minutes of UNAVAILABLE) pauses
-        the import instead of ending it."""
+        """`attempts` is the transient-error budget: the hosted parent's
+        registration pass uses a large one so a server roll (minutes of
+        UNAVAILABLE) pauses the import instead of ending it."""
         if self.dry:
             return
         req = kymo_pb2.ImportRunRequest(
@@ -466,6 +498,11 @@ class Sender:
                 e.code() == grpc.StatusCode.FAILED_PRECONDITION
                 and "bulk import is disabled" in (e.details() or "")
             ):
+                if self.cfg.installation:
+                    raise ImportAborted(
+                        "this local kymo runtime predates imports — upgrade "
+                        "kymo-local-runtime, run `kymo stop`, and retry"
+                    ) from e
                 raise ImportAborted(
                     "the server has bulk import disabled — start kymo-server "
                     "with KYMO_IMPORT_ENABLED=1 and retry"
@@ -668,8 +705,9 @@ class Sender:
     def close(self):
         if not self.dry:
             self.pool.shutdown(wait=True)
-            self.http.close()
-            self.channel.close()
+            if self.channel is not None:  # a --local Sender that never connected
+                self.http.close()
+                self.channel.close()
 
 
 # ------------------------------------------------------------- media handling
@@ -1367,7 +1405,7 @@ def import_run(sender, project_id, proj_slug, run_dir, run_meta, exported_at):
     sender.init_run(project_id, run_id, run_name, created_ms)
     if cfg.execute:
         # A re-import killed midway must not leave the previous complete marker standing; removed only now that ImportRun accepted the run, since a refusal changes nothing.
-        (run_dir / "_mkdb2_import.json").unlink(missing_ok=True)
+        (run_dir / cfg.marker).unlink(missing_ok=True)
     phase(
         "run_info",
         lambda: import_run_info(sender, ctx, run_dir, run_meta, created_ms),
@@ -1404,7 +1442,7 @@ def import_run(sender, project_id, proj_slug, run_dir, run_meta, exported_at):
 
     if cfg.execute:
         write_json(
-            run_dir / "_mkdb2_import.json",
+            run_dir / cfg.marker,
             {
                 "importer_version": IMPORTER_VERSION,
                 "imported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -1467,12 +1505,14 @@ def import_one(task):
     exported_at): run.json is read here rather than carried, because queued
     tasks that fill the executor's call-queue pipe hang a broken executor's
     shutdown before Python 3.11.5 (CPython gh-94777). Returns (run_dir.name,
-    counter delta, errors); ImportAborted, the server refusing imports
-    outright, propagates and ends the invocation."""
+    counter delta, errors); ImportAborted propagates and ends the
+    invocation."""
     sender = _WORKER
     before = sender.c.copy()
     project_id, dirname, run_dir, exported_at = task
     try:
+        if sender.cfg.installation:
+            sender.refresh_local()
         run_meta = read_json(run_dir / "run.json")
         errs = import_run(sender, project_id, dirname, run_dir, run_meta, exported_at)
     except ImportAborted:
@@ -1518,11 +1558,17 @@ def main():
     ap.add_argument(
         "--server",
         default=None,
-        help="kymo gRPC host:port (REQUIRED with --execute; no default "
-        "on purpose so no server is written by accident)",
+        help="kymo gRPC host:port (this or --local is REQUIRED with --execute; "
+        "no default on purpose so no server is written by accident)",
     )
     ap.add_argument(
         "--cdn", default=None, help="CDN base URL (default: server host :8080)"
+    )
+    ap.add_argument(
+        "--local",
+        action="store_true",
+        help="target this machine's kymo local mode instead of a --server; "
+        "--execute installs or starts it as needed",
     )
     ap.add_argument(
         "--rate",
@@ -1595,8 +1641,10 @@ def main():
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    if cfg.execute and not cfg.server:
-        ap.error("--execute requires an explicit --server")
+    if cfg.local and (cfg.server or cfg.cdn):
+        ap.error("--local replaces --server and --cdn")
+    if cfg.execute and not (cfg.server or cfg.local):
+        ap.error("--execute requires an explicit --server or --local")
     if not cfg.projects and not cfg.all:
         ap.error("pass --projects ... or --all")
     if cfg.workers < 1:
@@ -1640,6 +1688,19 @@ def main():
                     f"project {token!r} not found in {entity_root}/projects_map.json"
                 )
 
+    # --local keeps its markers in a file per installation, so a local import never touches a server's markers.
+    cfg.installation, cfg.marker = None, "_mkdb2_import.json"
+    if cfg.local and cfg.execute:
+        log.info(
+            "starting local kymo if needed (a first use installs it, which takes minutes)"
+        )
+        try:
+            cfg.installation = ensure_local_endpoint().installation_uuid
+        except RuntimeError as e:
+            log.error("%s", e)
+            return 1
+        cfg.marker = f"_kymo_import_local_{cfg.installation}.json"
+
     counters = Counters()
     pool = None
     if cfg.workers > 1:
@@ -1670,7 +1731,7 @@ def main():
             log.info("[%s] %s -> %s (%d runs)", mode, orig_name, project_id, len(runs))
             tasks = []
             for run_dir, run_meta in runs:
-                prev = read_json(run_dir / "_mkdb2_import.json") or {}
+                prev = read_json(run_dir / cfg.marker) or {}
                 if (
                     prev.get("server"),
                     prev.get("project_id"),
@@ -1692,9 +1753,10 @@ def main():
                         counters["export_changed"] += 1
                         log.warning(
                             "%s: export changed since its import (now %s); "
-                            "delete its _mkdb2_import.json to re-import it",
+                            "delete its %s to re-import it",
                             run_dir.name,
                             export_hold(exp, run_meta) or "settled",
+                            cfg.marker,
                         )
                     continue
                 if not cfg.allow_partial_export and (
@@ -1706,14 +1768,21 @@ def main():
                 if len(tasks) == cfg.limit_runs:
                     continue
                 if pool is not None:
-                    # Chronological, before any worker touches the project. ~40 attempts with the capped backoff is ~17 minutes of patience, enough to ride out a server roll. A per-run refusal (a trashed run, an invalid name) is left to the run's own ImportRun in its worker, which fails only that run.
+                    # Chronological, before any worker touches the project. Hosted, ~40 attempts with the capped backoff is ~17 minutes of patience, enough to ride out a server roll. A per-run refusal (a trashed run, an invalid name) is left to the run's own ImportRun in its worker, which fails only that run.
+                    if cfg.installation and not tasks:
+                        # The project's first registration: the scan so far can outlast ensure's short hold, and each ImportRun after it keeps the stack awake.
+                        _WORKER.refresh_local()
                     run_id, run_name, created_ms, _ = run_identity(dirname, run_meta)
+                    attempts = 1 if cfg.installation else 40
                     try:
                         _WORKER.init_run(
-                            project_id, run_id, run_name, created_ms, attempts=40
+                            project_id, run_id, run_name, created_ms, attempts=attempts
                         )
                     except grpc.RpcError as e:
-                        if e.code().name not in Sender._NO_RETRY_CODES:
+                        # Locally a stack has no roll to ride out, and one that stopped mid-pass comes back only through a worker's own ensure, whose ImportRun then registers the run: this pass just orders the runs.
+                        if not (
+                            cfg.installation or e.code().name in Sender._NO_RETRY_CODES
+                        ):
                             raise
                 tasks.append((project_id, dirname, run_dir, exported_at))
             results = (

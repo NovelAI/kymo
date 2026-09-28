@@ -58,6 +58,7 @@ Local mode uses:
 - Two distinct, high, loopback-only browser ports persisted in `runtime.json` at installation.
 - A release frontend bundle embedded in the local server.
 - An allowlisted supervisor environment (home, locale, XDG paths, `KYMO_LOCAL_ROOT`), inherited by every child, so the stack behaves the same whichever process woke it.
+- No caller descriptors in the stack: the launcher marks every descriptor above stderr close-on-exec before it starts anything, so the stack never holds its waker's pipes open (anything waiting for them to close, such as a parent's `join` or a shell pipeline, would otherwise wait until the stack stopped).
 
 The dashboard and CDN ports are stable across idle stops and restarts. Startup binds the exact persisted ports before spawning children. A conflict fails with a diagnostic naming `kymo ports`; it never silently changes a printable run URL. The supervisor retains duplicate listener descriptors for the life of the stack.
 
@@ -109,6 +110,8 @@ kymo.open_run()        # wakes the stack, opens this run, returns its URL
 ```
 
 `run_url()` uses the install-time dashboard port returned at initialization, so the URL remains valid after idle restarts. `open_run()` invokes `kymo open` with the expected installation UUID, which refuses to target a replacement data directory and adds a timed open hold while the browser starts. `kymo open` prints the URL before trying the browser helper, and a missing helper is only a warning.
+
+`tools/wandb-import/import_to_kymo.py --local` imports W&B history. The supervised server always enables the bulk-import lane: it sits behind the same bearer as every other native call, so it reaches no one who could not already log runs. The importer wakes the stack before each run and reconnects if the endpoint generation changed.
 
 On an individual VPN server, keep local mode bound to loopback and SSH-forward both persisted browser ports at the same numbers so the two-origin layout remains intact; `kymo ports` shows them, or sets memorable ones after a plain `kymo stop`; URLs printed earlier by `run_url()` then change. Open the forwarded URL as `127.0.0.1` or `localhost`. A team-shared service should use hosted mode with its own PostgreSQL and ClickHouse. Docker Compose remains a reference/fallback deployment outside this ticket, not a bind-address option in local mode.
 
@@ -222,3 +225,5 @@ Also settled: a native launcher instead of Docker Compose (no Docker Desktop pre
 ## Changes
 
 - 2026-09-23: A recorded failure no longer circuit-breaks the stack into a `Degraded` state that only `kymo start --retry` cleared; it is diagnostic, and the next start retries once the recorded processes are proven gone (a transient crash otherwise left local mode silently offline). The mkdb2 ProjectDirs migration was dropped: nothing had been installed externally, so pre-release installations reinstall.
+- 2026-09-28: The launcher stopped handing its caller's inheritable descriptors to the stack. A woken stack used to hold its waker's pipes open: a parent's `join` timed out, and a shell pipeline stayed open until the stack stopped.
+- 2026-09-28: The supervised server enables the bulk-import lane, and the W&B importer's `--local` imports into local mode.

@@ -323,10 +323,6 @@ async fn start_with_lock(paths: &RuntimePaths, lock: File) -> Result<()> {
     let mut command = Command::new(&executable);
     command
         .arg("__supervise")
-        .arg("--lock-fd")
-        .arg(SUPERVISOR_LOCK_FD.to_string())
-        .arg("--ready-fd")
-        .arg(SUPERVISOR_READY_FD.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log));
@@ -421,15 +417,16 @@ impl LaunchRecord<'_> {
     }
 }
 
-pub(crate) async fn run(paths: &RuntimePaths, lock_fd: RawFd, ready_fd: RawFd) -> Result<()> {
-    ensure!(
-        lock_fd == SUPERVISOR_LOCK_FD && ready_fd == SUPERVISOR_READY_FD,
-        "invalid inherited supervisor descriptors"
-    );
-    let _runtime_lock = unsafe { File::from_raw_fd(lock_fd) };
-    let ready = unsafe { StdUnixStream::from_raw_fd(ready_fd) };
-    set_close_on_exec(lock_fd)?;
-    set_close_on_exec(ready_fd)?;
+pub(crate) async fn run(paths: &RuntimePaths) -> Result<()> {
+    // start_with_lock places these at the fixed numbers; without them (a hand-run `kymo __supervise`), a stack would start without the runtime lock.
+    for fd in [SUPERVISOR_LOCK_FD, SUPERVISOR_READY_FD] {
+        ensure!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) } != -1,
+            "__supervise runs only under the launcher; use `kymo start`"
+        );
+    }
+    let _runtime_lock = unsafe { File::from_raw_fd(SUPERVISOR_LOCK_FD) };
+    let ready = unsafe { StdUnixStream::from_raw_fd(SUPERVISOR_READY_FD) };
     install_rotating_process_log(&paths.state.join("supervisor.log"))?;
     let result = run_inner(&ready).await;
     if let Err(error) = &result {
@@ -1389,6 +1386,8 @@ async fn start_server(
         .env("CDN_LISTEN_ADDR", cdn_addr.to_string())
         .env("CDN_LISTENER_FD", CDN_LISTENER_FD.to_string())
         .env("KYMO_CDN_ROOT", paths.cdn_data())
+        // Always on locally, where only the bearer's holder reaches the lane (docs/local-deployment.md).
+        .env("KYMO_IMPORT_ENABLED", "1")
         .stdin(Stdio::null())
         .stdout(stdout)
         .stderr(stderr);
@@ -2234,10 +2233,26 @@ unsafe fn dup_to(source: RawFd, target: RawFd) -> std::io::Result<()> {
     Ok(())
 }
 
-fn set_close_on_exec(fd: RawFd) -> std::io::Result<()> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
-        return Err(std::io::Error::last_os_error());
+/// The launcher inherits whatever its caller left inheritable (the Python client spawns it with `close_fds=False`); unmarked, those would stay open in the whole stack for its life, so anything waiting for the caller's pipes to close, such as a parent's `join` or a shell pipeline, would wait until the stack stopped. Descriptors passed on purpose are placed afterwards by `dup_to`, which leaves them inheritable; in the supervisor, this also keeps its lock and readiness descriptors out of the stack.
+pub(crate) fn close_inherited_descriptors_on_exec() -> Result<()> {
+    // /dev/fd is only a conventional symlink on Linux, whereas /proc is already required there (sysinfo reads it).
+    #[cfg(target_os = "linux")]
+    const OPEN_DESCRIPTORS: &str = "/proc/self/fd";
+    #[cfg(not(target_os = "linux"))]
+    const OPEN_DESCRIPTORS: &str = "/dev/fd";
+    for entry in std::fs::read_dir(OPEN_DESCRIPTORS).context("list open descriptors")? {
+        if let Some(fd) = entry?
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<RawFd>().ok())
+            && fd > libc::STDERR_FILENO
+        {
+            // Fails only (EBADF) for a descriptor another thread closed since the listing, which needs nothing. Read-modify-write keeps macOS's FD_CLOFORK.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if flags != -1 {
+                unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+            }
+        }
     }
     Ok(())
 }
@@ -2420,13 +2435,12 @@ mod tests {
     }
 
     #[test]
-    fn inherited_supervisor_descriptors_are_closed_for_child_execs() {
+    fn inherited_descriptors_become_close_on_exec() {
         let file = tempfile::tempfile().unwrap();
         let fd = file.as_raw_fd();
-        set_close_on_exec(fd).unwrap();
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        assert_ne!(flags, -1);
-        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        assert_ne!(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }, -1);
+        close_inherited_descriptors_on_exec().unwrap();
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, libc::FD_CLOEXEC);
     }
 
     #[test]
