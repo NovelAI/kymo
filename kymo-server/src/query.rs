@@ -70,10 +70,31 @@ const MAX_CHART_FETCH_CONCURRENCY: usize = 16;
 /// fan-out.
 const CHART_QUERY_TIMEOUT: Duration = Duration::from_secs(45);
 
-fn canonicalize_chart_request(request: &mut proto::ChartRequest) {
+fn canonicalize_chart_request(request: &mut proto::ChartRequest) -> Result<(), Status> {
     if request.use_timestamp_axis {
         request.x_series = None;
     }
+    if let Some(smoothing) = request.smoothing.as_mut() {
+        // prost's getter reads unknown values, retired ones included, as NONE, which would silently answer an unsmoothed chart.
+        if Algorithm::try_from(smoothing.algorithm).is_err() {
+            return Err(Status::invalid_argument(format!(
+                "unknown smoothing algorithm {}",
+                smoothing.algorithm
+            )));
+        }
+        // Clients that predate time_constant send alpha; nothing past this point reads it.
+        if smoothing.time_constant == 0.0 {
+            smoothing.time_constant = -1.0 / (-smoothing.alpha).ln_1p();
+        }
+        smoothing.alpha = 0.0;
+        let tau = smoothing.time_constant;
+        if smoothing.algorithm() == Algorithm::Ema && !(tau.is_finite() && tau > 0.0) {
+            return Err(Status::invalid_argument(
+                "EMA smoothing needs a finite, positive time_constant",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn custom_x_runs(request: &proto::ChartRequest) -> Option<(&proto::SeriesRef, Vec<(&str, &str)>)> {
@@ -821,7 +842,7 @@ fn read_smoothing_state(
         .collect()
 }
 
-/// New clients use an impossible held-series count when exact smoothing state is present. A pre-fix server then fails its existing membership gate and answers in full during a rolling deployment; this server recovers the real count from the versioned opaque state. Older clients' literal counts remain accepted.
+/// Dashboards below wire revision 2 send an impossible held-series count when exact smoothing state is present; recover the real count from the versioned opaque state. Current clients send the literal count.
 fn held_series_count(cache: &proto::ChartCacheState, allow_exact_state: bool) -> Option<usize> {
     match cache.held_series? {
         EXACT_STATE_HELD_SERIES if allow_exact_state => {
@@ -838,7 +859,7 @@ fn held_series_count(cache: &proto::ChartCacheState, allow_exact_state: bool) ->
 struct ChartParams {
     step_min: i64,
     step_max: i64,
-    // With smoothing + a zoom range, fetch a margin past both zoom edges so the smoothed curve keeps its unzoomed shape (clipping the fetch at the zoom edge made windows clip there like a data edge), then trim back to [step_min, step_max] after smoothing. Warmup bounds, not exactness guarantees: they're in steps while windows are in samples, so a sparser-than-4x logger's windows clip early — same artifact as a real data edge, vanishingly small under the biweight/gaussian taper. EMA needs left history only; 8 half-lives decays the truncated mass to e⁻⁸.
+    // With smoothing + a zoom range, fetch a margin past both zoom edges so the smoothed curve keeps its unzoomed shape (clipping the fetch at the zoom edge made windows clip there like a data edge), then trim back to [step_min, step_max] after smoothing. Warmup bounds, not exactness guarantees: they're in steps while windows are in samples, so a sparser-than-4x logger's windows clip early — same artifact as a real data edge, vanishingly small under the biweight taper. EMA needs left history only; 8 time constants decay the truncated mass to e⁻⁸.
     fetch_min: i64,
     fetch_max: i64,
     use_time: bool,
@@ -846,7 +867,7 @@ struct ChartParams {
     is_smoothed: bool,
     algo: Algorithm,
     window_size: u32,
-    alpha: f64,
+    time_constant: f64,
     poly_order: u32,
     /// Whether this delta-capable request has a whole-series data-derived smoothing plan that must round-trip exactly. Step EMA/Triangular have no such state; custom-x never deltas.
     exact_smoothing_state: bool,
@@ -869,15 +890,10 @@ fn chart_params(req: &proto::ChartRequest) -> ChartParams {
     let window_size = smoothing.window_size.min(chart::MAX_SMOOTHING_WINDOW);
     let (margin_l, margin_r): (i64, i64) = match algo {
         Algorithm::None => (0, 0),
-        Algorithm::Ema => {
-            let a = smoothing.alpha;
-            let half_life = if a > 0.0 && a < 1.0 {
-                -1.0 / (1.0 - a).ln()
-            } else {
-                10.0
-            };
-            (((8.0 * half_life).ceil() as i64).clamp(1, 1_000_000), 0)
-        }
+        Algorithm::Ema => (
+            ((8.0 * smoothing.time_constant).ceil() as i64).clamp(1, 1_000_000),
+            0,
+        ),
         // Causal like EMA (nothing ahead), but its weights never decay, so a
         // correct value needs the whole run behind it — an unbounded left
         // extent that no finite margin expresses, pinned in fetch_min below.
@@ -912,13 +928,13 @@ fn chart_params(req: &proto::ChartRequest) -> ChartParams {
         is_smoothed,
         algo,
         window_size,
-        alpha: smoothing.alpha,
+        time_constant: smoothing.time_constant,
         poly_order: smoothing.poly_order,
         exact_smoothing_state: req.x_series.is_none()
             && match algo {
                 Algorithm::None => false,
                 Algorithm::Ema | Algorithm::Triangular => req.use_timestamp_axis,
-                Algorithm::Gaussian | Algorithm::SavitzkyGolay => true,
+                Algorithm::SavitzkyGolay => true,
             },
         all_same_metric: req
             .y_series
@@ -1219,7 +1235,7 @@ fn prepare(
         }
     }
 
-    // `held_series` and smoothing-state counts are untrusted client bytes. Prove the whole positional override before smoothing: an extra old-only group could otherwise shift NoState onto Gaussian/Savitzky-Golay and panic, or overrun the plan slice and return a 500.
+    // `held_series` and smoothing-state counts are untrusted client bytes. Prove the whole positional override before smoothing: an extra old-only group could otherwise shift NoState onto Savitzky-Golay and panic, or overrun the plan slice and return a 500.
     if smoothing_override.is_some_and(|plans| {
         !raw_series
             .iter()
@@ -1321,7 +1337,7 @@ fn prepare(
                     &raw_v,
                     p.algo,
                     p.window_size,
-                    p.alpha,
+                    p.time_constant,
                     p.poly_order,
                     plan,
                 ),
@@ -1895,11 +1911,10 @@ mod frontier_delta_tests {
     mod marker_delta_tests;
     mod smoother_hole_tests;
 
-    const ALGORITHMS: [Algorithm; 5] = [
+    const ALGORITHMS: [Algorithm; 4] = [
         Algorithm::None,
         Algorithm::Ema,
         Algorithm::Triangular,
-        Algorithm::Gaussian,
         Algorithm::SavitzkyGolay,
     ];
 
@@ -2008,7 +2023,7 @@ mod frontier_delta_tests {
         request.relative_time = true;
         request.log_buckets = true;
         request.smoothing = Some(proto::SmoothingConfig {
-            algorithm: Algorithm::Gaussian as i32,
+            algorithm: Algorithm::SavitzkyGolay as i32,
             window_size: 20,
             ..Default::default()
         });
@@ -2018,7 +2033,7 @@ mod frontier_delta_tests {
         };
         request.x_series = Some(custom_x.clone());
 
-        canonicalize_chart_request(&mut request);
+        canonicalize_chart_request(&mut request).unwrap();
         assert!(request.x_series.is_none());
 
         let held_rows = rows_shaped(3_000, |i| i, |i| 1_000_000 + 10 * i);
@@ -2035,8 +2050,54 @@ mod frontier_delta_tests {
 
         let mut step_request = req(&["a"], 300);
         step_request.x_series = Some(custom_x.clone());
-        canonicalize_chart_request(&mut step_request);
+        canonicalize_chart_request(&mut step_request).unwrap();
         assert_eq!(step_request.x_series, Some(custom_x));
+    }
+
+    #[test]
+    fn ema_takes_time_constant_or_the_one_alpha_implies_and_rejects_non_finite() {
+        let ema = |alpha: f64, time_constant: f64| {
+            let mut request = req(&["a"], 300);
+            request.smoothing = Some(proto::SmoothingConfig {
+                algorithm: Algorithm::Ema as i32,
+                alpha,
+                time_constant,
+                ..Default::default()
+            });
+            canonicalize_chart_request(&mut request)
+                .map(|()| request.smoothing.unwrap().time_constant)
+        };
+        assert!((ema(0.5, 0.0).unwrap() - std::f64::consts::LOG2_E).abs() < 1e-12);
+        assert_eq!(ema(0.5, 7.0).unwrap(), 7.0);
+        for (alpha, time_constant) in [
+            (f64::NAN, 0.0),
+            (0.0, 0.0),
+            (1.0, 0.0),
+            (0.5, f64::NAN),
+            (0.5, -1.0),
+            (0.5, f64::INFINITY),
+        ] {
+            assert_eq!(
+                ema(alpha, time_constant).unwrap_err().code(),
+                tonic::Code::InvalidArgument
+            );
+        }
+    }
+
+    /// Retired enum numbers must fail loudly instead of reading as NONE and shipping an unsmoothed chart.
+    #[test]
+    fn retired_smoothing_algorithms_are_invalid_arguments() {
+        for algorithm in [1, 3] {
+            let mut request = req(&["a"], 300);
+            request.smoothing = Some(proto::SmoothingConfig {
+                algorithm,
+                window_size: 20,
+                ..Default::default()
+            });
+            let err = canonicalize_chart_request(&mut request).unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{algorithm}");
+            assert!(err.message().contains(&algorithm.to_string()), "{err:?}");
+        }
     }
 
     #[test]
@@ -2045,7 +2106,7 @@ mod frontier_delta_tests {
         request.step_min = Some(100_000);
         request.step_max = Some(200_000);
         request.smoothing = Some(proto::SmoothingConfig {
-            algorithm: Algorithm::Gaussian as i32,
+            algorithm: Algorithm::SavitzkyGolay as i32,
             window_size: u32::MAX,
             ..Default::default()
         });
@@ -2073,14 +2134,7 @@ mod frontier_delta_tests {
     fn echo(held: &proto::ChartResponse) -> Option<proto::ChartCacheState> {
         (!held.frontiers.is_empty()).then(|| proto::ChartCacheState {
             frontiers: held.frontiers.clone(),
-            held_series: Some(
-                if held.frontiers.get(SMOOTHING_STATE_VERSION_KEY) == Some(&SMOOTHING_STATE_VERSION)
-                {
-                    EXACT_STATE_HELD_SERIES
-                } else {
-                    held.series.len() as u32
-                },
-            ),
+            held_series: Some(held.series.len() as u32),
         })
     }
 
@@ -2444,7 +2498,7 @@ mod frontier_delta_tests {
     fn smoothed_appends_still_splice_exactly() {
         let mut r = req(&["a"], 250);
         r.smoothing = Some(proto::SmoothingConfig {
-            algorithm: proto::smoothing_config::Algorithm::Gaussian as i32,
+            algorithm: proto::smoothing_config::Algorithm::SavitzkyGolay as i32,
             window_size: 20,
             ..Default::default()
         });
@@ -2476,8 +2530,9 @@ mod frontier_delta_tests {
             r.smoothing = Some(proto::SmoothingConfig {
                 algorithm: algorithm as i32,
                 window_size: 10,
-                alpha: 0.5,
+                time_constant: std::f64::consts::LOG2_E,
                 poly_order: 1,
+                ..Default::default()
             });
             let held = build(&r, &[held_a.clone(), b.clone()]);
             assert_eq!(inflate_full(&held).x_values, vec![3.5, 11.5, 19.5, 27.5]);
@@ -2515,25 +2570,23 @@ mod frontier_delta_tests {
                 .collect::<Vec<_>>(),
         );
 
-        for algorithm in [Algorithm::Gaussian, Algorithm::SavitzkyGolay] {
-            let mut r = req(&["a", "b"], 5);
-            r.smoothing = Some(proto::SmoothingConfig {
-                algorithm: algorithm as i32,
-                window_size: 10,
-                alpha: 0.5,
-                poly_order: 1,
-            });
-            let held = build(&r, &[held_a.clone(), b.clone()]);
-            let mut continued = r.clone();
-            continued.cache_state = echo(&held);
-            let out = build(&continued, &[grown_a.clone(), b.clone()]);
-            assert!(!out.audit_failed, "{algorithm:?}: planner lost a prefix");
-            assert!(out.delta, "{algorithm:?}: stable grid should still delta");
-            assert_eq!(out.from_col, 1, "{algorithm:?}: finite predecessor");
+        let mut r = req(&["a", "b"], 5);
+        r.smoothing = Some(proto::SmoothingConfig {
+            algorithm: Algorithm::SavitzkyGolay as i32,
+            window_size: 10,
+            poly_order: 1,
+            ..Default::default()
+        });
+        let held = build(&r, &[held_a.clone(), b.clone()]);
+        let mut continued = r.clone();
+        continued.cache_state = echo(&held);
+        let out = build(&continued, &[grown_a.clone(), b.clone()]);
+        assert!(!out.audit_failed, "planner lost a prefix");
+        assert!(out.delta, "stable grid should still delta");
+        assert_eq!(out.from_col, 1, "finite predecessor");
 
-            let truth = inflate_full(&build(&r, &[grown_a.clone(), b.clone()]));
-            assert!(eq(&splice(&inflate_full(&held), &out), &truth));
-        }
+        let truth = inflate_full(&build(&r, &[grown_a.clone(), b.clone()]));
+        assert!(eq(&splice(&inflate_full(&held), &out), &truth));
     }
 
     /// A verified new negative timestamp can reuse earlier shared columns: causal influence is marked before filtering, and kind-4 placement is bounded separately. Here the centered smoothers answer in full because the timestamp changes their exact plan from Uniform to Median.
@@ -2550,8 +2603,9 @@ mod frontier_delta_tests {
             r.smoothing = (algorithm != Algorithm::None).then_some(proto::SmoothingConfig {
                 algorithm: algorithm as i32,
                 window_size: 10,
-                alpha: 0.5,
+                time_constant: std::f64::consts::LOG2_E,
                 poly_order: 1,
+                ..Default::default()
             });
             let held = build(&r, &[held_a.clone(), b.clone()]);
             let held_model = inflate_full(&held);
@@ -2828,9 +2882,7 @@ mod frontier_delta_tests {
             (Algorithm::Triangular, false, true, (0, 0)),
             (Algorithm::Ema, true, false, (0, 1)),
             (Algorithm::Triangular, true, false, (0, 1)),
-            (Algorithm::Gaussian, true, true, (1, 0)),
             (Algorithm::SavitzkyGolay, true, true, (1, 0)),
-            (Algorithm::Gaussian, true, false, (1, 1)),
             (Algorithm::SavitzkyGolay, true, false, (1, 1)),
         ];
         for (algorithm, use_time, uniform, expected) in cases {
@@ -2839,8 +2891,9 @@ mod frontier_delta_tests {
             r.smoothing = (algorithm != Algorithm::None).then_some(proto::SmoothingConfig {
                 algorithm: algorithm as i32,
                 window_size: 9,
-                alpha: 0.5,
+                time_constant: std::f64::consts::LOG2_E,
                 poly_order: 1,
+                ..Default::default()
             });
             let out = counted(expected, || {
                 build_response(&r, &[shaped(uniform)], None, false).unwrap()
@@ -2849,7 +2902,7 @@ mod frontier_delta_tests {
                 out.frontiers.get(SMOOTHING_STATE_VERSION_KEY) == Some(&SMOOTHING_STATE_VERSION);
             assert_eq!(
                 has_exact,
-                use_time || matches!(algorithm, Algorithm::Gaussian | Algorithm::SavitzkyGolay),
+                use_time || algorithm == Algorithm::SavitzkyGolay,
                 "{algorithm:?} use_time={use_time}"
             );
         }
@@ -2861,7 +2914,7 @@ mod frontier_delta_tests {
             let mut step_req = req(&["a"], 100);
             step_req.smoothing = Some(proto::SmoothingConfig {
                 algorithm: algorithm as i32,
-                alpha: 0.5,
+                time_constant: std::f64::consts::LOG2_E,
                 poly_order: 1,
                 ..Default::default()
             });
@@ -2920,10 +2973,10 @@ mod frontier_delta_tests {
         }
     }
 
-    fn gaussian_req(runs: &[&str], target: u32) -> proto::ChartRequest {
+    fn savgol_req(runs: &[&str], target: u32) -> proto::ChartRequest {
         let mut r = req(runs, target);
         r.smoothing = Some(proto::SmoothingConfig {
-            algorithm: proto::smoothing_config::Algorithm::Gaussian as i32,
+            algorithm: proto::smoothing_config::Algorithm::SavitzkyGolay as i32,
             window_size: 20,
             ..Default::default()
         });
@@ -2956,11 +3009,11 @@ mod frontier_delta_tests {
 
     #[test]
     fn smoothing_semantic_plan_shift_answers_full() {
-        // Appended intervals change the exact time median from 12 to 10, rescaling every Gaussian output. The semantic-plan gate must reject before the sampled audit.
+        // Appended intervals change the exact time median from 12 to 10, rescaling every Savitzky–Golay output. The semantic-plan gate must reject before the sampled audit.
         let ts = |i: i64| {
             1_000_000 + 10 * i.min(1000) + 12 * (i - 1000).clamp(0, 1000) + 10 * (i - 2000).max(0)
         };
-        let mut r = gaussian_req(&["a"], 300);
+        let mut r = savgol_req(&["a"], 300);
         r.use_timestamp_axis = true;
         let held = build(&r, &[rows_shaped(2001, |i| i, ts)]);
         let grown = [rows_shaped(2041, |i| i, ts)];
@@ -2975,10 +3028,10 @@ mod frontier_delta_tests {
             ));
         }
 
-        // Step axis, gaussian: held logged every step (uniform spacing), the
+        // Step axis, Savitzky–Golay: held logged every step (uniform spacing), the
         // appends log every 3rd step — smooth_run switches from the
         // index-space smoother to the x-aware one, moving every output.
-        let r = gaussian_req(&["a"], 300);
+        let r = savgol_req(&["a"], 300);
         let held = build(&r, &[rows_shaped(2000, |i| i, |i| 1_000_000 + i)]);
         let stride = |i: i64| i.min(2000) + 3 * (i - 2000).max(0);
         let grown = [rows_shaped(2060, stride, |i| 1_000_000 + i)];
@@ -3016,7 +3069,6 @@ mod frontier_delta_tests {
         for algorithm in [
             proto::smoothing_config::Algorithm::Ema,
             proto::smoothing_config::Algorithm::Triangular,
-            proto::smoothing_config::Algorithm::Gaussian,
             proto::smoothing_config::Algorithm::SavitzkyGolay,
         ] {
             let mut r = req(&["a", "a"], 100);
@@ -3027,8 +3079,9 @@ mod frontier_delta_tests {
             r.smoothing = Some(proto::SmoothingConfig {
                 algorithm: algorithm as i32,
                 window_size: 3,
-                alpha: 1.0 - (-0.01f64).exp(),
+                time_constant: 100.0,
                 poly_order: 1,
+                ..Default::default()
             });
             let held_rows = [
                 shaped(
@@ -3083,7 +3136,7 @@ mod frontier_delta_tests {
         for ts in [(|i: i64| 1_000_000 + 10 * i) as fn(i64) -> i64, |i: i64| {
             1_000_000 + 10 * i + 2 * (i / 5)
         }] {
-            let mut r = gaussian_req(&["a"], 300);
+            let mut r = savgol_req(&["a"], 300);
             r.use_timestamp_axis = true;
             let held = build(&r, &[rows_shaped(3000, |i| i, ts)]);
             let grown = [rows_shaped(3080, |i| i, ts)];
@@ -3101,9 +3154,9 @@ mod frontier_delta_tests {
             ));
             assert!(out.x_values.len() < truth.x_values.len() / 2);
 
-            // An already-open older frontend echoes the literal count. The new server accepts it alongside the exact state.
+            // A tab below wire revision 2 echoes the sentinel instead; the server recovers the count from the exact state.
             let mut old_client_state = echo(&held).unwrap();
-            old_client_state.held_series = Some(held.series.len() as u32);
+            old_client_state.held_series = Some(EXACT_STATE_HELD_SERIES);
             let mut old_client_req = r.clone();
             old_client_req.cache_state = Some(old_client_state);
             let old_client_out = build(&old_client_req, &grown);
@@ -3154,7 +3207,6 @@ mod frontier_delta_tests {
         for algorithm in [
             proto::smoothing_config::Algorithm::Ema,
             proto::smoothing_config::Algorithm::Triangular,
-            proto::smoothing_config::Algorithm::Gaussian,
             proto::smoothing_config::Algorithm::SavitzkyGolay,
         ] {
             let mut r = req(&["a"], 100);
@@ -3163,8 +3215,9 @@ mod frontier_delta_tests {
             r.smoothing = Some(proto::SmoothingConfig {
                 algorithm: algorithm as i32,
                 window_size: 3,
-                alpha: 0.5,
+                time_constant: std::f64::consts::LOG2_E,
                 poly_order: 1,
+                ..Default::default()
             });
             let held_rows = [shaped(
                 &[0, 2, 4, 6, 7, 8, 9, 10],
@@ -3245,9 +3298,9 @@ mod frontier_delta_tests {
 
     #[test]
     fn margin_only_series_keeps_the_delta_as_all_nan() {
-        // Run b's samples sit ONLY in the smoothing fetch margin of the zoomed range (steps 1010.., zoom [0, 1000], gaussian window 20 → fetch to 1080): it ships as an all-NaN series the client holds and counts in held_series, while the range trim leaves it with old_count == 0. Verified pre-trim membership (PreparedSeries::provably_held) continues it; without that, the held-count gate answered full on EVERY poll for as long as the shape persisted — and with ascending steps a run parked past the zoom edge persists indefinitely.
+        // Run b's samples sit ONLY in the smoothing fetch margin of the zoomed range (steps 1010.., zoom [0, 1000], Savitzky–Golay window 20 → fetch to 1080): it ships as an all-NaN series the client holds and counts in held_series, while the range trim leaves it with old_count == 0. Verified pre-trim membership (PreparedSeries::provably_held) continues it; without that, the held-count gate answered full on EVERY poll for as long as the shape persisted — and with ascending steps a run parked past the zoom edge persists indefinitely.
         let zoomed = |runs: &[&str]| {
-            let mut q = gaussian_req(runs, 300);
+            let mut q = savgol_req(runs, 300);
             q.step_min = Some(0);
             q.step_max = Some(1000);
             q
@@ -3404,7 +3457,7 @@ mod frontier_delta_tests {
     fn all_marker_smoothed_series_deltas_without_a_plan() {
         let mut r = req(&["a", "b"], 500);
         r.smoothing = Some(proto::SmoothingConfig {
-            algorithm: proto::smoothing_config::Algorithm::Gaussian as i32,
+            algorithm: proto::smoothing_config::Algorithm::SavitzkyGolay as i32,
             window_size: 10,
             ..Default::default()
         });
@@ -3490,7 +3543,7 @@ mod frontier_delta_tests {
         assert!(truth_markers.min_values.is_empty());
     }
 
-    /// A forged/corrupt exact-smoothing cache state — one that UNDERCOUNTS held_series so it slips past the count gate while the old-only audit reconstruction still contains the extra group — must answer in full, never panic (a `NoState` plan shifted onto an active Gaussian series) or 500 (a plan-slice overrun). The audit keys plans by request/tag identity and gates to full on any mismatch, because `held_series` is client-controlled and its count alone cannot prove old-only and continuing groups align.
+    /// A forged/corrupt exact-smoothing cache state — one that UNDERCOUNTS held_series so it slips past the count gate while the old-only audit reconstruction still contains the extra group — must answer in full, never panic (a `NoState` plan shifted onto an active Savitzky–Golay series) or 500 (a plan-slice overrun). The audit keys plans by request/tag identity and gates to full on any mismatch, because `held_series` is client-controlled and its count alone cannot prove old-only and continuing groups align.
     #[test]
     fn forged_smoothing_state_answers_full_not_panic() {
         // A: dense across the zoom (continuing). B: OLD rows only in the warmup margin, NEW rows in-range (provably-held yet NON-continuing). M: margin-only (continuing, NoState).
@@ -3506,7 +3559,7 @@ mod frontier_delta_tests {
         let mut b: Vec<i64> = (60..=99).collect();
         b.extend(150..=200);
         let m: Vec<i64> = (60..=99).collect();
-        // [A,B] overruns the plan slice (a 500); [B,A,M] shifts NoState onto the active Gaussian series (a panic). The identity gate turns BOTH into a clean full answer.
+        // [A,B] overruns the plan slice (a 500); [B,A,M] shifts NoState onto the active Savitzky–Golay series (a panic). The identity gate turns BOTH into a clean full answer.
         type ForgedCase = (
             Vec<&'static str>,
             Vec<Arc<Vec<VersionedRawPoint>>>,
@@ -3525,7 +3578,7 @@ mod frontier_delta_tests {
         for (runs, rows, series_key, plans) in cases {
             let mut r = req(&runs, 100);
             r.smoothing = Some(proto::SmoothingConfig {
-                algorithm: proto::smoothing_config::Algorithm::Gaussian as i32,
+                algorithm: proto::smoothing_config::Algorithm::SavitzkyGolay as i32,
                 window_size: 10,
                 ..Default::default()
             });
@@ -3580,12 +3633,11 @@ mod frontier_delta_tests {
             state
         };
         let algorithms = [
-            proto::smoothing_config::Algorithm::Gaussian as i32,
             proto::smoothing_config::Algorithm::Ema as i32,
             proto::smoothing_config::Algorithm::Triangular as i32,
             proto::smoothing_config::Algorithm::SavitzkyGolay as i32,
         ];
-        let mut covered = [[[false; 2]; 2]; 4];
+        let mut covered = [[[false; 2]; 2]; 3];
         let mut deltas = 0;
         for case in 0..90u32 {
             let smoothed = case % 3 != 0;
@@ -3635,14 +3687,15 @@ mod frontier_delta_tests {
             r.relative_time = use_time;
             r.log_buckets = log;
             if smoothed {
-                // Mixed-radix dimensions: every 48 cases cover smoothing on/off and step/time × linear/log axes; among smoothed cases every algorithm sees every axis pair.
-                let algorithm_index = ((case / 12) % 4) as usize;
+                // Mixed-radix dimensions: every 36 cases cover smoothing on/off and step/time × linear/log axes; among smoothed cases every algorithm sees every axis pair.
+                let algorithm_index = ((case / 12) % 3) as usize;
                 covered[algorithm_index][use_time as usize][log as usize] = true;
                 r.smoothing = Some(proto::SmoothingConfig {
                     algorithm: algorithms[algorithm_index],
                     window_size: 10,
-                    alpha: 1.0 - (-0.01f64).exp(),
+                    time_constant: 100.0,
                     poly_order: 1,
+                    ..Default::default()
                 });
             }
             let held = build(&r, &held_rows);
@@ -4473,7 +4526,7 @@ impl QueryService {
         request: Request<proto::ChartRequest>,
     ) -> Result<Response<proto::ChartResponse>, Status> {
         let mut req = request.into_inner();
-        canonicalize_chart_request(&mut req);
+        canonicalize_chart_request(&mut req)?;
         if req.y_series.is_empty() {
             return Ok(Response::new(proto::ChartResponse::default()));
         }
@@ -5122,7 +5175,7 @@ mod emit_inflate_roundtrip {
                 log_buckets: log,
                 smoothing: smoothed.then(|| proto::SmoothingConfig {
                     algorithm: if case % 10 < 5 {
-                        proto::smoothing_config::Algorithm::Gaussian as i32
+                        proto::smoothing_config::Algorithm::SavitzkyGolay as i32
                     } else {
                         proto::smoothing_config::Algorithm::Triangular as i32
                     },

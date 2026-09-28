@@ -13,6 +13,7 @@ mod ws_rpc;
 pub use client::GrpcClient;
 pub use gen::proto;
 pub use ws::{
-    connection, connection_changed, merge_versions, raise, set_page_visibility, subscribe_push,
-    wait_until_page_visible,
+    connection, connection_changed, is_stale, merge_versions, raise, set_page_visibility,
+    subscribe_push, wait_until_page_visible,
 };
+pub use ws_rpc::RELOAD_REQUIRED;

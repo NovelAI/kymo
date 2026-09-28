@@ -691,44 +691,14 @@ pub fn run_ordinal_for(runs: &[RunInfo], run_id: &str) -> u64 {
     find_run(runs, run_id).map(|r| r.ordinal).unwrap_or(0)
 }
 
-/// Rewrite a ChartSeries label from the server by replacing its owning run_id
-/// with the corresponding run_name. Current responses carry that identity
-/// explicitly; the prefix parser remains only for old servers that omit it.
+/// Rewrite a ChartSeries label from the server by replacing its owning run_id with the corresponding run_name.
 pub fn rewrite_label_with_run_name(label: &str, series_run_id: &str, runs: &[RunInfo]) -> String {
-    if !series_run_id.is_empty() {
-        let Some(run) = runs.iter().find(|run| run.run_id == series_run_id) else {
-            return label.to_string();
-        };
-        if label == series_run_id {
-            return run.run_name.clone();
+    let run = runs.iter().find(|run| run.run_id == series_run_id);
+    match (run, label.strip_prefix(series_run_id)) {
+        (Some(run), Some(rest)) if rest.is_empty() || rest.starts_with('/') => {
+            format!("{}{rest}", run.run_name)
         }
-        if let Some(suffix) = label
-            .strip_prefix(series_run_id)
-            .and_then(|value| value.strip_prefix('/'))
-        {
-            return format!("{}/{suffix}", run.run_name);
-        }
-        return label.to_string();
-    }
-
-    if let Some(r) = runs.iter().find(|r| r.run_id == label) {
-        return r.run_name.clone();
-    }
-    if let Some(slash_pos) = label.find('/') {
-        let prefix = &label[..slash_pos];
-        if let Some(r) = runs.iter().find(|r| r.run_id == prefix) {
-            return format!("{}{}", r.run_name, &label[slash_pos..]);
-        }
-    }
-    label.to_string()
-}
-
-/// Extract the run_id (UUID) from a ChartSeries label. Returns the prefix
-/// before the first '/', or the whole label. Used for color lookup.
-pub fn run_id_from_label(label: &str) -> &str {
-    match label.find('/') {
-        Some(pos) => &label[..pos],
-        None => label,
+        _ => label.to_string(),
     }
 }
 
@@ -768,10 +738,6 @@ mod display_precedence_tests {
         assert_eq!(
             rewrite_label_with_run_name("team", "team/run", &runs),
             "team",
-        );
-        assert_eq!(
-            rewrite_label_with_run_name("team/loss", "", &runs),
-            "Short/loss",
         );
     }
 

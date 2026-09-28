@@ -10,14 +10,8 @@ use std::rc::Rc;
 
 use prost::Message as _;
 
-use crate::grpc::chart_delta::{
-    self, DenseChart, DenseSeries, EXACT_STATE_HELD_SERIES, SMOOTHING_STATE_SERIES_KEY,
-    SMOOTHING_STATE_VERSION, SMOOTHING_STATE_VERSION_KEY,
-};
-use crate::grpc::proto::{
-    smoothing_config::Algorithm, ChartCacheState, ChartRequest, ChartResponse, ChartSeries,
-    SeriesRef,
-};
+use crate::grpc::chart_delta::{self, DenseChart, DenseSeries};
+use crate::grpc::proto::{ChartCacheState, ChartRequest, ChartResponse, ChartSeries, SeriesRef};
 use crate::state::versions_key;
 
 /// One panel's cached chart, module-level so it survives body unmounts (see metric_rect.rs). `response` is always the FULL dense model — deltas splice before storing — so it serves subset filters, delta splices, and instant remount renders alike.
@@ -32,7 +26,7 @@ pub struct ChartCacheEntry {
     pub versions: Rc<HashMap<String, u64>>,
     pub metrics_gen: Rc<HashMap<String, u64>>,
     pub epoch: u64,
-    /// ChartResponse.frontiers of the freshest response folded in — opaque server state, including legacy watermarks or versioned lineage proofs, echoed verbatim on the next query ([`echo_state`]).
+    /// ChartResponse.frontiers of the freshest response folded in — opaque server state, including versioned lineage proofs, echoed verbatim on the next query ([`echo_state`]).
     pub frontiers: Rc<HashMap<String, i64>>,
     /// Requested runs that produced no series — their version bumps are noise to this panel. Derived only from complete linear responses without custom X (else empty): a range-trimmed answer can't prove a run silent outside the range, while log-axis filtering and an all-empty exact X/Y join can lose every series identity on the wire.
     pub noncontrib: Rc<HashSet<String>>,
@@ -178,42 +172,20 @@ pub fn echo_state(
     request: &ChartRequest,
     current_epoch: u64,
 ) -> Option<ChartCacheState> {
-    let algorithm = request
-        .smoothing
-        .as_ref()
-        .map_or(Algorithm::None, |s| s.algorithm());
-    // Only algorithms with a whole-series data-derived plan need the exact-state downgrade sentinel. Step EMA/Triangular use local x gaps with fixed dx_ref=1, and custom-x never deltas.
-    let exact_required = request.x_series.is_none()
-        && match algorithm {
-            Algorithm::None => false,
-            Algorithm::Ema | Algorithm::Triangular => request.use_timestamp_axis,
-            Algorithm::Gaussian | Algorithm::SavitzkyGolay => true,
-        };
-    let exact_state = entry.frontiers.get(SMOOTHING_STATE_VERSION_KEY)
-        == Some(&SMOOTHING_STATE_VERSION)
-        && entry.frontiers.get(SMOOTHING_STATE_SERIES_KEY)
-            == i64::try_from(entry.response.series.len()).ok().as_ref();
     (request.x_series.is_none()
         && entry.epoch == current_epoch
         && params_match(&entry.request, request)
         && splice_pairable(&entry.request, request)
-        // A server predating exact semantic smoothing state can render a full response, but stateful smoothers must never send it back as a delta base.
-        && (!exact_required || exact_state)
         && !entry.frontiers.is_empty()
         && !entry.response.x_values.is_empty())
     .then(|| ChartCacheState {
         frontiers: (*entry.frontiers).clone(),
         // The held series count — the membership gate's ground truth (kymo.proto held_series): the server only ships a delta when every one of these continues, so the positional splice can never be asked to pair against a series it doesn't have.
-        // Exact-state charts use an impossible sentinel so a pre-fix server's existing count gate answers in full during a rolling deployment.
-        held_series: Some(if exact_required {
-            EXACT_STATE_HELD_SERIES
-        } else {
-            entry.response.series.len() as u32
-        }),
+        held_series: Some(entry.response.series.len() as u32),
     })
 }
 
-/// Client-side eligibility for positional splicing: shared (run, metric) refs must retain their complete identity, including tags, and relative order. Refs present on only one side may interleave freely; new series ship complete. The server also verifies ref identity/order in its opaque state, while this gate avoids sending unusable state and protects echoes to legacy servers.
+/// Client-side eligibility for positional splicing: shared (run, metric) refs must retain their complete identity, including tags, and relative order. Refs present on only one side may interleave freely; new series ship complete. The server also verifies ref identity/order in its opaque state, while this gate avoids sending unusable state.
 fn splice_pairable(held: &ChartRequest, new: &ChartRequest) -> bool {
     fn key(s: &SeriesRef) -> (&str, &str) {
         (&s.run_id, &s.metric_name)
@@ -958,53 +930,6 @@ mod tests {
         assert!(echo_state(&entry, &logd, 0).is_none());
         // Reconnect/resync may land on a different server build. Keep painting the cache, but make its first subsequent query full.
         assert!(echo_state(&entry, &req(&["a", "b"], 500), 1).is_none());
-
-        // Step EMA has no whole-series derived scale, so it safely echoes a literal count across versions without exact state.
-        let mut smooth_req = req(&["a", "b"], 500);
-        smooth_req.smoothing = Some(crate::grpc::proto::SmoothingConfig {
-            algorithm: Algorithm::Ema as i32,
-            alpha: 0.5,
-            ..Default::default()
-        });
-        let mut smooth_entry = entry.clone();
-        smooth_entry.request = smooth_req.clone();
-        assert_eq!(
-            echo_state(&smooth_entry, &smooth_req, 0)
-                .unwrap()
-                .held_series,
-            Some(0)
-        );
-
-        // Time EMA does depend on an exact median. Require the version/count marker, then use the held-count sentinel that makes an older server answer in full instead of attempting its unsound legacy delta.
-        smooth_req.use_timestamp_axis = true;
-        smooth_entry.request = smooth_req.clone();
-        assert!(echo_state(&smooth_entry, &smooth_req, 0).is_none());
-        let mut exact_frontiers = (*smooth_entry.frontiers).clone();
-        exact_frontiers.insert(SMOOTHING_STATE_VERSION_KEY.into(), SMOOTHING_STATE_VERSION);
-        exact_frontiers.insert(SMOOTHING_STATE_SERIES_KEY.into(), 1);
-        smooth_entry.frontiers = Rc::new(exact_frontiers);
-        assert!(echo_state(&smooth_entry, &smooth_req, 0).is_none());
-        Rc::make_mut(&mut smooth_entry.frontiers).insert(SMOOTHING_STATE_SERIES_KEY.into(), 0);
-        assert_eq!(
-            echo_state(&smooth_entry, &smooth_req, 0)
-                .unwrap()
-                .held_series,
-            Some(EXACT_STATE_HELD_SERIES)
-        );
-
-        // Gaussian/Savitzky–Golay need the exact uniform/median branch even on a step axis, while custom-x never deltas and therefore sends no cache state at all.
-        let mut gaussian_req = req(&["a", "b"], 500);
-        gaussian_req.smoothing = Some(crate::grpc::proto::SmoothingConfig {
-            algorithm: Algorithm::Gaussian as i32,
-            window_size: 9,
-            ..Default::default()
-        });
-        let mut gaussian_entry = entry.clone();
-        gaussian_entry.request = gaussian_req.clone();
-        assert!(echo_state(&gaussian_entry, &gaussian_req, 0).is_none());
-        gaussian_req.x_series = gaussian_req.y_series.first().cloned();
-        gaussian_entry.request = gaussian_req.clone();
-        assert!(echo_state(&gaussian_entry, &gaussian_req, 0).is_none());
     }
 
     #[test]

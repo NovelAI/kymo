@@ -11,7 +11,7 @@ use crate::components::uplot_chart::UPlotChart;
 use crate::grpc::chart_delta::DenseChart;
 use crate::grpc::proto::{ChartRequest, SeriesRef, SmoothingConfig};
 use crate::state::chart_sync::{self, ChartCacheEntry};
-use crate::state::layout_config::{MetricBinding, RectOptions};
+use crate::state::layout_config::{ema_time_constant, MetricBinding, RectOptions};
 use crate::state::visibility::{self, Zone};
 use crate::state::{resolve_capped_bindings, DashboardState};
 
@@ -533,8 +533,10 @@ pub(super) fn NumericContent(
                     smoothing: Some(SmoothingConfig {
                         algorithm: algo,
                         window_size: opts.smoothing_window,
+                        // alpha too, until no server predates time_constant.
                         alpha: opts.smoothing_alpha,
                         poly_order: opts.smoothing_poly_order,
+                        time_constant: ema_time_constant(opts.smoothing_alpha),
                     }),
                     target_resolution: measured_px,
                     step_min: zoom.map(|z| z.0),
@@ -784,12 +786,7 @@ pub(super) fn NumericContent(
                 (*chart).clone()
             };
 
-            // Resolve run_id UUIDs in labels to run_names, and compute
-            // per-series colors from run ordinals. Identity comes from the
-            // series' run_id field; older servers don't send it, so fall
-            // back to parsing the label ("run_id", "run_id/tag",
-            // "run_id/metric_name", ... — run_id is the prefix up to the
-            // first '/').
+            // Each series' run_id names its run: run_name for the label, ordinal for the color.
             let all_runs = state.display_runs();
             let labels: Vec<String> = display_chart
                 .series
@@ -800,12 +797,7 @@ pub(super) fn NumericContent(
                 .series
                 .iter()
                 .map(|s| {
-                    let rid = if !s.run_id.is_empty() {
-                        s.run_id.clone()
-                    } else {
-                        crate::state::run_id_from_label(&s.label).to_string()
-                    };
-                    if let Some(run) = all_runs.iter().find(|r| r.run_id == rid) {
+                    if let Some(run) = all_runs.iter().find(|r| r.run_id == s.run_id) {
                         (
                             crate::components::uplot_chart::run_color(&run.run_id, run.ordinal),
                             Some(run.run_name.clone()),

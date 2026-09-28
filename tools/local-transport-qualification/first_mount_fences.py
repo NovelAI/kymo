@@ -270,7 +270,7 @@ def fixture_page(browser: Browser, origin: str, peer: Peer):
             route.continue_()
 
     def route_socket(socket: WebSocketRoute) -> None:
-        if socket.url != origin.replace("http://", "ws://") + WS_PATH:
+        if socket.url.split("?", 1)[0] != origin.replace("http://", "ws://") + WS_PATH:
             peer.errors.append(f"unexpected socket: {socket.url}")
             socket.close()
             return

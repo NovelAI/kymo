@@ -11,8 +11,9 @@ fn settled_negative_log_markers_keep_polls_and_appends_small() {
             request.smoothing = (algorithm != Algorithm::None).then_some(proto::SmoothingConfig {
                 algorithm: algorithm as i32,
                 window_size: 20,
-                alpha: 0.5,
+                time_constant: std::f64::consts::LOG2_E,
                 poly_order: 1,
+                ..Default::default()
             });
             let held_rows = shaped(2_001);
             let held = build(&request, std::slice::from_ref(&held_rows));
@@ -26,9 +27,7 @@ fn settled_negative_log_markers_keep_polls_and_appends_small() {
                     let out = checked_delta(&request, &held, std::slice::from_ref(&current), audit);
                     // Centered smoothers additionally resend their bounded influence near the tail. Settled markers at the start must not force any algorithm to resend the whole chart.
                     let max_tail = match algorithm {
-                        Algorithm::Gaussian => 30,
-                        // The index-space polynomial fit also depends on prefix-sum block placement and its rounding, not only the mathematical window.
-                        Algorithm::SavitzkyGolay => 90,
+                        Algorithm::SavitzkyGolay => 30,
                         Algorithm::Ema | Algorithm::Triangular => 6,
                         _ => 5,
                     };
@@ -247,7 +246,6 @@ fn smoothers_bound_new_negative_timestamps_with_an_unchanged_plan() {
     for algorithm in [
         Algorithm::Ema,
         Algorithm::Triangular,
-        Algorithm::Gaussian,
         Algorithm::SavitzkyGolay,
     ] {
         for first_x in [64, 1_000_000] {
@@ -271,8 +269,9 @@ fn smoothers_bound_new_negative_timestamps_with_an_unchanged_plan() {
             request.smoothing = Some(proto::SmoothingConfig {
                 algorithm: algorithm as i32,
                 window_size: 5,
-                alpha: 0.5,
+                time_constant: std::f64::consts::LOG2_E,
                 poly_order: 1,
+                ..Default::default()
             });
             let held = build(&request, &[samples(60), other.clone()]);
             let current = [samples(61), other];
@@ -349,12 +348,12 @@ fn uniform_savgol_insertion_before_zoom_reemits_numerically_changed_blocks() {
         let mut request = req(&["a"], 1_000);
         request.use_timestamp_axis = true;
         request.log_buckets = true;
-        request.step_min = Some(12);
+        request.step_min = Some(32);
         request.step_max = Some(168);
         request.smoothing = Some(proto::SmoothingConfig {
             algorithm: Algorithm::SavitzkyGolay as i32,
-            window_size: 3,
-            poly_order: 1,
+            window_size: 20,
+            poly_order: 2,
             ..Default::default()
         });
         let held = build(&request, &[rows(false)]);
@@ -369,12 +368,16 @@ fn uniform_savgol_insertion_before_zoom_reemits_numerically_changed_blocks() {
             current_full.frontiers[&smoothing_state_key(0)],
             "the global smoothing-plan gate must also pass"
         );
-        let truth = inflate_full(&current_full);
-        // The insertion is in the right STEP warmup margin but sorts before the curve in TIME. Trimming hides its mathematical reach; shifting the prefix-sum blocks still changes this distant wire-rounded output.
-        assert_ne!(
-            inflate_full(&held).series[0].values[116 - 12].to_bits(),
-            truth.series[0].values[116 - 12].to_bits()
-        );
+        // The inserted row sorts first in TIME, outside the plotted steps and the planner's window-wide reach (steps 0-19 once sorted), yet it shifts every prefix-sum block under the plotted outputs. Compare f64 bits: the change rarely survives f32 rounding.
+        let smoothed = |rows: &[VersionedRawPoint]| {
+            let mut rows = rows.to_vec();
+            rows.sort_by_key(|row| row.timestamp_ms);
+            let xs: Vec<f64> = rows.iter().map(|row| row.timestamp_ms as f64).collect();
+            let ys: Vec<f64> = rows.iter().map(|row| f64::from(row.value)).collect();
+            chart::smooth_run(&xs, &ys, Algorithm::SavitzkyGolay, 20, 0.5, 2, false)
+        };
+        let (old, new) = (smoothed(&rows(false)), smoothed(&rows(true)));
+        assert!((32..=168).any(|step| old[step].to_bits() != new[step + 1].to_bits()));
         for out in assert_full_response(&request, &held, &current, None) {
             assert_eq!(
                 out.series[0].xnan_count, 0,
@@ -387,7 +390,8 @@ fn uniform_savgol_insertion_before_zoom_reemits_numerically_changed_blocks() {
 #[test]
 fn uniform_savgol_append_reemits_the_resized_final_block() {
     let mut state = 234u64;
-    let samples: Vec<_> = (0..180)
+    // Window 20's blocks cover twenty outputs each from step 10, so 195 samples leave steps 170-184 in a partial final block.
+    let samples: Vec<_> = (0..195)
         .map(|step| {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
             let value = (((state >> 32) % 20_001) as i64 - 10_000) as f32 / 97.0;
@@ -397,23 +401,25 @@ fn uniform_savgol_append_reemits_the_resized_final_block() {
     let mut request = req(&["a"], 1_000);
     request.smoothing = Some(proto::SmoothingConfig {
         algorithm: Algorithm::SavitzkyGolay as i32,
-        window_size: 3,
-        poly_order: 1,
+        window_size: 20,
+        poly_order: 2,
         ..Default::default()
     });
     let held = build(&request, &[Arc::new(samples.clone())]);
-    let mut grown = samples;
-    grown.extend([scalar_row(180, 3.0), scalar_row(181, 4.0)]);
+    let mut grown = samples.clone();
+    grown.extend([scalar_row(195, 3.0), scalar_row(196, 4.0)]);
+    // Appending resizes the final block and moves its origin, changing f64 outputs at steps 170-184 outside the new rows' ten-sample support.
+    let smoothed = |rows: &[VersionedRawPoint]| {
+        let xs: Vec<f64> = rows.iter().map(|row| row.step as f64).collect();
+        let ys: Vec<f64> = rows.iter().map(|row| f64::from(row.value)).collect();
+        chart::smooth_run(&xs, &ys, Algorithm::SavitzkyGolay, 20, 0.5, 2, true)
+    };
+    let (old, new) = (smoothed(&samples), smoothed(&grown));
+    assert!((170..185).any(|step| old[step].to_bits() != new[step].to_bits()));
     let current = [Arc::new(grown)];
-    let truth = inflate_full(&build(&request, &current));
-    // Resizing the final block changes its prefix-sum origin, and this value rounds differently well outside the three-sample mathematical reach.
-    assert_ne!(
-        inflate_full(&held).series[0].values[146].to_bits(),
-        truth.series[0].values[146].to_bits()
-    );
     for audit in [false, true] {
         let out = checked_delta(&request, &held, &current, audit);
-        assert_eq!(out.from_col, 129, "retain the preceding complete blocks, then include the changed block's interpolation predecessor");
+        assert_eq!(out.from_col, 169, "retain the preceding complete blocks, then include the changed block's interpolation predecessor");
     }
 }
 
@@ -440,7 +446,7 @@ fn log_marker_bound_composes_with_a_real_causal_interpolation_dependency() {
     request.log_buckets = true;
     request.smoothing = Some(proto::SmoothingConfig {
         algorithm: Algorithm::Ema as i32,
-        alpha: 0.5,
+        time_constant: std::f64::consts::LOG2_E,
         poly_order: 1,
         ..Default::default()
     });

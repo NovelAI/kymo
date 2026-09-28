@@ -20,17 +20,17 @@ Only output-determining global state is recorded:
 |---|---|---|---|
 | EMA / Triangular | step-sized | none | no uniform scan, no median sort |
 | EMA / Triangular | time | median bits | one median sort |
-| Gaussian / Savitzky–Golay | uniform | `Uniform` sentinel | one uniform scan |
-| Gaussian / Savitzky–Golay | irregular | median bits | one uniform scan and one median sort |
+| Savitzky–Golay | uniform | `Uniform` sentinel | one uniform scan |
+| Savitzky–Golay | irregular | median bits | one uniform scan and one median sort |
 | Any | no finite rendered value (including no position after range/x filtering) | `NoState` sentinel | no plan derivation and no smoothing |
 
 Step EMA/Triangular still use each local x gap; “none” means only that they have no whole-series derived scalar which an append could use to rescale earlier output. Custom-x charts never use frontier deltas, so they compute only the plan needed to render the full response and neither stamp nor echo continuation state.
 
-The live preparation path derives this semantic plan once and reuses it for smoothing, Gaussian/Savitzky–Golay reach marking, exact state stamping, and comparison on the next request. The sampled old-only audit receives the already-proven current plans paired with stable request/tag identities. It reuses them positionally only after proving the complete old-only identity sequence matches; client-controlled count or membership mismatches answer in full before a plan can be consumed. The reconstruction therefore performs no local uniform scan or median sort. `NoState` remains an explicit sequence entry when all-marker and margin-only series interleave.
+The live preparation path derives this semantic plan once and reuses it for smoothing, Savitzky–Golay reach marking, exact state stamping, and comparison on the next request. The sampled old-only audit receives the already-proven current plans paired with stable request/tag identities. It reuses them positionally only after proving the complete old-only identity sequence matches; client-controlled count or membership mismatches answer in full before a plan can be consumed. The reconstruction therefore performs no local uniform scan or median sort. `NoState` remains an explicit sequence entry when all-marker and margin-only series interleave.
 
-The opaque frontier map uses a version and response-series count plus one word per output series: `0 = NoState`, `1 = Uniform`, otherwise positive-finite median `f64` bits. New clients send `UINT32_MAX` as the held-series count only when this exact state is required, forcing older servers with the membership gate to answer in full during a rolling deployment. Step EMA/Triangular send the literal count.
+The opaque frontier map uses a version and response-series count plus one word per output series: `0 = NoState`, `1 = Uniform`, otherwise positive-finite median `f64` bits. Clients send the literal held-series count; dashboards before wire revision 2 send `UINT32_MAX` when this exact state is required, and the server recovers the real count from the state.
 
-The downgrade sentinel protects new clients against older servers. Current responses additionally omit every ordinary legacy ingest-frontier key: an older watermark-only server finds no held inputs and answers in full, including for an older client echoing the opaque map with a literal count. A new server rejects unsupported lineage state and seeds one full response. Frontend epoch changes suppress stale echoes after reconnect; the keyed stamp also invalidates pre-restart state.
+A server rejects unsupported lineage state and seeds one full response. Frontend epoch changes suppress stale echoes after reconnect; the keyed stamp also invalidates pre-restart state.
 
 Test-only derivation counters enforce the table above through the production response builder. They count semantic uniform scans and median sorts rather than elapsed time, including audited deltas and mixed active/margin-only charts.
 

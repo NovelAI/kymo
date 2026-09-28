@@ -415,9 +415,13 @@ mod smoothing_default_tests {
     }
 }
 
-/// EMA alpha as the e-folding time constant the editors display (old data's weight decays to 1/e after τ steps): τ = -1 / ln(1 - α), i.e. α = 1 - exp(-1/τ), clamped to ≥ 1 step. `None` outside (0, 1).
-pub fn ema_tau(alpha: f64) -> Option<f64> {
-    (alpha > 0.0 && alpha < 1.0).then(|| (-1.0 / (1.0 - alpha).ln()).max(1.0))
+/// The e-folding time constant a stored EMA alpha denotes (old data's weight decays to 1/e after τ steps), as the editor shows it and chart requests send it: τ = -1 / ln(1 - α), at least 1 step, and 10 for an alpha outside (0, 1).
+pub fn ema_time_constant(alpha: f64) -> f64 {
+    if alpha > 0.0 && alpha < 1.0 {
+        (-1.0 / (-alpha).ln_1p()).max(1.0)
+    } else {
+        10.0
+    }
 }
 
 /// Per-rect display options.

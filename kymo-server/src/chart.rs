@@ -2,7 +2,7 @@
 
 use crate::proto::smoothing_config::Algorithm;
 
-/// Server-side cap shared by smoothing execution and request planning.
+/// Server-side cap on the smoothing window: chart_params clamps the wire value to it, and the smoothers and delta planner rely on that bound.
 pub(crate) const MAX_SMOOTHING_WINDOW: u32 = 4096;
 
 /// Spacing of an x grid if it is uniform (within float tolerance), else
@@ -25,7 +25,7 @@ fn uniform_spacing(xs: &[f64]) -> Option<f64> {
     Some(d0)
 }
 
-/// Median sample interval — the x-unit the window/σ scales are quoted in
+/// Median sample interval — the x-unit the window scales are quoted in
 /// on irregular grids. Median, not mean: a handful of logging gaps must
 /// not stretch every window.
 pub(crate) fn median_dx(xs: &[f64]) -> f64 {
@@ -39,7 +39,7 @@ pub(crate) fn median_dx(xs: &[f64]) -> f64 {
     d[d.len() / 2].max(f64::MIN_POSITIVE)
 }
 
-/// The only whole-series, data-derived state a smoother consumes. `NoState` means appends cannot rescale a held prefix; `Uniform` selects an index-space Gaussian/Savitzky–Golay kernel; `Median` is time EMA/Triangular's decay unit or an irregular Gaussian/Savitzky–Golay x scale.
+/// The only whole-series, data-derived state a smoother consumes. `NoState` means appends cannot rescale a held prefix; `Uniform` selects the index-space Savitzky–Golay kernel; `Median` is time EMA/Triangular's decay unit or an irregular Savitzky–Golay x scale.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SmoothingPlan {
     NoState,
@@ -57,13 +57,13 @@ impl SmoothingPlan {
     }
 }
 
-/// Derive exactly the state the selected algorithm consumes: no spacing work for step EMA/Triangular, one median for time EMA/Triangular, and one uniformity scan plus a median only on the irregular Gaussian/Savitzky–Golay branch.
+/// Derive exactly the state the selected algorithm consumes: no spacing work for step EMA/Triangular, one median for time EMA/Triangular, and one uniformity scan plus a median only on the irregular Savitzky–Golay branch.
 pub(crate) fn smoothing_plan(xs: &[f64], algo: Algorithm, step_sized_x: bool) -> SmoothingPlan {
     match algo {
         Algorithm::None => SmoothingPlan::NoState,
         Algorithm::Ema | Algorithm::Triangular if step_sized_x => SmoothingPlan::NoState,
         Algorithm::Ema | Algorithm::Triangular => SmoothingPlan::Median(median_dx(xs).to_bits()),
-        Algorithm::Gaussian | Algorithm::SavitzkyGolay => {
+        Algorithm::SavitzkyGolay => {
             if uniform_spacing(xs).is_some() {
                 SmoothingPlan::Uniform
             } else {
@@ -83,57 +83,10 @@ pub(crate) fn take_spacing_derivations() -> (usize, usize) {
     SPACING_DERIVATIONS.with(|counts| counts.replace((0, 0)))
 }
 
-/// Debiased exponential moving average with x-aware decay.
-///
-/// The sample weights form an exponential kernel in x, not in sample
-/// count: each step decays the state by (1−α)^(Δx/dx_ref), so the product
-/// telescopes and sample j's weight at position i is (1−α)^((xᵢ−xⱼ)/dx_ref)
-/// regardless of how the samples between them are spaced. A logging gap
-/// decays the state by the gap's width instead of counting as one step.
-/// On a contiguous step grid every Δx/dx_ref is 1 and this reduces exactly
-/// to the classic per-step recurrence.
-///
-/// Debiasing: the classic form seeds from the first sample, which biases
-/// the first ~half-life of output toward it. Tracking the kernel's weight
-/// mass (`den`, → 1) and dividing it out removes the bias exactly — the
-/// output is always the true weighted mean of the samples seen so far.
-///
-/// Non-finite samples deposit nothing and the state coasts across them
-/// (their output positions are masked back to NaN by [`smooth_run`]).
-#[cfg(test)]
-fn ema(xs: &[f64], y: &[f64], alpha: f64, dx_ref: f64) -> Vec<f64> {
-    let mut out = vec![f64::NAN; y.len()];
-    let d_base = 1.0 - alpha;
-    let (mut num, mut den) = (0.0f64, 0.0f64);
-    let mut prev_x = f64::NAN;
-    for (i, &v) in y.iter().enumerate() {
-        if !v.is_finite() {
-            out[i] = if den > 0.0 { num / den } else { f64::NAN };
-            continue;
-        }
-        let d = if prev_x.is_finite() && dx_ref > 0.0 {
-            d_base.powf(((xs[i] - prev_x) / dx_ref).max(0.0))
-        } else {
-            0.0 // first finite sample: state is empty, decay is moot
-        };
-        num = d * num + alpha * v;
-        den = d * den + alpha;
-        prev_x = xs[i];
-        out[i] = num / den;
-    }
-    out
-}
-
-/// One-sided exponentially weighted polynomial regression, evaluated at
-/// each current x. Moments are kept in coordinates whose origin moves with
-/// the current sample; translating the five scalar moments and solving the
-/// at-most 3x3 normal equations is constant work per point. The coordinate
-/// unit is one exponential time constant, which keeps the moment matrix
-/// well-scaled even when alpha is very small.
-fn ema_polyfit(xs: &[f64], y: &[f64], alpha: f64, dx_ref: f64, poly_order: u32) -> Vec<f64> {
+/// One-sided exponentially weighted polynomial regression, evaluated at each current x. Moments are kept in coordinates whose origin moves with the current sample; translating the five scalar moments and solving the at-most 3x3 normal equations is constant work per point. The coordinate unit is the time constant τ, which keeps the moment matrix well-scaled at any τ.
+fn ema_polyfit(xs: &[f64], y: &[f64], tau: f64, dx_ref: f64, poly_order: u32) -> Vec<f64> {
     let mut out = vec![f64::NAN; y.len()];
     let deg = poly_order.min(2) as usize;
-    let log_decay = (1.0 - alpha).ln();
     let mut mw = [0.0f64; 5];
     let mut sw = [0.0f64; 3];
     let mut prev_x = f64::NAN;
@@ -143,12 +96,9 @@ fn ema_polyfit(xs: &[f64], y: &[f64], alpha: f64, dx_ref: f64, poly_order: u32) 
             continue;
         }
         if prev_x.is_finite() && dx_ref > 0.0 {
-            let delta = ((xs[i] - prev_x) / dx_ref).max(0.0);
-            let decay = (log_decay * delta).exp();
-            // In natural EMA coordinates, old u becomes u-h at the new
-            // origin, with h=-ln(1-alpha)*delta. Translate high-to-low so
-            // every right-hand-side value still comes from the old state.
-            let h = -log_decay * delta;
+            // In units of τ, old u becomes u − h at the new origin.
+            let h = ((xs[i] - prev_x) / dx_ref).max(0.0) / tau;
+            let decay = (-h).exp();
             if decay == 0.0 {
                 // Avoid 0 * inf when an enormous x gap underflows the old
                 // state's weight to exactly zero.
@@ -173,10 +123,10 @@ fn ema_polyfit(xs: &[f64], y: &[f64], alpha: f64, dx_ref: f64, poly_order: u32) 
                 }
             }
         }
-        mw[0] += alpha;
-        sw[0] += alpha * yv;
+        mw[0] += 1.0;
+        sw[0] += yv;
         prev_x = xs[i];
-        out[i] = fit_from_moments(&mw, &sw, yv, 1.0, deg);
+        out[i] = fit_from_moments(&mw, &sw, deg);
     }
     out
 }
@@ -256,49 +206,7 @@ fn triangular_polyfit(xs: &[f64], y: &[f64], dx_ref: f64, poly_order: u32) -> Ve
         mw[0] += weight;
         sw[0] += weight * yv;
         prev_x = xs[i];
-        out[i] = fit_from_moments(&mw, &sw, yv, 1.0, deg);
-    }
-    out
-}
-
-fn gaussian(y: &[f64], window: usize) -> Vec<f64> {
-    let n = y.len();
-    // σ in floating point — σ = window/8 exactly, so every window value
-    // smooths a little more than the last (an integer half-window made
-    // windows 2k and 2k+1 identical) and σ > 0 even for windows 1-2,
-    // whose integer half of 0 used to zero σ and turn the kernel into
-    // exp(0/0) = NaN, blanking the whole series. The support covers 4σ
-    // (scipy's gaussian_filter1d default): edge weight e⁻⁸ ≈ 0.03% of
-    // peak, so points enter and leave the window at negligible weight
-    // instead of stepping in at the e⁻² ≈ 13.5% a 2σ cut gave — that
-    // step tracked the window edge and put kinks in the smoothed line
-    // near large values.
-    let sigma = window as f64 / 8.0;
-    let sigma2 = 2.0 * sigma * sigma;
-    let half = window.div_ceil(2);
-
-    // Precompute kernel weights
-    let kernel: Vec<f64> = (0..=half)
-        .map(|d| (-(d as f64 * d as f64) / sigma2).exp())
-        .collect();
-
-    let mut out = vec![f64::NAN; n];
-    for (i, output) in out.iter_mut().enumerate() {
-        let lo = i.saturating_sub(half);
-        let hi = (i + half + 1).min(n);
-        let mut wsum = 0.0;
-        let mut wcount = 0.0;
-        for (j, &value) in y.iter().enumerate().take(hi).skip(lo) {
-            if !value.is_nan() {
-                let d = j.abs_diff(i);
-                let w = kernel[d.min(kernel.len() - 1)];
-                wsum += w * value;
-                wcount += w;
-            }
-        }
-        if wcount > 0.0 {
-            *output = wsum / wcount;
-        }
+        out[i] = fit_from_moments(&mw, &sw, deg);
     }
     out
 }
@@ -320,14 +228,11 @@ fn gaussian(y: &[f64], window: usize) -> Vec<f64> {
 /// window tapers to zero with zero slope at the edge, so window entry and
 /// exit are seamless and no boundary regime exists. And unlike a Gaussian
 /// window — which admits no finite moment decomposition and would force
-/// O(n·window) like [`gaussian`] — it is a polynomial: weighted moments
+/// O(n·window) direct sums — it is a polynomial: weighted moments
 /// are combinations of plain moments (Σw·xᵏ = mₖ − 2mₖ₊₂ + mₖ₊₄), so the
 /// NaN-free interior runs in O(n) off block-local prefix sums.
 ///
-/// Numerically there is no sliding state to drift: every output is either
-/// a fresh direct fit or a difference of prefix sums rebuilt each block,
-/// with recentering cancellation bounded by (span/half)⁶ = 64 — under two
-/// of f64's sixteen digits.
+/// Numerically there is no sliding state to drift: every output is either a fresh direct fit or a difference of prefix sums rebuilt for each block of 2·half outputs. A window's center lies within half of its block's origin and its inputs within 2·half, so recentering amplifies rounding by roughly 3⁶ whatever n or the absolute step: about 2e-12 of the series' magnitude, far below f32 rounding except for values near zero. Longer blocks save little time for much more error (4·half: 12% faster, ~40× the error).
 ///
 /// NaN values are excluded from every fit. The fit still produces a value
 /// at a NaN input position, but [`smooth_run_with_plan`] — the pipeline's entry
@@ -340,17 +245,7 @@ fn savitzky_golay(y: &[f64], window: usize, poly_order: u32) -> Vec<f64> {
     if n == 0 {
         return out;
     }
-    // half ≥ 2 so a quadratic has at least 3 points with nonzero weight
-    // (the |x| = 1 points carry weight 0); capped to bound the direct
-    // path's worst case (the editor caps windows at 200 anyway).
-    let (half, bsize) = savgol_blocks(window);
-    // Taper scale in floating point — window/2 exactly, so consecutive
-    // window values differ (an integer-only scale made windows 2k and
-    // 2k+1 identical). The support stays the integer `half`; for odd
-    // windows the support-edge points get a small positive weight instead
-    // of exactly zero. The max keeps |x| ≤ 1 over the support when the
-    // lower clamp lifts `half` above window/2.
-    let h_s = (window as f64 / 2.0).max(half as f64);
+    let (half, h_s) = savgol_geometry(window);
 
     // Interior shortcut: on a full, NaN-free window the odd weighted
     // moments vanish, so the fitted center value is a = α·S₀ʷ + β·S₂ʷ
@@ -399,7 +294,7 @@ fn savitzky_golay(y: &[f64], window: usize, poly_order: u32) -> Vec<f64> {
     if lo_int >= hi_int {
         return out;
     }
-    let cap = bsize + 2 * half + 1;
+    let cap = 4 * half + 1;
     let mut p0 = vec![0.0f64; cap];
     let mut p1 = vec![0.0f64; cap];
     let mut p2 = vec![0.0f64; cap];
@@ -412,7 +307,7 @@ fn savitzky_golay(y: &[f64], window: usize, poly_order: u32) -> Vec<f64> {
     let h6 = h4 * h2;
     let mut block_start = lo_int;
     while block_start < hi_int {
-        let block_end = (block_start + bsize).min(hi_int);
+        let block_end = (block_start + 2 * half).min(hi_int);
         let lo = block_start - half;
         let len = block_end + half - lo;
         let origin = (len / 2) as f64;
@@ -462,40 +357,33 @@ fn savitzky_golay(y: &[f64], window: usize, poly_order: u32) -> Vec<f64> {
     out
 }
 
-fn savgol_blocks(window: usize) -> (usize, usize) {
-    let half = (window / 2).clamp(2, 4096);
-    (half, (2 * half).max(64))
+/// (half, taper scale) for a window, shared by [`savitzky_golay`], [`savgol_dependency_start`] and the irregular-x scale. Windows floor at 3, the smallest whose taper weights any neighbor (window 3: half 1 at scale 1.5). Prefix-sum blocks cover 2·half outputs.
+///
+/// The taper scale is window/2 in floating point, so windows 2k and 2k+1 differ; the support stays the integer `half`, so odd windows give their support-edge points a small positive weight.
+fn savgol_geometry(window: usize) -> (usize, f64) {
+    let window = window.max(3);
+    (window / 2, window as f64 / 2.0)
 }
 
-/// Conservative starting index for outputs an insertion can change in the index-space smoother, including wire-visible rounding. Inserting a row shifts every later prefix-sum block; extending the final block can also move its origin. Even an unchanged mathematical window can then round differently. Blocks whose expanded input ranges end before `first_new` use identical inputs and arithmetic in every held snapshot; from the first intersecting block to the array end we must re-emit, including when the new row itself is later trimmed away. Keep this geometry shared with savitzky_golay.
+/// Conservative starting index for outputs an insertion can change in the index-space smoother, including wire-visible rounding. Inserting a row shifts every later prefix-sum block; extending the final block can also move its origin. Even an unchanged mathematical window can then round differently. Blocks whose expanded input ranges end before `first_new` use identical inputs and arithmetic in every held snapshot; from the first intersecting block to the array end we must re-emit, including when the new row itself is later trimmed away.
 pub(crate) fn savgol_dependency_start(window: usize, first_new: usize) -> usize {
-    let (half, block_size) = savgol_blocks(window.max(3));
-    if first_new < 2 * half {
+    let (half, _) = savgol_geometry(window);
+    let block = 2 * half;
+    if first_new < block {
         0
     } else {
-        half + (first_new - 2 * half) / block_size * block_size
+        half + (first_new - block) / block * block
     }
 }
 
-/// Direct biweight-weighted least-squares fit over y[lo..hi] (NaNs
-/// excluded), weights centered at `c`, returning the fitted value at `c`.
-/// Falls back to the weighted mean when the system is singular (fewer than
-/// deg+1 points with nonzero weight), then the unweighted mean, then NaN.
-fn sg_fit_window(y: &[f64], lo: usize, hi: usize, c: usize, h_s: f64, deg: usize) -> f64 {
+/// Biweight-weighted least-squares fit at x = 0 over (x, y) points, x in taper half-widths and NaN y excluded; too few weighted points step the degree down ([`fit_from_moments`]).
+fn biweight_fit(points: impl Iterator<Item = (f64, f64)>, deg: usize) -> f64 {
     // Weighted moments Σw·xᵏ (k ≤ 4) and Σw·xᵏ·y (k ≤ 2).
     let mut mw = [0.0f64; 5];
     let mut sw = [0.0f64; 3];
-    let (mut sum, mut count) = (0.0f64, 0.0f64);
-    for (j, &yv) in y.iter().enumerate().take(hi).skip(lo) {
-        if yv.is_nan() {
-            continue;
-        }
-        let x = (j as f64 - c as f64) / h_s;
+    for (x, yv) in points.filter(|(_, yv)| !yv.is_nan()) {
         let u = 1.0 - x * x;
-        let w = u * u;
-        sum += yv;
-        count += 1.0;
-        let mut pw = w;
+        let mut pw = u * u;
         for k in 0..5 {
             mw[k] += pw;
             if k < 3 {
@@ -504,58 +392,48 @@ fn sg_fit_window(y: &[f64], lo: usize, hi: usize, c: usize, h_s: f64, deg: usize
             pw *= x;
         }
     }
-    fit_from_moments(&mw, &sw, sum, count, deg)
+    fit_from_moments(&mw, &sw, deg)
 }
 
-/// Solve the biweight WLS normal equations for the fitted value at the
-/// window center (x = 0). Falls back to the weighted mean when singular,
-/// then the unweighted mean, then NaN.
-#[allow(clippy::needless_range_loop)] // Fixed-size Gaussian elimination is clearest in matrix indices.
-fn fit_from_moments(mw: &[f64; 5], sw: &[f64; 3], sum: f64, count: f64, deg: usize) -> f64 {
-    let p = deg + 1;
-    // Gaussian elimination with partial pivoting on the p×p system
-    // a[i][j] = mw[i+j], rhs sw[i].
-    let mut a = [[0.0f64; 4]; 3];
-    for i in 0..p {
-        a[i][..p].copy_from_slice(&mw[i..(p + i)]);
-        a[i][p] = sw[i];
+/// Direct fit over y[lo..hi] with weights centered at `c`, returning the fitted value at `c`.
+fn sg_fit_window(y: &[f64], lo: usize, hi: usize, c: usize, h_s: f64, deg: usize) -> f64 {
+    biweight_fit((lo..hi).map(|j| ((j as f64 - c as f64) / h_s, y[j])), deg)
+}
+
+/// Fitted value at x = 0 of the weighted least-squares polynomial of degree ≤ `deg`, from mw[k] = Σw·xᵏ and sw[k] = Σw·xᵏ·y. It sums qₖ(0)·⟨qₖ, y⟩/Dₖ over the weight-orthogonal monic polynomials qₖ, Dₖ = ⟨qₖ, qₖ⟩ (an unpivoted LDLᵀ of the moment matrix), so each degree adds one term to the lower degree's arithmetic.
+///
+/// Degrees are added while the pivot Dₖ exceeds 4ε·mw[2k]. Every term subtracted in forming Dₖ is at most mw[2k] (Cauchy–Schwarz), so below that Dₖ is rounding noise at any scale of x or the weights: the points numerically lie on k distinct x, which degree k − 1 already interpolates, so its value at the weighted point x = 0 is the answer. A small pivot above the cut is kept: its correction still carries digits. The cut does not see rounding accumulated before the pivot (in the moments, or carried in from D₁), so a noise pivot can occasionally pass. NaN without positive weight.
+#[allow(clippy::neg_cmp_op_on_partial_ord)] // The negated comparisons also reject NaN pivots.
+fn fit_from_moments(mw: &[f64; 5], sw: &[f64; 3], deg: usize) -> f64 {
+    const TOL: f64 = 4.0 * f64::EPSILON;
+    if !(mw[0] > 0.0) {
+        return f64::NAN;
     }
-    let mut ok = true;
-    for col in 0..p {
-        let piv = (col..p)
-            .max_by(|&r1, &r2| a[r1][col].abs().total_cmp(&a[r2][col].abs()))
-            .unwrap();
-        if a[piv][col].abs() < 1e-12 {
-            ok = false;
-            break;
-        }
-        a.swap(col, piv);
-        for row in col + 1..p {
-            let f = a[row][col] / a[col][col];
-            for j in col..=p {
-                a[row][j] -= f * a[col][j];
-            }
-        }
+    let mut fit = sw[0] / mw[0];
+    if deg == 0 {
+        return fit;
     }
-    if ok {
-        let mut coef = [0.0f64; 3];
-        for i in (0..p).rev() {
-            let mut v = a[i][p];
-            for j in i + 1..p {
-                v -= a[i][j] * coef[j];
-            }
-            coef[i] = v / a[i][i];
-        }
-        return coef[0]; // fitted value at the center, x = 0
+    // q₁ = x − μ
+    let mu = mw[1] / mw[0];
+    let d1 = mw[2] - mu * mw[1];
+    if !(d1 > TOL * mw[2]) {
+        return fit;
     }
-    if mw[0] > 1e-12 {
-        sw[0] / mw[0]
-    } else if count > 0.0 {
-        // Only zero-weight (window-edge) points are present.
-        sum / count
-    } else {
-        f64::NAN
+    let t1 = sw[1] - mu * sw[0];
+    fit -= mu * t1 / d1;
+    if deg == 1 {
+        return fit;
     }
+    // q₂ = x² − β·q₁ − m₂₀
+    let m20 = mw[2] / mw[0];
+    let g = mw[3] - mu * mw[2]; // ⟨x², q₁⟩
+    let beta = g / d1;
+    let d2 = mw[4] - m20 * mw[2] - beta * g;
+    if !(d2 > TOL * mw[4]) {
+        return fit;
+    }
+    let t2 = sw[2] - m20 * sw[0] - beta * t1;
+    fit + (beta * mu - m20) * t2 / d2
 }
 
 /// Savitzky-Golay for an irregular x grid: the same biweight WLS fit as
@@ -578,64 +456,7 @@ fn savgol_x(xs: &[f64], y: &[f64], h_x: f64, deg: usize) -> Vec<f64> {
         while hi + 1 < n && xs[hi + 1] - xs[i] <= h_x {
             hi += 1;
         }
-        let mut mw = [0.0f64; 5];
-        let mut sw = [0.0f64; 3];
-        let (mut sum, mut count) = (0.0f64, 0.0f64);
-        for j in lo..=hi {
-            let yv = y[j];
-            if yv.is_nan() {
-                continue;
-            }
-            let x = (xs[j] - xs[i]) / h_x;
-            let u = 1.0 - x * x;
-            let w = u * u;
-            sum += yv;
-            count += 1.0;
-            let mut pw = w;
-            for k in 0..5 {
-                mw[k] += pw;
-                if k < 3 {
-                    sw[k] += pw * yv;
-                }
-                pw *= x;
-            }
-        }
-        out[i] = fit_from_moments(&mw, &sw, sum, count, deg);
-    }
-    out
-}
-
-/// Gaussian smoothing for an irregular x grid: weights from real
-/// x-distance, support truncated at 4σ like the index-space version.
-fn gaussian_x(xs: &[f64], y: &[f64], sigma: f64) -> Vec<f64> {
-    let n = y.len();
-    let mut out = vec![f64::NAN; n];
-    let support = 4.0 * sigma;
-    let s2 = 2.0 * sigma * sigma;
-    let (mut lo, mut hi) = (0usize, 0usize);
-    for i in 0..n {
-        while xs[i] - xs[lo] > support {
-            lo += 1;
-        }
-        if hi < i {
-            hi = i;
-        }
-        while hi + 1 < n && xs[hi + 1] - xs[i] <= support {
-            hi += 1;
-        }
-        let (mut wsum, mut wcount) = (0.0f64, 0.0f64);
-        for j in lo..=hi {
-            if y[j].is_nan() {
-                continue;
-            }
-            let dx = xs[j] - xs[i];
-            let w = (-(dx * dx) / s2).exp();
-            wsum += w * y[j];
-            wcount += w;
-        }
-        if wcount > 0.0 {
-            out[i] = wsum / wcount;
-        }
+        out[i] = biweight_fit((lo..=hi).map(|j| ((xs[j] - xs[i]) / h_x, y[j])), deg);
     }
     out
 }
@@ -647,8 +468,7 @@ mod tests {
     /// One window's fit through the direct path, as ground truth for the
     /// prefix-sum interior.
     fn direct(y: &[f64], c: usize, window: usize) -> f64 {
-        let half = (window / 2).clamp(2, 4096);
-        let h_s = (window as f64 / 2.0).max(half as f64);
+        let (half, h_s) = savgol_geometry(window);
         let lo = c.saturating_sub(half);
         let hi = (c + half + 1).min(y.len());
         sg_fit_window(y, lo, hi, c, h_s, 2)
@@ -734,7 +554,7 @@ mod tests {
 
     /// The prefix-sum interior must agree with the direct fit across a
     /// long series, including NaN windows (which divert to the direct
-    /// path), block seams, and the clipped boundaries.
+    /// path), block seams, and the clipped boundaries. NaNs fill only the first half, so every window size also runs NaN-free prefix sums.
     #[test]
     fn sg_prefix_matches_direct_fits() {
         let n = 5000usize;
@@ -744,14 +564,53 @@ mod tests {
                 (x * 0.01).sin() * 50.0 + ((i * 7919) % 100) as f64 / 7.0
             })
             .collect();
-        for i in (37..n).step_by(97) {
+        for i in (37..n / 2).step_by(97) {
             y[i] = f64::NAN;
         }
-        let half = 15;
-        let out = savitzky_golay(&y, 2 * half, 2);
-        for (c, &actual) in out.iter().enumerate() {
-            let want = direct(&y, c, 2 * half);
-            assert!((actual - want).abs() < 1e-6, "c={c}: {actual} vs {want}");
+        for window in [3, 4, 5, 8, 16, 30, 64, 130] {
+            let out = savitzky_golay(&y, window, 2);
+            for (c, &actual) in out.iter().enumerate() {
+                let want = direct(&y, c, window);
+                assert!(
+                    (actual - want).abs() < 1e-9,
+                    "window={window}, c={c}: {actual} vs {want}"
+                );
+            }
+        }
+    }
+
+    /// Windows 3 and 4 have different taper weights, so they differ at orders 0–1 (at order 2 both interpolate their three weighted points).
+    #[test]
+    fn sg_windows_3_and_4() {
+        let y: Vec<f64> = (0..200).map(|i| ((i * 7919) % 1000) as f64).collect();
+        for order in 0..=1 {
+            let w3 = savitzky_golay(&y, 3, order);
+            let w4 = savitzky_golay(&y, 4, order);
+            assert!(w3.iter().zip(&w4).any(|(a, b)| a != b), "order {order}");
+        }
+    }
+
+    /// Two weighted points leave the quadratic's pivot at rounding level, below the cut in these fixtures, so order 2 returns exactly order 1's result in both the direct SG fit and the causal fits.
+    #[test]
+    fn underdetermined_order_2_matches_order_1() {
+        let (xs, y) = ([0.0, 1.0], [7.0, 9.0]);
+        let fits = |order| {
+            [
+                savitzky_golay(&y, 4, order),
+                ema_polyfit(&xs, &y, 10.0, 1.0, order),
+                triangular_polyfit(&xs, &y, 1.0, order),
+            ]
+        };
+        assert_eq!(fits(2), fits(1));
+    }
+
+    /// The degree switch is scale-free: three early samples determine a quadratic, which interpolates the newest one, at each tested time constant up to τ = 1e6, where they span a millionth of the EMA's unit.
+    #[test]
+    fn early_ema_samples_fit_full_degree() {
+        let (xs, y) = ([0.0, 1.0, 2.0], [0.0, 0.0, 1.0]);
+        for tau in [1e6, 1e3, 2.0] {
+            let out = ema_polyfit(&xs, &y, tau, 1.0, 2);
+            assert!((out[2] - 1.0).abs() < 1e-9, "tau={tau}: {}", out[2]);
         }
     }
 
@@ -818,31 +677,6 @@ mod tests {
         assert!(two.iter().all(|v| v.is_finite()));
         let all_nan = savitzky_golay(&[f64::NAN, f64::NAN, f64::NAN, f64::NAN], 5, 2);
         assert!(all_nan.iter().all(|v| v.is_nan()));
-    }
-
-    /// Tiny windows must not blank the series (integer half = 0 used to
-    /// make σ = 0 and the kernel exp(0/0) = NaN), and the float σ makes
-    /// consecutive window values genuinely different smoothers.
-    #[test]
-    fn gaussian_small_windows_and_distinct_sigmas() {
-        let y: Vec<f64> = (0..50).map(|i| ((i * 7919) % 100) as f64).collect();
-        for w in 1..=4 {
-            let out = gaussian(&y, w);
-            assert!(out.iter().all(|v| v.is_finite()), "window {w} blanked");
-        }
-        // window 1: neighbor weight exp(-32) — identity for all purposes
-        let out = gaussian(&y, 1);
-        for (a, b) in out.iter().zip(&y) {
-            assert!((a - b).abs() < 1e-9);
-        }
-        let w8 = gaussian(&y, 8);
-        let w9 = gaussian(&y, 9);
-        let diff = w8
-            .iter()
-            .zip(&w9)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f64, f64::max);
-        assert!(diff > 1e-3, "windows 8 and 9 still identical: {diff}");
     }
 }
 
@@ -2605,17 +2439,7 @@ pub fn nan_kind(v: f64) -> u8 {
 /// which other runs share the chart, and makes it impossible for smoothing
 /// to extend a line past the run's first/last logged step.
 ///
-/// `xs` are the run's x positions (steps or timestamps), ascending, same
-/// length as `y`. A uniform grid — contiguous step logging, the
-/// overwhelmingly common case — takes the fast index-space smoothers
-/// (sample distance IS x distance there, checked exactly since step grids
-/// are integer-valued). Irregular grids take the O(n·window) x-aware paths
-/// with the window/σ scale quoted in median sample intervals, so the same
-/// UI setting spans the same x range either way and a logging gap narrows
-/// a window instead of silently stretching it. `step_sized_x` declares
-/// that one x unit is one step: EMA's α keeps its per-step meaning even
-/// for every-k-step loggers; on time axes the α reference is the median
-/// sample interval instead.
+/// `xs` are the run's x positions (steps or timestamps), ascending, same length as `y`. A uniform grid — contiguous step logging, the overwhelmingly common case — takes the fast index-space smoothers (sample distance IS x distance there, checked exactly since step grids are integer-valued). Irregular grids take the O(n·window) x-aware paths with the window scale quoted in median sample intervals, so the same UI setting spans the same x range either way and a logging gap narrows a window instead of silently stretching it. `step_sized_x` declares that one x unit is one step: EMA's τ stays in steps even for every-k-step loggers; on time axes it is in median sample intervals instead.
 ///
 /// Non-finite values (logged NaN/Inf) get the least-effort policy: they
 /// are excluded from every window (an Inf would poison sums), their output
@@ -2627,12 +2451,12 @@ pub fn smooth_run(
     y: &[f64],
     algo: Algorithm,
     window: u32,
-    alpha: f64,
+    time_constant: f64,
     poly_order: u32,
     step_sized_x: bool,
 ) -> Vec<f64> {
     let plan = smoothing_plan(xs, algo, step_sized_x);
-    smooth_run_with_plan(xs, y, algo, window, alpha, poly_order, plan)
+    smooth_run_with_plan(xs, y, algo, window, time_constant, poly_order, plan)
 }
 
 /// Run a smoother with its already-derived semantic plan. Production preparation calls this after deriving the live plan once; audit reconstruction supplies the proven current plan and derives nothing from its conservative old snapshot.
@@ -2641,54 +2465,41 @@ pub(crate) fn smooth_run_with_plan(
     y: &[f64],
     algo: Algorithm,
     window: u32,
-    alpha: f64,
+    time_constant: f64,
     poly_order: u32,
     plan: SmoothingPlan,
 ) -> Vec<f64> {
     debug_assert_eq!(xs.len(), y.len());
-    // Wire input: the editors cap windows at 200 (500 for Sav-Gol), but the
-    // server is the trust boundary — bound it here, before it sizes the
-    // gaussian kernel
-    // allocation, the O(n·window) loops, and the x-aware bandwidths (4096
-    // matches savgol's index-space half clamp).
-    let window = window.min(MAX_SMOOTHING_WINDOW);
+    debug_assert!(window <= MAX_SMOOTHING_WINDOW);
     let sanitized: Vec<f64> = y
         .iter()
         .map(|v| if v.is_finite() { *v } else { f64::NAN })
         .collect();
     let mut out = match algo {
         Algorithm::None => sanitized.clone(),
-        Algorithm::Ema => {
-            let dx_ref = plan.causal_dx_ref();
-            ema_polyfit(
-                xs,
-                &sanitized,
-                alpha.clamp(1e-6, 1.0 - 1e-9),
-                dx_ref,
-                poly_order,
-            )
-        }
+        Algorithm::Ema => ema_polyfit(
+            xs,
+            &sanitized,
+            time_constant,
+            plan.causal_dx_ref(),
+            poly_order,
+        ),
         Algorithm::Triangular => {
             let dx_ref = plan.causal_dx_ref();
             triangular_polyfit(xs, &sanitized, dx_ref, poly_order)
         }
-        Algorithm::Gaussian => match plan {
-            SmoothingPlan::Uniform => gaussian(&sanitized, window.max(1) as usize),
-            SmoothingPlan::Median(bits) => gaussian_x(
-                xs,
-                &sanitized,
-                (window.max(1) as f64 / 8.0) * f64::from_bits(bits),
-            ),
-            SmoothingPlan::NoState => panic!("gaussian smoother requires a spacing plan"),
-        },
         Algorithm::SavitzkyGolay => {
-            let w = window.max(3) as usize;
+            let w = window as usize;
             match plan {
                 SmoothingPlan::Uniform => savitzky_golay(&sanitized, w, poly_order),
                 SmoothingPlan::Median(bits) => {
-                    let half = (w / 2).clamp(2, 4096);
-                    let h_x = (w as f64 / 2.0).max(half as f64) * f64::from_bits(bits);
-                    savgol_x(xs, &sanitized, h_x, poly_order.min(2) as usize)
+                    let (_, h_s) = savgol_geometry(w);
+                    savgol_x(
+                        xs,
+                        &sanitized,
+                        h_s * f64::from_bits(bits),
+                        poly_order.min(2) as usize,
+                    )
                 }
                 SmoothingPlan::NoState => panic!("Savitzky-Golay smoother requires a spacing plan"),
             }
@@ -2704,12 +2515,11 @@ pub(crate) fn smooth_run_with_plan(
 
 #[cfg(test)]
 mod smooth_run_tests {
-    use super::{savgol_blocks, savgol_dependency_start, smooth_run};
+    use super::{savgol_dependency_start, savgol_geometry, smooth_run};
     use crate::proto::smoothing_config::Algorithm;
 
-    const ALGOS: [Algorithm; 4] = [
+    const ALGOS: [Algorithm; 3] = [
         Algorithm::Ema,
-        Algorithm::Gaussian,
         Algorithm::SavitzkyGolay,
         Algorithm::Triangular,
     ];
@@ -2718,12 +2528,14 @@ mod smooth_run_tests {
         (0..n).map(|i| i as f64).collect()
     }
 
+    /// Compares f64 bits, which the bound keeps identical (so wire values match too); block placement moves outputs too little to show reliably after f32 rounding. Inputs use full f64 mantissas, since f32-valued inputs make small windows' prefix sums exact and hide block placement; the lengths leave both full and partial final blocks.
     #[test]
-    fn savgol_block_bound_preserves_the_actual_wire_rounded_prefix() {
+    fn savgol_block_bound_preserves_the_bitwise_prefix() {
         let mut changes_outside_support = 0usize;
         for window in [1usize, 3, 5, 10, 20, 50, 100, 130] {
             let mut retained = 0usize;
-            let (half, block_size) = savgol_blocks(window.max(3));
+            let (half, _) = savgol_geometry(window);
+            let block_size = 2 * half;
             let lengths = if window >= 100 {
                 vec![
                     2 * half + block_size - 1,
@@ -2732,7 +2544,7 @@ mod smooth_run_tests {
                     4 * block_size + 7,
                 ]
             } else {
-                vec![60, 100, 180, 2 * half + block_size]
+                vec![60, 99, 181, 2 * half + block_size]
             };
             for n in lengths {
                 for order in 0..=2 {
@@ -2745,8 +2557,7 @@ mod smooth_run_tests {
                                     if hole && i == n / 3 {
                                         f64::NAN
                                     } else {
-                                        ((((state >> 32) % 20_001) as i64 - 10_000) as f32 / 97.0)
-                                            as f64
+                                        (((state >> 32) % 20_001) as i64 - 10_000) as f64 / 97.0
                                     }
                                 })
                                 .collect();
@@ -2800,8 +2611,8 @@ mod smooth_run_tests {
                                     assert!(from > 0 && from <= old.len(), "window={window}, n={n}: append fixture must retain a real prefix");
                                 }
                                 for (i, value) in old.iter().enumerate() {
-                                    let a = crate::chart_delta::round_y(*value).to_bits();
-                                    let b = crate::chart_delta::round_y(new[i + offset]).to_bits();
+                                    let a = value.to_bits();
+                                    let b = new[i + offset].to_bits();
                                     if i + offset < from {
                                         assert_eq!(a, b, "window={window}, n={n}, order={order}, seed={seed}, growth={growth}, index={i}");
                                         retained += 1;
@@ -2871,29 +2682,23 @@ mod smooth_run_tests {
         let a = smooth_run(&xs, &y, Algorithm::SavitzkyGolay, 8, 0.3, 2, true);
         let b = super::savitzky_golay(&y, 8, 2);
         assert_eq!(a, b, "uniform grid must give the exact index-space result");
-        let a = smooth_run(&xs, &y, Algorithm::Gaussian, 8, 0.3, 2, true);
-        let b = super::gaussian(&y, 8);
-        assert_eq!(a, b);
     }
 
-    /// EMA output must equal the explicit exponential kernel in x:
-    /// out_i = Σ_j (1−α)^((xᵢ−xⱼ)/dx_ref)·v_j / Σ_j (1−α)^((xᵢ−xⱼ)/dx_ref),
-    /// on uniform AND irregular grids (gaps decay by their width).
+    /// EMA output must equal the explicit exponential kernel in x, out_i = Σ_j e^(−(xᵢ−xⱼ)/τ)·v_j / Σ_j e^(−(xᵢ−xⱼ)/τ), on uniform AND irregular grids (gaps decay by their width).
     #[test]
     fn ema_matches_explicit_kernel() {
-        let alpha = 0.2f64;
+        let tau = 4.5f64;
         let cases: Vec<Vec<f64>> = vec![
             (0..40).map(|i| i as f64).collect(), // contiguous steps
             vec![0.0, 1.0, 2.0, 10.0, 11.0, 50.0, 51.0, 52.0], // gappy steps
         ];
         for xs in cases {
             let y: Vec<f64> = xs.iter().map(|x| (x * 0.7).sin() * 10.0 + 3.0).collect();
-            let out = smooth_run(&xs, &y, Algorithm::Ema, 0, alpha, 0, true);
-            let d = 1.0 - alpha;
+            let out = smooth_run(&xs, &y, Algorithm::Ema, 0, tau, 0, true);
             for i in 0..y.len() {
                 let (mut num, mut den) = (0.0, 0.0);
                 for j in 0..=i {
-                    let w = d.powf(xs[i] - xs[j]);
+                    let w = (-(xs[i] - xs[j]) / tau).exp();
                     num += w * y[j];
                     den += w;
                 }
@@ -2909,22 +2714,11 @@ mod smooth_run_tests {
     fn ema_is_debiased() {
         let y = [0.0, 1.0, 1.0, 1.0];
         let xs = step_xs(y.len());
-        let out = smooth_run(&xs, &y, Algorithm::Ema, 0, 0.1, 0, true);
+        let out = smooth_run(&xs, &y, Algorithm::Ema, 0, -1.0 / 0.9f64.ln(), 0, true);
         assert_eq!(out[0], 0.0);
         // classic seeded EMA gives 0.1 here; the debiased weighted mean of
         // {0, 1} with weights {0.9, 1} is 1/1.9
         assert!((out[1] - 1.0 / 1.9).abs() < 1e-12, "{}", out[1]);
-    }
-
-    #[test]
-    fn ema_polyfit_order_zero_is_ema() {
-        let xs = [0.0, 1.0, 3.0, 4.0, 10.0, 11.0];
-        let y = [2.0, -1.0, 4.0, 8.0, 3.0, 7.0];
-        let ema = super::ema(&xs, &y, 0.17, 1.0);
-        let fit = smooth_run(&xs, &y, Algorithm::Ema, 0, 0.17, 0, true);
-        for (a, b) in ema.iter().zip(fit) {
-            assert!((a - b).abs() < 1e-12, "{a} vs {b}");
-        }
     }
 
     #[test]
@@ -2941,7 +2735,7 @@ mod smooth_run_tests {
                     }
                 })
                 .collect();
-            let out = smooth_run(&xs, &y, Algorithm::Ema, 0, 0.1, order, true);
+            let out = smooth_run(&xs, &y, Algorithm::Ema, 0, 10.0, order, true);
             for i in order as usize..xs.len() {
                 assert!(
                     (out[i] - y[i]).abs() < 1e-7 * (1.0 + y[i].abs()),
@@ -3127,18 +2921,6 @@ mod smooth_run_tests {
                 out[i],
                 q(x)
             );
-        }
-    }
-
-    /// Gaussian on an irregular grid: constants are preserved and the
-    /// result is finite everywhere.
-    #[test]
-    fn gaussian_irregular_grid_preserves_constant() {
-        let xs = [0.0, 1.0, 2.0, 9.0, 10.0, 30.0, 31.0, 33.0];
-        let y = [4.0; 8];
-        let out = smooth_run(&xs, &y, Algorithm::Gaussian, 6, 0.0, 0, true);
-        for (i, v) in out.iter().enumerate() {
-            assert!((v - 4.0).abs() < 1e-12, "i={i}: {v}");
         }
     }
 }

@@ -32,8 +32,9 @@ fn recovered_evicted_lineages_keep_real_wire_deltas_for_every_smoother() {
         request.smoothing = (algorithm != Algorithm::None).then_some(proto::SmoothingConfig {
             algorithm: algorithm as i32,
             window_size: 3,
-            alpha: 0.5,
+            time_constant: std::f64::consts::LOG2_E,
             poly_order: 1,
+            ..Default::default()
         });
         let held =
             super::super::build_response(&request, std::slice::from_ref(&original), None, false)
@@ -261,8 +262,9 @@ fn held_timestamp_rewrites_are_detected_for_every_smoother() {
         request.smoothing = (algorithm != Algorithm::None).then_some(proto::SmoothingConfig {
             algorithm: algorithm as i32,
             window_size: 3,
-            alpha: 0.5,
+            time_constant: std::f64::consts::LOG2_E,
             poly_order: 1,
+            ..Default::default()
         });
         let held = build(&request, &[a.clone(), b.clone()]);
         assert_eq!(inflate_full(&held).series[0].values[0], 42.0);
@@ -317,37 +319,35 @@ fn rewritten_warmup_positions_cannot_hide_a_changed_curve() {
         timestamp_ms: 30,
         ..scalar_row(50, 1_000.0)
     });
-    for algorithm in [Algorithm::Gaussian, Algorithm::SavitzkyGolay] {
-        let mut request = req(&["a"], 1_000);
-        request.use_timestamp_axis = true;
-        request.log_buckets = true;
-        request.step_min = Some(20);
-        request.step_max = Some(40);
-        request.smoothing = Some(proto::SmoothingConfig {
-            algorithm: algorithm as i32,
-            window_size: 3,
-            poly_order: 1,
-            ..Default::default()
-        });
-        let held = build(&request, &[Arc::new(original.clone())]);
-        for timestamp in [-1, 60] {
-            let mut changed = original.clone();
-            changed[50].timestamp_ms = timestamp;
-            changed[50].inserted_ms = 600_000_000;
-            let current = [Arc::new(changed)];
-            let truth = inflate_full(&build(&request, &current));
-            assert!(inflate_full(&held).series[0]
-                .values
-                .iter()
-                .zip(&truth.series[0].values)
-                .any(|(a, b)| a.to_bits() != b.to_bits()));
-            assert_full_response(
-                &request,
-                &held,
-                &current,
-                Some(Rejection::Digest(LineageOrigin::Rewrite)),
-            );
-        }
+    let mut request = req(&["a"], 1_000);
+    request.use_timestamp_axis = true;
+    request.log_buckets = true;
+    request.step_min = Some(20);
+    request.step_max = Some(40);
+    request.smoothing = Some(proto::SmoothingConfig {
+        algorithm: Algorithm::SavitzkyGolay as i32,
+        window_size: 3,
+        poly_order: 1,
+        ..Default::default()
+    });
+    let held = build(&request, &[Arc::new(original.clone())]);
+    for timestamp in [-1, 60] {
+        let mut changed = original.clone();
+        changed[50].timestamp_ms = timestamp;
+        changed[50].inserted_ms = 600_000_000;
+        let current = [Arc::new(changed)];
+        let truth = inflate_full(&build(&request, &current));
+        assert!(inflate_full(&held).series[0]
+            .values
+            .iter()
+            .zip(&truth.series[0].values)
+            .any(|(a, b)| a.to_bits() != b.to_bits()));
+        assert_full_response(
+            &request,
+            &held,
+            &current,
+            Some(Rejection::Digest(LineageOrigin::Rewrite)),
+        );
     }
 }
 
@@ -485,8 +485,9 @@ fn backfill_starts_a_new_lineage_including_relative_time_for_every_smoother() {
             request.smoothing = (algorithm != Algorithm::None).then_some(proto::SmoothingConfig {
                 algorithm: algorithm as i32,
                 window_size: 3,
-                alpha: 0.5,
+                time_constant: std::f64::consts::LOG2_E,
                 poly_order: 1,
+                ..Default::default()
             });
             let old = rows_at(&[(2, 1.0), (3, 3.0), (4, 4.0)]);
             let held = build(&request, std::slice::from_ref(&old));
@@ -568,7 +569,7 @@ fn cache_lineage_covers_warmup_and_conservatively_rejects_outside_rewrites() {
     request.step_max = Some(200);
     request.smoothing = Some(proto::SmoothingConfig {
         algorithm: Algorithm::Ema as i32,
-        alpha: 0.5,
+        time_constant: std::f64::consts::LOG2_E,
         ..Default::default()
     });
     let p = chart_params(&request);
@@ -608,7 +609,7 @@ fn changed_render_parameters_cannot_reuse_an_old_lineage() {
     changed = request.clone();
     changed.smoothing = Some(proto::SmoothingConfig {
         algorithm: Algorithm::Ema as i32,
-        alpha: 0.5,
+        time_constant: std::f64::consts::LOG2_E,
         ..Default::default()
     });
     assert_full_response(&changed, &held, &rows, None);

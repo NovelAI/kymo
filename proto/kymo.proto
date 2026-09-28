@@ -462,16 +462,16 @@ message SeriesRef {
 message SmoothingConfig {
   enum Algorithm {
     NONE = 0;
-    reserved 1; reserved "RUNNING_AVERAGE";  // removed; old clients sending 1 decode as NONE
+    reserved 1, 3; reserved "RUNNING_AVERAGE", "GAUSSIAN";  // removed; the server rejects unknown values as InvalidArgument
     EMA = 2;
-    GAUSSIAN = 3;
     SAVITZKY_GOLAY = 4;
     TRIANGULAR = 5;
   }
   Algorithm algorithm = 1;
-  uint32 window_size = 2;   // gaussian, savgol
-  double alpha = 3;          // EMA polyfit (0-1)
+  uint32 window_size = 2;   // savgol
+  double alpha = 3;          // EMA, from clients that predate time_constant: 1 - exp(-1 / time_constant)
   uint32 poly_order = 4;     // polyfit degree (0-2), all polyfits
+  double time_constant = 5;  // EMA: e-folding length in steps (step axis) or median sample gaps (time axis), finite and > 0; wins over alpha
 }
 
 message ChartRequest {
@@ -495,7 +495,7 @@ message ChartCacheState {
   reserved 7; reserved "downsampled";  // pre-2026-07 echoed decision; the fixed-threshold rules made it derivable
   map<string, int64> frontiers = 6;  // ChartResponse.frontiers of the held response, verbatim; keys beginning with NUL are versioned opaque server metadata
   // Series count of the held response. Together with verified input lineages and shared-ref order, count equality against continuing series protects positional pairing when refs or tag groups change. A mismatch answers in full instead of shipping a delta the client cannot splice.
-  // When versioned exact-smoothing state is required, new clients send UINT32_MAX as a downgrade sentinel and the real count rides in that state. Fixed servers recover it; older servers that know this count gate deterministically answer in full during a rolling deployment. Stateless step EMA/Triangular send the literal count because no median/uniform drift can rescale their held prefix.
+  // Dashboards before wire revision 2 send UINT32_MAX instead when versioned exact-smoothing state is required; the server recovers the real count from that state.
   optional uint32 held_series = 8;
 }
 

@@ -41,7 +41,7 @@ fn response_builder_benchmark() {
     let response = |request: &proto::ChartRequest, rows: &[Arc<SeriesSnapshot>]| {
         super::super::build_response(request, rows, None, false).unwrap()
     };
-    for algorithm in [Algorithm::None, Algorithm::Ema, Algorithm::Gaussian] {
+    for algorithm in [Algorithm::None, Algorithm::Ema, Algorithm::SavitzkyGolay] {
         for zoom in [false, true] {
             let mut req = req(&runs, 500);
             if zoom {
@@ -51,8 +51,9 @@ fn response_builder_benchmark() {
             req.smoothing = (algorithm != Algorithm::None).then_some(proto::SmoothingConfig {
                 algorithm: algorithm as i32,
                 window_size: 20,
-                alpha: 0.5,
+                time_constant: std::f64::consts::LOG2_E,
                 poly_order: 1,
+                ..Default::default()
             });
             let held = response(&req, &old_inputs);
             let mut continued = req.clone();

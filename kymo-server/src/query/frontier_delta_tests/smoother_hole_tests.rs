@@ -126,7 +126,7 @@ fn synthetic_params() -> ChartParams {
     let mut request = req(&["anchor", "holes"], 16);
     request.smoothing = Some(proto::SmoothingConfig {
         algorithm: Algorithm::Ema as i32,
-        alpha: 0.5,
+        time_constant: std::f64::consts::LOG2_E,
         ..Default::default()
     });
     chart_params(&request)

@@ -734,7 +734,7 @@ def prepare(page: Page, fixture: Fixture, url: str) -> None:
         })()"""
     )
     page.route_web_socket(
-        re.compile(r"/(?:grpc-ws|trash/_kymo-grpc-ws-local-v1)$"), fixture.connect
+        re.compile(r"/(?:grpc-ws|trash/_kymo-grpc-ws-local-v1)"), fixture.connect
     )
     page.route(
         "**/alerts",

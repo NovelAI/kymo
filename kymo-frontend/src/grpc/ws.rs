@@ -32,8 +32,11 @@
 //! matter how the deploys are ordered. Evolve by mounting a new route
 //! (/grpc-ws2) beside this one and pointing the frontend at it once the
 //! server is live.
+//!
+//! The URL carries `?rev=FRONTEND_WIRE_REVISION`; a server whose floor is above it refuses every request with RELOAD_REQUIRED, and [`connection_task`] then stops connecting for good and reloads the page once if the server had ever served it.
 
 use std::collections::{hash_map::Entry, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
@@ -425,6 +428,8 @@ impl PushSubscription {
 static PUSH: OnceLock<PushHub> = OnceLock::new();
 static HIDDEN: OnceLock<Watch<bool>> = OnceLock::new();
 static CONNECTED: OnceLock<Watch<bool>> = OnceLock::new();
+/// Set when the server refuses this bundle's wire revision; the connection task has then stopped for good.
+static STALE: AtomicBool = AtomicBool::new(false);
 
 fn push_hub() -> &'static PushHub {
     PUSH.get_or_init(Default::default)
@@ -445,6 +450,11 @@ fn conn_watch() -> &'static Watch<bool> {
 /// `(generation, connected)`: the generation bumps on every connect and disconnect, so 0 means the socket has never connected.
 pub fn connection() -> (u64, bool) {
     conn_watch().get()
+}
+
+/// Whether the server refused this bundle's wire revision, so the tab no longer connects.
+pub fn is_stale() -> bool {
+    STALE.load(Ordering::Relaxed)
 }
 
 /// Resolves on the first connect or disconnect after generation `seen`.
@@ -711,8 +721,15 @@ fn decode_response(mut buf: Vec<u8>) -> Option<(u32, Result<Vec<u8>, Status>)> {
 
 async fn connection_task(mut requests: mpsc::UnboundedReceiver<Pending>) {
     let mut next_id: u32 = 0;
+    // Whether the server answered any request with something other than the refusal. A page refused from its first answer was just served the too-old bundle, so reloading it again would loop.
+    let mut served = false;
+    let url = format!(
+        "{}?rev={}",
+        crate::runtime::config().websocket_url,
+        super::ws_rpc::FRONTEND_WIRE_REVISION
+    );
     loop {
-        let ws = match WebSocket::open(&crate::runtime::config().websocket_url) {
+        let ws = match WebSocket::open(&url) {
             Ok(ws) => ws,
             Err(_) => {
                 gloo_timers::future::sleep(std::time::Duration::from_millis(
@@ -752,7 +769,7 @@ async fn connection_task(mut requests: mpsc::UnboundedReceiver<Pending>) {
         // visibility arm fire immediately if the flag ever flipped, and
         // each later flip bumps its gen. Sending only the latest state (no
         // queued per-flip messages) makes reordering impossible. Control
-        // frames take an id but expect no reply.
+        // frames take an id but expect no reply (a refusing server still answers them).
         let mut sent_hidden = false;
         let mut seen_vis_gen = 0u64;
         // Parked oneshots, by correlation id. Dropped wholesale on
@@ -807,6 +824,9 @@ async fn connection_task(mut requests: mpsc::UnboundedReceiver<Pending>) {
                     match msg {
                         Some(Ok(Message::Bytes(buf))) => {
                             if let Some((id, result)) = decode_response(buf) {
+                                // Any request can carry the refusal, push control included (a hidden tab's first frame).
+                                let refused = matches!(&result, Err(s) if s.code() == tonic::Code::InvalidArgument && s.message() == super::ws_rpc::RELOAD_REQUIRED);
+                                served |= id != 0 && !refused;
                                 if id == 0 {
                                     // Server push (see ws_proxy.rs): id 0
                                     // carries a RunVersionsEvent, never a
@@ -824,6 +844,10 @@ async fn connection_task(mut requests: mpsc::UnboundedReceiver<Pending>) {
                                 } else if let Some(tx) = inflight.remove(&id) {
                                     let _ = tx.send(result);
                                 }
+                                if refused {
+                                    STALE.store(true, Ordering::Relaxed);
+                                    break;
+                                }
                             }
                         }
                         Some(Ok(Message::Text(_))) => {}
@@ -838,6 +862,15 @@ async fn connection_task(mut requests: mpsc::UnboundedReceiver<Pending>) {
             *c = false;
             changed
         });
+        if is_stale() {
+            // Stop for good: dropping `requests` fails every waiting and later call at once, and the notice bar asks for a reload.
+            if served {
+                if let Some(window) = web_sys::window() {
+                    let _ = window.location().reload();
+                }
+            }
+            return;
+        }
         gloo_timers::future::sleep(std::time::Duration::from_millis(RECONNECT_DELAY_MS as u64))
             .await;
     }

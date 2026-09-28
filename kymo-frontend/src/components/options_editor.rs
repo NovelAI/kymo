@@ -4,7 +4,8 @@ use serde_json::Value;
 use crate::components::editor_dialog::EditorDialog;
 use crate::components::icons::{CaretDownIcon, CaretRightIcon, CloseIcon};
 use crate::state::layout_config::{
-    ema_tau, finer_overrides, OptionOverride, OverrideTarget, RectOptions, SmoothingAlgorithm,
+    ema_time_constant, finer_overrides, OptionOverride, OverrideTarget, RectOptions,
+    SmoothingAlgorithm,
 };
 use crate::state::DashboardState;
 use crate::util::{primary, use_live_apply};
@@ -52,10 +53,10 @@ fn pretty_option_value(field: &str, v: &Value) -> String {
         }
         .to_string(),
         Value::Number(n) if field == "smoothing_alpha" => {
-            match ema_tau(n.as_f64().unwrap_or(0.0)) {
-                Some(tau) => format!("τ {}", tau.round() as u32),
-                None => n.to_string(),
-            }
+            format!(
+                "τ {}",
+                ema_time_constant(n.as_f64().unwrap_or(0.0)).round() as u32
+            )
         }
         other => other.to_string(),
     }
@@ -196,7 +197,7 @@ pub fn SmoothingFields(
     let window = o.smoothing_window;
     let poly_order = o.smoothing_poly_order;
     // The UI edits the e-folding time constant, while the draft stores alpha.
-    let tc_display = ema_tau(o.smoothing_alpha).unwrap_or(10.0).round() as u32;
+    let tc_display = ema_time_constant(o.smoothing_alpha).round() as u32;
     let inherited_smoothing = anchor.smoothing.clone();
     let inherited_order = anchor.smoothing_poly_order;
     let inherited_window = anchor.smoothing_window;

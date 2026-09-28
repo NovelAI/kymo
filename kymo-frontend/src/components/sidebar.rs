@@ -616,20 +616,6 @@ fn apply_rename_if_current(
     Some(run.clone())
 }
 
-fn rename_failure_message(status: &tonic::Status) -> String {
-    if status.code() == tonic::Code::Unimplemented
-        && status.message().contains("not proxied over ws")
-    {
-        return "Rename isn’t available on this server yet.".to_string();
-    }
-    let detail = status.message();
-    if detail.is_empty() {
-        "Couldn’t rename the run.".to_string()
-    } else {
-        format!("Couldn’t rename the run: {detail}")
-    }
-}
-
 #[component]
 fn InlineRunRename(
     target: RenameRunTarget,
@@ -729,7 +715,10 @@ fn InlineRunRename(
                         // while leaving the inline draft available for retry.
                         state.request_runs_refresh();
                         busy.set(false);
-                        let message = rename_failure_message(&status);
+                        let message = match status.message() {
+                            "" => "Couldn’t rename the run.".to_string(),
+                            detail => format!("Couldn’t rename the run: {detail}"),
+                        };
                         error.set(message.clone());
                         on_error.call(message);
                     }
@@ -873,10 +862,9 @@ mod selection_pick_tests {
     use super::{
         all_or_none_selection, apply_rename_if_current, continue_selection_paint,
         is_json_run_selection, legacy_selected_runs_v1_key, legacy_selected_runs_v2_key,
-        live_trash_warning, persisted_run_selection, rename_failure_message,
-        restored_json_run_selection, restored_run_selection, run_list_empty_message,
-        selected_runs_key, selection_action_label, sidebar_needs_run_ordinals, sidebar_run_label,
-        summarize_trash_results, SelectionPaint,
+        live_trash_warning, persisted_run_selection, restored_json_run_selection,
+        restored_run_selection, run_list_empty_message, selected_runs_key, selection_action_label,
+        sidebar_needs_run_ordinals, sidebar_run_label, summarize_trash_results, SelectionPaint,
     };
 
     #[test]
@@ -1146,14 +1134,5 @@ mod selection_pick_tests {
         // rename that was already observed through ListRuns.
         assert!(apply_rename_if_current(&mut runs, "p", "a", "old", "stale").is_none());
         assert_eq!(runs[0].run_name, "new");
-    }
-
-    #[test]
-    fn old_ws_proxy_errors_explain_the_server_mismatch() {
-        let status = tonic::Status::unimplemented("not proxied over ws: /kymo.Kymo/RenameRun");
-        assert_eq!(
-            rename_failure_message(&status),
-            "Rename isn’t available on this server yet."
-        );
     }
 }

@@ -38,6 +38,13 @@ static DISMISSED: GlobalSignal<Vec<String>> = Signal::global(Vec::new);
 static OFFLINE: GlobalSignal<Option<u64>> = Signal::global(|| None);
 
 fn offline_notice(generation: u64) -> Notice {
+    if crate::grpc::is_stale() {
+        return Notice {
+            key: "stale".to_owned(),
+            text: crate::grpc::RELOAD_REQUIRED.to_owned(),
+            title: "The server no longer supports this tab's version of kymo, so the tab has stopped connecting.".to_owned(),
+        };
+    }
     Notice {
         key: format!("offline|{generation}"),
         text: if generation == 0 {

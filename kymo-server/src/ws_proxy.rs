@@ -28,11 +28,13 @@
 //! connection to at most one frame per EVENT_COALESCE_MS carrying only the
 //! counters that changed; logging rate cannot inflate this (versions bump
 //! per ingest flush, ~2s per active run, not per point).
+//!
+//! The socket URL carries the dashboard's wire revision as `?rev=` (none counts as 1). Below MIN_FRONTEND_WIRE_REVISION every request frame is answered with InvalidArgument(RELOAD_REQUIRED) and nothing is dispatched (ws_rpc.rs).
 
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{RawQuery, State};
 use axum::http::{header::ORIGIN, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::{SinkExt, StreamExt};
@@ -275,6 +277,7 @@ async fn dispatch(svc: &KymoService, path: &str, body: &[u8]) -> Result<Vec<u8>,
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<WsState>,
+    RawQuery(query): RawQuery,
     headers: HeaderMap,
 ) -> Response {
     let local = matches!(&state.mode, WsMode::Local { .. });
@@ -297,6 +300,13 @@ pub async fn ws_handler(
         WsMode::Local { activity } => Some(activity.clone()),
         WsMode::Hosted => None,
     };
+    // Bundles without a valid `?rev=` count as revision 1.
+    let rev = query
+        .as_deref()
+        .and_then(|q| q.split('&').find_map(|p| p.strip_prefix("rev=")))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let refused = rev < crate::ws_rpc::MIN_FRONTEND_WIRE_REVISION;
     // Match native gRPC's transport-byte admission. This bounds one frame,
     // not the number of run ids accepted by a lifecycle request.
     ws.max_message_size(crate::ingest::MAX_GRPC_MESSAGE_BYTES)
@@ -304,7 +314,7 @@ pub async fn ws_handler(
             let _frontend = activity
                 .as_ref()
                 .map(|activity| activity.frontend_connected());
-            handle_socket(socket, state.service, activity.is_some()).await;
+            handle_socket(socket, state.service, activity.is_some(), refused).await;
         })
         .into_response()
 }
@@ -325,7 +335,7 @@ const EVENT_COALESCE_MS: u64 = 1_000;
 const KEEPALIVE_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
 const KEEPALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-async fn handle_socket(socket: WebSocket, svc: Arc<KymoService>, keepalive: bool) {
+async fn handle_socket(socket: WebSocket, svc: Arc<KymoService>, keepalive: bool, refused: bool) {
     let (mut sink, mut stream) = socket.split();
     // Requests run concurrently (a slow QueryChart must not stall the
     // others), so responses funnel through one writer task.
@@ -384,6 +394,14 @@ async fn handle_socket(socket: WebSocket, svc: Arc<KymoService>, keepalive: bool
                     tracing::warn!("ws: dropping malformed frame ({} bytes)", buf.len());
                     continue;
                 };
+                // Refuse push control too: it may be a hidden tab's first frame. Pushes still flow, so an old bundle's live panels refetch and show the refusal.
+                if refused {
+                    let refusal = Err(Status::invalid_argument(crate::ws_rpc::RELOAD_REQUIRED));
+                    if tx.send(encode_response(id, &refusal)).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
                 // Per-connection control frames mutate this loop's push
                 // state, which dispatch tasks can't reach — handle inline,
                 // with no response (the client parks nothing for them).

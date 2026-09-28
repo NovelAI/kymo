@@ -68,7 +68,7 @@ Deleting a run moves it to Trash, where it can be restored for 7 days. After tha
 
 ## Building and running
 
-Build both images from the `kymo/` directory. The dashboard compiles in the server's HTTP origin as the browser should reach it, and its build fails without one:
+Build both images from the same commit, in the `kymo/` directory. The dashboard compiles in the server's HTTP origin as the browser should reach it, and its build fails without one:
 
 ```sh
 docker build -f kymo-server/Dockerfile -t kymo-server .
@@ -88,6 +88,8 @@ docker run -d --name kymo-dashboard -p 80:80 kymo-dashboard
 ```
 
 Serve the dashboard at the root of its host. Another web server works if it answers unknown paths with `index.html`, as the image's nginx does. A dashboard served over HTTPS needs an `https://` server origin, for example through a TLS proxy in front of port 8080.
+
+Upgrade the dashboard before the server. Tabs left open on a dashboard the server no longer supports reload themselves; reload by hand any tab that stops updating.
 
 ## Clients
 
