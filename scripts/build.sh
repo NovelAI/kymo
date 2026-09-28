@@ -15,7 +15,7 @@ frontend)
     ;;
 notices)
     {
-        printf 'Third-party software in kymo-local-runtime\n\nThe kymo and kymo-server binaries and the embedded dashboard include the following crates, under the licenses below. Their source is available from crates.io.\n'
+        printf 'Third-party software in kymo-local-runtime\n\nThe kymo and kymo-server binaries and the embedded dashboard include the following crates, under the licenses below. Their source is available from crates.io, or from the git source given after the version of a patched crate.\n'
         cargo about generate --locked -c scripts/about.toml -m local-runtime/Cargo.toml scripts/about.hbs
         cargo about generate --locked -c scripts/about.toml -m kymo-frontend/Cargo.toml scripts/about.hbs
         for notice in kymo-frontend/assets/vendor/LICENSE-*; do

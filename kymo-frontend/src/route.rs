@@ -196,6 +196,33 @@ mod route_tests {
         );
     }
 
+    // Fails if the patched router macro (see Cargo.toml) stops applying.
+    #[test]
+    fn unfocused_routes_have_no_bare_query_mark() {
+        let project = Route::ProjectPage {
+            project_id: "p".to_string(),
+            chart: None.into(),
+        };
+        let run = Route::RunPage {
+            project_id: "p".to_string(),
+            run_id: "r".to_string(),
+            chart: None.into(),
+        };
+        assert_eq!(project.to_string(), "/p/");
+        assert_eq!(run.to_string(), "/p/r");
+        assert_eq!(
+            Route::ProjectPage {
+                project_id: "p".to_string(),
+                chart: Some("x".to_string()).into(),
+            }
+            .to_string(),
+            "/p/?chart=x"
+        );
+        // Older links end in a bare `?` and must open the same page.
+        assert_eq!(Route::from_str("/p/?").unwrap(), project);
+        assert_eq!(Route::from_str("/p/r?").unwrap(), run);
+    }
+
     #[test]
     fn focused_chart_query_roundtrips_every_valid_identifier_shape() {
         for value in [

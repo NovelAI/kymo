@@ -2,7 +2,7 @@
 
 ================================================================================
 {{{name}}} ({{id}})
-Used by: {{#each used_by}}{{crate.name}} {{crate.version}}{{#unless @last}}, {{/unless}}{{/each}}
+Used by: {{#each used_by}}{{crate.name}} {{crate.version}}{{#unless (eq crate.source "registry+https://github.com/rust-lang/crates.io-index")}} ({{{crate.source}}}){{/unless}}{{#unless @last}}, {{/unless}}{{/each}}
 ================================================================================
 
 {{{text}}}

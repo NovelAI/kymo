@@ -1,3 +1,7 @@
 [workspace]
 members = ["kymo-server", "kymo-frontend"]
 resolver = "2"
+
+# Upstream's router macro writes a bare `?` for an empty query; fork tag kymo-v0.7.9-1 is v0.7.9 plus the unmerged fix DioxusLabs/dioxus#5845. Drop this once upstream releases the fix.
+[patch.crates-io]
+dioxus-router-macro = { git = "https://github.com/ad8e/dioxus", rev = "fec64a2d503b40c0d7c95fd6e9f4328a6fd965a5" }
