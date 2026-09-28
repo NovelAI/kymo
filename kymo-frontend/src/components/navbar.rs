@@ -1,6 +1,6 @@
 use dioxus::prelude::*;
 
-use crate::components::icons::{CloseIcon, GearIcon, ResetIcon};
+use crate::components::icons::{CloseIcon, CollapseAllIcon, ExpandAllIcon, GearIcon, ResetIcon};
 use crate::components::options_editor::ProjectDefaultsEditor;
 use crate::components::theme_toggle::ThemeToggle;
 use crate::route::Route;
@@ -20,6 +20,26 @@ pub fn Navbar() -> Element {
 
     let mut panel_filter = state.panel_filter;
     let filter_value = panel_filter.read().clone();
+    let sections_visible = user_config.sections_visible();
+
+    // The collapse toggle acts on the sections the grid shows: it collapses them while any is open, else expands them.
+    let needle = state.panel_needle();
+    let mut shown_names = Vec::new();
+    let mut any_open = false;
+    if *state.grid_mounted.read() {
+        for section in state.layout_config.read().iter().flat_map(|l| &l.sections) {
+            if section.matches_filter(&needle) {
+                any_open |= !section.is_collapsed(sections_visible);
+                shown_names.push(section.name.clone());
+            }
+        }
+    }
+    let collapse_verb = if any_open { "Collapse" } else { "Expand" };
+    let collapse_scope = if needle.is_empty() {
+        "all sections"
+    } else {
+        "all listed sections"
+    };
     rsx! {
         nav { class: "navbar",
             Link { to: Route::ProjectsPage {}, class: "navbar-brand", "kymo" }
@@ -99,6 +119,15 @@ pub fn Navbar() -> Element {
                 }
             }
             button {
+                class: "navbar-action icon-button",
+                title: "{collapse_verb} {collapse_scope}",
+                disabled: shown_names.is_empty(),
+                onmousedown: primary(move |_| {
+                    state.set_sections_collapsed(&shown_names, any_open, sections_visible);
+                }),
+                if any_open { CollapseAllIcon {} } else { ExpandAllIcon {} }
+            }
+            button {
                 class: "navbar-action",
                 title: "Add a section",
                 onmousedown: primary(move |_| {
@@ -112,7 +141,7 @@ pub fn Navbar() -> Element {
                     let name = unique_id("section");
                     let mut section = SectionConfig::auto(name, Vec::new());
                     section.display_name = "New Section".to_string();
-                    section.set_collapsed(false, user_config.current().sections_visible);
+                    section.set_collapsed(false, sections_visible);
                     state.add_section(section);
                 }),
                 "+ Section"

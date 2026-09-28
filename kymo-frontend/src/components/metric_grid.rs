@@ -9,12 +9,13 @@ use crate::util::editor_trigger_id;
 
 #[component]
 pub fn MetricGrid() -> Element {
-    let state = use_context::<DashboardState>();
+    let mut state = use_context::<DashboardState>();
     let drag = SectionDrag::provide();
     let mut list = use_signal(|| None::<web_sys::Element>);
     let layout = state.layout_config.read().clone();
-    // Search needle: trimmed + lowercased; empty = no filter.
-    let needle = state.panel_filter.read().trim().to_lowercase();
+    let needle = state.panel_needle();
+    use_effect(move || state.grid_mounted.set(true));
+    use_drop(move || state.grid_mounted.set(false));
 
     // Close the section dialog if its section drops out of a regenerated
     // layout mid-edit — better than silently editing a ghost. (Effect, not
@@ -45,11 +46,7 @@ pub fn MetricGrid() -> Element {
             div { class: "empty-state", "Loading metrics..." }
         },
         Some(config) => {
-            // With no filter, keep every section — including empty ones, so their add-chart button stays reachable.
-            let active = !needle.is_empty();
-            let section_shown =
-                |s: &SectionConfig| !active || s.rects.iter().any(|r| r.matches_filter(&needle));
-            let any_visible = config.sections.iter().any(section_shown);
+            let any_visible = config.sections.iter().any(|s| s.matches_filter(&needle));
             rsx! {
             div {
                 class: "metric-sections",
@@ -64,10 +61,10 @@ pub fn MetricGrid() -> Element {
                     } else {
                         div { class: "empty-state", "No sections. Add one to get started." }
                     }
-                } else if active && !any_visible {
+                } else if !any_visible {
                     div { class: "empty-state", "No panels match the filter." }
                 }
-                for section in config.sections.iter().filter(|s| section_shown(s)) {
+                for section in config.sections.iter().filter(|s| s.matches_filter(&needle)) {
                     {
                         // Handlers record intent against the section's
                         // immutable `name`; the diff store is updated per

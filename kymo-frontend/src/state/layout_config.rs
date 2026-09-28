@@ -310,6 +310,11 @@ impl SectionConfig {
         }
     }
 
+    /// Whether the navbar filter shows this section: any panel matches, and an empty `needle` shows every section, even one with no panels, so its add-chart button stays reachable.
+    pub fn matches_filter(&self, needle: &str) -> bool {
+        needle.is_empty() || self.rects.iter().any(|r| r.matches_filter(needle))
+    }
+
     /// Label shown in the UI and used for sort tie-breaks: the user's
     /// rename if set, the immutable `name` otherwise.
     pub fn display_name(&self) -> &str {
@@ -1098,6 +1103,19 @@ mod filter_tests {
         // A just-created blank rect (empty label, one empty binding) matches no non-empty needle — the reason create actions clear the filter first.
         assert!(!rect("", &[""]).matches_filter("active-filter"));
     }
+
+    #[test]
+    fn a_section_shows_when_any_panel_matches_and_empty_ones_only_unfiltered() {
+        let train = SectionConfig::auto(
+            "train".to_string(),
+            vec![rect("", &["train/accuracy"]), rect("", &["train/loss"])],
+        );
+        assert!(train.matches_filter("loss"));
+        assert!(!train.matches_filter("system/"));
+        let empty = SectionConfig::auto("empty".to_string(), Vec::new());
+        assert!(empty.matches_filter(""));
+        assert!(!empty.matches_filter("empty"));
+    }
 }
 
 #[cfg(test)]
@@ -1474,6 +1492,7 @@ mod cascade_tests {
 
 #[cfg(test)]
 mod user_section_tests {
+    use super::section_order_integration_tests::base as base_with_sections;
     use super::*;
 
     /// Base owning a "train" section with one rect, as auto-gen would build.
@@ -1758,6 +1777,70 @@ mod user_section_tests {
         assert!(diff.is_empty());
     }
 
+    fn section_patch<'a>(diff: &'a LayoutDiff, name: &str) -> Option<&'a Value> {
+        diff.section_overrides
+            .iter()
+            .find(|ov| ov.key == name)
+            .map(|ov| &ov.patch)
+    }
+
+    #[test]
+    fn bulk_collapse_records_only_the_named_sections_that_change() {
+        let base = base_with_sections(&["", "train", "eval", "system", "old"]);
+        let names = ["", "train", "eval", "old"].map(String::from);
+        let mut diff = LayoutDiff::default();
+        let mut eval = base.find_section("eval").unwrap().clone();
+        eval.chart_height = 400;
+        diff.upsert_section_settings(&base, &eval);
+        diff.delete_section(&base, "old");
+
+        // Under the visible default every named section is open; "system" is out of scope, and the deleted "old" gets no patch.
+        assert!(diff.set_sections_collapsed(&base, &names, true, true));
+        let collapsed = serde_json::json!({ "collapsed": true });
+        assert_eq!(section_patch(&diff, ""), Some(&collapsed));
+        assert_eq!(section_patch(&diff, "train"), Some(&collapsed));
+        assert_eq!(
+            section_patch(&diff, "eval"),
+            Some(&serde_json::json!({ "chart_height": 400, "collapsed": true }))
+        );
+        assert_eq!(section_patch(&diff, "system"), None);
+        assert_eq!(section_patch(&diff, "old"), None);
+        let saved = diff.clone();
+        assert!(!diff.set_sections_collapsed(&base, &names, true, true));
+        assert_eq!(diff, saved);
+
+        // Expanding under the same default removes the collapse patches and keeps the other edit.
+        assert!(diff.set_sections_collapsed(&base, &names, false, true));
+        assert_eq!(diff.section_overrides.len(), 1);
+        assert_eq!(
+            section_patch(&diff, "eval"),
+            Some(&serde_json::json!({ "chart_height": 400 }))
+        );
+    }
+
+    #[test]
+    fn bulk_collapse_keeps_an_explicit_override_already_in_place() {
+        let base = base_with_sections(&["", "train", "eval"]);
+        let names = ["", "train", "eval"].map(String::from);
+        let mut diff = LayoutDiff::default();
+        // Closed under the visible default, so it stays closed if that default returns.
+        let mut train = base.find_section("train").unwrap().clone();
+        train.set_collapsed(true, true);
+        diff.upsert_section_settings(&base, &train);
+
+        // Under the collapsed default only the catch-all is open.
+        assert!(diff.set_sections_collapsed(&base, &names, true, false));
+        let collapsed = serde_json::json!({ "collapsed": true });
+        assert_eq!(section_patch(&diff, ""), Some(&collapsed));
+        assert_eq!(section_patch(&diff, "train"), Some(&collapsed));
+        assert_eq!(section_patch(&diff, "eval"), None);
+        assert!(diff
+            .apply(&base)
+            .sections
+            .iter()
+            .all(|s| s.is_collapsed(false)));
+    }
+
     #[test]
     fn specific_binding_keeps_an_absent_base_rect_editable() {
         let base = LayoutConfig::auto_generate(&[MetricInfo {
@@ -2000,6 +2083,26 @@ impl LayoutDiff {
         if let Some(patch) = patch {
             self.section_overrides.push(patch);
         }
+    }
+
+    /// Set the named sections to `collapsed`, recording each one that changes as its header toggle would; one already there keeps its override, and names gone from the layout are skipped. Returns whether anything changed.
+    pub fn set_sections_collapsed(
+        &mut self,
+        base: &LayoutConfig,
+        names: &[String],
+        collapsed: bool,
+        sections_visible: bool,
+    ) -> bool {
+        let mut changed = false;
+        for mut section in self.materialized_sections(base).sections {
+            if names.contains(&section.name) && section.is_collapsed(sections_visible) != collapsed
+            {
+                section.set_collapsed(collapsed, sections_visible);
+                self.upsert_section_settings(base, &section);
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Record deletion of one section, dropping the user content and per-rect entries it carried; base-derived sections get a tombstone (which also keeps them deleted if their metrics vanish and return).
@@ -2416,7 +2519,7 @@ mod section_order_integration_tests {
     use super::*;
     use crate::state::section_order::{Anchor, Placement};
 
-    fn base(names: &[&str]) -> LayoutConfig {
+    pub(super) fn base(names: &[&str]) -> LayoutConfig {
         LayoutConfig {
             sections: names
                 .iter()

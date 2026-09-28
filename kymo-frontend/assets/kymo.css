@@ -2086,6 +2086,7 @@ button.editor-section-toggle:focus-visible {
     padding: 2px 8px;
     white-space: nowrap;
 }
+.navbar-action:disabled { color: var(--text-disabled); cursor: default; opacity: 0.45; }
 /* Bordered header buttons on standalone pages (projects list). */
 .page-action {
     display: inline-flex;

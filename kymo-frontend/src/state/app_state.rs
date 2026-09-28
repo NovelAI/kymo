@@ -247,6 +247,8 @@ pub struct DashboardState {
     pub step_zoom: Signal<Option<(i64, i64)>>,
     /// Navbar "filter panels" text; empty = no filter. Transient view state like `step_zoom`/`maximized` — never persisted to the layout diff, but survives navigation. The grid hides panels whose label/metric names don't match.
     pub panel_filter: Signal<String>,
+    /// Whether a `MetricGrid` is mounted. A run page that can't show its run renders none while `layout_config` keeps the last layout, so the navbar's collapse toggle checks this.
+    pub grid_mounted: Signal<bool>,
     /// CopyValue (untracked, never written) rather than a bare GrpcClient,
     /// so the whole state struct is Copy and handlers can capture it
     /// without a clone per closure.
@@ -279,6 +281,7 @@ impl DashboardState {
             editing_section: Signal::new(None),
             step_zoom: Signal::new(None),
             panel_filter: Signal::new(String::new()),
+            grid_mounted: Signal::new(false),
             grpc: CopyValue::new(GrpcClient::new()),
         }
     }
@@ -350,6 +353,11 @@ impl DashboardState {
         )
     }
 
+    /// The panel filter in the form panels match it against: trimmed, lowercased, empty for no filter.
+    pub fn panel_needle(&self) -> String {
+        self.panel_filter.read().trim().to_lowercase()
+    }
+
     /// The single write funnel for layout edits: re-read the saved diff,
     /// apply one intent `f` to it, persist, and refresh the displayed layout
     /// as `diff.apply(base)`.
@@ -410,6 +418,18 @@ impl DashboardState {
     /// section to its old values as rect overrides.
     pub fn update_section_settings(&self, new_section: SectionConfig) {
         self.record_edit(|diff, base| diff.upsert_section_settings(base, &new_section));
+    }
+
+    /// Collapse or expand the named sections as one edit (see [`LayoutDiff::set_sections_collapsed`]).
+    pub fn set_sections_collapsed(
+        &self,
+        names: &[String],
+        collapsed: bool,
+        sections_visible: bool,
+    ) {
+        self.record_edit_if_changed(|diff, base| {
+            diff.set_sections_collapsed(base, names, collapsed, sections_visible)
+        });
     }
 
     pub fn delete_section(&self, name: &str) {
