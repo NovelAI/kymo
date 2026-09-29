@@ -709,7 +709,7 @@ pub fn Sidebar() -> Element {
                         }
                     }
                     button {
-                        class: "sidebar-trash-commit",
+                        class: "btn btn-primary sidebar-trash-commit",
                         disabled: pending_count == 0 || *trash_busy.read(),
                         onmousedown: primary({
                             let project_id = project_id.clone();

@@ -22,6 +22,8 @@
     --chart-axis: #888;
     --scrollbar-thumb: var(--bg3);
     --scrollbar-thumb-hover: #5f668c;
+    /* The light theme's dark fill needs a larger factor for the same visible brighten. */
+    --primary-hover-filter: brightness(1.08);
     /* Native widgets and unstyled scrollbars follow the theme. */
     color-scheme: dark;
     /* 0s on purpose: every hover/focus change lands the same frame as the
@@ -1298,7 +1300,7 @@ input[type="checkbox"]:checked::before {
     font-size: var(--font-size-14);
     cursor: pointer;
     border: none;
-    transition: background var(--transition);
+    transition: background var(--transition), filter var(--transition);
 }
 
 .btn-ghost { background: none; color: var(--text-disabled); }
@@ -1309,7 +1311,12 @@ input[type="checkbox"]:checked::before {
     color: var(--bg0);
     font-weight: 600;
 }
-.btn-primary:hover { background: var(--text-main); }
+.btn-primary:hover:not(:disabled) { filter: var(--primary-hover-filter); }
+.btn-primary:disabled {
+    background: var(--bg3);
+    color: var(--text-disabled);
+    cursor: default;
+}
 
 .btn-link { color: var(--text-headings); }
 .btn-link:hover { color: var(--text-main); }
@@ -1787,19 +1794,7 @@ input[type="checkbox"]:checked::before {
     justify-content: center;
     gap: 6px;
     min-height: 30px;
-    padding: var(--spacing-xs) var(--spacing-sm);
-    border: 0;
-    background: var(--text-headings);
-    color: var(--bg0);
-    cursor: pointer;
-    font-size: var(--font-size-14);
-    font-weight: 600;
-}
-.sidebar-trash-commit:hover:not(:disabled) { filter: brightness(1.08); }
-.sidebar-trash-commit:disabled {
-    background: var(--bg3);
-    color: var(--text-disabled);
-    cursor: default;
+    padding-inline: var(--spacing-sm);
 }
 
 /* === Run Marker ===
@@ -2155,6 +2150,7 @@ button.editor-section-toggle:focus-visible {
     --chart-axis: #707070;
     --scrollbar-thumb: #C0C0C0;
     --scrollbar-thumb-hover: #A0A0A0;
+    --primary-hover-filter: brightness(1.15);
     color-scheme: light;
 }
 
