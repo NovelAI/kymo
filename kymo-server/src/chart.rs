@@ -25,18 +25,25 @@ fn uniform_spacing(xs: &[f64]) -> Option<f64> {
     Some(d0)
 }
 
-/// Median sample interval — the x-unit the window scales are quoted in
+/// Median interval between consecutive distinct x values — the x-unit the window scales are quoted in
 /// on irregular grids. Median, not mean: a handful of logging gaps must
 /// not stretch every window.
+/// Zero gaps are skipped: a majority of them would collapse the unit, overflowing Triangular's weights, resetting EMA at every new x and shrinking Savitzky–Golay windows to one x.
+/// Without two distinct x values every unit smooths alike, so the unit is 1.
+/// The MIN_POSITIVE floor keeps every result decodable by decode_smoothing_plan (query.rs).
 pub(crate) fn median_dx(xs: &[f64]) -> f64 {
     #[cfg(test)]
     SPACING_DERIVATIONS.with(|counts| counts.set((counts.get().0, counts.get().1 + 1)));
-    if xs.len() < 2 {
+    let mut gaps: Vec<f64> = xs
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .filter(|&gap| gap > 0.0)
+        .collect();
+    if gaps.is_empty() {
         return 1.0;
     }
-    let mut d: Vec<f64> = xs.windows(2).map(|w| w[1] - w[0]).collect();
-    d.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    d[d.len() / 2].max(f64::MIN_POSITIVE)
+    gaps.sort_by(f64::total_cmp);
+    gaps[gaps.len() / 2].max(f64::MIN_POSITIVE)
 }
 
 /// The only whole-series, data-derived state a smoother consumes. `NoState` means appends cannot rescale a held prefix; `Uniform` selects the index-space Savitzky–Golay kernel; `Median` is time EMA/Triangular's decay unit or an irregular Savitzky–Golay x scale.
@@ -44,6 +51,7 @@ pub(crate) fn median_dx(xs: &[f64]) -> f64 {
 pub(crate) enum SmoothingPlan {
     NoState,
     Uniform,
+    /// f64 bits of a median of at least f64::MIN_POSITIVE (median_dx floors it; decode_smoothing_plan rejects anything smaller), so the smoothers divide by it unguarded.
     Median(u64),
 }
 
@@ -95,7 +103,7 @@ fn ema_polyfit(xs: &[f64], y: &[f64], tau: f64, dx_ref: f64, poly_order: u32) ->
         if !yv.is_finite() {
             continue;
         }
-        if prev_x.is_finite() && dx_ref > 0.0 {
+        if prev_x.is_finite() {
             // In units of τ, old u becomes u − h at the new origin.
             let h = ((xs[i] - prev_x) / dx_ref).max(0.0) / tau;
             let decay = (-h).exp();
@@ -168,13 +176,13 @@ fn triangular_polyfit(xs: &[f64], y: &[f64], dx_ref: f64, poly_order: u32) -> Ve
     let mut mw = [0.0f64; 5];
     let mut sw = [0.0f64; 3];
     let mut prev_x = f64::NAN;
-    let mut weight = 0.0f64; // 1 + elapsed x since the first sample, in dx_ref units
+    let mut weight = 1.0f64; // 1 + elapsed x since the first sample, in dx_ref units
     for (i, &yv) in y.iter().enumerate() {
         if !yv.is_finite() {
             continue;
         }
-        let prev_weight = weight;
-        if prev_x.is_finite() && dx_ref > 0.0 {
+        if prev_x.is_finite() {
+            let prev_weight = weight;
             // Weight accumulates the x-distance covered (in dx_ref units), so
             // a gap raises it by the gap's width, not by one.
             weight += (xs[i] - prev_x) / dx_ref;
@@ -199,9 +207,6 @@ fn triangular_polyfit(xs: &[f64], y: &[f64], dx_ref: f64, poly_order: u32) -> Ve
                 }
                 *moment = acc;
             }
-        } else {
-            // First finite sample (or dx_ref unusable): seed the ramp at 1.
-            weight = 1.0;
         }
         mw[0] += weight;
         sw[0] += weight * yv;
@@ -2515,7 +2520,7 @@ pub(crate) fn smooth_run_with_plan(
 
 #[cfg(test)]
 mod smooth_run_tests {
-    use super::{savgol_dependency_start, savgol_geometry, smooth_run};
+    use super::{median_dx, savgol_dependency_start, savgol_geometry, smooth_run};
     use crate::proto::smoothing_config::Algorithm;
 
     const ALGOS: [Algorithm; 3] = [
@@ -2921,6 +2926,20 @@ mod smooth_run_tests {
                 out[i],
                 q(x)
             );
+        }
+    }
+
+    /// Repeated timestamps (fast logging, importer rows without _timestamp) keep the unit at the median gap between distinct timestamps, so every smoother stays finite and smooths across them (AI-1508).
+    #[test]
+    fn repeated_timestamps_keep_the_smoothing_unit() {
+        // Gaps 0, 0, 1, 5, 9: the positive gaps' median is 5; counting the zeros would give 1.
+        assert_eq!(median_dx(&[0.0, 0.0, 0.0, 1.0, 6.0, 15.0]), 5.0);
+        let xs = [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 2.0];
+        let y = [1.0, 2.0, 3.0, 4.0, 5.0, 4.0, -4.0];
+        for algo in ALGOS {
+            let out = smooth_run(&xs, &y, algo, 5, 0.5, 0, false);
+            assert!(out.iter().all(|v| v.is_finite()), "{algo:?}: {out:?}");
+            assert_ne!(out[6], y[6], "{algo:?} returned the raw last sample");
         }
     }
 }

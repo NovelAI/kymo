@@ -277,7 +277,7 @@ pub fn UPlotChart(
             let height = *height_signal.read();
             let _color_ver = *color_ver_signal.read();
             let smoothed = *smoothed_signal.read();
-            let x_label_for_sync = x_label_signal.read().clone();
+            let x_label = x_label_signal.read().clone();
             let zoom_refetch = *zoom_refetch_signal.read();
             let is_time_axis = *is_time_signal.read();
             let is_wall_time = *is_wall_signal.read();
@@ -431,23 +431,7 @@ pub fn UPlotChart(
                 zoom_refetch,
                 is_time_axis,
                 is_wall_time,
-                x_label: x_label_for_sync.clone(),
-                sync_key: if is_wall_time {
-                    "wall".to_string()
-                } else if is_time_axis {
-                    "rel".to_string()
-                } else if x_label_for_sync != "step" {
-                    // The key only groups charts by custom axis, so keep its internal form compact and identifier-like.
-                    format!(
-                        "m-{}",
-                        x_label_for_sync
-                            .chars()
-                            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                            .collect::<String>()
-                    )
-                } else {
-                    "step".to_string()
-                },
+                x_label,
             };
             // Structure-unchanged refreshes swap the arrays in place:
             // live runs tick on every pushed update, and a full destroy/

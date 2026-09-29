@@ -101,9 +101,7 @@ impl ShownAxis {
         !self.time && self.x_metric.is_empty()
     }
 
-    /// Axis label — also the cursor-sync group key. The custom-x case keeps
-    /// the full metric path: the tail alone made train/epoch and eval/epoch
-    /// sync as the same axis.
+    /// Axis label; on a custom axis it also keys the cursor-sync group, so it keeps the full metric path (the tail alone would sync train/epoch with eval/epoch).
     fn x_label(&self) -> String {
         if self.time {
             "time".to_string()

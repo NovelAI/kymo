@@ -49,11 +49,7 @@ pub(super) struct ChartJsConfig {
     pub(super) is_time_axis: bool,
     /// Wall-clock time (format as HH:MM:SS) vs relative (format as elapsed)
     pub(super) is_wall_time: bool,
-    /// Cursor-sync group: charts sharing an x-axis kind (step / rel-time /
-    /// wall-time / same custom metric) mirror each other's crosshair and
-    /// show compact tooltips at the synced x.
-    pub(super) sync_key: String,
-    /// Human-readable x-axis label shown above the copied text table.
+    /// Human-readable x-axis label shown above the copied text table; on a custom axis, the full metric name that keys `sync_key`.
     pub(super) x_label: String,
 }
 
@@ -122,6 +118,21 @@ fn render_template(replacements: &[(&str, String)]) -> String {
         assert!(was_used, "create.js is missing {token}");
     }
     rendered
+}
+
+/// Cursor-sync group: charts on the same x axis (step, relative time, wall time, or one custom metric) mirror each other's crosshair, compact tooltips, zoom and selection boxes. Step charts come first because `zoom_refetch` also gives them the syncX scale, so a group never mixes sync scales.
+fn sync_key(cfg: &ChartJsConfig) -> String {
+    if cfg.zoom_refetch {
+        "step".to_string()
+    } else if cfg.is_wall_time {
+        "wall".to_string()
+    } else if cfg.is_time_axis {
+        "rel".to_string()
+    } else {
+        // The full metric name: esc_js escapes it, and a lossy rewrite could map two metrics to one key.
+        // The m- prefix keeps a metric named step, wall or rel out of those built-in groups.
+        format!("m-{}", cfg.x_label)
+    }
 }
 
 /// Build the JS that creates a uPlot chart. Rust's `ChartJsConfig` equality gate keeps ordinary data-only refreshes out of this roughly 52-KiB renderer entirely; the embedded config hash is a second, browser-side race guard so overlapping same-config create evaluations coalesce through `setData` instead of destroying and recreating the chart. A genuinely different config still falls through to destroy + recreate.
@@ -333,7 +344,7 @@ pub(super) fn build_create_js(id: &str, cfg: &ChartJsConfig) -> String {
         ("__KYMO_IS_TIME__", cfg.is_time_axis.to_string()),
         ("__KYMO_IS_WALL__", cfg.is_wall_time.to_string()),
         ("__KYMO_X_LABEL__", esc_js(&cfg.x_label)),
-        ("__KYMO_SYNC_KEY__", esc_js(&cfg.sync_key)),
+        ("__KYMO_SYNC_KEY__", esc_js(&sync_key(cfg))),
         ("__KYMO_SYNC_SCALE__", sync_scale.to_string()),
         (
             "__KYMO_SYNC_SCALE_KEY__",
@@ -369,7 +380,6 @@ mod tests {
             zoom_refetch: true,
             is_time_axis: false,
             is_wall_time: false,
-            sync_key: "step-sync".into(),
             x_label: "step".into(),
         }
     }
@@ -396,7 +406,6 @@ mod tests {
             zoom_refetch: false,
             is_time_axis: true,
             is_wall_time: true,
-            sync_key: "wall".into(),
             x_label: "time".into(),
         }
     }
@@ -526,16 +535,31 @@ mod tests {
         assert!(js.contains("let readoutXShift=0.001;"));
     }
 
+    /// AI-1429: a custom axis syncs only with its own metric, never with one differing only in punctuation nor, when named "step", with the step charts.
+    #[test]
+    fn custom_axes_sync_only_with_the_same_metric() {
+        let key = |zoom_refetch, metric: &str| {
+            let mut cfg = full_config();
+            cfg.zoom_refetch = zoom_refetch;
+            cfg.x_label = metric.to_string();
+            sync_key(&cfg)
+        };
+        assert_ne!(key(false, "train/epoch"), key(false, "train_epoch"));
+        assert_ne!(key(false, "step"), key(true, "step"));
+    }
+
     #[test]
     fn does_not_interpret_tokens_from_dynamic_values() {
         let mut config = minimal_config();
         config.labels[0] = "__KYMO_COLORS__".to_string();
-        config.sync_key = "sync'key\n".to_string();
+        config.is_time_axis = false;
+        config.is_wall_time = false;
+        config.x_label = "sync'key\n".to_string();
         let js = build_create_js("chart'7\n", &config);
 
         assert!(js.contains("'__KYMO_COLORS__'"));
         assert!(js.contains("chart\\'7\\n"));
-        assert!(js.contains("sync\\'key\\n"));
+        assert!(js.contains("key:'kymo-m-sync\\'key\\n'"));
     }
 
     #[test]
