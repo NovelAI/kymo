@@ -7,7 +7,6 @@ use axum::Router;
 use http::Method;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Server;
-use tonic_web::GrpcWebLayer;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::alerts;
@@ -26,20 +25,6 @@ const HOSTED_WS_PATH: &str = "/grpc-ws";
 const LOCAL_WS_PATH: &str = "/trash/_kymo-grpc-ws-local-v1";
 const CDN_UPLOAD_PATH: &str = "/cdn/upload";
 const CDN_RESOURCE_PATH: &str = "/cdn/{key}";
-
-enum NativeEndpoint {
-    Hosted {
-        address: std::net::SocketAddr,
-        browser_origins: ws_proxy::AllowedOrigins,
-    },
-    Local {
-        path: std::path::PathBuf,
-        auth: Arc<local_auth::LocalAuth>,
-        lifecycle_auth: Arc<local_control::LifecycleAuth>,
-        bumps: Arc<ingest::BumpCoalescer>,
-        activity: Arc<crate::activity::ActivityTracker>,
-    },
-}
 
 pub(crate) struct LocalSecurity {
     auth: Arc<local_auth::LocalAuth>,
@@ -73,16 +58,18 @@ pub(crate) async fn serve(
 ) -> anyhow::Result<()> {
     // Declare guards before the tasks so Rust drops the listener-owning JoinSet first and only then unlinks its Unix socket paths.
     let mut unix_socket_guards = Vec::new();
-    let mut http_tasks = tokio::task::JoinSet::new();
+    let mut listeners = tokio::task::JoinSet::new();
     let activity = cdn_state.activity.clone();
-    let native = match config {
+    let kymo = KymoServer::from_arc(service.clone())
+        .max_decoding_message_size(ingest::MAX_GRPC_MESSAGE_BYTES);
+    match config {
         transport::TransportConfig::Hosted {
             native_addr,
             cdn_addr,
             metrics_addr,
         } => {
             spawn_http(
-                &mut http_tasks,
+                &mut listeners,
                 "hosted CDN",
                 tokio::net::TcpListener::bind(cdn_addr).await?,
                 hosted_cdn_router(
@@ -94,15 +81,15 @@ pub(crate) async fn serve(
                 ),
             );
             spawn_http(
-                &mut http_tasks,
+                &mut listeners,
                 "metrics",
                 tokio::net::TcpListener::bind(metrics_addr).await?,
                 metrics_router(prometheus),
             );
-            NativeEndpoint::Hosted {
-                address: native_addr,
-                browser_origins,
-            }
+            tracing::info!(address = %native_addr, "hosted native gRPC server starting");
+            let native = Server::builder().add_service(kymo).serve(native_addr);
+            listeners
+                .spawn(async move { native.await.context("hosted native gRPC listener failed") });
         }
         transport::TransportConfig::Local {
             native_socket,
@@ -120,7 +107,7 @@ pub(crate) async fn serve(
             let security = security.context("local authentication is required")?;
             let auth = security.auth;
             spawn_http(
-                &mut http_tasks,
+                &mut listeners,
                 "local dashboard",
                 transport::local_tcp_listener(
                     "local dashboard",
@@ -139,41 +126,48 @@ pub(crate) async fn serve(
                 ),
             );
             spawn_http(
-                &mut http_tasks,
+                &mut listeners,
                 "local CDN",
                 transport::local_tcp_listener("local CDN", cdn_addr, cdn_listener_fd)?,
-                local_cdn_router(cdn_state.clone(), browser_origins.clone(), cdn_addr),
+                local_cdn_router(cdn_state.clone(), browser_origins, cdn_addr),
             );
             let (upload_listener, upload_guard) = transport::bind_unix_listener(&upload_socket)?;
             unix_socket_guards.push(upload_guard);
             spawn_http(
-                &mut http_tasks,
+                &mut listeners,
                 "local CDN upload",
                 upload_listener,
                 local_upload_router(cdn_state, auth.clone()),
             );
-            NativeEndpoint::Local {
-                path: native_socket,
-                auth,
-                lifecycle_auth: security.lifecycle_auth,
-                bumps,
-                activity,
-            }
+            // Bound last: the supervisor takes a native ListProjects answer as readiness, so every browser listener must already be bound.
+            let (native_listener, native_guard) = transport::bind_unix_listener(&native_socket)?;
+            unix_socket_guards.push(native_guard);
+            tracing::info!(socket = %native_socket.display(), "local native gRPC server starting");
+            let native = Server::builder()
+                .add_service(InterceptedService::new(
+                    kymo,
+                    local_auth::grpc_interceptor(auth),
+                ))
+                .add_service(InterceptedService::new(
+                    LocalRuntimeControlServer::new(local_control::LocalRuntimeControlService::new(
+                        bumps, activity,
+                    )),
+                    security.lifecycle_auth.interceptor(),
+                ))
+                .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(
+                    native_listener,
+                ));
+            listeners
+                .spawn(async move { native.await.context("local native gRPC listener failed") });
         }
-    };
+    }
 
-    // Hosted also fails the whole process when any sibling listener exits. Kubernetes can restart a complete pod; silently retaining only gRPC would leave a deceptively healthy deployment without its CDN/dashboard or metrics endpoint.
-    tokio::select! {
-        result = serve_native(native, service) => {
-            result?;
-            anyhow::bail!("native gRPC listener exited unexpectedly");
-        },
-        result = http_tasks.join_next() => match result {
-            Some(Ok(Ok(()))) => anyhow::bail!("HTTP listener exited unexpectedly"),
-            Some(Ok(Err(error))) => Err(error),
-            Some(Err(error)) => Err(error.into()),
-            None => anyhow::bail!("no HTTP listeners are running"),
-        }
+    // Any listener exiting fails the whole process. Kubernetes can restart a complete pod; silently retaining only gRPC would leave a deceptively healthy deployment without its CDN/dashboard or metrics endpoint.
+    match listeners.join_next().await {
+        Some(Ok(Ok(()))) => anyhow::bail!("a listener exited unexpectedly"),
+        Some(Ok(Err(error))) => Err(error),
+        Some(Err(error)) => Err(error.into()),
+        None => anyhow::bail!("no listeners are running"),
     }
 }
 
@@ -335,56 +329,6 @@ fn spawn_http<L>(
             .await
             .with_context(|| format!("{name} listener failed"))
     });
-}
-
-async fn serve_native(endpoint: NativeEndpoint, service: Arc<KymoService>) -> anyhow::Result<()> {
-    let server =
-        KymoServer::from_arc(service).max_decoding_message_size(ingest::MAX_GRPC_MESSAGE_BYTES);
-    match endpoint {
-        NativeEndpoint::Hosted {
-            address,
-            browser_origins,
-        } => {
-            tracing::info!(%address, "hosted native gRPC server starting");
-            let cors = CorsLayer::new()
-                .allow_origin(browser_origins.cors_policy())
-                .allow_headers(Any)
-                .allow_methods([Method::POST, Method::OPTIONS])
-                .expose_headers(Any);
-            Server::builder()
-                .accept_http1(true)
-                .layer(cors)
-                .layer(GrpcWebLayer::new())
-                .add_service(server)
-                .serve(address)
-                .await?;
-        }
-        NativeEndpoint::Local {
-            path,
-            auth,
-            lifecycle_auth,
-            bumps,
-            activity,
-        } => {
-            tracing::info!(socket = %path.display(), "local native gRPC server starting");
-            let (listener, _socket_guard) = transport::bind_unix_listener(&path)?;
-            let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
-            Server::builder()
-                .add_service(InterceptedService::new(
-                    server,
-                    local_auth::grpc_interceptor(auth),
-                ))
-                .add_service(InterceptedService::new(
-                    LocalRuntimeControlServer::new(local_control::LocalRuntimeControlService::new(
-                        bumps, activity,
-                    )),
-                    lifecycle_auth.interceptor(),
-                ))
-                .serve_with_incoming(incoming)
-                .await?;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

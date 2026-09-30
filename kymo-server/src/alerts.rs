@@ -175,7 +175,7 @@ async fn get_alerts(
 }
 
 /// The `/alerts` sub-router — always mounted on the hosted listener (disabled ⇒ `[]`), fenced to
-/// the dashboard origins like gRPC-Web and the WebSocket (the CDN routes' open CORS is for media).
+/// the browser-origin allowlist by CORS (the CDN routes' open CORS is for media).
 pub(crate) fn router(state: Option<Arc<AlertsState>>, browser_origins: &AllowedOrigins) -> Router {
     Router::new()
         .route(ALERTS_PATH, get(get_alerts))

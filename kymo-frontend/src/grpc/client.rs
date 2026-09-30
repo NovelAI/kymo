@@ -3,8 +3,7 @@ use super::routes;
 use super::ws::WsClient;
 
 /// The dashboard's RPC client. All unary calls ride the shared WebSocket
-/// transport (see ws.rs) — one connection, unlimited in-flight requests —
-/// instead of grpc-web fetches that the browser caps at ~6 per origin.
+/// transport (see ws.rs).
 #[derive(Clone)]
 pub struct GrpcClient {
     ws: WsClient,

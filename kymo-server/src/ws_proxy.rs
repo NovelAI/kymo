@@ -51,8 +51,7 @@ const ALLOWED_ORIGINS_ENV: &str = "KYMO_ALLOWED_ORIGINS";
 // origins in deployment configuration rather than duplicating them here.
 const DEFAULT_ALLOWED_ORIGINS: &str = "http://localhost:*,http://127.0.0.1:*";
 
-/// One allowlist shared by the WebSocket upgrade, the native gRPC-Web CORS
-/// policy, and `/alerts`. Browser `Origin` values are serialized origins, not
+/// One allowlist shared by the WebSocket upgrade and the CORS fences on `/alerts` and local CDN reads. Browser `Origin` values are serialized origins, not
 /// URLs: a path, query, fragment, `*`, or trailing slash is a
 /// configuration error rather than something we try to normalize. The one
 /// wildcard is a loopback host with any port (`http://localhost:*`; rationale
