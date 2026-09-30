@@ -856,7 +856,7 @@ impl ChClient {
             .await
         {
             Ok(()) => tracing::info!(
-                "added idx_cdn_key to mkdb2.metrics; parts written before it stay unindexed until an operator runs MATERIALIZE INDEX (docs/cdn-gcs-migration.md)"
+                "added idx_cdn_key to mkdb2.metrics; parts written before it stay unindexed until an operator runs MATERIALIZE INDEX"
             ),
             Err(e) => tracing::warn!(
                 "adding idx_cdn_key to mkdb2.metrics failed; the CDN collector keeps reading every part: {e}"
