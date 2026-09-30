@@ -285,12 +285,7 @@ pub fn TrashPage() -> Element {
 
     let page = data.read().clone();
     let now_ms = page.now_ms();
-    let runs = page
-        .runs
-        .iter()
-        .filter(|record| record.run.is_some())
-        .cloned()
-        .collect::<Vec<_>>();
+    let runs = page.runs;
     let loaded_count = runs.len();
     let total_count = page.total_count;
     let count_label = if page.total_count == 1 {
@@ -308,7 +303,7 @@ pub fn TrashPage() -> Element {
                     Link { to: Route::ProjectsPage {}, class: "trash-back-link", "← Projects" }
                     h1 { "Trash" }
                     p { class: "trash-description",
-                        "Runs remain recoverable for 7 days. After that, they can no longer be viewed or restored."
+                        "Runs are recoverable for 7 days after deletion."
                     }
                 }
 
@@ -346,7 +341,7 @@ pub fn TrashPage() -> Element {
                                     div { class: "trash-table-title",
                                         h2 { id: "trash-runs-heading", "Runs" }
                                         if page.loaded {
-                                            span { class: "trash-count", "{count_label}" }
+                                            span { "{count_label}" }
                                         }
                                     }
                                 }
@@ -354,10 +349,9 @@ pub fn TrashPage() -> Element {
                                     id: "trash-expiry-heading",
                                     scope: "col",
                                     role: "columnheader",
-                                    class: "trash-expiry-heading",
                                     "Deletes permanently"
                                 }
-                                th { scope: "col", role: "columnheader", class: "trash-actions-heading",
+                                th { scope: "col", role: "columnheader",
                                     span { class: "visually-hidden", "Actions" }
                                 }
                             }
@@ -373,11 +367,8 @@ pub fn TrashPage() -> Element {
 
                     if !page.loaded && page.error.is_none() {
                         div { class: "trash-empty", role: "status", h3 { "Loading Trash…" } }
-                    } else if page.loaded && page.runs.is_empty() && page.total_count == 0 {
-                        div { class: "trash-empty", role: "status",
-                            h3 { "Trash is empty" }
-                            p { "Runs moved to Trash remain recoverable here for 7 days." }
-                        }
+                    } else if page.loaded && page.total_count == 0 {
+                        div { class: "trash-empty", role: "status", h3 { "Trash is empty" } }
                     }
 
                     if let Some(cursor) = page.next.clone() {

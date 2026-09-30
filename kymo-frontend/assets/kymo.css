@@ -640,7 +640,6 @@ input[type="checkbox"]:checked::before {
 .trash-description {
     margin-top: var(--spacing-xs);
     color: var(--text-disabled);
-    font-size: var(--font-size-15);
 }
 .trash-section {
     border: 1px solid var(--bg3);
@@ -669,14 +668,8 @@ input[type="checkbox"]:checked::before {
     gap: var(--spacing-sm);
 }
 .trash-table-title h2 {
-    font-family: var(--font-ui);
     font-size: var(--font-size-16);
 }
-.trash-count {
-    color: var(--text-disabled);
-    font-size: var(--font-size-13);
-}
-.trash-actions-heading { text-align: right; }
 .visually-hidden {
     position: absolute;
     width: 1px;
@@ -701,7 +694,6 @@ input[type="checkbox"]:checked::before {
     display: flex;
     align-items: baseline;
     gap: 12px;
-    min-width: 0;
     overflow: hidden;
     white-space: nowrap;
 }
@@ -711,11 +703,6 @@ input[type="checkbox"]:checked::before {
     gap: 8px;
     min-width: 0;
 }
-.trash-run-link:hover .trash-run-name,
-.trash-run-link:focus-visible .trash-run-name {
-    text-decoration: underline 2px;
-    text-underline-offset: 2px;
-}
 .trash-run-link:focus-visible { outline: none; }
 .trash-run-meta {
     display: flex;
@@ -723,7 +710,6 @@ input[type="checkbox"]:checked::before {
     gap: 6px;
     min-width: 0;
     overflow: hidden;
-    white-space: nowrap;
 }
 .trash-run-name-host {
     anchor-name: --trash-run-name;
@@ -732,9 +718,7 @@ input[type="checkbox"]:checked::before {
 .trash-run-name,
 .trash-run-name-placeholder {
     color: var(--text-main);
-    font-family: var(--font-ui);
     font-size: var(--font-size-17);
-    white-space: nowrap;
 }
 .trash-run-name-placeholder { visibility: hidden; }
 .trash-run-name {
@@ -750,6 +734,8 @@ input[type="checkbox"]:checked::before {
     left: anchor(left);
     width: max-content;
     background: var(--bg1);
+    text-decoration: underline 2px;
+    text-underline-offset: 2px;
     z-index: 2;
     pointer-events: none;
 }
@@ -775,7 +761,6 @@ input[type="checkbox"]:checked::before {
     flex-wrap: wrap;
     align-items: baseline;
     gap: var(--spacing-xs) var(--spacing-sm);
-    color: var(--text-main);
     font-size: var(--font-size-14);
 }
 .trash-expiry-relative {
@@ -820,13 +805,7 @@ input[type="checkbox"]:checked::before {
     text-align: center;
 }
 .trash-empty h3 {
-    font-family: var(--font-ui);
     font-size: var(--font-size-17);
-}
-.trash-empty p {
-    margin-top: var(--spacing-xs);
-    color: var(--text-disabled);
-    font-size: var(--font-size-14);
 }
 
 @media (max-width: 800px) {
@@ -844,7 +823,7 @@ input[type="checkbox"]:checked::before {
         gap: var(--spacing-xs);
         white-space: normal;
     }
-    .trash-run-meta { flex-wrap: wrap; white-space: normal; }
+    .trash-run-meta { flex-wrap: wrap; }
     .trash-run-project { overflow-wrap: anywhere; }
     .trash-run-ordinal { flex-shrink: 0; }
     .trash-run-name-host { white-space: normal; }
@@ -855,7 +834,6 @@ input[type="checkbox"]:checked::before {
         display: inline;
         position: static;
         width: auto;
-        white-space: normal;
         overflow-wrap: anywhere;
     }
     .trash-run-name-placeholder { display: none; }
@@ -885,7 +863,6 @@ input[type="checkbox"]:checked::before {
     padding: var(--spacing-sm) var(--spacing-md);
     border: 1px solid var(--bg3);
     background: var(--bg2);
-    color: var(--text-main);
     font-size: var(--font-size-14);
     box-shadow: 0 8px 24px rgba(0, 0, 0, 0.24);
 }
@@ -902,7 +879,6 @@ input[type="checkbox"]:checked::before {
 }
 .trashed-run-notice strong {
     color: var(--text-main);
-    font-family: var(--font-ui);
 }
 .trashed-run-notice a {
     margin-left: auto;
