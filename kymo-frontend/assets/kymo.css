@@ -1344,7 +1344,8 @@ input[type="checkbox"]:checked::before {
 .field-reset-dot {
     position: absolute;
     top: 50%;
-    left: -10px;
+    /* Right edge on the label's: the gap is the right padding, whatever font draws the glyph. */
+    right: 100%;
     padding: 4px;
     border: 0;
     background: transparent;
