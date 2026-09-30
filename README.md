@@ -6,6 +6,7 @@
 - ❌ All webpage viewers have admin access, so you can't show untrusted friends your graphs
 - ❌ Vibe-coded. I can't read Rust and don't know Postgres or ClickHouse or webdev. That means I can't read your PRs
 - ❌ It's internal tooling. We don't dogfood the local mode
+- ❌ Someone decided to coerce all metric (chart) values to fp32, which will be fixed later but maybe not soon
 
 Two options:
 
