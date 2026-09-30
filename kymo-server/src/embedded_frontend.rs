@@ -47,7 +47,8 @@ pub(crate) async fn serve(
         return StatusCode::NOT_FOUND.into_response();
     };
     if *name == "index.html" {
-        activity.dashboard_page_served();
+        // A viewer is arriving. The restarted clock also covers a slow (e.g. SSH-forwarded) load until the page's WebSocket connects: asset bodies stream after their request's work guard is released, and the page connects only after the WASM compiles.
+        activity.restart_idle_clock();
         return shell(asset.bytes, &config);
     }
     let response = Response::builder()

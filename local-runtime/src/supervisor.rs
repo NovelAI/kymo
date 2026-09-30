@@ -854,7 +854,6 @@ fn idle_eligible(
 ) -> bool {
     Duration::from_millis(snapshot.keepalive_idle_for_ms) >= idle_timeout
         && !holds.blocks_idle(now)
-        && snapshot.frontend_reconnect_grace_remaining_ms == 0
         && snapshot.frontend_connections == 0
         && snapshot.in_flight_work == 0
         && !snapshot.ingest_bookkeeping_draining
@@ -2265,7 +2264,6 @@ mod tests {
         GetActivityResponse {
             keepalive_idle_for_ms: idle_for.as_millis() as u64,
             last_committed_ingest_ago_ms: None,
-            frontend_reconnect_grace_remaining_ms: 0,
             frontend_connections: 0,
             in_flight_work: 0,
             ingest_bookkeeping_draining: false,
@@ -2292,9 +2290,6 @@ mod tests {
         assert!(!default_idle_eligible(&snapshot, &holds, now));
         snapshot.keepalive_idle_for_ms += 1;
 
-        snapshot.frontend_reconnect_grace_remaining_ms = 1;
-        assert!(!default_idle_eligible(&snapshot, &holds, now));
-        snapshot.frontend_reconnect_grace_remaining_ms = 0;
         snapshot.frontend_connections = 1;
         assert!(!default_idle_eligible(&snapshot, &holds, now));
         snapshot.frontend_connections = 0;

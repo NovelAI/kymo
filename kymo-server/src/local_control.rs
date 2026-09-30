@@ -98,7 +98,6 @@ impl LocalRuntimeControl for LocalRuntimeControlService {
         Ok(Response::new(GetActivityResponse {
             keepalive_idle_for_ms: snapshot.keepalive_idle_for_ms,
             last_committed_ingest_ago_ms: snapshot.last_committed_ingest_ago_ms,
-            frontend_reconnect_grace_remaining_ms: snapshot.frontend_reconnect_grace_remaining_ms,
             frontend_connections: snapshot.frontend_connections,
             in_flight_work: snapshot.in_flight_work,
             ingest_bookkeeping_draining: self.bumps.is_draining(),

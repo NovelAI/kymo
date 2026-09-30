@@ -4,18 +4,14 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-const FRONTEND_RECONNECT_GRACE: Duration = Duration::from_secs(10);
-// Covers a slow (e.g. SSH-forwarded) page load from its shell to its WebSocket: asset bodies stream after their request's work guard is released, and the page connects only after the WASM compiles. The connection ends it.
-const PAGE_LOAD_GRACE: Duration = Duration::from_secs(60);
 const MAX_FULFILLED_HOLDS: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ActivitySnapshot {
     pub(crate) keepalive_idle_for_ms: u64,
     pub(crate) last_committed_ingest_ago_ms: Option<u64>,
-    pub(crate) frontend_reconnect_grace_remaining_ms: u64,
     pub(crate) frontend_connections: u32,
     pub(crate) in_flight_work: u32,
     pub(crate) fulfilled_hold_ids: Vec<String>,
@@ -24,7 +20,6 @@ pub(crate) struct ActivitySnapshot {
 struct ActivityState {
     last_keepalive: Instant,
     last_committed_ingest: Option<Instant>,
-    frontend_reconnect_until: Option<Instant>,
     frontend_connections: u32,
     in_flight_work: u32,
     fulfilled_hold_ids: VecDeque<String>,
@@ -51,7 +46,6 @@ impl ActivityTracker {
             state: Mutex::new(ActivityState {
                 last_keepalive: now,
                 last_committed_ingest: None,
-                frontend_reconnect_until: None,
                 frontend_connections: 0,
                 in_flight_work: 0,
                 fulfilled_hold_ids: VecDeque::new(),
@@ -59,8 +53,7 @@ impl ActivityTracker {
         })
     }
 
-    /// Seed the idle clock only after schema/reconciliation startup is ready to expose listeners; constructor time can precede readiness by minutes.
-    pub(crate) fn mark_ready(&self) {
+    pub(crate) fn restart_idle_clock(&self) {
         if !self.enabled {
             return;
         }
@@ -114,20 +107,10 @@ impl ActivityTracker {
         debug_assert!(self.enabled, "hosted mode must not track frontend sockets");
         let mut state = self.state();
         state.frontend_connections = state.frontend_connections.saturating_add(1);
-        state.frontend_reconnect_until = None;
         drop(state);
         FrontendGuard {
             tracker: self.clone(),
         }
-    }
-
-    /// A dashboard page shell was served: hold the stack until the page can connect its WebSocket.
-    pub(crate) fn dashboard_page_served(&self) {
-        if !self.enabled {
-            return;
-        }
-        let mut state = self.state();
-        extend_grace(&mut state, Instant::now() + PAGE_LOAD_GRACE);
     }
 
     pub(crate) fn snapshot(&self) -> ActivitySnapshot {
@@ -139,9 +122,6 @@ impl ActivityTracker {
             last_committed_ingest_ago_ms: state
                 .last_committed_ingest
                 .map(|instant| elapsed_ms(now, instant)),
-            frontend_reconnect_grace_remaining_ms: state
-                .frontend_reconnect_until
-                .map_or(0, |deadline| remaining_ms(now, deadline)),
             frontend_connections: state.frontend_connections,
             in_flight_work: state.in_flight_work,
             fulfilled_hold_ids: state.fulfilled_hold_ids.iter().cloned().collect(),
@@ -170,6 +150,7 @@ impl Drop for WorkGuard {
     }
 }
 
+/// Held by each connected dashboard socket, blocking idle shutdown; dropping it restarts the idle clock.
 pub(crate) struct FrontendGuard {
     tracker: Arc<ActivityTracker>,
 }
@@ -179,15 +160,9 @@ impl Drop for FrontendGuard {
         let mut state = self.tracker.state();
         debug_assert!(state.frontend_connections > 0);
         state.frontend_connections = state.frontend_connections.saturating_sub(1);
-        if state.frontend_connections == 0 {
-            extend_grace(&mut state, Instant::now() + FRONTEND_RECONNECT_GRACE);
-        }
+        // Under the same lock as the decrement: no snapshot sees the last viewer gone with a stale clock.
+        state.last_keepalive = Instant::now();
     }
-}
-
-fn extend_grace(state: &mut ActivityState, until: Instant) {
-    // `None < Some`, so this also starts a grace.
-    state.frontend_reconnect_until = state.frontend_reconnect_until.max(Some(until));
 }
 
 fn valid_hold_id(id: &str) -> bool {
@@ -204,16 +179,10 @@ fn elapsed_ms(now: Instant, then: Instant) -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
-fn remaining_ms(now: Instant, deadline: Instant) -> u64 {
-    deadline
-        .saturating_duration_since(now)
-        .as_millis()
-        .min(u128::from(u64::MAX)) as u64
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn work_and_frontend_guards_are_relative_and_drop_owned() {
@@ -224,11 +193,13 @@ mod tests {
         assert_eq!(active.in_flight_work, 1);
         assert_eq!(active.frontend_connections, 1);
         drop(work);
+        activity.state().last_keepalive -= Duration::from_secs(10);
         drop(frontend);
         let idle = activity.snapshot();
         assert_eq!(idle.in_flight_work, 0);
         assert_eq!(idle.frontend_connections, 0);
-        assert!(idle.frontend_reconnect_grace_remaining_ms > 0);
+        // The departing viewer restarted the idle clock.
+        assert!(idle.keepalive_idle_for_ms < 10_000);
     }
 
     #[test]
@@ -255,27 +226,12 @@ mod tests {
     }
 
     #[test]
-    fn a_served_page_holds_the_stack_until_it_connects() {
-        let activity = ActivityTracker::new_local();
-        activity.dashboard_page_served();
-        let remaining = activity.snapshot().frontend_reconnect_grace_remaining_ms;
-        assert!(remaining > FRONTEND_RECONNECT_GRACE.as_millis() as u64);
-        // Once the page connects, the socket itself holds the stack.
-        let frontend = activity.frontend_connected();
-        let connected = activity.snapshot();
-        assert_eq!(connected.frontend_connections, 1);
-        assert_eq!(connected.frontend_reconnect_grace_remaining_ms, 0);
-        drop(frontend);
-    }
-
-    #[test]
     fn hosted_tracker_does_not_lock_or_retain_work() {
         let activity = ActivityTracker::disabled();
         let work = activity.begin_work();
         assert!(work.tracker.is_none());
-        activity.mark_ready();
+        activity.restart_idle_clock();
         activity.record_committed_ingest();
         activity.record_lifecycle_mutation(None);
-        activity.dashboard_page_served();
     }
 }

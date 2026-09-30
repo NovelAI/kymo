@@ -611,7 +611,7 @@ pub async fn run() -> anyhow::Result<()> {
     sys_stats::spawn_metrics(cdn_disk, ch);
 
     // Startup schema work and reconciliation can be long on a recovered laptop. Seed from server-ready, not process construction.
-    activity.mark_ready();
+    activity.restart_idle_clock();
 
     http_transport::serve(
         transport,
