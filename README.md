@@ -8,20 +8,16 @@
 - ❌ It's internal tooling. We don't dogfood the local mode
 - ❌ Someone decided to coerce all metric (chart) values to fp32, which will be fixed later but maybe not soon
 
+## Setup
+
+You will run your own backend, since I'm too lazy to make money hosting for anyone.
+
 Two options:
 
-- **Local mode** runs the backend on your machine, started on demand and stopped when idle. Works on Linux x86-64 and Apple Silicon Mac, too bad for Windows users
-- **Hosted mode** logs to your server; see [self-hosting](docs/self-hosting.md)
+- **Local mode** (recommended) runs the backend on your machine. `pip install "kymo[local]"`
+- **Hosted mode** logs to a server which you must separately set up; see [self-hosting](docs/self-hosting.md). `pip install kymo`
 
-We don't host a server for you since I'm too lazy to make money.
-
-## Install
-
-```sh
-pip install "kymo[local]"
-```
-
-Hosted mode needs only `pip install kymo`. `[local]` adds the backend `kymo-local-runtime`. Python 3.10 or newer. The first time local mode starts, it downloads PostgreSQL and ClickHouse, about 700 MB.
+Python 3.10 or newer. The first time local mode starts, it downloads PostgreSQL and ClickHouse, about 700 MB. Linux x86-64 and Apple Silicon Mac, too bad for Windows users.
 
 ## Usage
 
@@ -40,7 +36,7 @@ if __name__ == "__main__":
 
 Keep the `if __name__ == "__main__":` guard. kymo uploads from a helper process, and on macOS that process re-imports your script.
 
-The local stack starts when logged to and stops itself after an hour with no logging and no open dashboard. `kymo open` starts it again.
+In local mode, the backend autostarts when logged to and stops after an hour idle; logging or viewing will reset the clock. `kymo open` starts it for viewing, since your browser can't autostart it.
 
 The [client README](python_client/README.md) covers the `kymo` commands, remote machines, undelivered data, backups, and logging to a server.
 
