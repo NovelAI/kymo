@@ -157,7 +157,7 @@ class Peer:
                 ),
                 server_now_ms=1_700_000_002_000,
             ).SerializeToString()
-        elif method == "ListRunSetMetrics":
+        elif method in ("ListMetrics", "ListRunSetMetrics"):
             response = pb.ListMetricsResponse().SerializeToString()
         elif method == "ListProjects":
             response = pb.ListProjectsResponse(

@@ -11,7 +11,7 @@ fn response_builder_benchmark() {
     let cache = crate::series_cache::SeriesCache::with_test_budget(64 * 1024 * 1024);
     let keys: Vec<_> = runs
         .iter()
-        .map(|run| ("p".to_owned(), (*run).to_owned(), "loss".to_owned()))
+        .map(|run| crate::series_cache::SeriesKey::new("p", *run, "loss"))
         .collect();
     let old_inputs: Vec<_> = keys
         .iter()

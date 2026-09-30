@@ -119,6 +119,23 @@ impl Fixture {
         }
     }
 
+    fn media_row(&self, run: &str, metric: &str, tag: &str, step: i64, cdn_key: &str) -> MetricRow {
+        MetricRow {
+            tag: tag.into(),
+            value: None,
+            cdn_key: Some(cdn_key.into()),
+            ..self.row(run, metric, step, 1)
+        }
+    }
+
+    fn text_row(&self, run: &str, metric: &str, step: i64, text: &str) -> MetricRow {
+        MetricRow {
+            value: None,
+            text_data: Some(text.into()),
+            ..self.row(run, metric, step, 1)
+        }
+    }
+
     async fn ingest(&self, rows: Vec<MetricRow>) -> Result<i64> {
         let run = rows[0].run_id.clone();
         self.ingest_many(rows)
@@ -149,19 +166,24 @@ impl Fixture {
                 "{run}: receipt {receipt} outside server-clock interval {before}..={after}"
             );
         }
-        for row in rows {
+        // Payload rows (CDN, text) are not numeric points.
+        for row in rows.iter().filter(|row| row.value.is_some()) {
             let points = self
                 .ch
-                .query_raw(
+                .query_raw_many(
                     &self.project,
-                    &row.run_id,
+                    std::slice::from_ref(&row.run_id),
                     &row.metric_name,
                     row.step,
                     row.step,
                 )
-                .await?;
-            assert_eq!(points.len(), 1, "ACK did not expose the inserted point");
-            assert_eq!(Some(points[0].value), row.value, "inserted point value");
+                .await?
+                .swap_remove(0);
+            assert_eq!(
+                points,
+                [(row.step, f64::from(row.value.unwrap()))],
+                "ACK did not expose the inserted point"
+            );
         }
         Ok(accepted)
     }
@@ -646,4 +668,165 @@ async fn stale_system_with_fresh_main_does_not_refresh_project() -> Result<()> {
 #[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL and KYMO_LIVE_TEST_CLICKHOUSE_URL"]
 async fn trash_retains_pending_ingest_timing() -> Result<()> {
     with_fixture(async |fixture, run| trash_before_drain(fixture, run).await).await
+}
+
+/// Numeric reads return only numeric rows and the CDN lookup only media rows, for a metric name that logged all three payload types; a SELECT alias must not shadow the column a filter tests.
+async fn mixed_payload_reads(fixture: &mut Fixture, run: &str) -> Result<()> {
+    fixture.init(run).await?;
+    let project = fixture.project.clone();
+    let metric = "mixed";
+    let cached = async || -> Result<Vec<(i64, f32)>> {
+        let rows = fixture
+            .ch
+            .query_raw_any_cached(&project, run, metric, || None)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(rows.iter().map(|row| (row.step, row.value)).collect())
+    };
+    fixture
+        .ingest(vec![
+            fixture.row(run, metric, 1, 1),
+            fixture.media_row(run, metric, "", 2, "two.png"),
+            fixture.text_row(run, metric, 3, "three\n"),
+            fixture.media_row(run, metric, "b", 4, "four-b.png"),
+            fixture.media_row(run, metric, "a", 4, "four-a.png"),
+        ])
+        .await?;
+
+    let scalar = fixture
+        .ch
+        .query_raw_many(&project, &[run.to_string()], metric, i64::MIN, i64::MAX)
+        .await?;
+    assert_eq!(scalar[0], [(1, 1.0)]);
+    assert_eq!(cached().await?, [(1, 1.0)]);
+    let keys = fixture
+        .ch
+        .query_cdn_keys_batch(
+            &[(project.clone(), run.to_string(), metric.to_string())],
+            i64::MIN,
+            i64::MAX,
+        )
+        .await?;
+    assert_eq!(
+        keys.iter()
+            .map(|row| (row.step, row.cdn_key.as_str()))
+            .collect::<Vec<_>>(),
+        [(2, "two.png"), (4, "four-a.png"), (4, "four-b.png")]
+    );
+
+    // Incremental refreshes: a non-numeric row at a new step is no point, and one replacing a cached step deletes it.
+    fixture
+        .ingest(vec![fixture.media_row(run, metric, "", 5, "five.png")])
+        .await?;
+    assert_eq!(cached().await?, [(1, 1.0)]);
+    fixture
+        .ingest(vec![
+            fixture.text_row(run, metric, 1, "replaced\n"),
+            fixture.row(run, metric, 6, 1),
+        ])
+        .await?;
+    assert_eq!(cached().await?, [(6, 6.0)]);
+    Ok(())
+}
+
+/// A cold chart reads all of its runs' series in one ClickHouse statement, each run's rows reaching its own series.
+async fn cold_chart_batches_its_reads(fixture: &mut Fixture, run: &str) -> Result<()> {
+    // A quote exercises the bound run-id array.
+    let runs = [
+        run.to_string(),
+        format!("{run}-o'brien"),
+        format!("{run}-3"),
+    ];
+    for (index, run) in runs.iter().enumerate() {
+        fixture.init(run).await?;
+        let steps = index as i64 + 1;
+        let rows = (1..=steps)
+            .flat_map(|step| {
+                [
+                    fixture.row(run, "loss", step, 1),
+                    fixture.row(run, "acc", step, 1),
+                ]
+            })
+            .collect();
+        fixture.ingest(rows).await?;
+    }
+    // Each read of the counter counts itself, so the chart's statements are the observed difference minus one.
+    // Exact because the suite gate serializes the live tests and their throwaway ClickHouse has no other client.
+    let selects = async || -> Result<u64> {
+        Ok(fixture
+            .ch
+            .test_client()
+            .query("SELECT value FROM system.events WHERE event = 'SelectQuery'")
+            .fetch_one::<u64>()
+            .await?)
+    };
+    // Charts (run, metric, points) refs, checks the series come back in request order with those points, and returns the chart's statement count.
+    let chart = async |refs: &[(&String, &str, u32)]| -> Result<u64> {
+        let before = selects().await?;
+        let response = fixture
+            .query
+            .query_chart(Request::new(proto::ChartRequest {
+                y_series: refs
+                    .iter()
+                    .map(|(run, metric, _)| proto::SeriesRef {
+                        project_id: fixture.project.clone(),
+                        run_id: (*run).clone(),
+                        metric_name: (*metric).into(),
+                        tags: vec![],
+                    })
+                    .collect(),
+                ..Default::default()
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(
+            response
+                .series
+                .iter()
+                .map(|series| (series.run_id.as_str(), series.seg_lens.iter().sum::<u32>()))
+                .collect::<Vec<_>>(),
+            refs.iter()
+                .map(|(run, _, points)| (run.as_str(), *points))
+                .collect::<Vec<_>>()
+        );
+        Ok(selects().await? - before - 1)
+    };
+    let cold = [
+        (&runs[0], "loss", 1),
+        (&runs[1], "loss", 2),
+        (&runs[2], "loss", 3),
+    ];
+    assert_eq!(
+        chart(&cold).await?,
+        1,
+        "one batched full read for the cold chart"
+    );
+
+    // Two groups and a duplicate ref, with every series cached but run 0's acc: only that one reads.
+    fixture
+        .ch
+        .query_raw_any_cached(&fixture.project, &runs[1], "acc", || None)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mixed = [
+        (&runs[0], "acc", 1),
+        (&runs[1], "loss", 2),
+        (&runs[0], "acc", 1),
+        (&runs[1], "acc", 2),
+        (&runs[2], "loss", 3),
+    ];
+    assert_eq!(chart(&mixed).await?, 1, "one read, for run 0's acc");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL and KYMO_LIVE_TEST_CLICKHOUSE_URL"]
+async fn mixed_payload_metric_reads() -> Result<()> {
+    with_fixture(async |fixture, run| mixed_payload_reads(fixture, run).await).await
+}
+
+#[tokio::test]
+#[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL and KYMO_LIVE_TEST_CLICKHOUSE_URL"]
+async fn cold_chart_reads_its_runs_in_one_statement() -> Result<()> {
+    with_fixture(async |fixture, run| cold_chart_batches_its_reads(fixture, run).await).await
 }

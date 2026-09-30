@@ -10,6 +10,8 @@ accept in time are spooled to disk (kymo.spool) and delivered later by
 
 import atexit
 import base64
+import collections
+import copy
 import io
 import json
 import math
@@ -46,6 +48,7 @@ except (ImportError, RuntimeError) as e:
         "kymo's generated proto stubs are unavailable or incompatible with "
         f"the installed grpc/protobuf runtime (original error: {e})"
     ) from e
+from kymo import _gpu
 from kymo._cdn import gallery_item, gallery_manifest, metadata_manifest
 from kymo._log import logger as _log
 from kymo._wire import (
@@ -284,6 +287,14 @@ _run_metadata: Optional[dict] = None
 # preserving the existing hosted rich-write path byte-for-byte.
 _rich_writer_epoch: Optional[int] = None
 _rich_mutation_seq = None  # multiprocessing.Value("I") when versioning is negotiated
+# log() calls whose GPU values are still being copied to the host (kymo._gpu), oldest first; log_cdn() and update_config() writes queue behind them. All are published in that order. The system-metrics poller and captured text publish directly: log() never writes their metrics.
+_pending: collections.deque = collections.deque()
+# Reentrant: the shutdown signal handler runs on the main thread, possibly inside log().
+_pending_lock = threading.RLock()
+# Set when a value was dropped after its log() returned; wait_for_upload() and finish() then report incomplete delivery.
+_pending_incomplete = False
+# Host copies and pickled rich items the pending calls may hold before log() waits for the oldest.
+_PENDING_MAX_BYTES = 256 << 20
 
 
 def _reserve_rich_mutation_versions(count: int) -> Optional[tuple[int, ...]]:
@@ -313,12 +324,28 @@ def _reserve_rich_mutation_versions(count: int) -> Optional[tuple[int, ...]]:
         lock.release()
 
 
+def _forget_pending() -> None:
+    """Drop the pending calls unpublished, keeping their CUDA objects in _gpu.unfreeable."""
+    global _pending_incomplete
+    _gpu.unfreeable.extend(entry.reads for entry in _pending if entry.reads is not None)
+    _pending.clear()
+    _pending_incomplete = False
+
+
+def _forget_pending_in_child() -> None:
+    """A fork child cannot use the parent's CUDA context, so it never publishes the parent's pending calls."""
+    global _pending_lock
+    _forget_pending()
+    _pending_lock = threading.RLock()
+
+
 if hasattr(os, "register_at_fork"):
     os.register_at_fork(
         before=_capture_drain_lock.acquire,
         after_in_parent=_capture_drain_lock.release,
         after_in_child=_capture_drain_lock.release,
     )
+    os.register_at_fork(after_in_child=_forget_pending_in_child)
 
 
 def _next_rich_mutation_version() -> Optional[int]:
@@ -449,6 +476,9 @@ def init(
     # Shut down previous worker if re-initialising
     if _is_initialized:
         _drain_and_shutdown()
+    # Drop what a log() on another thread queued behind the previous run's shutdown, so it does not reach this run (a log() still racing init() can, as its direct publications always could).
+    with _pending_lock:
+        _forget_pending()
 
     local_endpoint = None
     local_init_hold_id = None
@@ -656,6 +686,15 @@ def log(metrics: dict, step: int) -> None:
     Numeric and text values take the queue fast path. Rich values are pickled
     synchronously to freeze caller-owned data before background delivery, so
     logging a large rich payload may copy it on the calling thread.
+
+    CUDA tensors, as scalar values and in a value whose items are all Images
+    holding CUDA tensors, are copied to the host without waiting for the GPU;
+    log() raises if it would read one during a CUDA graph capture. The call's
+    points are then published, in call order, by a later log(),
+    wait_for_upload() or finish() once the copies have completed. A value that
+    can no longer be sent (for example a float64 beyond float32 range) is
+    dropped with a warning, and wait_for_upload() and finish() report
+    incomplete delivery.
     """
     global _last_log_duration_ms
 
@@ -673,6 +712,13 @@ def log(metrics: dict, step: int) -> None:
 
     numeric_points = []
     cdn_batches = []
+    # CUDA values, read asynchronously once CUDA is initialized.
+    torch = _gpu.cuda_torch()
+    if torch is not None:
+        is_gpu_scalar, is_gpu_image = _gpu.classifiers(torch)
+    gpu_keys = []  # (name, tag) of each of gpu_scalars
+    gpu_scalars = []
+    gpu_batches = []  # rich batches whose images are all on the GPU, pickled once copied
 
     for name, value in all_metrics.items():
         # Per-point validation dominates a large log(): exact ASCII str names and exact floats below ±_F32_OVERFLOW skip it, since the full checks return them unchanged.
@@ -685,6 +731,9 @@ def log(metrics: dict, step: int) -> None:
             name = _normalize_metric_name(name)
         if type(value) is float and -_F32_OVERFLOW < value < _F32_OVERFLOW:
             numeric_points.append(("numeric_ts", name, step, value, now_ms))
+        elif torch is not None and is_gpu_scalar(value):
+            gpu_keys.append((name, None))
+            gpu_scalars.append(value)
         elif isinstance(value, (int, float)):
             numeric_points.append(
                 ("numeric_ts", name, step, _normalize_numeric_value(value), now_ms)
@@ -693,26 +742,32 @@ def log(metrics: dict, step: int) -> None:
             cdn_batches.append(
                 _rich_queue_tuple("metadata_batch", name, step, value, now_ms)
             )
-        elif isinstance(value, (Image, Resource)):
-            cdn_batches.append(
-                _rich_queue_tuple("cdn_batch", name, step, [value], now_ms)
-            )
-        elif (
+        elif isinstance(value, (Image, Resource)) or (
             isinstance(value, list)
             and value
             and isinstance(value[0], (Image, Resource))
         ):
-            for index, item in enumerate(value):
+            items = value if isinstance(value, list) else [value]
+            for index, item in enumerate(items):
                 if not isinstance(item, (Image, Resource)):
                     raise TypeError(
                         f"rich metric {name!r} item {index} must be Image or "
                         f"Resource, got {type(item).__name__}"
                     )
-            cdn_batches.append(
-                _rich_queue_tuple("cdn_batch", name, step, value, now_ms)
-            )
+            batches = cdn_batches
+            if torch is not None and all(
+                isinstance(item, Image) and is_gpu_image(item.data) for item in items
+            ):
+                # The queued copies' data becomes the host copies.
+                items = [copy.copy(item) for item in items]
+                batches = gpu_batches
+            batches.append(_rich_queue_tuple("cdn_batch", name, step, items, now_ms))
         elif isinstance(value, list):
             for i, v in enumerate(value):
+                if torch is not None and is_gpu_scalar(v):
+                    gpu_keys.append((name, str(i)))
+                    gpu_scalars.append(v)
+                    continue
                 numeric_points.append(
                     (
                         "numeric_tagged_ts",
@@ -735,17 +790,27 @@ def log(metrics: dict, step: int) -> None:
     # latency is intentionally proportional to the snapshot size.
     rich_queue_items = _snapshot_rich_queue_items(cdn_batches)
 
+    if gpu_scalars or gpu_batches or _pending:
+        _queue_pending_log(
+            torch,
+            _PendingLog(
+                numeric_points,
+                rich_queue_items,
+                step=step,
+                timestamp_ms=now_ms,
+                gpu_keys=gpu_keys,
+                gpu_batches=gpu_batches,
+            ),
+            gpu_scalars,
+        )
+        # Published in call order, now or later; the captured text below never waits.
+        numeric_points, rich_queue_items = [], []
+
     # Drain stdout/stderr buffers (keyed by timestamp, independent of step). Destructive — keep below anything that can raise (bad name, un-floatable value), or a failed log() discards the captured text.
     text_points = _drain_capture_points(now_ms)
 
-    total = len(numeric_points) + len(cdn_batches) + len(text_points)
-    if total > 0:
-        queue_items = []
-        all_points = numeric_points + text_points
-        if all_points:
-            queue_items.append(all_points)
-        queue_items.extend(rich_queue_items)
-        _publish_queue_items(queue_items)
+    all_points = numeric_points + text_points
+    _publish_queue_items(([all_points] if all_points else []) + rich_queue_items)
 
     _warn_if_backlogged()
     _last_log_duration_ms = (time.perf_counter() - t0) * 1000.0
@@ -785,23 +850,36 @@ _SERIALIZED_RICH_QUEUE_ITEM = "__kymo_serialized_rich_v1__"
 
 
 class _HostTensorPickler(pickle.Pickler):
-    """Snapshot pickler that copies accelerator tensors to host memory.
+    """Snapshot pickler that pickles a tensor as its host NumPy array, or as a host tensor when that is smaller or NumPy cannot hold it.
 
-    Torch pickles a device tensor with its device, so the upload worker would unpickle it onto the accelerator: a forked worker cannot initialize CUDA and would drop the item as lost, and one that can opens its own context. Pickling copies the data to host anyway. Everything else, CPU tensors included, pickles exactly as pickle.dumps would.
+    Torch pickles a tensor with its device and its whole storage.
+    A forked upload worker cannot initialize CUDA to unpickle a device tensor and would drop the item as lost, and one that can opens its own context.
+    A view, such as one image of a batch, would carry the whole batch.
+    A NumPy array pickles only its own elements, and the worker converts an image tensor to NumPy first anyway.
+    Other objects use their normal pickle reducers.
     """
 
     def reducer_override(self, obj):
         # Never imports torch: a tensor can only exist once it is loaded.
         # A stub or half-imported torch has no Tensor type; pickle normally then.
         tensor = getattr(sys.modules.get("torch"), "Tensor", None)
-        if (
-            isinstance(tensor, type)
-            and isinstance(obj, tensor)
-            # A meta tensor has no data to copy; it pickles as before and the worker drops it.
-            and obj.device.type not in ("cpu", "meta")
-        ):
-            return obj.detach().cpu().__reduce_ex__(pickle.HIGHEST_PROTOCOL)
-        return NotImplemented
+        if not (isinstance(tensor, type) and isinstance(obj, tensor)):
+            return NotImplemented
+        # A meta tensor has no data to copy; torch pickles it and the worker drops it.
+        if obj.device.type == "meta":
+            return NotImplemented
+        # For an accelerator tensor this waits for the value: log() snapshots it.
+        host = obj.detach().cpu()
+        try:
+            array = host.numpy()
+            # An expanded (stride-0) view's array holds every element it repeats, more than its storage.
+            if array.nbytes <= host.untyped_storage().nbytes():
+                return array.__reduce_ex__(pickle.HIGHEST_PROTOCOL)
+        except (TypeError, RuntimeError, AttributeError):
+            # NumPy has no bfloat16 or float8, conjugated, sparse, nested and quantized tensors refuse, and torch 1.x has no untyped_storage.
+            pass
+        # Torch's own pickle, embedded as bytes so this override cannot turn the tensors a nested or quantized tensor rebuilds from into arrays.
+        return pickle.loads, (pickle.dumps(host, protocol=pickle.HIGHEST_PROTOCOL),)
 
 
 def _snapshot_rich_queue_items(cdn_batches: list[tuple]) -> list[tuple]:
@@ -975,6 +1053,157 @@ def _warn_if_backlogged() -> None:
     )
 
 
+class _PendingLog:
+    """A log() call whose GPU values are being copied to the host, or a later write queued behind one."""
+
+    def __init__(
+        self,
+        points: list,
+        rich: list,
+        *,
+        step: int = 0,
+        timestamp_ms: int = 0,
+        gpu_keys: list = (),
+        gpu_batches: list = (),
+    ):
+        self.points = points
+        self.rich = rich
+        self.step = step
+        self.timestamp_ms = timestamp_ms
+        self.gpu_keys = gpu_keys
+        self.gpu_batches = gpu_batches
+        self.reads = None
+        # Budget 16 host bytes per scalar, its 8-byte gather word and 8-byte result; the images' data is still on the GPU.
+        self.nbytes = (
+            16 * len(gpu_keys)
+            + sum(image.data.nbytes for batch in gpu_batches for image in batch[3])
+            + sum(len(item[2]) for item in rich)
+        )
+
+
+def _queue_pending_log(torch, entry: _PendingLog, gpu_scalars: list) -> None:
+    """Start a log() call's GPU-to-host copies and queue it behind the pending calls, publishing every call whose copies have completed."""
+    with _pending_lock:
+        # Querying or waiting on an event during a capture can invalidate it. After a CUDA error the check raises, and nothing can be capturing.
+        try:
+            capturing = torch is not None and torch.cuda.is_current_stream_capturing()
+        except Exception:
+            capturing = False
+        if capturing:
+            if gpu_scalars or entry.gpu_batches:
+                raise RuntimeError(
+                    "kymo.log() cannot read CUDA tensors during CUDA graph capture; "
+                    "log them outside the captured region"
+                )
+            _pending.append(entry)
+            return
+        held = entry.nbytes + sum(pending.nbytes for pending in _pending)
+        while _pending and held > _PENDING_MAX_BYTES:
+            held -= _pending[0].nbytes
+            _publish_oldest_pending(None)
+        images = [image for batch in entry.gpu_batches for image in batch[3]]
+        if gpu_scalars or images:
+            entry.reads = _gpu.Reads(
+                torch, gpu_scalars, [image.data for image in images]
+            )
+            for image, host in zip(images, entry.reads.images):
+                image.data = host
+        _pending.append(entry)
+        # A past deadline publishes only the calls whose copies have completed.
+        _publish_pending(0.0)
+
+
+def _publish_pending(deadline: Optional[float]) -> bool:
+    """Publish the pending calls, oldest first, as their copies complete, waiting until the time.monotonic() deadline (None: as long as they take); True once none remain."""
+    while _pending:
+        if not _publish_oldest_pending(deadline):
+            return False
+    return True
+
+
+def _publish_oldest_pending(
+    deadline: Optional[float],
+    *,
+    drop_unfinished: bool = False,
+    hard_deadline: Optional[float] = None,
+) -> bool:
+    """Publish the oldest pending call once its copies complete, waiting until the time.monotonic() deadline (None: as long as they take).
+
+    If they have not completed by then, return False and keep it, or with drop_unfinished publish it without its GPU values; a CUDA error does the latter.
+    """
+    global _pending_incomplete
+    entry = _pending[0]
+    failure = None
+    if entry.reads is not None:
+        try:
+            if not entry.reads.wait(deadline):
+                if not drop_unfinished:
+                    return False
+                failure = "their copies to the host did not complete"
+        except Exception as error:
+            # A CUDA error is sticky: the copies never complete, and freeing them would abort the process.
+            _gpu.unfreeable.append(entry.reads)
+            failure = f"reading them failed: {error}"
+    # Popped and marked incomplete before publishing: a shutdown signal handler that interrupts the publication must neither publish it again nor report it complete. The flag is restored once it has been published.
+    _pending.popleft()
+    incomplete, _pending_incomplete = _pending_incomplete, True
+    points, rich, dropped = entry.points, entry.rich, []
+    if failure is not None:
+        _log.warning(
+            "dropped %d GPU value(s) of step %d: %s",
+            len(entry.gpu_keys) + len(entry.gpu_batches),
+            entry.step,
+            failure,
+        )
+        incomplete = True
+    elif entry.reads is not None:
+        keys, step, timestamp_ms = entry.gpu_keys, entry.step, entry.timestamp_ms
+        for index, value in entry.reads.scalars():
+            name, tag = keys[index]
+            if not -_F32_OVERFLOW < value < _F32_OVERFLOW:
+                try:
+                    value = _normalize_numeric_value(value)
+                except OverflowError:
+                    dropped.append(name)
+                    continue
+            points.append(
+                ("numeric_ts", name, step, value, timestamp_ms)
+                if tag is None
+                else ("numeric_tagged_ts", name, step, value, tag, timestamp_ms)
+            )
+        for batch in entry.gpu_batches:
+            try:
+                rich.extend(_snapshot_rich_queue_items([batch]))
+            except TypeError:
+                dropped.append(batch[1])
+    if dropped:
+        _log.warning(
+            "dropped %d value(s) of step %d that cannot be sent: %s",
+            len(dropped),
+            entry.step,
+            ", ".join(sorted(set(dropped))),
+        )
+        incomplete = True
+    try:
+        _publish_queue_items(
+            ([points] if points else []) + rich, hard_deadline=hard_deadline
+        )
+    except Exception as error:
+        _log.warning("failed to publish the values of step %d: %s", entry.step, error)
+        incomplete = True
+    _pending_incomplete = incomplete
+    return True
+
+
+def _publish_in_log_order(entry: _PendingLog) -> None:
+    """Publish a write now, or behind the pending log() calls, so it never overtakes one; never touches the GPU."""
+    with _pending_lock:
+        if _pending:
+            _pending.append(entry)
+            return
+        _publish_queue_items(([entry.points] if entry.points else []) + entry.rich)
+
+
 def log_cdn(cdn_keys: dict[str, str], step: int) -> None:
     """Queue CDN key metrics for upload."""
     if not _is_initialized:
@@ -1016,7 +1245,7 @@ def log_cdn(cdn_keys: dict[str, str], step: int) -> None:
         )
         points.append(point)
 
-    _publish_queue_items([points])
+    _publish_in_log_order(_PendingLog(points, [], step=step))
     _warn_if_backlogged()
 
 
@@ -1031,8 +1260,12 @@ def _normalize_timeout_budget(value: float, name: str) -> float:
 def wait_for_upload(timeout: Optional[float] = None) -> bool:
     """Block until all queued metrics are uploaded.
 
+    It first waits for the GPU values of pending log() calls, so on the
+    calling thread it waits for the GPU work queued before them.
+
     Returns True only if everything reached the server. Returns False on a
-    timeout or once any point has failed over to the replayable disk spool.
+    timeout, once any point has failed over to the replayable disk spool, or
+    once a value was dropped after its log() returned.
 
     Raises:
         RuntimeError: if the upload worker has died with points still queued,
@@ -1044,6 +1277,21 @@ def wait_for_upload(timeout: Optional[float] = None) -> bool:
     if timeout is not None:
         timeout = _normalize_timeout_budget(timeout, "upload")
     deadline = None if timeout is None else time.monotonic() + timeout
+    # Another thread may hold the pending calls while it waits for the GPU.
+    if not _pending_lock.acquire(
+        timeout=-1 if deadline is None else _remaining_seconds(deadline)
+    ):
+        _log.warning("timeout — another thread holds the pending log() calls")
+        return False
+    try:
+        if not _publish_pending(deadline):
+            _log.warning(
+                "timeout — %d log() call(s) still wait for their GPU values",
+                len(_pending),
+            )
+            return False
+    finally:
+        _pending_lock.release()
     wait_time = 0.05
     accounting_unavailable_since = None
 
@@ -1100,6 +1348,11 @@ def wait_for_upload(timeout: Optional[float] = None) -> bool:
             )
             return False
         if remaining <= 0:
+            if _pending_incomplete:
+                _log.warning(
+                    "values were dropped after log() returned; see the warnings above"
+                )
+                return False
             return True
         # A dead worker can't drain the queue; sleeping on it is a silent
         # forever-hang (the way a missing __main__ guard on macOS used to
@@ -1133,8 +1386,11 @@ def finish(flush_timeout: Optional[float] = None) -> bool:
     Spooled points are delivered later from any CPU-only machine with
     ``python -m kymo.sync``.
 
+    log() calls whose GPU values are still being copied get half the budget;
+    values not copied by then are dropped.
+
     Returns True only if delivery was proven complete. Returns False if points
-    were spooled or the worker otherwise could not prove delivery.
+    were spooled or dropped, or the worker otherwise could not prove delivery.
     """
     reject_legacy_client_env()
     if not _is_initialized:
@@ -1295,17 +1551,20 @@ def _push_run_metadata():
     """Queue one immutable metadata snapshot on the ordered rich lane."""
     if not _is_initialized or _run_metadata is None:
         return
-    _publish_queue_items(
-        _snapshot_rich_queue_items(
-            [
-                _rich_queue_tuple(
-                    "metadata_batch",
-                    "info/run_info",
-                    0,
-                    Metadata(_run_metadata),
-                    int(time.time() * 1000),
-                )
-            ]
+    _publish_in_log_order(
+        _PendingLog(
+            [],
+            _snapshot_rich_queue_items(
+                [
+                    _rich_queue_tuple(
+                        "metadata_batch",
+                        "info/run_info",
+                        0,
+                        Metadata(_run_metadata),
+                        int(time.time() * 1000),
+                    )
+                ]
+            ),
         )
     )
 
@@ -2007,6 +2266,19 @@ def _drain_and_shutdown(flush_timeout: Optional[float] = None) -> bool:
         poller_quiesced = _system_poller.stop(timeout=_remaining_seconds(hard_deadline))
         _system_poller = None
 
+    # log() calls still copying GPU values get half the budget, including any wait for another thread that holds them while it waits for the GPU; any left then are published without those values.
+    pending_deadline = time.monotonic() + _remaining_seconds(hard_deadline) / 2
+    if _pending_lock.acquire(timeout=_remaining_seconds(pending_deadline)):
+        try:
+            while _pending:
+                _publish_oldest_pending(
+                    pending_deadline, drop_unfinished=True, hard_deadline=hard_deadline
+                )
+        finally:
+            _pending_lock.release()
+    else:
+        _log.error("the pending log() calls stayed locked by another thread")
+
     backlog = _read_shutdown_status(_queue_status)
     if backlog is not None and backlog > 0:
         _log.info("flushing %d queued points (budget %.0fs)…", backlog, flush_timeout)
@@ -2150,10 +2422,15 @@ def _drain_and_shutdown(flush_timeout: Optional[float] = None) -> bool:
     _url_base = ""
     _rich_writer_epoch = None
     _rich_mutation_seq = None
+    # A log() on another thread can queue behind this shutdown after the drain above.
+    values_complete = not (_pending_incomplete or _pending)
     # A terminated worker takes its private in-RAM buffers with it, so queue salvage alone cannot prove complete delivery.
     return _shutdown_succeeded(
         worker_clean=(
-            worker_clean and shutdown_marker_published and capture_tail_published
+            worker_clean
+            and shutdown_marker_published
+            and capture_tail_published
+            and values_complete
         ),
         poller_quiesced=poller_quiesced,
         had_spool=had_spool,

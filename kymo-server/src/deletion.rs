@@ -1161,7 +1161,7 @@ mod tests {
         // Exercise the cache-eviction leg as well as both queue branches. An
         // empty entry is sufficient: the test cares about identity eviction,
         // while ClickHouse below independently proves physical row deletion.
-        let cached_series = (project_id.clone(), fresh_run_id.clone(), "loss".to_string());
+        let cached_series = crate::series_cache::SeriesKey::new(&project_id, &fresh_run_id, "loss");
         ch.series_cache()
             .insert_full(cached_series.clone(), Vec::new(), std::time::Instant::now());
 
@@ -1213,8 +1213,14 @@ mod tests {
                 })
             ));
             assert!(ch
-                .query_raw(&key.project_id, &key.run_id, "loss", i64::MIN, i64::MAX)
-                .await?
+                .query_raw_many(
+                    &key.project_id,
+                    std::slice::from_ref(&key.run_id),
+                    "loss",
+                    i64::MIN,
+                    i64::MAX
+                )
+                .await?[0]
                 .is_empty());
         }
         // A retry after a lost acknowledgement must reconcile the stable zero

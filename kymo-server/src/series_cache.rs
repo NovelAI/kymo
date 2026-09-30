@@ -178,7 +178,27 @@ impl SeriesSnapshot {
     }
 }
 
-pub type SeriesKey = (String, String, String);
+/// One cached series: a metric of a run.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SeriesKey {
+    pub project_id: String,
+    pub run_id: String,
+    pub metric_name: String,
+}
+
+impl SeriesKey {
+    pub fn new(
+        project_id: impl Into<String>,
+        run_id: impl Into<String>,
+        metric_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            project_id: project_id.into(),
+            run_id: run_id.into(),
+            metric_name: metric_name.into(),
+        }
+    }
+}
 
 /// Bounded, process-local history of LRU victims; neither rows nor tags are retained, and a restart discards it.
 const EVICTED_LINEAGE_LIMIT: usize = 4096;
@@ -388,7 +408,7 @@ impl SeriesRefreshLocks {
             // Attach deliveries are bump-gated (docs/admission-control.md
             // goal 4): a snapshot whose fetch predates a bump this caller's
             // consult postdates falls through to a fresh election instead.
-            if is_fresh(cache.last_bump(&key.1), done.started) {
+            if is_fresh(cache.last_bump(&key.run_id), done.started) {
                 state.published = Some(done.clone());
                 SeriesCache::record_lookup_result("fresh");
                 SeriesCache::record_shared("running");
@@ -411,7 +431,7 @@ impl SeriesRefreshLocks {
                     if let Some(rows) = state
                         .published
                         .as_ref()
-                        .filter(|result| is_fresh(cache.last_bump(&key.1), result.started))
+                        .filter(|result| is_fresh(cache.last_bump(&key.run_id), result.started))
                         .map(|result| result.rows.clone())
                     {
                         SeriesCache::record_lookup_result("fresh");
@@ -425,44 +445,13 @@ impl SeriesRefreshLocks {
                 // sharing, just as Entry::started gates retained rows.
                 let refresh_started = Instant::now();
                 let fut = refresh(needs_refresh);
-                let fut = async move {
-                    fut.await.map(|rows| PublishedRefresh {
+                let done = match detach() {
+                    None => fut.await.map(|rows| PublishedRefresh {
                         rows,
                         started: refresh_started,
-                    })
-                };
-                let done = match detach() {
-                    None => fut.await,
+                    }),
                     Some(ctx) => {
-                        // The task owns the detach RAII and its own lease, so
-                        // the refresh slot — the attach point for re-polls —
-                        // outlives every cancelled requester for the task's
-                        // bounded lifetime.
-                        let task_lease = self.lease_for(key);
-                        state.running = Some(tokio::spawn(async move {
-                            // Declaration order is load-bearing: locals drop in
-                            // reverse, so the lease (the slot's last owner) is
-                            // declared AFTER the detach RAII and retires before
-                            // the run guard is released — a writer taking the
-                            // gate in between (finalize/purge evicting the run)
-                            // must not find an attachable slot still holding a
-                            // pre-eviction result.
-                            let _detach = ctx;
-                            let _lease = task_lease;
-                            let outcome = tokio::time::timeout(DETACHED_REFRESH_TIMEOUT, fut)
-                                .await
-                                .unwrap_or(Err(RefreshError::Timeout));
-                            metrics::counter!(
-                                "mkdb2_series_refresh_detached_total",
-                                "outcome" => match &outcome {
-                                    Ok(_) => "ok",
-                                    Err(RefreshError::Timeout) => "timeout",
-                                    Err(_) => "error",
-                                }
-                            )
-                            .increment(1);
-                            outcome
-                        }));
+                        state.running = Some(self.spawn_detached(key, ctx, fut, refresh_started));
                         // The leader's consult predates its task's fetch
                         // start, so its delivery is never bump-gated.
                         Self::await_running(&mut state).await
@@ -473,6 +462,113 @@ impl SeriesRefreshLocks {
                 }
                 done.map(|published| published.rows)
             }
+        }
+    }
+
+    /// Stage R's detached refresh: the task owns `ctx` (the admission units and run guards backing its read) and its own lease, so the refresh slot, the attach point for re-polls, outlives every cancelled requester for the task's bounded lifetime.
+    fn spawn_detached<D: Send + 'static>(
+        &self,
+        key: &SeriesKey,
+        ctx: D,
+        refresh: impl std::future::Future<Output = RefreshOutcome> + Send + 'static,
+        started: Instant,
+    ) -> tokio::task::JoinHandle<RunningOutcome> {
+        let task_lease = self.lease_for(key);
+        tokio::spawn(async move {
+            // Declaration order is load-bearing: locals drop in reverse, so the lease (the slot's last owner) is declared AFTER the detach RAII and retires before the run guard is released — a writer taking the gate in between (finalize/purge evicting the run) must not find an attachable slot still holding a pre-eviction result.
+            let _detach = ctx;
+            let _lease = task_lease;
+            let outcome = tokio::time::timeout(DETACHED_REFRESH_TIMEOUT, refresh)
+                .await
+                .unwrap_or(Err(RefreshError::Timeout));
+            metrics::counter!(
+                "mkdb2_series_refresh_detached_total",
+                "outcome" => match &outcome {
+                    Ok(_) => "ok",
+                    Err(RefreshError::Timeout) => "timeout",
+                    Err(_) => "error",
+                }
+            )
+            .increment(1);
+            outcome.map(|rows| PublishedRefresh { rows, started })
+        })
+    }
+
+    /// Elect this caller as the full-read refresher of up to `limit` of `keys`, taking only slots that are free right now, so electing never waits.
+    /// A key that is not a miss, whose slot is busy, or that a running or still-fresh published refresh already covers is left for [`Self::get_or_refresh`], which waits or attaches as usual.
+    /// No deadlock: the future holding the elected slots ([`Self::spawn_batch`]) awaits only its own tasks, which take no locks.
+    pub(crate) fn elect_misses(
+        &self,
+        cache: &SeriesCache,
+        keys: &[SeriesKey],
+        limit: usize,
+    ) -> Vec<ElectedMiss> {
+        let mut elected = Vec::new();
+        for key in keys {
+            if elected.len() == limit {
+                break;
+            }
+            // Keeps fresh series, every poll's common case, off the refresh registry.
+            if !matches!(cache.lookup_untracked(key), Lookup::Miss) {
+                continue;
+            }
+            let lease = self.lease_for(key);
+            let Some(state) = lease.try_lock_owned() else {
+                continue;
+            };
+            // The checks get_or_refresh makes once it holds the lock.
+            let covered = state.running.is_some()
+                || state
+                    .published
+                    .as_ref()
+                    .is_some_and(|result| is_fresh(cache.last_bump(&key.run_id), result.started));
+            if covered || !matches!(cache.lookup_untracked(key), Lookup::Miss) {
+                continue;
+            }
+            SeriesCache::record_lookup(&Lookup::Miss);
+            elected.push(ElectedMiss {
+                key: key.clone(),
+                state,
+                _lease: lease,
+            });
+        }
+        elected
+    }
+
+    /// Refresh each of `elected` in its own detached task running `refresh(its position in elected, its key)`, as [`Self::get_or_refresh`] would.
+    /// Every task is spawned, and its slot's `running` set, before this returns: cancelling the caller cannot strand an elected slot or leave the shared read running on released units.
+    /// Every task keeps a clone of `ctx`, so it is released only when the last task ends.
+    /// `started` must predate the read: it is each key's fetch start and published stamp.
+    /// The returned future awaits each task under its slot lock and publishes, as a leader does, up to the first failure; the tasks it leaves stay attachable, as a cancelled leader's do.
+    pub(crate) fn spawn_batch<D, Fut>(
+        &self,
+        elected: Vec<ElectedMiss>,
+        ctx: D,
+        started: Instant,
+        mut refresh: impl FnMut(usize, &SeriesKey) -> Fut,
+    ) -> impl std::future::Future<Output = Result<Vec<(SeriesKey, Arc<SeriesSnapshot>)>, RefreshError>>
+    where
+        D: Clone + Send + 'static,
+        Fut: std::future::Future<Output = RefreshOutcome> + Send + 'static,
+    {
+        let running: Vec<ElectedMiss> = elected
+            .into_iter()
+            .enumerate()
+            .map(|(index, mut miss)| {
+                let fut = refresh(index, &miss.key);
+                miss.state.running =
+                    Some(self.spawn_detached(&miss.key, ctx.clone(), fut, started));
+                miss
+            })
+            .collect();
+        async move {
+            let mut rows = Vec::with_capacity(running.len());
+            for mut miss in running {
+                let published = Self::await_running(&mut miss.state).await?;
+                miss.state.published = Some(published.clone());
+                rows.push((miss.key, published.rows));
+            }
+            Ok(rows)
         }
     }
 
@@ -494,6 +590,14 @@ impl SeriesRefreshLocks {
 }
 
 type SeriesRefreshLease = crate::refresh_locks::RefreshLease<SeriesKey, SlotState>;
+
+/// A key [`SeriesRefreshLocks::elect_misses`] elected; its slot stays locked until the batch that refreshes it publishes.
+pub(crate) struct ElectedMiss {
+    pub(crate) key: SeriesKey,
+    // Declared before the lease so it drops first: the lease's exact registry removal needs the slot's last Arc.
+    state: tokio::sync::OwnedMutexGuard<SlotState>,
+    _lease: SeriesRefreshLease,
+}
 
 /// What the cache knows when a query starts.
 pub enum Lookup {
@@ -553,7 +657,7 @@ impl SeriesCache {
     /// failed attempt); followers that avoid ClickHouse report fresh.
     fn lookup_untracked(&self, key: &SeriesKey) -> Lookup {
         let mut inner = self.inner.lock().unwrap();
-        let last_bump = inner.bumps.get(&key.1).copied();
+        let last_bump = inner.bumps.get(&key.run_id).copied();
         match inner.map.get_mut(key) {
             None => Lookup::Miss,
             Some(e) => {
@@ -717,8 +821,8 @@ impl SeriesCache {
         let mut inner = self.inner.lock().unwrap();
         let mut removed = 0usize;
         let mut removed_bytes = 0usize;
-        inner.map.retain(|(project_id, run_id, _), entry| {
-            if runs.contains(&(project_id.as_str(), run_id.as_str())) {
+        inner.map.retain(|key, entry| {
+            if runs.contains(&(key.project_id.as_str(), key.run_id.as_str())) {
                 removed += 1;
                 removed_bytes += entry.bytes;
                 false
@@ -726,9 +830,9 @@ impl SeriesCache {
                 true
             }
         });
-        inner.evicted.retain(|(project_id, run_id, _), _| {
-            !runs.contains(&(project_id.as_str(), run_id.as_str()))
-        });
+        inner
+            .evicted
+            .retain(|key, _| !runs.contains(&(key.project_id.as_str(), key.run_id.as_str())));
         inner.total_bytes -= removed_bytes;
         Self::settle(&mut inner, self.budget_bytes);
         removed
@@ -797,7 +901,7 @@ fn merge_increment_tracked(
     cached: &[VersionedRawPoint],
     increment: &[VersionedRawPoint],
 ) -> Option<MergedRows> {
-    // The increment is read WITHOUT FINAL (see `fetch_versioned`), so one
+    // The increment is read WITHOUT FINAL (see `fetch_increment`), so one
     // (tag, step) can appear as several versions — unmerged duplicate
     // inserts, or a re-log inside the watermark window. ORDER BY (tag,
     // step) leaves versions adjacent but unordered; keep the one FINAL
@@ -954,7 +1058,7 @@ mod tests {
     #[test]
     fn snapshot_lineage_tracks_additions_not_fetch_watermarks_or_overlap_restamps() {
         let cache = SeriesCache::new();
-        let key = ("p".into(), "r".into(), "m".into());
+        let key = SeriesKey::new("p", "r", "m");
         let now = unix_ms_now();
         let first = cache.insert_full(key.clone(), vec![row("", 0, 1.0, now)], Instant::now());
         assert_eq!(first.maximum(), Some(now));
@@ -1017,7 +1121,7 @@ mod tests {
     #[test]
     fn irrelevant_tombstone_advances_fetch_watermark_without_forging_numeric_membership() {
         let cache = SeriesCache::new();
-        let key = ("p".into(), "r".into(), "m".into());
+        let key = SeriesKey::new("p", "r", "m");
         let first = cache.insert_full(key.clone(), vec![row("", 0, 1.0, 100)], Instant::now());
         let next = cache
             .apply_increment(
@@ -1039,7 +1143,7 @@ mod tests {
             inner: std::sync::Mutex::new(Inner::default()),
             budget_bytes: entry_bytes(&source),
         };
-        let key = ("p".into(), "r".into(), "m".into());
+        let key = SeriesKey::new("p", "r", "m");
         let first = cache.insert_full(key.clone(), source.clone(), Instant::now());
         let stale_generation = gen_of(&cache, &key);
         let replacement = cache.insert_full(key.clone(), source.clone(), Instant::now());
@@ -1084,7 +1188,7 @@ mod tests {
     }
 
     fn evict(cache: &SeriesCache, key: &SeriesKey, row_count: usize) {
-        let other = ("p".into(), "eviction-pressure".into(), "m".into());
+        let other = SeriesKey::new("p", "eviction-pressure", "m");
         cache.insert_full(
             other,
             (0..row_count)
@@ -1099,7 +1203,7 @@ mod tests {
     #[test]
     fn lru_reload_restores_lineage_and_origin_through_repeated_evictions() {
         let cache = eviction_cache(4);
-        let key = ("p".into(), "r".into(), "m".into());
+        let key = SeriesKey::new("p", "r", "m");
         let first = cache.insert_full_with_origin(
             key.clone(),
             vec![row("a", 2, 1.0, 100)],
@@ -1150,7 +1254,7 @@ mod tests {
         ];
         for (case, rows) in cases.into_iter().enumerate() {
             let cache = eviction_cache(4);
-            let key = ("p".into(), "r".into(), "m".into());
+            let key = SeriesKey::new("p", "r", "m");
             let first = cache.insert_full(key.clone(), original.clone(), Instant::now());
             evict(&cache, &key, 4);
             let reloaded = cache.insert_full(key, rows, Instant::now());
@@ -1161,7 +1265,7 @@ mod tests {
     #[test]
     fn empty_lineage_can_be_reloaded_and_then_extended() {
         let cache = eviction_cache(2);
-        let key = ("p".into(), "r".into(), "m".into());
+        let key = SeriesKey::new("p", "r", "m");
         let first = cache.insert_full(key.clone(), vec![], Instant::now());
         evict(&cache, &key, 2);
         let empty = cache.insert_full(key.clone(), vec![], Instant::now());
@@ -1175,7 +1279,7 @@ mod tests {
     #[test]
     fn oversized_reload_consumes_recovery_without_recording_its_returned_snapshot() {
         let cache = eviction_cache(1);
-        let key = ("p".into(), "r".into(), "m".into());
+        let key = SeriesKey::new("p", "r", "m");
         let first = cache.insert_full(key.clone(), vec![row("", 0, 1.0, 100)], Instant::now());
         evict(&cache, &key, 1);
         let full = vec![row("", 0, 1.0, 100), row("", 1, 2.0, 200)];
@@ -1191,7 +1295,7 @@ mod tests {
     #[test]
     fn concurrent_full_reloads_cannot_fork_an_evicted_lineage() {
         let cache = eviction_cache(3);
-        let key = ("p".into(), "r".into(), "m".into());
+        let key = SeriesKey::new("p", "r", "m");
         let first = cache.insert_full(key.clone(), vec![row("", 0, 1.0, 100)], Instant::now());
         evict(&cache, &key, 3);
         let barrier = std::sync::Barrier::new(2);
@@ -1226,14 +1330,14 @@ mod tests {
     #[test]
     fn eviction_records_are_single_use_bounded_and_purged_by_exact_run() {
         let cache = eviction_cache(1);
-        let key = ("p".into(), "r".into(), "m".into());
+        let key = SeriesKey::new("p", "r", "m");
         let first = cache.insert_full(key.clone(), vec![row("", 0, 1.0, 100)], Instant::now());
         evict(&cache, &key, 1);
         let claimed = cache.inner.lock().unwrap().evicted.remove(&key).unwrap();
         let concurrent = cache.insert_full(key.clone(), first.to_vec(), Instant::now());
         assert_ne!(concurrent.lineage(), claimed.lineage);
         evict(&cache, &key, 1);
-        let other_project = ("other-project".into(), "r".into(), "m".into());
+        let other_project = SeriesKey::new("other-project", "r", "m");
         let other = cache.insert_full(other_project.clone(), first.to_vec(), Instant::now());
         evict(&cache, &other_project, 1);
         cache.purge_runs([("p", "r")]);
@@ -1242,25 +1346,16 @@ mod tests {
         assert_eq!(reloaded.lineage(), other.lineage());
         for n in 0..=EVICTED_LINEAGE_LIMIT + 1 {
             cache.insert_full(
-                ("p".into(), format!("bounded-{n}"), "m".into()),
+                SeriesKey::new("p", format!("bounded-{n}"), "m"),
                 first.to_vec(),
                 Instant::now(),
             );
         }
-        assert_eq!(
-            cache.inner.lock().unwrap().evicted.len(),
-            EVICTED_LINEAGE_LIMIT
-        );
-        assert!(!cache.inner.lock().unwrap().evicted.contains_key(&(
-            "p".into(),
-            "bounded-0".into(),
-            "m".into()
-        )));
-        assert!(cache.inner.lock().unwrap().evicted.contains_key(&(
-            "p".into(),
-            format!("bounded-{EVICTED_LINEAGE_LIMIT}"),
-            "m".into()
-        )));
+        let evicted = &cache.inner.lock().unwrap().evicted;
+        assert_eq!(evicted.len(), EVICTED_LINEAGE_LIMIT);
+        assert!(!evicted.contains_key(&SeriesKey::new("p", "bounded-0", "m")));
+        let newest = SeriesKey::new("p", format!("bounded-{EVICTED_LINEAGE_LIMIT}"), "m");
+        assert!(evicted.contains_key(&newest));
     }
 
     #[test]
@@ -1271,7 +1366,7 @@ mod tests {
         let mut late = 0;
         for seed in 1..=8u64 {
             let cache = eviction_cache(128);
-            let key = ("p".into(), "r".into(), "m".into());
+            let key = SeriesKey::new("p", "r", "m");
             let mut current =
                 cache.insert_full(key.clone(), vec![row("", 2, 1.0, 100)], Instant::now());
             let mut history = vec![current.clone()];
@@ -1524,7 +1619,7 @@ mod tests {
             inner: std::sync::Mutex::new(Inner::default()),
             budget_bytes: usize::MAX,
         };
-        let k = ("p".into(), "r".into(), "m".into());
+        let k = SeriesKey::new("p", "r", "m");
         // A row stamped "now" must not advance the watermark past
         // now − margin, or rows from a still-committing concurrent flush
         // (stamped earlier, visible later) would be skipped forever.
@@ -1555,7 +1650,7 @@ mod tests {
             inner: std::sync::Mutex::new(Inner::default()),
             budget_bytes: entry_bytes(&vec![row("", 0, 0.0, 0); 8]),
         };
-        let k = ("p".into(), "r".into(), "m".into());
+        let k = SeriesKey::new("p", "r", "m");
         cache.insert_full(k.clone(), vec![row("", 1, 1.0, 100)], Instant::now());
         assert!(matches!(cache.lookup(&k), Lookup::Fresh(_)));
         // A note for the run invalidates entries stamped before
@@ -1563,7 +1658,7 @@ mod tests {
         cache.note_bumps(std::iter::once("r"));
         assert!(matches!(cache.lookup(&k), Lookup::Stale { .. }));
         // ...while other runs' entries are untouched.
-        let k2 = ("p".into(), "r2".into(), "m".into());
+        let k2 = SeriesKey::new("p", "r2", "m");
         cache.insert_full(k2.clone(), vec![row("", 1, 1.0, 100)], Instant::now());
         assert!(matches!(cache.lookup(&k2), Lookup::Fresh(_)));
         // The refetch the bump triggers re-stamps past the note; the rest of
@@ -1580,7 +1675,7 @@ mod tests {
             inner: std::sync::Mutex::new(Inner::default()),
             budget_bytes: entry_bytes(&vec![row("", 0, 0.0, 0); 8]),
         };
-        let k = ("p".into(), "r".into(), "m".into());
+        let k = SeriesKey::new("p", "r", "m");
         cache.insert_full(k.clone(), vec![row("", 1, 1.0, 100)], Instant::now());
         let stale_gen = gen_of(&cache, &k);
         // A concurrent full fetch replaces the entry while the increment
@@ -1610,7 +1705,7 @@ mod tests {
             inner: std::sync::Mutex::new(Inner::default()),
             budget_bytes: entry_bytes(&vec![row("", 0, 0.0, 0); 8]),
         };
-        let k = ("p".into(), "r".into(), "m".into());
+        let k = SeriesKey::new("p", "r", "m");
         // A bump noted seconds ago while a slow
         // fetch is still in flight. Backdate it directly; note_bumps always
         // stamps now. (10s, not minutes: Instant subtraction panics if it
@@ -1649,7 +1744,7 @@ mod tests {
         };
         // A fetch that started a whole window ago is stale on arrival, however recently it stored.
         if let Some(started) = Instant::now().checked_sub(FRESH_WINDOW + Duration::from_secs(1)) {
-            let k = ("p".into(), "r".into(), "m".into());
+            let k = SeriesKey::new("p", "r", "m");
             cache.insert_full(k.clone(), vec![row("", 1, 1.0, 100)], started);
             assert!(matches!(cache.lookup(&k), Lookup::Stale { .. }));
         }
@@ -1661,8 +1756,8 @@ mod tests {
             inner: std::sync::Mutex::new(Inner::default()),
             budget_bytes: entry_bytes(&vec![row("", 0, 0.0, 0); 3]) * 2,
         };
-        let k1 = ("p".into(), "r1".into(), "m".into());
-        let k2 = ("p".into(), "r2".into(), "m".into());
+        let k1 = SeriesKey::new("p", "r1", "m");
+        let k2 = SeriesKey::new("p", "r2", "m");
 
         assert!(matches!(cache.lookup(&k1), Lookup::Miss));
         cache.insert_full(k1.clone(), vec![row("", 1, 1.0, 100)], Instant::now());
@@ -1703,7 +1798,7 @@ mod tests {
             inner: std::sync::Mutex::new(Inner::default()),
             budget_bytes: entry_bytes(&vec![row("", 0, 0.0, 0); 2]),
         };
-        let k = ("p".into(), "r".into(), "m".into());
+        let k = SeriesKey::new("p", "r", "m");
 
         // Full insert over budget: rows come back, nothing is retained.
         let rows = cache.insert_full(k.clone(), vec![row("", 1, 1.0, 100); 3], Instant::now());
@@ -1737,31 +1832,11 @@ mod tests {
             inner: std::sync::Mutex::new(Inner::default()),
             budget_bytes: usize::MAX,
         };
-        let target_a = (
-            "project-a".to_string(),
-            "same-run".to_string(),
-            "loss".to_string(),
-        );
-        let target_b = (
-            "project-a".to_string(),
-            "same-run".to_string(),
-            "lr".to_string(),
-        );
-        let other_project = (
-            "project-b".to_string(),
-            "same-run".to_string(),
-            "loss".to_string(),
-        );
-        let target_c = (
-            "project-a".to_string(),
-            "other-run".to_string(),
-            "loss".to_string(),
-        );
-        let kept_run = (
-            "project-a".to_string(),
-            "kept-run".to_string(),
-            "loss".to_string(),
-        );
+        let target_a = SeriesKey::new("project-a", "same-run", "loss");
+        let target_b = SeriesKey::new("project-a", "same-run", "lr");
+        let other_project = SeriesKey::new("project-b", "same-run", "loss");
+        let target_c = SeriesKey::new("project-a", "other-run", "loss");
+        let kept_run = SeriesKey::new("project-a", "kept-run", "loss");
 
         for key in [&target_a, &target_b, &target_c, &other_project, &kept_run] {
             cache.insert_full(key.clone(), vec![row("", 1, 1.0, 100)], Instant::now());
@@ -1830,7 +1905,7 @@ mod tests {
     async fn detached_refresh_survives_requester_cancellation() {
         let cache = plain_cache();
         let locks = Arc::new(SeriesRefreshLocks::default());
-        let key = ("p".to_string(), "r".to_string(), "m".to_string());
+        let key = SeriesKey::new("p", "r", "m");
         let sem = Arc::new(tokio::sync::Semaphore::new(2));
         let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1892,7 +1967,7 @@ mod tests {
     async fn repoll_after_all_requesters_died_attaches_to_the_running_task() {
         let cache = plain_cache();
         let locks = Arc::new(SeriesRefreshLocks::default());
-        let key = ("p".to_string(), "r".to_string(), "m".to_string());
+        let key = SeriesKey::new("p", "r", "m");
         let sem = Arc::new(tokio::sync::Semaphore::new(2));
         let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1947,7 +2022,7 @@ mod tests {
     async fn attacher_after_a_bump_is_gated_off_the_running_snapshot() {
         let cache = plain_cache();
         let locks = Arc::new(SeriesRefreshLocks::default());
-        let key = ("p".to_string(), "r".to_string(), "m".to_string());
+        let key = SeriesKey::new("p", "r", "m");
         let sem = Arc::new(tokio::sync::Semaphore::new(2));
         let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -1999,7 +2074,7 @@ mod tests {
         wait_until(|| locks.lease_count(&key) >= 2).await;
         // The bump lands after the task's fetch started and after the
         // attacher's consult; the snapshot must not be served to it.
-        cache.note_bumps(std::iter::once(key.1.as_str()));
+        cache.note_bumps(std::iter::once(key.run_id.as_str()));
         gate_tx.send(()).unwrap();
         let rows = tokio::time::timeout(Duration::from_secs(1), attacher)
             .await
@@ -2014,7 +2089,7 @@ mod tests {
     async fn detached_failure_surfaces_once_and_later_waiters_reelect() {
         let cache = plain_cache();
         let locks = Arc::new(SeriesRefreshLocks::default());
-        let key = ("p".to_string(), "r".to_string(), "m".to_string());
+        let key = SeriesKey::new("p", "r", "m");
         let sem = Arc::new(tokio::sync::Semaphore::new(1));
         let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
         let leader = {
@@ -2065,7 +2140,7 @@ mod tests {
     async fn task_death_without_a_result_reports_failed_not_timeout() {
         let cache = plain_cache();
         let locks = Arc::new(SeriesRefreshLocks::default());
-        let key = ("p".to_string(), "r".to_string(), "m".to_string());
+        let key = SeriesKey::new("p", "r", "m");
         let sem = Arc::new(tokio::sync::Semaphore::new(1));
         let error = locks
             .get_or_refresh(&cache, &key, detach_ctx(&sem), |_| async {
@@ -2081,7 +2156,7 @@ mod tests {
     async fn detached_refresh_is_bounded_by_the_task_deadline() {
         let cache = plain_cache();
         let locks = Arc::new(SeriesRefreshLocks::default());
-        let key = ("p".to_string(), "r".to_string(), "m".to_string());
+        let key = SeriesKey::new("p", "r", "m");
         let sem = Arc::new(tokio::sync::Semaphore::new(1));
         let error = locks
             .get_or_refresh(&cache, &key, detach_ctx(&sem), |_| {
@@ -2102,7 +2177,7 @@ mod tests {
             budget_bytes: 0,
         });
         let locks = Arc::new(SeriesRefreshLocks::default());
-        let key = ("p".to_string(), "r".to_string(), "m".to_string());
+        let key = SeriesKey::new("p", "r", "m");
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let start = Arc::new(tokio::sync::Barrier::new(9));
         let mut tasks = Vec::new();
@@ -2153,7 +2228,7 @@ mod tests {
             budget_bytes: usize::MAX,
         });
         let locks = Arc::new(SeriesRefreshLocks::default());
-        let key = ("p".to_string(), "r".to_string(), "m".to_string());
+        let key = SeriesKey::new("p", "r", "m");
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (leader_started_tx, leader_started_rx) = tokio::sync::oneshot::channel();
         let (release_leader_tx, release_leader_rx) = tokio::sync::oneshot::channel();
@@ -2239,7 +2314,7 @@ mod tests {
             budget_bytes: 0,
         });
         let locks = Arc::new(SeriesRefreshLocks::default());
-        let key = ("p".to_string(), "r".to_string(), "m".to_string());
+        let key = SeriesKey::new("p", "r", "m");
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (leader_started_tx, leader_started_rx) = tokio::sync::oneshot::channel();
         let (release_leader_tx, release_leader_rx) = tokio::sync::oneshot::channel();
@@ -2322,7 +2397,7 @@ mod tests {
     #[tokio::test]
     async fn cancellation_and_loader_errors_release_refresh_election() {
         let locks = Arc::new(SeriesRefreshLocks::default());
-        let key = ("p".to_string(), "r".to_string(), "m".to_string());
+        let key = SeriesKey::new("p", "r", "m");
         let leader_lease = locks.lease_for(&key);
         let leader_guard = leader_lease.lock().await;
         let (waiter_ready_tx, waiter_ready_rx) = tokio::sync::oneshot::channel();
@@ -2367,5 +2442,174 @@ mod tests {
         cancelled_leader.abort();
         assert!(cancelled_leader.await.unwrap_err().is_cancelled());
         assert_eq!(locks.registry_len(), 0);
+    }
+
+    fn series_key(run: &str) -> SeriesKey {
+        SeriesKey::new("p", run, "m")
+    }
+
+    #[tokio::test]
+    async fn batch_election_takes_only_free_misses_up_to_the_limit() {
+        let cache = plain_cache();
+        let locks = SeriesRefreshLocks::default();
+        let keys: Vec<_> = ["fresh", "busy", "a", "b"]
+            .into_iter()
+            .map(series_key)
+            .collect();
+        cache.insert_full(keys[0].clone(), vec![row("", 1, 1.0, 1)], Instant::now());
+        let busy = locks.lease_for(&keys[1]);
+        let _busy_guard = busy.lock().await;
+
+        let elected = locks.elect_misses(&cache, &keys, 1);
+        assert_eq!(
+            elected.iter().map(|miss| &miss.key).collect::<Vec<_>>(),
+            [&keys[2]]
+        );
+        // An elected slot stays locked until its batch publishes, so a second election skips it.
+        let second = locks.elect_misses(&cache, &keys, usize::MAX);
+        assert_eq!(
+            second.iter().map(|miss| &miss.key).collect::<Vec<_>>(),
+            [&keys[3]]
+        );
+        drop((elected, second));
+        assert_eq!(locks.elect_misses(&cache, &keys, usize::MAX).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_batch_reads_once_and_outlives_its_cancelled_requester() {
+        use futures::FutureExt;
+        let cache = plain_cache();
+        let locks = Arc::new(SeriesRefreshLocks::default());
+        let keys: Vec<_> = ["a", "b"].into_iter().map(series_key).collect();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+        let read = {
+            let reads = reads.clone();
+            async move {
+                reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = gate_rx.await;
+            }
+            .boxed()
+            .shared()
+        };
+        // The batch's units, shared by its tasks.
+        let sem = Arc::new(tokio::sync::Semaphore::new(2));
+        let units = Arc::new(sem.clone().try_acquire_many_owned(2).unwrap());
+
+        let elected = locks.elect_misses(&cache, &keys, usize::MAX);
+        let batch = locks.spawn_batch(elected, units, Instant::now(), |index, key| {
+            let (read, cache, key) = (read.clone(), cache.clone(), key.clone());
+            async move {
+                // The first task ends before the read completes, as one timing out would.
+                if index == 1 {
+                    read.await;
+                }
+                Ok(cache.insert_full(key, vec![row("", 1, index as f32, 1)], Instant::now()))
+            }
+        });
+        // Cancelled before it is ever polled: the tasks were already spawned.
+        drop(batch);
+
+        let attach = |key: SeriesKey| {
+            let (cache, locks) = (cache.clone(), locks.clone());
+            tokio::spawn(async move {
+                locks
+                    .get_or_refresh(&cache, &key, no_detach, |_| async {
+                        unreachable!("waiters must attach to the batch, not elect")
+                    })
+                    .await
+            })
+        };
+        let first = attach(keys[0].clone()).await.unwrap().unwrap();
+        assert_eq!(first[0].value, 0.0);
+        wait_until(|| reads.load(std::sync::atomic::Ordering::SeqCst) == 1).await;
+        // The finished task released nothing: the read still runs.
+        assert_eq!(sem.available_permits(), 0);
+        let second = attach(keys[1].clone());
+        gate_tx.send(()).unwrap();
+        let rows = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("the waiter shares the batch's result");
+        assert_eq!(rows[0].value, 1.0);
+        wait_until(|| sem.available_permits() == 2).await;
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(locks.registry_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_re_poll_after_a_cancelled_batch_attaches_instead_of_electing() {
+        use futures::FutureExt;
+        let cache = plain_cache();
+        let locks = Arc::new(SeriesRefreshLocks::default());
+        let key = series_key("a");
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+        let read = async move {
+            let _ = gate_rx.await;
+        }
+        .boxed()
+        .shared();
+        let elected = locks.elect_misses(&cache, std::slice::from_ref(&key), 1);
+        drop(locks.spawn_batch(elected, (), Instant::now(), |_, key| {
+            let (read, cache, key) = (read.clone(), cache.clone(), key.clone());
+            async move {
+                read.await;
+                Ok(cache.insert_full(key, vec![row("", 1, 1.0, 1)], Instant::now()))
+            }
+        }));
+
+        // The cancelled request's task still runs: a re-poll must attach to it, not start a second read.
+        assert!(locks
+            .elect_misses(&cache, std::slice::from_ref(&key), 1)
+            .is_empty());
+        let waiter = {
+            let (cache, locks, key) = (cache.clone(), locks.clone(), key.clone());
+            tokio::spawn(async move {
+                locks
+                    .get_or_refresh(&cache, &key, no_detach, |_| async {
+                        unreachable!("the re-poll must attach to the running batch task")
+                    })
+                    .await
+            })
+        };
+        gate_tx.send(()).unwrap();
+        let rows = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("the re-poll shares the batch's result");
+        assert_eq!(rows[0].value, 1.0);
+    }
+
+    #[tokio::test]
+    async fn a_batch_task_publishes_the_batch_stamp() {
+        let cache = plain_cache();
+        let locks = SeriesRefreshLocks::default();
+        let key = series_key("a");
+        let started = Instant::now();
+        cache.note_bumps(std::iter::once(key.run_id.as_str()));
+        let elected = locks.elect_misses(&cache, std::slice::from_ref(&key), 1);
+        // A pass-through result, as under cache ablation, reaches others only through the slot, stamped by the task.
+        drop(locks.spawn_batch(elected, (), started, |_, _| async {
+            Ok(Arc::new(SeriesSnapshot::full_with_origin(
+                vec![row("", 1, 1.0, 1)],
+                LineageOrigin::Miss,
+            )))
+        }));
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = reads.clone();
+        locks
+            .get_or_refresh(&cache, &key, no_detach, |_| async move {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Arc::new(SeriesSnapshot::full_with_origin(
+                    Vec::new(),
+                    LineageOrigin::Miss,
+                )))
+            })
+            .await
+            .unwrap();
+        // The batch started before the bump, so its result must not satisfy a later consult.
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

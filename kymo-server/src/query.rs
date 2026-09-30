@@ -9,7 +9,7 @@ use crate::chart;
 use crate::chart_delta::{
     self, SMOOTHING_STATE_SERIES_KEY, SMOOTHING_STATE_VERSION, SMOOTHING_STATE_VERSION_KEY,
 };
-use crate::clickhouse::{CdnKeyBatchRow, ChClient, VersionedRawPoint};
+use crate::clickhouse::{CdnKeyBatchRow, ChClient, RefreshDetach, VersionedRawPoint};
 use crate::ingest::{
     is_reserved_project_id, storable_ident, BumpCoalescer, MAX_ID_BYTES, MAX_METRIC_NAME_BYTES,
     RESERVED_PROJECT_ID,
@@ -23,7 +23,7 @@ use crate::pg::{
 };
 use crate::proto;
 use crate::proto::smoothing_config::Algorithm;
-use crate::series_cache::SeriesSnapshot;
+use crate::series_cache::{SeriesKey, SeriesSnapshot};
 
 mod lineage;
 use lineage::{inspect_lineages, stamp_lineages, VerifiedLineages};
@@ -40,7 +40,7 @@ const MAX_TEXT_WINDOW_METRICS: usize = 256;
 const MAX_TEXT_SEARCH_BYTES: usize = 512;
 /// Chart reads return whole raw series and retain their Arcs through response
 /// construction. Charge the exact request shape — Y refs (runs × bindings
-/// after frontend resolution) plus distinct per-run custom-X reads — against
+/// after frontend resolution) plus the distinct custom-X runs — against
 /// one process-wide budget held through response construction. Narrow panels
 /// therefore share the budget by their combined width; a request wider than
 /// the budget initially takes every permit.
@@ -106,6 +106,21 @@ fn custom_x_runs(request: &proto::ChartRequest) -> Option<(&proto::SeriesRef, Ve
         })
         .collect();
     Some((x_series, runs))
+}
+
+/// A chart's distinct series grouped by (project, metric), groups and members in first-appearance order.
+fn series_groups(keys: &[SeriesKey]) -> Vec<Vec<SeriesKey>> {
+    let mut groups: Vec<Vec<SeriesKey>> = Vec::new();
+    for key in keys {
+        match groups.iter_mut().find(|group| {
+            group[0].project_id == key.project_id && group[0].metric_name == key.metric_name
+        }) {
+            Some(group) if group.contains(key) => {}
+            Some(group) => group.push(key.clone()),
+            None => groups.push(vec![key.clone()]),
+        }
+    }
+    groups
 }
 
 fn chart_admission_weight(request: &proto::ChartRequest) -> usize {
@@ -251,6 +266,15 @@ impl ChartAdmissionPermit {
             return None;
         }
         permit.split(1)
+    }
+
+    /// Units [`Self::split_refresh_unit`] can still hand out.
+    fn spare_refresh_units(&self) -> usize {
+        self.permit
+            .lock()
+            .unwrap()
+            .num_permits()
+            .saturating_sub(self.inline_floor)
     }
 }
 
@@ -4491,53 +4515,89 @@ impl QueryService {
         req: &proto::ChartRequest,
         permit: ChartAdmissionPermit,
     ) -> Result<proto::ChartResponse, Status> {
-        let keys: Vec<_> = req
+        let series_keys: Vec<_> = req
             .y_series
             .iter()
-            .map(|series| RunKey::new(series.project_id.clone(), series.run_id.clone()))
+            .map(|s| SeriesKey::new(&s.project_id, &s.run_id, &s.metric_name))
             .collect();
-        // Keyed so each detached refresh co-owns exactly ITS run's guard —
-        // a purge of run A waits for A's scans, never run B's.
-        let guards = self.gates.read_many_keyed(keys.iter().cloned()).await;
+        let runs: Vec<_> = series_keys
+            .iter()
+            .map(|key| RunKey::new(&key.project_id, &key.run_id))
+            .collect();
+        // Keyed so each detached refresh co-owns exactly its runs' guards — a purge of run A waits for the scans reading A (a batched scan reads several runs), never for run B's own.
+        let guards = self.gates.read_many_keyed(runs.iter().cloned()).await;
         self.pg
-            .ensure_runs_readable(&keys)
+            .ensure_runs_readable(&runs)
             .await
             .map_err(lifecycle_access_status)?;
 
-        // One ClickHouse query per series — scalar and tagged rows come back
-        // together (probing tagged first and falling back to scalar
-        // serialized two round trips for the common scalar case) — and the
-        // series are fetched concurrently. Bounded so a wide chart can't
-        // open unbounded simultaneous queries; results keep request order.
         use futures::stream::{self, StreamExt, TryStreamExt};
         let fetch_concurrency = self.chart_admission.fetch_concurrency();
-        let permit = &permit;
-        let fetches: Vec<_> = req
-            .y_series
+        // Split lazily at election time: a unit leaves the request only when a detached refresh actually spawns, so cache-hit series cost nothing and protection lands on the series that scan.
+        let detach_for = |key: &SeriesKey| {
+            permit.split_refresh_unit().map(|unit| RefreshDetach {
+                _permit: unit,
+                _run_guard: Arc::clone(&guards[&RunKey::new(&key.project_id, &key.run_id)]),
+            })
+        };
+
+        // Distinct series grouped by (project, metric); a group's cache misses share one full read (clickhouse.rs fetch_full_many).
+        // Election and unit splits run in this synchronous pass, before any per-series fetch below can split units or take slots; each batch is backed by one unit per series and spawns its detached tasks here.
+        // A group of one distinct series keeps its own read (a larger group still elects a one-series batch when its other series are cached or busy), and batches take at most half of the request's `fetch_concurrency` reads, leaving the rest to the per-series stream below.
+        let mut groups = series_groups(&series_keys);
+        let mut batches = Vec::new();
+        for group in &mut groups {
+            if batches.len() >= fetch_concurrency / 2 {
+                break;
+            }
+            if group.len() < 2 {
+                continue;
+            }
+            let elected = self
+                .ch
+                .elect_full_reads(group, permit.spare_refresh_units());
+            if elected.is_empty() {
+                continue;
+            }
+            group.retain(|key| !elected.iter().any(|miss| &miss.key == key));
+            let ctx = elected
+                .iter()
+                .map(|miss| detach_for(&miss.key).expect("counted as spare"))
+                .collect();
+            batches.push(self.ch.spawn_full_read_batch(elected, ctx));
+        }
+        let per_series_concurrency = fetch_concurrency - batches.len();
+        // The first failed batch fails the request at once, as a failed per-series read does; the other batches' tasks finish detached.
+        let batched_rows = futures::future::try_join_all(batches);
+
+        // Every other series: its own cached read (fresh, attached, incremental, or a full read of its own), concurrently, sharing the request's read bound with the batches.
+        let per_series_keys: Vec<_> = groups.iter().flatten().collect();
+        let fetches: Vec<_> = per_series_keys
             .iter()
-            .zip(&keys)
-            .map(|(s, key)| {
-                // Split lazily at election time: a unit leaves the request only
-                // when a detached refresh actually spawns, so cache-hit series
-                // cost nothing and protection lands on the series that scan.
-                let guard = &guards[key];
-                let detach = move || {
-                    permit
-                        .split_refresh_unit()
-                        .map(|unit| crate::clickhouse::RefreshDetach {
-                            _permit: unit,
-                            _run_guard: std::sync::Arc::clone(guard),
-                        })
-                };
-                self.ch
-                    .query_raw_any_cached(&s.project_id, &s.run_id, &s.metric_name, detach)
+            .map(|&key| {
+                self.ch.query_raw_any_cached(
+                    &key.project_id,
+                    &key.run_id,
+                    &key.metric_name,
+                    move || detach_for(key),
+                )
             })
             .collect();
-        let all_rows: Vec<_> = stream::iter(fetches)
-            .buffered(fetch_concurrency)
-            .try_collect()
-            .await
-            .map_err(chart_fetch_status)?;
+        let per_series = stream::iter(fetches)
+            .buffered(per_series_concurrency)
+            .try_collect::<Vec<_>>();
+        let (batched_rows, per_series) =
+            futures::try_join!(batched_rows, per_series).map_err(chart_fetch_status)?;
+        let rows: std::collections::HashMap<_, _> = batched_rows
+            .iter()
+            .flatten()
+            .map(|(key, rows)| (key, rows))
+            .chain(per_series_keys.into_iter().zip(&per_series))
+            .collect();
+        let all_rows: Vec<_> = series_keys
+            .iter()
+            .map(|key| Arc::clone(rows[key]))
+            .collect();
 
         // Custom x-axis: map each run's points through THAT run's x metric.
         // The request's x_series names the metric; its run_id is ignored
@@ -4548,12 +4608,19 @@ impl QueryService {
             Some((x_ref, run_refs)) => {
                 let step_min = req.step_min.unwrap_or(i64::MIN);
                 let step_max = req.step_max.unwrap_or(i64::MAX);
-                // One fetch per distinct run, concurrent like the y fetches.
-                let x_fetches: Vec<_> = run_refs
+                // One read per project covers all of its runs.
+                let mut projects: Vec<(&str, Vec<String>)> = Vec::new();
+                for (pid, rid) in run_refs {
+                    match projects.iter_mut().find(|(project, _)| *project == pid) {
+                        Some((_, runs)) => runs.push(rid.to_string()),
+                        None => projects.push((pid, vec![rid.to_string()])),
+                    }
+                }
+                let x_fetches: Vec<_> = projects
                     .iter()
-                    .map(|&(pid, rid)| {
+                    .map(|(pid, runs)| {
                         self.ch
-                            .query_raw(pid, rid, &x_ref.metric_name, step_min, step_max)
+                            .query_raw_many(pid, runs, &x_ref.metric_name, step_min, step_max)
                     })
                     .collect();
                 let fetched: Vec<_> = stream::iter(x_fetches)
@@ -4562,11 +4629,10 @@ impl QueryService {
                     .await
                     .map_err(|e| Status::internal(format!("x-axis query failed: {e}")))?;
                 let mut maps = std::collections::HashMap::new();
-                for ((_, rid), rows) in run_refs.into_iter().zip(fetched) {
-                    maps.insert(
-                        rid.to_string(),
-                        rows.into_iter().map(|r| (r.step, r.value as f64)).collect(),
-                    );
+                for ((_, runs), series) in projects.into_iter().zip(fetched) {
+                    for (rid, rows) in runs.into_iter().zip(series) {
+                        maps.insert(rid, rows.into_iter().collect());
+                    }
                 }
                 Some(maps)
             }
@@ -4766,7 +4832,26 @@ mod chart_admission_tests {
     }
 
     #[test]
-    fn chart_admission_counts_y_and_distinct_custom_x_reads() {
+    fn series_groups_dedupe_and_keep_first_appearance_order() {
+        let key = |project, run, metric| SeriesKey::new(project, run, metric);
+        assert_eq!(
+            series_groups(&[
+                key("p", "a", "loss"),
+                key("p", "b", "acc"),
+                key("q", "a", "loss"),
+                key("p", "b", "loss"),
+                key("p", "a", "loss"),
+            ]),
+            [
+                vec![key("p", "a", "loss"), key("p", "b", "loss")],
+                vec![key("p", "b", "acc")],
+                vec![key("q", "a", "loss")],
+            ]
+        );
+    }
+
+    #[test]
+    fn chart_admission_counts_y_and_distinct_custom_x_runs() {
         let mut request = proto::ChartRequest {
             y_series: vec![series("run-a"), series("run-a"), series("run-b")],
             x_series: Some(series("ignored-by-query")),

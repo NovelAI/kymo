@@ -6,6 +6,7 @@ import json
 import math
 import multiprocessing
 import os
+import pickle
 import queue
 import shlex
 import subprocess
@@ -22,6 +23,7 @@ import numpy as np
 from PIL import Image as PILImage
 
 from kymo import _capture as capture_module
+from kymo import _gpu as gpu_module
 from kymo import client as client_module
 from kymo import spool as spool_module
 from kymo import sync as sync_module
@@ -35,6 +37,12 @@ from kymo._local_runtime import (
 from kymo.spool import SpoolWriter, make_spool_path, read_spool
 from kymo.system_metrics import SystemMetricsPoller
 from kymo.types import Image, Metadata, Resource
+
+try:
+    import torch
+except ImportError:
+    # CI installs no torch: _StubTensor covers the device branches there, and the real-tensor tests skip.
+    torch = None
 
 
 def numeric(index: int) -> tuple:
@@ -110,6 +118,14 @@ class _StubTensor:
         if self.device.type == "meta":
             raise NotImplementedError("Cannot copy out of meta tensor; no data!")
         return _StubTensor("cpu", list(self.values))
+
+    def numpy(self):
+        if self.device.type != "cpu":
+            raise TypeError("can't convert a device tensor to numpy")
+        return np.array(self.values)
+
+    def untyped_storage(self):
+        return types.SimpleNamespace(nbytes=lambda: np.array(self.values).nbytes)
 
     def __reduce__(self):
         if self.device.type not in ("cpu", "meta"):
@@ -1326,15 +1342,84 @@ class AccountingTests(unittest.TestCase):
             client_module.log(metrics, step=1)
         return [call.args[0] for call in target.put.call_args_list]
 
-    def test_rich_snapshot_copies_only_accelerator_tensors_to_host(self):
-        for device, pickled in (("cuda", "cpu"), ("cpu", "cpu"), ("meta", "meta")):
+    def test_rich_snapshot_pickles_tensors_as_host_arrays(self):
+        for device in ("cuda", "cpu"):
             with self.subTest(device=device):
                 tensor = _StubTensor(device, [1, 2, 3])
                 (queued,) = self._log({"demo/gallery": [Image(tensor)]})
                 snapshot = client_module._decode_queue_item(queued)[0][3][0].data
-                self.assertEqual(snapshot.device.type, pickled)
-                self.assertEqual(snapshot.values, [1, 2, 3])
+                self.assertIsInstance(snapshot, np.ndarray)
+                self.assertEqual(snapshot.tolist(), [1, 2, 3])
                 self.assertEqual(tensor.device.type, device)
+        # A meta tensor has no data; it pickles as itself.
+        (queued,) = self._log({"demo/gallery": [Image(_StubTensor("meta", [1]))]})
+        snapshot = client_module._decode_queue_item(queued)[0][3][0].data
+        self.assertEqual(snapshot.device.type, "meta")
+
+    @staticmethod
+    def _host_pickle(obj) -> bytes:
+        buffer = io.BytesIO()
+        client_module._HostTensorPickler(buffer, protocol=pickle.HIGHEST_PROTOCOL).dump(
+            obj
+        )
+        return buffer.getvalue()
+
+    @unittest.skipUnless(torch is not None, "requires torch")
+    def test_rich_snapshot_pickles_a_cpu_view_without_its_storage(self):
+        batch = torch.rand(32, 3, 64, 64)
+        # One image of the batch, a strided channel across every image, and every image as one item's list (torch writes the whole storage once per view).
+        for views in ([batch[5]], [batch[:, 0]], list(batch)):
+            with self.subTest(shape=tuple(views[0].shape), views=len(views)):
+                own = sum(view.nelement() * view.element_size() for view in views)
+                payload = self._host_pickle(views)
+                self.assertGreaterEqual(len(payload), own)
+                self.assertLess(len(payload), own + 4096)
+                restored = pickle.loads(payload)
+                for array, view in zip(restored, views):
+                    self.assertTrue(np.array_equal(array, view.numpy()))
+
+    @unittest.skipUnless(torch is not None, "requires torch")
+    def test_rich_snapshot_pickles_other_tensors_as_host_tensors(self):
+        expanded = torch.rand(1, 64, 64).expand(3, 64, 64)
+        for name, tensor in (
+            ("bfloat16", torch.rand(4, 4).to(torch.bfloat16)[1]),
+            ("conjugated", torch.rand(3, dtype=torch.complex64).conj()),
+            ("sparse", torch.sparse_coo_tensor([[0, 2], [1, 0]], [1.0, 2.0], (3, 3))),
+            ("nested", torch.nested.nested_tensor([torch.rand(2), torch.rand(3)])),
+            (
+                "per-channel quantized",
+                torch.quantize_per_channel(
+                    torch.rand(2, 3),
+                    torch.tensor([0.1, 0.2]),
+                    torch.tensor([0, 1]),
+                    0,
+                    torch.quint8,
+                ),
+            ),
+            # Its array would repeat the stored row three times.
+            ("expanded", expanded),
+        ):
+            with self.subTest(name):
+                payload = self._host_pickle(tensor)
+                restored = pickle.loads(payload)
+                self.assertIsInstance(restored, torch.Tensor)
+                if name == "nested":
+                    self.assertTrue(
+                        all(map(torch.equal, restored.unbind(), tensor.unbind()))
+                    )
+                elif name == "per-channel quantized":
+                    self.assertTrue(torch.equal(restored.int_repr(), tensor.int_repr()))
+                else:
+                    self.assertTrue(
+                        torch.equal(
+                            restored.resolve_conj().to_dense(),
+                            tensor.resolve_conj().to_dense(),
+                        )
+                    )
+        self.assertLess(
+            len(self._host_pickle(expanded)),
+            expanded.nelement() * expanded.element_size(),
+        )
 
     def test_metadata_snapshot_is_frozen_to_its_rendered_json(self):
         data = {"stats": _StubTensor("cuda", [1]), "shape": (2, 3), 5: None}
@@ -1767,6 +1852,1044 @@ class AccountingTests(unittest.TestCase):
         self.assertEqual(status.value, 1)
 
 
+class _GpuScalar:
+    """Stands in for a CUDA scalar tensor."""
+
+    def __init__(self, value):
+        self.value = value
+
+
+class _GpuImage:
+    """Stands in for a CUDA image tensor; its host copy is the array."""
+
+    def __init__(self, array):
+        self.array = array
+        self.nbytes = array.nbytes
+
+
+class _FakeReads:
+    """Stands in for kymo._gpu.Reads: the copies complete when the test says, or when a caller waits without a deadline."""
+
+    def __init__(self, _torch, scalars, images):
+        self.values = [scalar.value for scalar in scalars]
+        self.images = [image.array.copy() for image in images]
+        self.complete = False
+        self.error = None
+
+    def done(self):
+        if self.error is not None:
+            raise self.error
+        return self.complete
+
+    def wait(self, deadline=None):
+        if deadline is None:
+            self.complete = True
+        return self.done()
+
+    def scalars(self):
+        return enumerate(self.values)
+
+
+def _hold_pending_lock(case) -> None:
+    """Hold client._pending_lock on another thread until the test ends."""
+    locked, release = threading.Event(), threading.Event()
+
+    def hold():
+        with client_module._pending_lock:
+            locked.set()
+            release.wait()
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    case.addCleanup(holder.join)
+    case.addCleanup(release.set)
+    locked.wait()
+
+
+def _patch_log_client(case, *extra) -> mock.Mock:
+    """Patch the client state a log() call needs, plus extra patches, for one test; return the queue it publishes to."""
+    queue = mock.Mock()
+    for patch in (
+        mock.patch.object(client_module, "_is_initialized", True),
+        mock.patch.object(client_module, "_init_pid", os.getpid()),
+        mock.patch.object(client_module, "_metric_queue", queue),
+        mock.patch.object(client_module, "_queue_status", _QueueStatus()),
+        mock.patch.object(client_module, "_last_log_duration_ms", 0.0),
+        mock.patch.object(client_module, "_pending", deque()),
+        mock.patch.object(client_module, "_pending_incomplete", False),
+        mock.patch.object(gpu_module, "unfreeable", []),
+        mock.patch.object(client_module, "_rich_writer_epoch", None),
+        mock.patch.object(capture_module, "drain_buffers", return_value=("", "")),
+        *extra,
+    ):
+        patch.start()
+        case.addCleanup(patch.stop)
+    return queue
+
+
+def _published_groups(queue) -> list:
+    """The groups published to queue, decoded, without log()'s own overhead metric."""
+    groups = (
+        [
+            item
+            for item in client_module._decode_queue_item(call.args[0])
+            if item[1] != "system/log_overhead_ms"
+        ]
+        for call in queue.put.call_args_list
+    )
+    return [group for group in groups if group]
+
+
+def _pending_nbytes() -> int:
+    return sum(entry.nbytes for entry in client_module._pending)
+
+
+class _FakeTensor:
+    """Stands in for a torch tensor in the classifier tests."""
+
+    def __init__(
+        self, dtype="float32", *, cuda=True, layout="strided", numel=1, negative=False
+    ):
+        self.dtype, self.is_cuda, self.layout = dtype, cuda, layout
+        self._numel, self._negative = numel, negative
+
+    def numel(self):
+        return self._numel
+
+    def is_neg(self):
+        return self._negative
+
+
+class _FakeParameter(_FakeTensor):
+    pass
+
+
+def _fake_torch():
+    """A torch with the attributes the classifiers read; dtypes are their names."""
+    fake = types.SimpleNamespace(
+        Tensor=_FakeTensor, nn=types.SimpleNamespace(Parameter=_FakeParameter)
+    )
+    fake.strided = "strided"
+    for name in gpu_module.DTYPES:
+        setattr(fake, name, name)
+    return fake
+
+
+class GpuClassifierTests(unittest.TestCase):
+    def test_scalars_read_asynchronously(self):
+        is_scalar, is_image = gpu_module.classifiers.__wrapped__(_fake_torch())
+        for dtype in gpu_module.DTYPES:
+            with self.subTest(dtype=dtype):
+                self.assertTrue(is_scalar(_FakeTensor(dtype)))
+        self.assertTrue(is_scalar(_FakeParameter()))
+        for name, value in (
+            # Its bytes hold the negated value.
+            ("negative view", _FakeTensor(negative=True)),
+            ("two elements", _FakeTensor(numel=2)),
+            ("on the CPU", _FakeTensor(cuda=False)),
+            ("sparse", _FakeTensor(layout="sparse_coo")),
+            ("float8", _FakeTensor("float8_e4m3fn")),
+            ("another subclass", type("Subclass", (_FakeTensor,), {})()),
+            ("a float", 1.0),
+        ):
+            with self.subTest(name):
+                self.assertFalse(is_scalar(value))
+        # An image is copied by torch, which resolves a negative view.
+        self.assertTrue(is_image(_FakeTensor(numel=12, negative=True)))
+
+
+def _unavailable(torch):
+    raise AttributeError("torch.cuda has no _compile_kernel")
+
+
+class GatherSelectionTests(unittest.TestCase):
+    def setUp(self):
+        self.select = gpu_module.gather.__wrapped__
+        self.nvrtc, self.triton = object(), object()
+
+    def builders(self, nvrtc, triton, reads_exactly=lambda torch, launch: True):
+        return mock.patch.multiple(
+            gpu_module,
+            nvrtc_gather=nvrtc,
+            triton_gather=triton,
+            reads_exactly=reads_exactly,
+        )
+
+    def test_nvrtc_else_triton_else_the_stack(self):
+        for nvrtc, triton, selected in (
+            (lambda torch: self.nvrtc, lambda torch: self.triton, self.nvrtc),
+            (_unavailable, lambda torch: self.triton, self.triton),
+            (_unavailable, _unavailable, None),
+        ):
+            with self.builders(nvrtc, triton):
+                self.assertIs(self.select(None, 0), selected)
+
+    def test_a_kernel_that_reads_values_wrongly_is_not_used(self):
+        with (
+            self.builders(
+                lambda torch: self.nvrtc,
+                lambda torch: self.triton,
+                lambda torch, launch: launch is self.triton,
+            ),
+            self.assertLogs("kymo", level="WARNING") as logs,
+        ):
+            self.assertIs(self.select(None, 0), self.triton)
+        self.assertIn("reads values incorrectly", logs.output[0])
+
+
+class GpuHelperTests(unittest.TestCase):
+    def test_only_an_out_of_memory_error_frees_what_a_failed_call_made(self):
+        class OutOfMemoryError(RuntimeError):
+            pass
+
+        fake = types.SimpleNamespace(
+            cuda=types.SimpleNamespace(
+                OutOfMemoryError=OutOfMemoryError,
+                device_count=lambda: 1,
+                device=lambda device: contextlib.nullcontext(),
+            ),
+        )
+        scalars = [types.SimpleNamespace(requires_grad=False)]
+        with (
+            mock.patch.object(gpu_module, "unfreeable", []),
+            mock.patch.object(gpu_module, "gather") as gather,
+        ):
+            gather.side_effect = OutOfMemoryError
+            with self.assertRaises(OutOfMemoryError):
+                gpu_module.Reads(fake, scalars, [])
+            self.assertEqual(gpu_module.unfreeable, [])
+            gather.side_effect = RuntimeError("CUDA error: an illegal memory access")
+            with self.assertRaises(RuntimeError):
+                gpu_module.Reads(fake, scalars, [])
+            self.assertEqual(len(gpu_module.unfreeable), 1)
+
+    def test_the_known_answer_check_samples_every_dtype(self):
+        self.assertEqual(
+            {name for name, _ in gpu_module.SAMPLES}, set(gpu_module.DTYPES)
+        )
+
+    def test_scalars_group_by_device_only_with_several_devices(self):
+        one = types.SimpleNamespace(cuda=types.SimpleNamespace(device_count=lambda: 1))
+        two = types.SimpleNamespace(cuda=types.SimpleNamespace(device_count=lambda: 2))
+        tensors = [types.SimpleNamespace(get_device=lambda d=d: d) for d in (1, 0, 1)]
+        self.assertEqual(gpu_module._by_device(one, tensors), {0: (range(3), tensors)})
+        self.assertEqual(gpu_module._by_device(one, []), {})
+        self.assertEqual(
+            gpu_module._by_device(two, tensors),
+            {1: ([0, 2], [tensors[0], tensors[2]]), 0: ([1], [tensors[1]])},
+        )
+
+    @unittest.skipUnless(torch is not None, "requires torch")
+    def test_no_asynchronous_reads_inside_a_torch_func_transform(self):
+        seen = []
+
+        def record(x):
+            seen.append(gpu_module.cuda_torch())
+            return x.sum()
+
+        with mock.patch.object(torch.cuda, "is_initialized", return_value=True):
+            self.assertIs(gpu_module.cuda_torch(), torch)
+            torch.func.grad(record)(torch.ones(2))
+        self.assertEqual(seen, [None])
+
+
+class PendingGpuLogTests(unittest.TestCase):
+    """log() calls with GPU values, driven through fake copies: publication order, waits, drops and backpressure."""
+
+    def setUp(self):
+        self.capturing = False
+        self.reads = []
+        fake_torch = types.SimpleNamespace(
+            cuda=types.SimpleNamespace(
+                is_current_stream_capturing=lambda: self.capturing
+            )
+        )
+
+        def reads(*args):
+            self.reads.append(_FakeReads(*args))
+            return self.reads[-1]
+
+        self.queue = _patch_log_client(
+            self,
+            mock.patch.object(client_module.time, "time", return_value=1.234),
+            mock.patch.object(gpu_module, "cuda_torch", return_value=fake_torch),
+            mock.patch.object(
+                gpu_module,
+                "classifiers",
+                return_value=(
+                    lambda value: type(value) is _GpuScalar,
+                    lambda data: type(data) is _GpuImage,
+                ),
+            ),
+            mock.patch.object(gpu_module, "Reads", side_effect=reads),
+        )
+
+    def published(self):
+        return _published_groups(self.queue)
+
+    def test_a_gpu_log_publishes_at_a_later_log_in_call_order(self):
+        client_module.log(
+            {"gpu": _GpuScalar(1.5), "cpu": 2.0, "tagged": [_GpuScalar(3.0), 4.0]},
+            step=1,
+        )
+        self.assertEqual(self.published(), [])
+        # Its copies have not completed: a later CPU-only call waits behind it.
+        client_module.log({"later": 5.0}, step=2)
+        self.assertEqual(self.published(), [])
+
+        self.reads[0].complete = True
+        client_module.log({"last": 6.0}, step=3)
+
+        self.assertEqual(
+            self.published(),
+            [
+                [
+                    ("numeric_ts", "cpu", 1, 2.0, 1234),
+                    ("numeric_tagged_ts", "tagged", 1, 4.0, "1", 1234),
+                    ("numeric_ts", "gpu", 1, 1.5, 1234),
+                    ("numeric_tagged_ts", "tagged", 1, 3.0, "0", 1234),
+                ],
+                [("numeric_ts", "later", 2, 5.0, 1234)],
+                [("numeric_ts", "last", 3, 6.0, 1234)],
+            ],
+        )
+        self.assertEqual(len(client_module._pending), 0)
+
+    def test_captured_text_never_waits_for_gpu_values(self):
+        with mock.patch.object(
+            capture_module, "drain_buffers", return_value=("out", "")
+        ):
+            client_module.log({"gpu": _GpuScalar(1.0)}, step=1)
+
+        self.assertEqual(
+            self.published(), [[("text_ts", "logs/std_out", 1234, "out", 1234)]]
+        )
+        self.assertEqual(len(client_module._pending), 1)
+
+    def test_later_cdn_keys_and_config_queue_behind_a_pending_log(self):
+        client_module.log({"gpu": _GpuScalar(1.0)}, step=1)
+        with mock.patch.object(client_module, "_run_metadata", {"config": {}}):
+            client_module.log_cdn({"cdn/key": "abc"}, step=1)
+            client_module.update_config({"lr": 0.1})
+        self.assertEqual(self.published(), [])
+
+        self.reads[0].complete = True
+        client_module.log({}, step=2)
+
+        gpu, cdn, (metadata,) = self.published()
+        self.assertEqual(gpu, [("numeric_ts", "gpu", 1, 1.0, 1234)])
+        self.assertEqual(cdn, [("cdn_ts", "cdn/key", 1, "abc", 1234)])
+        self.assertEqual(metadata[:3], ("metadata_batch", "info/run_info", 0))
+        self.assertEqual(metadata[3].data["config"], {"lr": 0.1})
+
+    def test_wait_for_upload_bounds_its_wait_for_the_pending_calls_lock(self):
+        _hold_pending_lock(self)
+        started = time.monotonic()
+        with self.assertLogs("kymo", level="WARNING") as logs:
+            self.assertFalse(client_module.wait_for_upload(timeout=0.1))
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertIn("another thread holds", logs.output[0])
+
+    def test_wait_for_upload_publishes_pending_logs_once_their_copies_complete(self):
+        client_module.log({"gpu": _GpuScalar(1.0)}, step=1)
+        with mock.patch.object(
+            client_module, "_delivery_status_snapshot", return_value=(0, 0, 0)
+        ):
+            with self.assertLogs("kymo", level="WARNING") as logs:
+                self.assertFalse(client_module.wait_for_upload(timeout=0))
+            self.assertIn("still wait for their GPU values", logs.output[0])
+            self.assertEqual(self.published(), [])
+
+            self.reads[0].complete = True
+            self.assertTrue(client_module.wait_for_upload(timeout=0))
+        self.assertEqual(self.published(), [[("numeric_ts", "gpu", 1, 1.0, 1234)]])
+
+    def test_a_value_beyond_float32_is_dropped_and_reported(self):
+        client_module.log(
+            {
+                "huge": _GpuScalar(1e300),
+                "fine": _GpuScalar(1.0),
+                "nan": _GpuScalar(math.nan),
+            },
+            step=4,
+        )
+        self.reads[0].complete = True
+        with self.assertLogs("kymo", level="WARNING") as logs:
+            client_module.log({}, step=5)
+        self.assertIn("huge", logs.output[0])
+
+        (group,) = self.published()
+        self.assertEqual([point[1] for point in group], ["fine", "nan"])
+        self.assertTrue(math.isnan(group[1][3]))
+        with mock.patch.object(
+            client_module, "_delivery_status_snapshot", return_value=(0, 0, 0)
+        ):
+            with self.assertLogs("kymo", level="WARNING") as logs:
+                self.assertFalse(client_module.wait_for_upload(timeout=0))
+        self.assertIn("values were dropped after log() returned", logs.output[0])
+
+    def test_a_publication_failure_is_reported_instead_of_raised(self):
+        client_module.log({"gpu": _GpuScalar(1.0), "cpu": 2.0}, step=1)
+        self.reads[0].complete = True
+        self.queue.put.side_effect = OSError("queue closed")
+
+        with self.assertLogs("kymo", level="WARNING") as logs:
+            client_module.log({"next": 3.0}, step=2)
+
+        self.assertIn("failed to publish the values of step 1", logs.output[0])
+        self.assertIn("failed to publish the values of step 2", logs.output[1])
+        self.assertTrue(client_module._pending_incomplete)
+        self.assertEqual(len(client_module._pending), 0)
+
+    def test_an_interrupted_publication_is_reported_and_never_repeated(self):
+        client_module.log({"gpu": _GpuScalar(1.0)}, step=1)
+        self.reads[0].complete = True
+        seen = []
+
+        def interrupted():
+            # A shutdown signal handler that runs here must report step 1 incomplete.
+            seen.append(client_module._pending_incomplete)
+            raise KeyboardInterrupt
+
+        self.reads[0].scalars = interrupted
+        with self.assertRaises(KeyboardInterrupt):
+            client_module.log({}, step=2)
+
+        self.assertEqual(seen, [True])
+        # Only step 2's own entry is left: that handler would not publish step 1 again.
+        self.assertEqual(len(client_module._pending), 1)
+        self.assertIsNone(client_module._pending[0].reads)
+        self.assertTrue(client_module._pending_incomplete)
+
+    def test_a_cuda_error_drops_the_gpu_values_and_keeps_later_logs_working(self):
+        client_module.log({"gpu": _GpuScalar(1.0), "cpu": 2.0}, step=1)
+        client_module.log({"gpu": _GpuScalar(3.0)}, step=2)
+        for reads in self.reads:
+            reads.error = RuntimeError("CUDA error: an illegal memory access")
+
+        with self.assertLogs("kymo", level="WARNING") as logs:
+            client_module.log({"later": 4.0}, step=3)
+
+        self.assertIn("illegal memory access", logs.output[0])
+        self.assertEqual(
+            self.published(),
+            [
+                [("numeric_ts", "cpu", 1, 2.0, 1234)],
+                [("numeric_ts", "later", 3, 4.0, 1234)],
+            ],
+        )
+        # Freeing their pinned host copies would now abort the process.
+        self.assertEqual(gpu_module.unfreeable, self.reads)
+        self.assertTrue(client_module._pending_incomplete)
+
+    def test_gpu_images_are_copied_to_the_host_and_pickled_once_copied(self):
+        pixels = np.arange(12, dtype=np.uint8).reshape(2, 2, 3)
+        image = Image(_GpuImage(pixels), caption="c")
+        client_module.log(
+            {"single": image, "gallery": [Image(_GpuImage(pixels))]}, step=1
+        )
+        self.assertEqual(_pending_nbytes(), 2 * pixels.nbytes)
+        # The caller's image keeps its data; the queued copy's becomes the host copy.
+        self.assertIs(type(image.data), _GpuImage)
+
+        self.reads[0].complete = True
+        client_module.log({}, step=2)
+
+        ((single,), (gallery,)) = self.published()
+        self.assertEqual(single[:3], ("cdn_batch", "single", 1))
+        self.assertEqual(single[3][0].caption, "c")
+        np.testing.assert_array_equal(single[3][0].data, pixels)
+        np.testing.assert_array_equal(gallery[3][0].data, pixels)
+        self.assertEqual(_pending_nbytes(), 0)
+
+    def test_a_gallery_with_any_other_item_is_snapshotted_now(self):
+        client_module.log(
+            {"gallery": [Image(_GpuImage(np.zeros(2))), Image(np.ones(2))]}, step=1
+        )
+        self.assertEqual(self.reads, [])
+        ((batch,),) = self.published()
+        self.assertEqual(batch[1], "gallery")
+
+    def test_log_waits_for_the_oldest_call_when_pending_copies_exceed_the_cap(self):
+        with mock.patch.object(client_module, "_PENDING_MAX_BYTES", 100):
+            client_module.log(
+                {"image": Image(_GpuImage(np.zeros(80, np.uint8)))}, step=1
+            )
+            client_module.log(
+                {"image": Image(_GpuImage(np.ones(80, np.uint8)))}, step=2
+            )
+
+        # The second call waited for the first's copies and published it before starting its own.
+        self.assertTrue(self.reads[0].complete)
+        self.assertFalse(self.reads[1].complete)
+        ((batch,),) = self.published()
+        self.assertEqual(batch[2], 1)
+        np.testing.assert_array_equal(batch[3][0].data, np.zeros(80, np.uint8))
+        self.assertEqual(_pending_nbytes(), 80)
+
+    def test_scalar_copies_count_toward_the_cap(self):
+        with mock.patch.object(client_module, "_PENDING_MAX_BYTES", 100):
+            client_module.log({"t": [_GpuScalar(0.0)] * 10}, step=1)
+            client_module.log({"t": [_GpuScalar(1.0)] * 10}, step=2)
+
+        self.assertTrue(self.reads[0].complete)
+        self.assertEqual(_pending_nbytes(), 160)
+
+    def test_graph_capture_rejects_gpu_values_and_never_polls(self):
+        self.capturing = True
+        with self.assertRaisesRegex(RuntimeError, "CUDA graph capture"):
+            client_module.log({"gpu": _GpuScalar(1.0)}, step=1)
+        self.assertEqual(self.reads, [])
+
+        self.capturing = False
+        client_module.log({"gpu": _GpuScalar(1.0)}, step=1)
+        self.reads[0].complete = True
+        self.capturing = True
+        client_module.log({"cpu": 2.0}, step=2)
+        self.assertEqual(self.published(), [])
+        self.assertEqual(len(client_module._pending), 2)
+
+        self.capturing = False
+        client_module.log({}, step=3)
+        self.assertEqual(len(self.published()), 2)
+
+    def test_a_fork_child_forgets_the_parents_pending_calls(self):
+        client_module.log({"gpu": _GpuScalar(1.0)}, step=1)
+        parent_lock = client_module._pending_lock
+        # Restore the parent's lock with the rest of the patched state.
+        self.addCleanup(setattr, client_module, "_pending_lock", parent_lock)
+
+        client_module._pending_incomplete = True
+
+        client_module._forget_pending_in_child()
+
+        self.assertEqual(len(client_module._pending), 0)
+        self.assertFalse(client_module._pending_incomplete)
+        self.assertIsNot(client_module._pending_lock, parent_lock)
+        # Freeing the parent's CUDA objects would abort the child.
+        self.assertEqual(gpu_module.unfreeable, self.reads)
+
+
+_REQUIRES_CUDA = unittest.skipUnless(
+    torch is not None and torch.cuda.is_available(), "requires a CUDA device"
+)
+
+
+class _CudaLogTests:
+    """log() with real CUDA tensors: exact values, snapshots at the call, and no wait for the GPU, copying scalars with the subclass's backend."""
+
+    backend: str
+
+    @classmethod
+    def setUpClass(cls):
+        cls.launch = None
+        if cls.backend != "stack":
+            try:
+                # A function stored on the class would bind to the test as a method.
+                cls.launch = staticmethod(
+                    getattr(gpu_module, cls.backend + "_gather")(torch)
+                )
+            except (AttributeError, ImportError) as error:
+                raise unittest.SkipTest(f"this torch cannot build it: {error}")
+
+    def setUp(self):
+        self.queue = _patch_log_client(self)
+        torch.cuda.synchronize()
+        launch = self.launch
+        patches = [
+            mock.patch.object(gpu_module, "gather", lambda torch, device: launch)
+        ]
+        if launch is not None:
+            # A kernel never stacks.
+            patches.append(
+                mock.patch.object(torch, "stack", side_effect=AssertionError("stacked"))
+            )
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def publish(self):
+        """Wait for every pending call and return every published item, decoded."""
+        with client_module._pending_lock:
+            client_module._publish_pending(None)
+        return [item for group in _published_groups(self.queue) for item in group]
+
+    def values(self):
+        """publish()'s numeric values by name, or by (name, tag) for a tagged one."""
+        return {
+            (point[1], point[4])
+            if point[0] == "numeric_tagged_ts"
+            else point[1]: point[3]
+            for point in self.publish()
+        }
+
+    def test_values_equal_float_for_every_dtype(self):
+        cuda = torch.device("cuda")
+        values = {
+            "float16": torch.tensor(1 / 3, dtype=torch.float16, device=cuda),
+            "float16/inf": torch.tensor(math.inf, dtype=torch.float16, device=cuda),
+            "float16/subnormal": torch.tensor(-6e-8, dtype=torch.float16, device=cuda),
+            "bfloat16": torch.tensor(1 / 3, dtype=torch.bfloat16, device=cuda),
+            "float32": torch.tensor(1 / 3, device=cuda),
+            "float32/nan": torch.tensor(math.nan, device=cuda),
+            "float32/negative zero": torch.tensor(-0.0, device=cuda),
+            "float64": torch.tensor(1 / 3, dtype=torch.float64, device=cuda),
+            "float64/subnormal": torch.tensor(5e-324, dtype=torch.float64, device=cuda),
+            "int64": torch.tensor(65520, device=cuda),
+            "int64/beyond 2**53": torch.tensor(2**53 + 1, device=cuda),
+            "int64/min": torch.tensor(-(2**63), device=cuda),
+            "int32": torch.tensor(-7, dtype=torch.int32, device=cuda),
+            "int16": torch.tensor(-32768, dtype=torch.int16, device=cuda),
+            "int8": torch.tensor(-3, dtype=torch.int8, device=cuda),
+            "uint8": torch.tensor(255, dtype=torch.uint8, device=cuda),
+            "bool": torch.tensor(True, device=cuda),
+            "bool/false": torch.tensor(False, device=cuda),
+            "one element, 2-d": torch.tensor([[2.5]], device=cuda),
+            "storage offset": torch.arange(10.0, device=cuda)[7],
+            # autograd's efficient zero tensor has no memory: data_ptr() is 0.
+            "zero tensor": torch._efficientzerotensor((), device=cuda),
+            # Its bytes hold 3; it is read synchronously.
+            "negative view": torch._neg_view(torch.tensor(3.0, device=cuda)),
+            "parameter": torch.nn.Parameter(torch.tensor(4.0, device=cuda)),
+            "requires grad": torch.tensor(2.0, device=cuda, requires_grad=True) * 3,
+        }
+        tagged = [
+            torch.tensor(65504, dtype=torch.float16, device=cuda),
+            torch.tensor(65520, device=cuda),
+            1.5,
+        ]
+        expected = {name: float(value.detach()) for name, value in values.items()}
+        expected.update({("tagged", str(i)): float(v) for i, v in enumerate(tagged)})
+
+        with mock.patch.object(gpu_module, "Reads", wraps=gpu_module.Reads) as reads:
+            client_module.log({**values, "tagged": tagged}, step=1)
+        reads.assert_called_once()
+
+        logged = self.values()
+        self.assertEqual(logged.keys(), expected.keys())
+        for key, value in expected.items():
+            with self.subTest(key=key):
+                self.assertTrue(
+                    gpu_module._same(logged[key], value),
+                    f"{logged[key]!r} != {value!r}",
+                )
+                self.assertIs(type(logged[key]), float)
+
+    def test_every_float16_and_bfloat16_bit_pattern_reads_exactly(self):
+        patterns = torch.arange(1 << 16, dtype=torch.int32, device="cuda").to(
+            torch.int16
+        )
+        if self.launch is None:
+            self.skipTest("the stack converts with torch")
+        for dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                values = patterns.view(dtype)
+                reads = gpu_module.Reads(torch, list(values), [])
+                reads.wait()
+                got = [value for _, value in sorted(reads.scalars())]
+                for index, (read, want) in enumerate(
+                    zip(got, values.double().tolist())
+                ):
+                    if not gpu_module._same(read, want):
+                        self.fail(
+                            f"bit pattern {index:#06x}: read {read!r}, want {want!r}"
+                        )
+
+    def test_tensors_whose_bytes_are_not_their_value_read_as_float_does(self):
+        cuda = torch.device("cuda")
+        zeros = torch._efficientzerotensor((4,), device=cuda)
+        values = {
+            # Autograd's efficient zero tensors: data_ptr() is an offset from a null allocation.
+            "zero views": list(zeros),
+            "zero tensor": torch._efficientzerotensor((), device=cuda),
+            # A functional tensor's data_ptr() is 0.
+            "functional": torch._to_functional_tensor(torch.tensor(3.0, device=cuda)),
+            "plain": torch.tensor(2.0, device=cuda),
+        }
+        client_module.log(values, step=1)
+        logged = self.values()
+        self.assertEqual(
+            logged,
+            {
+                **{("zero views", str(i)): 0.0 for i in range(4)},
+                "zero tensor": 0.0,
+                "functional": 3.0,
+                "plain": 2.0,
+            },
+        )
+
+    def test_a_view_of_a_freed_storage_raises_as_float_does(self):
+        base = torch.arange(4.0, device="cuda")
+        view = base[2]
+        base.untyped_storage().resize_(0)
+        with self.assertRaisesRegex(RuntimeError, "not allocated|invalid"):
+            float(view)
+        with self.assertRaises(RuntimeError):
+            client_module.log({"view": view}, step=1)
+
+    def test_log_inside_a_torch_func_transform_reads_synchronously(self):
+        def loss(x):
+            total = (x * 2).sum()
+            client_module.log({"total": total}, step=1)
+            return total
+
+        torch.func.grad(loss)(torch.ones(3, device="cuda"))
+        self.assertEqual(
+            [point[3] for point in self.publish() if point[1] == "total"], [6.0]
+        )
+
+    def test_a_cuda_default_device_does_not_make_log_wait(self):
+        value = torch.ones((), device="cuda")
+        client_module.log({"value": value}, step=0)
+        self.publish()
+        self.queue.reset_mock()
+        torch.set_default_device("cuda")
+        self.addCleanup(torch.set_default_device, None)
+        torch.cuda._sleep(2_000_000_000)  # about a second of queued GPU work
+        started = time.perf_counter()
+        client_module.log({"value": value}, step=1)
+        self.assertLess(time.perf_counter() - started, 0.2)
+        self.assertEqual(
+            [point[3] for point in self.publish() if point[1] == "value"], [1.0]
+        )
+
+    def test_a_float64_beyond_float32_is_dropped(self):
+        # log() itself publishes it when its copies complete before it returns.
+        with self.assertLogs("kymo", level="WARNING"):
+            client_module.log(
+                {
+                    "huge": torch.tensor(1e300, dtype=torch.float64, device="cuda"),
+                    "fine": torch.tensor(1.0, device="cuda"),
+                },
+                step=1,
+            )
+            points = self.publish()
+        self.assertEqual([point[1] for point in points], ["fine"])
+        self.assertTrue(client_module._pending_incomplete)
+
+    def test_log_returns_before_queued_gpu_work_and_reads_the_value_at_the_call(self):
+        value = torch.zeros((), device="cuda")
+        pixels = torch.randint(0, 256, (3, 64, 48), dtype=torch.uint8, device="cuda")
+        scalars = [torch.full((), float(i), device="cuda") for i in range(1000)]
+        # CUDA loads a kernel at its first launch, waiting for the GPU; this call loads the ones below.
+        client_module.log(
+            {
+                "value": value,
+                "scalars": scalars,
+                "image": Image(pixels.permute(1, 2, 0)),
+            },
+            step=0,
+        )
+        self.publish()
+        self.queue.reset_mock()
+
+        torch.cuda._sleep(2_000_000_000)  # about a second of queued GPU work
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            started = time.perf_counter()
+            client_module.log(
+                {
+                    "value": value,
+                    "scalars": scalars,
+                    "image": Image(pixels.permute(1, 2, 0)),
+                },
+                step=1,
+            )
+            elapsed = time.perf_counter() - started
+            # The caller changes the tensors right after the call.
+            value.add_(1)
+            pixels.zero_()
+        finally:
+            torch.cuda.set_sync_debug_mode(0)
+        self.assertFalse(client_module._pending[0].reads.done())
+        self.assertLess(elapsed, 0.2)
+
+        points = self.publish()
+        by_name = {point[1]: point for point in points}
+        self.assertEqual(by_name["value"][3], 0.0)
+        tagged = sorted(
+            (int(point[4]), point[3])
+            for point in points
+            if point[0] == "numeric_tagged_ts"
+        )
+        self.assertEqual(tagged, [(i, float(i)) for i in range(1000)])
+        image = by_name["image"][3][0].data
+        self.assertIsInstance(image, np.ndarray)
+        self.assertTrue(image.any())
+
+    def test_images_equal_their_synchronous_snapshot(self):
+        pixels = torch.randint(0, 256, (3, 64, 48), dtype=torch.uint8, device="cuda")
+        images = {
+            "contiguous": pixels,
+            "permuted": pixels.permute(1, 2, 0),
+            "one channel": pixels[1],
+            "float": pixels.float() / 255,
+            "bfloat16": pixels.bfloat16(),
+        }
+        caller = {name: Image(data) for name, data in images.items()}
+        client_module.log(dict(caller), step=1)
+        for name, image in caller.items():
+            self.assertIs(image.data, images[name])
+
+        logged = {point[1]: point[3][0].data for point in self.publish()}
+        for name, data in images.items():
+            with self.subTest(name=name):
+                expected = client_module._decode_queue_item(
+                    client_module._snapshot_rich_queue_items(
+                        [("cdn_batch", name, 1, [Image(data)])]
+                    )[0]
+                )[0][3][0].data
+                if isinstance(expected, np.ndarray):
+                    np.testing.assert_array_equal(logged[name], expected)
+                else:
+                    self.assertTrue(torch.equal(logged[name], expected))
+
+    def test_backpressure_waits_for_the_oldest_call(self):
+        pixels = torch.zeros(1024, dtype=torch.uint8, device="cuda")
+        with mock.patch.object(client_module, "_PENDING_MAX_BYTES", 1500):
+            for step in range(3):
+                torch.cuda._sleep(10_000_000)
+                client_module.log({"image": Image(pixels)}, step=step)
+        # The third call waited for the second's copies, and the second for the first's.
+        self.assertEqual(len(client_module._pending), 1)
+        published = [
+            item
+            for group in _published_groups(self.queue)
+            for item in group
+            if item[1] == "image"
+        ]
+        self.assertEqual([batch[2] for batch in published], [0, 1])
+
+    def test_another_tensor_subclass_is_read_synchronously(self):
+        class Subclass(torch.Tensor):
+            pass
+
+        value = torch.tensor(1.25, device="cuda").as_subclass(Subclass)
+        client_module.log({"subclass": value}, step=1)
+        self.assertEqual(len(client_module._pending), 0)
+        self.assertEqual(
+            [point[3] for point in self.publish() if point[1] == "subclass"], [1.25]
+        )
+
+    def test_a_retained_source_keeps_no_autograd_graph_alive(self):
+        client_module.log({"warm": torch.ones((), device="cuda")}, step=0)
+        self.publish()
+        weight = torch.ones((), device="cuda", requires_grad=True)
+        activations = torch.rand(1 << 22, device="cuda")
+        before = torch.cuda.memory_allocated()
+        # exp saves its 16 MiB output for a backward pass that never comes.
+        metric = torch.exp(activations * weight).sum()
+        torch.cuda._sleep(200_000_000)
+        client_module.log({"metric": metric}, step=1)
+        self.assertEqual(len(client_module._pending), 1)
+
+        del metric
+        self.assertLess(torch.cuda.memory_allocated() - before, 1 << 20)
+        self.publish()
+
+    _SUBPROCESS_PRELUDE = """
+import multiprocessing, os
+from unittest import mock
+import functools
+import torch
+from kymo import _gpu, client
+# BACKEND, set before this prelude, picks how scalars are copied.
+if BACKEND == "stack":
+    _gpu.gather = lambda torch, device: None
+else:
+    build = getattr(_gpu, BACKEND + "_gather")
+    _gpu.gather = functools.cache(lambda torch, device: build(torch))
+patches = mock.patch.multiple(
+    client,
+    _is_initialized=True,
+    _init_pid=os.getpid(),
+    _metric_queue=mock.Mock(),
+    _queue_status=multiprocessing.Value("q", 0),
+)
+
+
+def log_pending(metrics):
+    # CUDA loads a kernel at its first launch, waiting for the GPU; the first call loads them.
+    client.log(metrics, step=0)
+    client._publish_pending(None)
+    torch.cuda._sleep(500_000_000)
+    client.log(metrics, step=1)
+    assert client._pending
+"""
+
+    def _run_script(
+        self, script: str, env: dict | None = None
+    ) -> subprocess.CompletedProcess:
+        # On Python 3.12, os.fork() in a threaded process warns before the parent's at-fork handlers release kymo's capture locks, and printing that warning deadlocks (AI-1518).
+        return subprocess.run(
+            [
+                sys.executable,
+                "-W",
+                "ignore::DeprecationWarning",
+                "-c",
+                f"BACKEND = {self.backend!r}\n" + self._SUBPROCESS_PRELUDE + script,
+            ],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            env={**os.environ, **(env or {})},
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+    def test_log_never_waits_where_the_allocator_maps_device_memory_low(self):
+        # Expandable segments map device memory below _NULL_OFFSET_BOUND, where each pointer is compared with its storage offset.
+        result = self._run_script(
+            """
+with patches:
+    cuda = torch.device("cuda")
+    real = [torch.tensor(2.0, device=cuda), torch.arange(4.0, device=cuda)[3]]
+    assert max(t.data_ptr() for t in real) < _gpu._NULL_OFFSET_BOUND
+    log_pending({"real": real})
+    assert not client._pending[0].reads.done(), "log() waited for the GPU"
+    null = [
+        torch._efficientzerotensor((4,), device=cuda)[2],
+        torch._to_functional_tensor(torch.tensor(5.0, device=cuda)),
+    ]
+    reads = _gpu.Reads(torch, real + null, [])
+    reads.wait()
+    assert [value for _, value in sorted(reads.scalars())] == [2.0, 3.0, 0.0, 5.0]
+print("done")
+""",
+            env={"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        self.assertIn("done", result.stdout)
+
+    def test_a_fork_child_never_frees_the_parents_cuda_objects(self):
+        # Freeing a pinned host copy or an event in a fork child aborts it; this child runs a full interpreter shutdown.
+        result = self._run_script(
+            """
+with patches:
+    image = torch.zeros(8, 8, 3, dtype=torch.uint8, device="cuda")
+    log_pending({"x": torch.ones((), device="cuda"), "image": client.Image(image)})
+    pid = os.fork()
+    if pid == 0:
+        raise SystemExit(3)
+    _, status = os.waitpid(pid, 0)
+    print("child", os.waitstatus_to_exitcode(status))
+    torch.cuda.synchronize()
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        self.assertIn("child 3", result.stdout)
+
+    def test_a_cuda_error_neither_breaks_later_logs_nor_aborts_the_process(self):
+        # Freeing a pinned host copy after a CUDA error aborts the process.
+        result = self._run_script(
+            """
+with patches:
+    log_pending({"x": torch.ones((), device="cuda")})
+    values = torch.zeros(10, device="cuda")
+    values[torch.tensor([10**9], device="cuda")] = 1
+    try:
+        torch.cuda.synchronize()
+    except Exception:
+        pass
+    client.log({"cpu": 1.0}, step=2)
+    assert client._pending_incomplete and not client._pending
+print("done")
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        self.assertIn("done", result.stdout)
+
+    def test_a_cuda_error_while_starting_the_copies_does_not_abort_the_process(self):
+        # The error surfaces once a pinned host copy exists (the first dtype group's stack, or the kernel's word table); freeing it would abort.
+        result = self._run_script(
+            """
+with patches:
+    values = {
+        "a": torch.ones((), device="cuda"),
+        "b": torch.ones((), dtype=torch.int64, device="cuda"),
+    }
+    client.log(values, step=0)
+    client._publish_pending(None)
+    def fault():
+        index = torch.tensor([10**9], device="cuda")
+        torch.zeros(10, device="cuda")[index] = 1
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+    if BACKEND == "stack":
+        stack, calls = torch.stack, []
+        def failing(tensors):
+            calls.append(tensors)
+            if len(calls) == 2:
+                fault()
+            return stack(tensors)
+        patch = mock.patch.object(torch, "stack", failing)
+    else:
+        gather = _gpu.gather
+        def failing(torch, device):
+            launch = gather(torch, device)
+            def launch_after_fault(*args):
+                fault()
+                launch(*args)
+            return launch_after_fault
+        patch = mock.patch.object(_gpu, "gather", failing)
+    with patch:
+        try:
+            client.log(values, step=1)
+        except Exception:
+            print("log raised")
+print("done")
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        self.assertIn("log raised\ndone", result.stdout)
+
+    def test_graph_capture_rejects_cuda_values_before_touching_the_gpu(self):
+        static = torch.zeros((), device="cuda")
+        graph = torch.cuda.CUDAGraph()
+        with self.assertRaisesRegex(RuntimeError, "CUDA graph capture"):
+            with torch.cuda.graph(graph):
+                static.add_(1)
+                client_module.log({"x": static}, step=1)
+        self.assertEqual(len(client_module._pending), 0)
+
+
+@_REQUIRES_CUDA
+class CudaNvrtcLogTests(_CudaLogTests, unittest.TestCase):
+    backend = "nvrtc"
+
+
+@_REQUIRES_CUDA
+class CudaTritonLogTests(_CudaLogTests, unittest.TestCase):
+    backend = "triton"
+
+
+@_REQUIRES_CUDA
+class CudaStackLogTests(_CudaLogTests, unittest.TestCase):
+    backend = "stack"
+
+
+@_REQUIRES_CUDA
+class GatherBuildTests(unittest.TestCase):
+    def test_the_first_kernel_that_builds_is_used_even_under_sync_debug_mode(self):
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            launch = gpu_module.gather.__wrapped__(torch, 0)
+        finally:
+            torch.cuda.set_sync_debug_mode(0)
+        builds = []
+        for build in (gpu_module.nvrtc_gather, gpu_module.triton_gather):
+            try:
+                build(torch)
+                builds.append(build.__name__)
+            except (AttributeError, ImportError):
+                pass
+        if not builds:
+            self.assertIsNone(launch)
+        else:
+            self.assertTrue(launch.__qualname__.startswith(builds[0]))
+
+
 class QueueDrainTests(unittest.TestCase):
     class ScriptedQueue:
         def __init__(self, events=()):
@@ -1998,6 +3121,77 @@ class ShutdownProofTests(unittest.TestCase):
             ],
         )
         self.assertEqual(status.value, 0)
+
+    def test_shutdown_publishes_pending_logs_without_values_never_copied(self):
+        for copied in (True, False):
+            with self.subTest(copied=copied):
+                status = _QueueStatus()
+
+                class AckingQueue(self._Queue):
+                    def put(queue_self, item):
+                        queue_self.items.append(item)
+                        if item is not None:
+                            status.value -= client_module._queue_item_size(item)
+
+                entry = client_module._PendingLog(
+                    [("numeric_ts", "cpu", 1, 1.0, 1)],
+                    [],
+                    step=1,
+                    timestamp_ms=1,
+                    gpu_keys=[("gpu", None)],
+                )
+                entry.reads = mock.Mock()
+                entry.reads.wait.return_value = copied
+                entry.reads.scalars.return_value = [(0, 2.0)]
+                target = AckingQueue()
+                with (
+                    mock.patch.object(client_module, "_pending", deque([entry])),
+                    mock.patch.object(client_module, "_pending_incomplete", False),
+                    contextlib.nullcontext()
+                    if copied
+                    else self.assertLogs("kymo", level="WARNING"),
+                ):
+                    complete = self._run_shutdown(target=target, status=status)
+
+                self.assertEqual(complete, copied)
+                points = [("numeric_ts", "cpu", 1, 1.0, 1)]
+                if copied:
+                    points.append(("numeric_ts", "gpu", 1, 2.0, 1))
+                self.assertEqual(target.items, [points, None])
+
+    def test_shutdown_fails_when_a_log_queues_behind_it(self):
+        status = _QueueStatus()
+        pending = deque()
+
+        class LateLogQueue(self._Queue):
+            def put(queue_self, item):
+                queue_self.items.append(item)
+                if item is not None:
+                    status.value -= client_module._queue_item_size(item)
+                    # Another thread's log() queues after the pending calls were drained.
+                    pending.append(client_module._PendingLog([], []))
+
+        with (
+            mock.patch.object(client_module, "_pending", pending),
+            mock.patch.object(client_module, "_pending_incomplete", False),
+        ):
+            complete = self._run_shutdown(
+                target=LateLogQueue(), status=status, capture=("tail", "")
+            )
+
+        self.assertFalse(complete)
+
+    def test_shutdown_bounds_its_wait_for_the_pending_calls_lock(self):
+        _hold_pending_lock(self)
+        started = time.monotonic()
+        with (
+            mock.patch.object(client_module, "_pending", deque()),
+            self.assertLogs("kymo", level="ERROR"),
+        ):
+            complete = self._run_shutdown(flush_timeout=0.2)
+
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertTrue(complete)
 
     def test_shutdown_continues_but_fails_if_captured_tail_cannot_publish(self):
         status = _QueueStatus()

@@ -77,6 +77,11 @@ impl<K: Eq + Hash, State> RefreshLease<K, State> {
     pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, State> {
         self.slot.lock().await
     }
+
+    /// The slot's lock if it is free right now, owned so a caller can hold several slots without borrowing their leases.
+    pub fn try_lock_owned(&self) -> Option<tokio::sync::OwnedMutexGuard<State>> {
+        self.slot.clone().try_lock_owned().ok()
+    }
 }
 
 impl<K: Eq + Hash, State> Drop for RefreshLease<K, State> {

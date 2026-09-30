@@ -12,7 +12,10 @@ use rustls::pki_types::{pem::PemObject, CertificateDer};
 use rustls::{ClientConfig, RootCertStore};
 use serde::{Deserialize, Serialize};
 
-use crate::series_cache::SeriesRefreshLocks;
+use crate::series_cache::{
+    ElectedMiss, LineageOrigin, RefreshError, RefreshOutcome, SeriesKey, SeriesRefreshLocks,
+    SeriesSnapshot,
+};
 use crate::text_index_cache::{
     IndexedTextChunk, Lookup as TextIndexLookup, TextIndexCache, TextIndexKey, TextIndexRow,
     TextRefreshLocks, TextStreamIndex,
@@ -337,12 +340,6 @@ impl CdnGcReport {
 }
 
 #[derive(Debug, Clone, Deserialize, clickhouse::Row)]
-pub struct RawPoint {
-    pub step: i64,
-    pub value: f32,
-}
-
-#[derive(Debug, Clone, Deserialize, clickhouse::Row)]
 pub struct CdnKeyBatchRow {
     pub project_id: String,
     pub run_id: String,
@@ -446,6 +443,20 @@ pub struct RegistryOutboxStorage {
     pub rows: u64,
     pub bytes: u64,
     pub parts: u64,
+}
+
+/// A multi-run read's row's position in `run_ids` (distinct run ids), reusing the previous row's `position` while rows stay in that run.
+/// Rows are ordered by run, so the search runs once per run; ClickHouse's `indexOf` searched the list for every row, several times the read's cost for wide batches.
+fn run_position(run_ids: &[String], run_id: &str, position: &mut usize) -> Result<usize> {
+    if run_ids.get(*position).is_none_or(|known| known != run_id) {
+        *position = run_ids
+            .iter()
+            .position(|known| known == run_id)
+            .with_context(|| {
+                format!("multi-run read returned run {run_id:?} it did not ask for")
+            })?;
+    }
+    Ok(*position)
 }
 
 /// Held for the detached task's whole lifetime, so a purge of the run waits for its in-flight scans (docs/admission-control.md Stage R).
@@ -1356,32 +1367,45 @@ impl ChClient {
 
     // --- Numeric queries ---
 
-    pub async fn query_raw(
+    /// Each run's scalar (tag = '') numeric (step, value) points of one metric within the step range, in `run_ids` order, from one statement.
+    pub async fn query_raw_many(
         &self,
         project_id: &str,
-        run_id: &str,
+        run_ids: &[String],
         metric_name: &str,
         step_min: i64,
         step_max: i64,
-    ) -> Result<Vec<RawPoint>> {
-        let rows = self
+    ) -> Result<Vec<Vec<(i64, f64)>>> {
+        #[derive(Deserialize, clickhouse::Row)]
+        struct Row<'a> {
+            run_id: &'a str,
+            step: i64,
+            value: f32,
+        }
+        // ClickHouse resolves a name to a same-named SELECT alias before the column, so a filter on a column its statement re-aliases must qualify it, or it tests the alias: `metrics.value` here and in `fetch_full_many`/`fetch_increment`, `metrics.cdn_key` in `query_cdn_keys_batch`.
+        let mut cursor = self
             .client
             .query(
-                "SELECT step, assumeNotNull(value) AS value
+                "SELECT run_id, step, assumeNotNull(value) AS value
                  FROM mkdb2.metrics FINAL
-                 WHERE project_id = ? AND run_id = ? AND metric_name = ?
+                 WHERE project_id = ? AND run_id IN ? AND metric_name = ?
                    AND step >= ? AND step <= ?
-                   AND value IS NOT NULL AND tag = ''
-                 ORDER BY step",
+                   AND metrics.value IS NOT NULL AND tag = ''
+                 ORDER BY run_id, step",
             )
             .bind(project_id)
-            .bind(run_id)
+            .bind(run_ids)
             .bind(metric_name)
             .bind(step_min)
             .bind(step_max)
-            .fetch_all::<RawPoint>()
-            .await?;
-        Ok(rows)
+            .fetch::<Row>()?;
+        let mut series = vec![Vec::new(); run_ids.len()];
+        let mut position = 0;
+        while let Some(row) = cursor.next().await? {
+            series[run_position(run_ids, row.run_id, &mut position)?]
+                .push((row.step, f64::from(row.value)));
+        }
+        Ok(series)
     }
 
     /// All points of a metric — scalar (tag = '') and tagged together in
@@ -1398,31 +1422,31 @@ impl ChClient {
         run_id: &str,
         metric_name: &str,
         detach: impl FnOnce() -> Option<RefreshDetach>,
-    ) -> crate::series_cache::RefreshOutcome {
-        use crate::series_cache::{LineageOrigin, Lookup, WATERMARK_OVERLAP_MS};
-        let key = (
-            project_id.to_string(),
-            run_id.to_string(),
-            metric_name.to_string(),
-        );
+    ) -> RefreshOutcome {
+        use crate::series_cache::{Lookup, WATERMARK_OVERLAP_MS};
+        let key = SeriesKey::new(project_id, run_id, metric_name);
         // The refresh future must own everything it touches: with `detach` it
         // runs in a spawned task that outlives this call and its borrows.
         let ch = self.clone();
         let refresh_key = key.clone();
         self.series_refresh_locks
             .get_or_refresh(&self.series_cache, &key, detach, move |lookup| async move {
-                let (project_id, run_id, metric_name) = &refresh_key;
+                let SeriesKey {
+                    project_id,
+                    run_id,
+                    metric_name,
+                } = &refresh_key;
                 // Taken BEFORE the ClickHouse read: freshness must date from a
                 // moment when the fetched rows were provably complete, or a
                 // slow select can stamp pre-insert data as fresh (see the full-store bump gate).
                 let fetch_started = std::time::Instant::now();
                 let origin = if let Lookup::Stale { watermark_ms, gen } = lookup {
                     let increment = ch
-                        .fetch_versioned(
+                        .fetch_increment(
                             project_id,
                             run_id,
                             metric_name,
-                            Some(watermark_ms - WATERMARK_OVERLAP_MS),
+                            watermark_ms - WATERMARK_OVERLAP_MS,
                         )
                         .await?;
                     if let Ok(rows) =
@@ -1436,91 +1460,165 @@ impl ChClient {
                     LineageOrigin::Miss
                 };
 
-                // Miss, or an incremental refresh whose base was rewritten,
-                // evicted, or replaced: rebuild from the full series. Cache
-                // ablation keeps this singleflight but retains no result.
+                // Miss, or an incremental refresh whose base was rewritten, evicted, or replaced: rebuild from the full series.
                 let full = ch
-                    .fetch_versioned(project_id, run_id, metric_name, None)
-                    .await?;
-                Ok(if ch.series_cache_enabled {
-                    ch.series_cache.insert_full_with_origin(
-                        refresh_key.clone(),
-                        full,
-                        fetch_started,
-                        origin,
-                    )
-                } else {
-                    std::sync::Arc::new(crate::series_cache::SeriesSnapshot::full_with_origin(
-                        full, origin,
-                    ))
-                })
+                    .fetch_full_many(project_id, metric_name, std::slice::from_ref(run_id))
+                    .await?
+                    .swap_remove(0);
+                Ok(ch.store_full(refresh_key, full, fetch_started, origin))
             })
             .await
     }
 
-    /// One (tag, step)-ordered read of a metric's rows, full or — when
-    /// `after_inserted_ms` is set — only rows inserted after that instant.
+    /// The authoritative read of one metric's whole series for each of `run_ids` (one project) in one statement, in `run_ids` order.
+    /// FINAL dedups every series, and with project and metric fixed, ORDER BY (run, tag, step) is the table's sorting-key order, so ClickHouse streams it.
+    /// On prod, one read of 12 series cost about a third of the ClickHouse time of their 12 separate reads and opened 17 parts instead of 76.
+    async fn fetch_full_many(
+        &self,
+        project_id: &str,
+        metric_name: &str,
+        run_ids: &[String],
+    ) -> Result<Vec<Vec<VersionedRawPoint>>> {
+        #[derive(Deserialize, clickhouse::Row)]
+        struct Row<'a> {
+            run_id: &'a str,
+            tag: String,
+            step: i64,
+            timestamp_ms: i64,
+            value: f32,
+            inserted_ms: i64,
+        }
+        let mut cursor = self
+            .client
+            .query(
+                "SELECT run_id, tag, step, timestamp_ms,
+                        assumeNotNull(value) AS value,
+                        toUnixTimestamp64Milli(inserted_at) AS inserted_ms
+                 FROM mkdb2.metrics FINAL
+                 WHERE project_id = ? AND run_id IN ? AND metric_name = ?
+                   AND metrics.value IS NOT NULL
+                 ORDER BY run_id, tag, step",
+            )
+            .bind(project_id)
+            .bind(run_ids)
+            .bind(metric_name)
+            .fetch::<Row>()?;
+        let mut series: Vec<Vec<VersionedRawPoint>> = vec![Vec::new(); run_ids.len()];
+        let mut position = 0;
+        while let Some(row) = cursor.next().await? {
+            series[run_position(run_ids, row.run_id, &mut position)?].push(VersionedRawPoint {
+                tag: row.tag,
+                step: row.step,
+                timestamp_ms: row.timestamp_ms,
+                value: row.value,
+                is_value: 1,
+                inserted_ms: row.inserted_ms,
+            });
+        }
+        Ok(series)
+    }
+
+    /// The (tag, step)-ordered rows of one series inserted after `after_inserted_ms`.
     ///
-    /// The full read runs under FINAL: it is the authoritative dedup of the
-    /// whole series. The incremental read deliberately does NOT — FINAL
-    /// merges across the series' whole key range AND disables the
-    /// `idx_inserted_at` skip index (`use_skip_indexes_if_final` is off by
-    /// default, for good reason in the general case), which would turn
-    /// every refresh back into the full scan the cache exists to avoid.
-    /// Skipping FINAL here is sound for this filter: versions of a row
-    /// only ever gain a larger `inserted_at` (it is the ReplacingMergeTree
-    /// version column), so a granule whose whole range is ≤ the watermark
-    /// holds nothing the increment needs. The price is that an increment
-    /// can carry several versions of one (tag, step) — unmerged duplicate
-    /// inserts, or a re-log inside the window — and `merge_increment`
-    /// keeps the latest by `inserted_ms`. It must also carry nonnumeric payloads: a newer CDN/text row at the same ReplacingMergeTree key is a tombstone for a cached numeric point.
-    async fn fetch_versioned(
+    /// Deliberately NOT under FINAL: FINAL merges across the series' whole key range AND disables the `idx_inserted_at` skip index (`use_skip_indexes_if_final` is off by default, for good reason in the general case), which would turn every refresh back into the full scan the cache exists to avoid.
+    /// Skipping FINAL here is sound for this filter: versions of a row only ever gain a larger `inserted_at` (it is the ReplacingMergeTree version column), so a granule whose whole range is ≤ the watermark holds nothing the increment needs.
+    /// The price is that an increment can carry several versions of one (tag, step) — unmerged duplicate inserts, or a re-log inside the window — and `merge_increment_tracked` keeps the latest by `inserted_ms`.
+    /// It must also carry nonnumeric payloads: a newer CDN/text row at the same ReplacingMergeTree key is a tombstone for a cached numeric point.
+    async fn fetch_increment(
         &self,
         project_id: &str,
         run_id: &str,
         metric_name: &str,
-        after_inserted_ms: Option<i64>,
+        after_inserted_ms: i64,
     ) -> Result<Vec<VersionedRawPoint>> {
-        let rows = match after_inserted_ms {
-            None => {
-                self.client
-                    .query(
-                        "SELECT tag, step, timestamp_ms,
-                                assumeNotNull(value) AS value,
-                                toUInt8(1) AS is_value,
-                                toUnixTimestamp64Milli(inserted_at) AS inserted_ms
-                         FROM mkdb2.metrics FINAL
-                         WHERE project_id = ? AND run_id = ? AND metric_name = ?
-                           AND value IS NOT NULL
-                         ORDER BY tag, step",
-                    )
-                    .bind(project_id)
-                    .bind(run_id)
-                    .bind(metric_name)
-                    .fetch_all::<VersionedRawPoint>()
-                    .await?
-            }
-            Some(ms) => {
-                self.client
-                    .query(
-                        "SELECT tag, step, timestamp_ms,
-                                ifNull(value, toFloat32(0)) AS value,
-                                toUInt8(value IS NOT NULL) AS is_value,
-                                toUnixTimestamp64Milli(inserted_at) AS inserted_ms
-                         FROM mkdb2.metrics
-                         WHERE project_id = ? AND run_id = ? AND metric_name = ?
-                           AND inserted_at > fromUnixTimestamp64Milli(?)
-                         ORDER BY tag, step",
-                    )
-                    .bind(project_id)
-                    .bind(run_id)
-                    .bind(metric_name)
-                    .bind(ms)
-                    .fetch_all::<VersionedRawPoint>()
-                    .await?
-            }
-        };
+        let rows = self
+            .client
+            .query(
+                "SELECT tag, step, timestamp_ms,
+                        ifNull(value, toFloat32(0)) AS value,
+                        toUInt8(metrics.value IS NOT NULL) AS is_value,
+                        toUnixTimestamp64Milli(inserted_at) AS inserted_ms
+                 FROM mkdb2.metrics
+                 WHERE project_id = ? AND run_id = ? AND metric_name = ?
+                   AND inserted_at > fromUnixTimestamp64Milli(?)
+                 ORDER BY tag, step",
+            )
+            .bind(project_id)
+            .bind(run_id)
+            .bind(metric_name)
+            .bind(after_inserted_ms)
+            .fetch_all::<VersionedRawPoint>()
+            .await?;
         Ok(rows)
+    }
+
+    /// Retain a full read; under cache ablation (`KYMO_SERIES_CACHE=0`) it is only shared with the requests already waiting for it.
+    fn store_full(
+        &self,
+        key: SeriesKey,
+        rows: Vec<VersionedRawPoint>,
+        fetch_started: std::time::Instant,
+        origin: LineageOrigin,
+    ) -> Arc<SeriesSnapshot> {
+        if self.series_cache_enabled {
+            self.series_cache
+                .insert_full_with_origin(key, rows, fetch_started, origin)
+        } else {
+            Arc::new(SeriesSnapshot::full_with_origin(rows, origin))
+        }
+    }
+
+    /// Elect this request as the full-read refresher of up to `limit` of `keys`, one project and metric (see [`SeriesRefreshLocks::elect_misses`]).
+    pub(crate) fn elect_full_reads(&self, keys: &[SeriesKey], limit: usize) -> Vec<ElectedMiss> {
+        self.series_refresh_locks
+            .elect_misses(&self.series_cache, keys, limit)
+    }
+
+    /// Refresh `elected` (nonempty, one project and metric) from a single full read shared by one detached task per key (see [`SeriesRefreshLocks::spawn_batch`]).
+    /// `ctx` backs the read with one admission unit and run guard per key; every task holds all of them, so a lifecycle writer on any of these runs waits for the whole batch.
+    pub(crate) fn spawn_full_read_batch(
+        &self,
+        elected: Vec<ElectedMiss>,
+        ctx: Vec<RefreshDetach>,
+    ) -> impl std::future::Future<Output = Result<Vec<(SeriesKey, Arc<SeriesSnapshot>)>, RefreshError>>
+    {
+        use futures::FutureExt;
+        // Taken before the read exists, so it predates the query for every key: the bump gate's fetch start.
+        let started = std::time::Instant::now();
+        let project_id = elected[0].key.project_id.clone();
+        let metric_name = elected[0].key.metric_name.clone();
+        let run_ids: Vec<String> = elected.iter().map(|miss| miss.key.run_id.clone()).collect();
+        let ch = self.clone();
+        // Shared needs a Clone output: each run's rows sit in their own slot, moved out once by that run's task, which stores its own series.
+        let read = {
+            let ch = ch.clone();
+            async move {
+                let series = ch
+                    .fetch_full_many(&project_id, &metric_name, &run_ids)
+                    .await
+                    .map_err(|e| format!("{e:#}"))?;
+                Ok::<_, String>(Arc::new(
+                    series
+                        .into_iter()
+                        .map(|rows| std::sync::Mutex::new(Some(rows)))
+                        .collect::<Vec<_>>(),
+                ))
+            }
+        }
+        .shared();
+        self.series_refresh_locks
+            .spawn_batch(elected, Arc::new(ctx), started, move |index, key| {
+                let (read, ch, key) = (read.clone(), ch.clone(), key.clone());
+                async move {
+                    let series = read.await.map_err(anyhow::Error::msg)?;
+                    let rows = series[index]
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("each run's rows are taken once, by its own task");
+                    Ok(ch.store_full(key, rows, started, LineageOrigin::Miss))
+                }
+            })
     }
 
     // --- CDN queries ---
@@ -1556,7 +1654,7 @@ impl ChClient {
                         inserted_at
                  FROM mkdb2.metrics FINAL
                  WHERE (project_id, run_id, metric_name) IN ({placeholders})
-                   AND step >= ? AND step <= ? AND cdn_key IS NOT NULL
+                   AND step >= ? AND step <= ? AND metrics.cdn_key IS NOT NULL
                  UNION ALL
                  SELECT project_id, run_id, metric_name, tag, step, cdn_key,
                         toUInt8(1) AS is_versioned, mutation_version, inserted_at
@@ -1565,7 +1663,7 @@ impl ChClient {
                    AND step >= ? AND step <= ?
              )
              GROUP BY project_id, run_id, metric_name, tag, step
-             ORDER BY project_id, run_id, metric_name, step
+             ORDER BY project_id, run_id, metric_name, step, tag
              SETTINGS use_skip_indexes_if_final = 0"
         );
         let mut q = self.client.query(&sql);
@@ -1686,7 +1784,7 @@ impl ChClient {
             .text_index_cache
             .lookup(&key, self.series_cache.last_bump(run_id))
         {
-            TextIndexLookup::Fresh(index) => Ok(index),
+            TextIndexLookup::Fresh(index) => return Ok(index),
             TextIndexLookup::Stale {
                 watermark_ms,
                 generation,
@@ -1695,44 +1793,25 @@ impl ChClient {
                 let (increment, _) = self
                     .fetch_text_index_rows(project_id, run_id, metric_names, Some(watermark_ms))
                     .await?;
-                match self.text_index_cache.apply_increment(
+                if let Ok(index) = self.text_index_cache.apply_increment(
                     &key,
                     increment,
                     fetch_started,
                     generation,
                 ) {
-                    Ok(index) => Ok(index),
-                    Err(()) => {
-                        // Another request replaced the base while this
-                        // increment was in flight. A fresh authoritative read
-                        // avoids merging against a watermark from that old
-                        // generation.
-                        let fetch_started = std::time::Instant::now();
-                        let (rows, observed_max_inserted_ms) = self
-                            .fetch_text_index_rows(project_id, run_id, metric_names, None)
-                            .await?;
-                        Ok(self.text_index_cache.insert_full(
-                            key,
-                            rows,
-                            observed_max_inserted_ms,
-                            fetch_started,
-                        ))
-                    }
+                    return Ok(index);
                 }
             }
-            TextIndexLookup::Miss => {
-                let fetch_started = std::time::Instant::now();
-                let (rows, observed_max_inserted_ms) = self
-                    .fetch_text_index_rows(project_id, run_id, metric_names, None)
-                    .await?;
-                Ok(self.text_index_cache.insert_full(
-                    key,
-                    rows,
-                    observed_max_inserted_ms,
-                    fetch_started,
-                ))
-            }
+            TextIndexLookup::Miss => {}
         }
+        // Miss, or an increment the cache refused: another request replaced the base while it was in flight (merging would use that old generation's watermark), or it holds equal-version rows only FINAL can order.
+        let fetch_started = std::time::Instant::now();
+        let (rows, observed_max_inserted_ms) = self
+            .fetch_text_index_rows(project_id, run_id, metric_names, None)
+            .await?;
+        Ok(self
+            .text_index_cache
+            .insert_full(key, rows, observed_max_inserted_ms, fetch_started))
     }
 
     /// Return one bounded, line-oriented slice across the requested text
@@ -2810,7 +2889,7 @@ mod schema_tests {
         let mock = ::clickhouse::test::Mock::new();
         let client = ChClient::new(mock.url()).unwrap();
         let cache = client.series_cache();
-        let key = ("p".to_string(), "r".to_string(), "m".to_string());
+        let key = SeriesKey::new("p", "r", "m");
         let rows = [MetricRow {
             project_id: "p".into(),
             run_id: "r".into(),
@@ -2847,6 +2926,51 @@ mod schema_tests {
         assert!(matches!(cache.lookup(&key), Lookup::Fresh(_)));
         tokio::time::sleep(3 * io_timeout).await;
         assert!(matches!(cache.lookup(&key), Lookup::Stale { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_batch_stamps_its_series_before_its_read_and_maps_rows_by_run() {
+        use crate::series_cache::Lookup;
+        #[derive(Serialize, ::clickhouse::Row)]
+        struct Row {
+            run_id: String,
+            tag: String,
+            step: i64,
+            timestamp_ms: i64,
+            value: f32,
+            inserted_ms: i64,
+        }
+        let row = |run_id: &str, value: f32| Row {
+            run_id: run_id.into(),
+            tag: String::new(),
+            step: 1,
+            timestamp_ms: 0,
+            value,
+            inserted_ms: 1,
+        };
+        let mock = ::clickhouse::test::Mock::new();
+        let client = ChClient::new(mock.url()).unwrap();
+        let cache = client.series_cache();
+        let keys: Vec<SeriesKey> = ["a", "b"]
+            .into_iter()
+            .map(|run| SeriesKey::new("p", run, "m"))
+            .collect();
+        mock.add(::clickhouse::test::handlers::provide(vec![
+            row("b", 2.0),
+            row("a", 1.0),
+        ]));
+
+        let batch =
+            client.spawn_full_read_batch(client.elect_full_reads(&keys, usize::MAX), Vec::new());
+        // The current-thread runtime runs the batch's tasks only at the await below, so this note lands after the batch's stamp and before its read.
+        cache.note_bumps(std::iter::once("a"));
+        let rows = batch.await.unwrap();
+
+        for ((key, rows), value) in rows.into_iter().zip([1.0, 2.0]) {
+            assert_eq!(rows[0].value, value, "{key:?}");
+        }
+        assert!(matches!(cache.lookup(&keys[0]), Lookup::Stale { .. }));
+        assert!(matches!(cache.lookup(&keys[1]), Lookup::Fresh(_)));
     }
 }
 

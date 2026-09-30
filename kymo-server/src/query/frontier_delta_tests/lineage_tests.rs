@@ -7,7 +7,7 @@ fn cache_append(
     key: &crate::series_cache::SeriesKey,
     rows: Vec<VersionedRawPoint>,
 ) -> Arc<SeriesSnapshot> {
-    cache.note_bumps(std::iter::once(key.1.as_str()));
+    cache.note_bumps(std::iter::once(key.run_id.as_str()));
     let crate::series_cache::Lookup::Stale { gen, .. } = cache.lookup(key) else {
         panic!("bumped fixture must refresh its retained snapshot");
     };
@@ -21,8 +21,8 @@ fn recovered_evicted_lineages_keep_real_wire_deltas_for_every_smoother() {
     use crate::series_cache::{Lookup, SeriesCache};
     for algorithm in ALGORITHMS {
         let cache = SeriesCache::with_test_budget(1_024);
-        let key = ("p".into(), "a".into(), "loss".into());
-        let other = ("p".into(), "other".into(), "loss".into());
+        let key = crate::series_cache::SeriesKey::new("p", "a", "loss");
+        let other = crate::series_cache::SeriesKey::new("p", "other", "loss");
         let original = cache.insert_full(
             key.clone(),
             rows(8, 3).as_ref().clone(),
@@ -84,7 +84,7 @@ fn recovered_evicted_lineages_keep_real_wire_deltas_for_every_smoother() {
 fn actual_cache_lineages_reject_regression_and_late_visibility_then_recover() {
     use lineage::Rejection;
     let cache = crate::series_cache::SeriesCache::new();
-    let key = ("p".into(), "a".into(), "loss".into());
+    let key = crate::series_cache::SeriesKey::new("p", "a", "loss");
     let request = req(&["a"], 1_000);
     let first = cache.insert_full(
         key.clone(),

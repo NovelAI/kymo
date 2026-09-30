@@ -32,7 +32,7 @@ impl TextIndexKey {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, clickhouse::Row)]
+#[derive(Debug, Clone, PartialEq, Deserialize, clickhouse::Row)]
 pub struct TextIndexRow {
     pub step: i64,
     pub metric_name: String,
@@ -128,8 +128,9 @@ pub struct TextStreamIndex {
 }
 
 impl TextStreamIndex {
-    fn from_rows(rows: Vec<TextIndexRow>, observed_max_inserted_ms: i64) -> Self {
-        let rows = latest_rows(rows);
+    /// None when [`latest_rows`] finds versions it cannot order.
+    fn from_rows(rows: Vec<TextIndexRow>, observed_max_inserted_ms: i64) -> Option<Self> {
+        let rows = latest_rows(rows)?;
         let max_inserted_ms = rows
             .iter()
             .map(|row| row.inserted_ms)
@@ -157,12 +158,12 @@ impl TextStreamIndex {
         }
         let total_lines = completed_lines
             .saturating_add(u64::from(last_non_empty_ends_with_newline == Some(false)));
-        Self {
+        Some(Self {
             first_step,
             total_lines,
             chunks,
             max_inserted_ms,
-        }
+        })
     }
 
     pub fn window_chunks(&self, offset: u64, limit: u32) -> &[IndexedTextChunk] {
@@ -202,27 +203,22 @@ fn row_key_cmp(left: &TextIndexRow, right: &TextIndexRow) -> Ordering {
         .then_with(|| left.tag.cmp(&right.tag))
 }
 
-fn same_key(left: &TextIndexRow, right: &TextIndexRow) -> bool {
-    left.step == right.step && left.metric_name == right.metric_name && left.tag == right.tag
-}
-
 /// Sort into display order and retain the newest version of every table key.
-/// Incremental reads deliberately omit FINAL so the inserted_at skip index can
-/// prune old granules; overlap can therefore return several row versions. The
-/// stable sort makes a newly appended incremental row win when timestamps tie.
-fn latest_rows(mut rows: Vec<TextIndexRow>) -> Vec<TextIndexRow> {
+/// Incremental reads deliberately omit FINAL so the inserted_at skip index can prune old granules; overlap can therefore return several row versions.
+/// None when a key's newest `inserted_ms` holds versions whose index fields disagree: ReplacingMergeTree FINAL keeps one of them and nothing in a non-FINAL read says which, so the caller needs a FINAL read (the numeric cache's rule in `merge_increment_tracked`).
+/// Agreeing versions at that stamp are the overlap re-reading a row; a newer stamp is a legitimate replacement.
+fn latest_rows(mut rows: Vec<TextIndexRow>) -> Option<Vec<TextIndexRow>> {
+    // Newest first within each key, so dedup keeps it and compares every older version against it.
     rows.sort_by(|left, right| {
-        row_key_cmp(left, right).then_with(|| left.inserted_ms.cmp(&right.inserted_ms))
+        row_key_cmp(left, right).then_with(|| right.inserted_ms.cmp(&left.inserted_ms))
     });
-    let mut latest = Vec::<TextIndexRow>::with_capacity(rows.len());
-    for row in rows {
-        if latest.last().is_some_and(|current| same_key(current, &row)) {
-            *latest.last_mut().expect("checked above") = row;
-        } else {
-            latest.push(row);
-        }
-    }
-    latest
+    let mut newest_disagrees = false;
+    rows.dedup_by(|older, newest| {
+        let same_key = row_key_cmp(older, newest).is_eq();
+        newest_disagrees |= same_key && older.inserted_ms == newest.inserted_ms && older != newest;
+        same_key
+    });
+    (!newest_disagrees).then_some(rows)
 }
 
 fn default_budget_bytes() -> usize {
@@ -351,11 +347,13 @@ impl TextIndexCache {
     ) -> Arc<TextStreamIndex> {
         self.store(
             key,
-            TextStreamIndex::from_rows(rows, observed_max_inserted_ms),
+            TextStreamIndex::from_rows(rows, observed_max_inserted_ms)
+                .expect("a FINAL read holds one version of each key"),
             fetch_started,
         )
     }
 
+    /// Fold an increment into the cached index; `Err(())` sends the caller to a full FINAL read, because the base changed generation or the increment holds versions only FINAL can order (see [`latest_rows`]).
     pub fn apply_increment(
         &self,
         key: &TextIndexKey,
@@ -384,7 +382,7 @@ impl TextIndexCache {
             .map(IndexedTextChunk::into_row)
             .chain(increment)
             .collect();
-        let index = TextStreamIndex::from_rows(rows, 0);
+        let index = TextStreamIndex::from_rows(rows, 0).ok_or(())?;
         let mut inner = self.inner.lock().unwrap();
         if inner
             .entries
@@ -522,7 +520,8 @@ mod tests {
                 row(7, "stdout", "a", "one\n", 1),
             ],
             0,
-        );
+        )
+        .unwrap();
         assert_eq!(index.total_lines, 2);
         assert_eq!(index.chunks[0].tag, "a");
         assert_eq!(index.chunks[0].lines_before, 0);
@@ -536,7 +535,8 @@ mod tests {
         let index = TextStreamIndex::from_rows(
             vec![row(1, "stdout", "", "tail", 1), row(2, "stdout", "", "", 2)],
             0,
-        );
+        )
+        .unwrap();
         assert_eq!(index.total_lines, 1);
         assert_eq!(index.window_chunks(0, 1).len(), 2);
     }
@@ -551,7 +551,8 @@ mod tests {
                 row(4, "stdout", "", "ial\n", 1),
             ],
             0,
-        );
+        )
+        .unwrap();
 
         let selected = index.window_chunks(1, 1);
         assert_eq!(
@@ -591,7 +592,7 @@ mod tests {
     }
 
     #[test]
-    fn equal_timestamp_increment_replaces_the_cached_row() {
+    fn equal_timestamp_versions_that_disagree_need_a_final_read() {
         let cache = TextIndexCache {
             inner: std::sync::Mutex::new(Default::default()),
             budget_bytes: usize::MAX,
@@ -605,17 +606,35 @@ mod tests {
         );
         let generation = cache.inner.lock().unwrap().entries[&key].generation;
 
+        // Against the cached row, and between two increment rows.
+        for increment in [
+            vec![row(1, "stdout", "", "new\nextra\n", 1)],
+            vec![
+                row(2, "stdout", "", "a\n", 3),
+                row(2, "stdout", "", "b\nc\n", 3),
+            ],
+        ] {
+            assert!(cache
+                .apply_increment(&key, increment, Instant::now(), generation)
+                .is_err());
+        }
+
+        // The overlap re-reading the cached row agrees with it; a newer version supersedes a disagreeing tie.
         let index = cache
             .apply_increment(
                 &key,
-                vec![row(1, "stdout", "", "new\nextra\n", 1)],
+                vec![
+                    row(1, "stdout", "", "old\n", 1),
+                    row(2, "stdout", "", "a\n", 3),
+                    row(2, "stdout", "", "b\nc\n", 3),
+                    row(2, "stdout", "", "d\ne\nf\n", 4),
+                ],
                 Instant::now(),
                 generation,
             )
             .unwrap();
-
-        assert_eq!(index.total_lines, 2);
-        assert_eq!(index.chunks.len(), 1);
+        assert_eq!(index.total_lines, 4);
+        assert_eq!(index.chunks.len(), 2);
     }
 
     #[test]
