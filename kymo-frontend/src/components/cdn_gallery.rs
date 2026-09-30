@@ -304,9 +304,10 @@ fn file_groups(run_manifests: &[RunManifest]) -> Vec<(&str, &str, &[ManifestItem
         .collect()
 }
 
-/// Ok(None) is settled knowledge — a 404 (nothing at that key) or
-/// unparseable content, neither of which heals on retry. Err is transient
-/// (network failure, 5xx) and must be retried: a finished run's keys never
+/// Ok(None) is settled knowledge — a 404 (nothing at that key), a 400 (the
+/// hosted route's answer to a malformed key, which ingest stores unvalidated)
+/// or unparseable content, none of which heals on retry. Err (a network
+/// failure or any other status) must be retried: a finished run's keys never
 /// change, so a failure settled into the manifests resource would never be
 /// refetched.
 async fn fetch_manifest(cdn_key: &str) -> Result<Option<Manifest>, String> {
@@ -315,7 +316,7 @@ async fn fetch_manifest(cdn_key: &str) -> Result<Option<Manifest>, String> {
         .send()
         .await
         .map_err(|e| e.to_string())?;
-    if resp.status() == 404 {
+    if matches!(resp.status(), 400 | 404) {
         return Ok(None);
     }
     if !resp.ok() {
@@ -432,9 +433,7 @@ pub fn CdnGallery(
         keys_signal.set(run_keys.clone());
     }
 
-    // Fetch ALL manifests for this step (one per run) — concurrently, with
-    // per-manifest retry, so one transiently-failing manifest neither
-    // blocks the others nor settles as missing.
+    // Fetch this step's manifests concurrently, retrying each until it settles; the step publishes once every source has settled.
     let manifests = use_resource(move || {
         let keys = keys_signal.read().clone();
         async move {
@@ -452,8 +451,7 @@ pub fn CdnGallery(
         }
     });
 
-    // Classify the CDN sub-type as soon as a manifest is available and
-    // publish it upward so the BindingEditor only shows applicable panels.
+    // Publish the settled step's CDN sub-type upward so the BindingEditor only shows applicable panels.
     let mut cdn_class_sig = cdn_class;
     let class_keys = run_keys.clone();
     use_effect(move || {

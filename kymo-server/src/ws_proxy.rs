@@ -313,7 +313,7 @@ pub async fn ws_handler(
             let _frontend = activity
                 .as_ref()
                 .map(|activity| activity.frontend_connected());
-            handle_socket(socket, state.service, activity.is_some(), refused).await;
+            handle_socket(socket, state.service, local, refused).await;
         })
         .into_response()
 }
@@ -329,24 +329,27 @@ const MAX_IN_FLIGHT: usize = 64;
 /// runs' flushes stagger inside a second — they merge into one frame.
 const EVENT_COALESCE_MS: u64 = 1_000;
 
-/// Local sockets hold the stack up, so a peer that vanished without a close (a dropped SSH tunnel, a sleeping laptop) must be noticed. Browsers answer pings natively, even for hidden tabs.
+/// Every socket is pinged: an idle one otherwise carries no bytes, and a proxy with an idle timeout (nginx's default is 60 s) closes it. Browsers answer pings natively, even for hidden tabs.
 const KEEPALIVE_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+/// Only local sockets are dropped after this much silence: they hold the stack up, so a peer that vanished without a close (a dropped SSH tunnel, a sleeping laptop) must be noticed. Dropping a silent hosted socket would only make every tab reconnect and resync after a sleep.
 const KEEPALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-async fn handle_socket(socket: WebSocket, svc: Arc<KymoService>, keepalive: bool, refused: bool) {
+async fn handle_socket(socket: WebSocket, svc: Arc<KymoService>, drop_silent: bool, refused: bool) {
     let (mut sink, mut stream) = socket.split();
     // Requests run concurrently (a slow QueryChart must not stall the
     // others), so responses funnel through one writer task.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
-    let writer = tokio::spawn(async move {
+    let mut writer = tokio::spawn(async move {
         let mut ping = tokio::time::interval(KEEPALIVE_PING_INTERVAL);
         loop {
             let message = tokio::select! {
+                // A due ping goes ahead of queued responses, so a long queue can't delay the pong that keeps a local socket alive.
+                biased;
+                _ = ping.tick() => Message::Ping(Default::default()),
                 frame = rx.recv() => match frame {
                     Some(frame) => Message::Binary(frame.into()),
                     None => break,
                 },
-                _ = ping.tick(), if keepalive => Message::Ping(Default::default()),
             };
             if sink.send(message).await.is_err() {
                 break;
@@ -468,6 +471,12 @@ async fn handle_socket(socket: WebSocket, svc: Arc<KymoService>, keepalive: bool
                 }
             }
             _ = tick.tick(), if dirty_any && !quiet => {
+                // A full writer queue keeps the changes for a later tick instead of stalling this loop, which would leave the peer's frames and the silence deadline unpolled.
+                let permit = match tx.try_reserve() {
+                    Ok(permit) => permit,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(())) => continue,
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => break,
+                };
                 let ev = proto::RunVersionsEvent {
                     run_versions: std::mem::take(&mut dirty_runs),
                     project_versions: std::mem::take(&mut dirty_projects),
@@ -475,11 +484,12 @@ async fn handle_socket(socket: WebSocket, svc: Arc<KymoService>, keepalive: bool
                     metrics_changed_runs: dirty_metrics.drain().collect(),
                     resync: std::mem::take(&mut dirty_resync),
                 };
-                if tx.send(encode_response(0, &Ok(ev.encode_to_vec()))).await.is_err() {
-                    break;
-                }
+                permit.send(encode_response(0, &Ok(ev.encode_to_vec())));
             }
-            _ = tokio::time::sleep_until(last_heard + KEEPALIVE_TIMEOUT), if keepalive => break,
+            _ = tokio::time::sleep_until(last_heard + KEEPALIVE_TIMEOUT), if drop_silent => {
+                tracing::info!("ws: closing a local socket silent for {:?}", KEEPALIVE_TIMEOUT);
+                break;
+            }
         }
     }
     // Abort in-flight work before releasing the writer — the tasks hold tx
@@ -487,7 +497,6 @@ async fn handle_socket(socket: WebSocket, svc: Arc<KymoService>, keepalive: bool
     tasks.shutdown().await;
     drop(tx);
     // A peer that stopped reading can leave the writer blocked in `send` forever; it must not keep this socket counted as connected.
-    let mut writer = writer;
     if tokio::time::timeout(std::time::Duration::from_secs(5), &mut writer)
         .await
         .is_err()

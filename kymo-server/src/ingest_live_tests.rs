@@ -21,13 +21,7 @@ struct Fixture {
 
 impl Fixture {
     async fn new(pg_url: &str, ch_url: &str) -> Result<Self> {
-        let project = format!(
-            "ingest-timing-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_nanos()
-        );
+        let project = format!("ingest-timing-{}", crate::pg::unique_suffix());
         let pg = Arc::new(PgStore::connect(pg_url).await?);
         pg.ensure_run_metrics_run_fk().await?;
         let ch = Arc::new(ChClient::new(ch_url)?);
@@ -57,26 +51,10 @@ impl Fixture {
 
     async fn cleanup(&self) -> Result<()> {
         tokio::time::timeout(Duration::from_secs(60), async {
-            let client = self.ch.test_client();
-            for table in ["mkdb2.metrics", "mkdb2.metric_registry_outbox"] {
-                client
-                    .query(&format!(
-                        "ALTER TABLE {table} DELETE WHERE project_id = ? SETTINGS mutations_sync = 2"
-                    ))
-                    .bind(&self.project)
-                    .execute()
-                    .await?;
-            }
-            let mut tx = self.pg.test_pool().begin().await?;
-            // Production's foreign keys cascade registry and rich-mutation rows.
-            for table in ["runs", "run_ids", "purged_runs", "project_activity", "projects"] {
-                sqlx::query(&format!("DELETE FROM {table} WHERE project_id = $1"))
-                    .bind(&self.project)
-                    .execute(&mut *tx)
-                    .await?;
-            }
-            tx.commit().await?;
-            Ok(())
+            self.ch.delete_live_project(&self.project).await?;
+            self.pg
+                .delete_live_projects(std::slice::from_ref(&self.project))
+                .await
         })
         .await
         .context("ingest timing cleanup timed out")?
@@ -339,16 +317,9 @@ async fn wait_past_receipt(receipt: i64) -> Result<()> {
 }
 
 /// Each case owns one unique project and cleans up after success.
-/// Never fall back to service database configuration.
 async fn with_fixture(case: impl AsyncFnOnce(&mut Fixture, &str) -> Result<()>) -> Result<()> {
-    let pg_url = std::env::var("KYMO_LIVE_TEST_DATABASE_URL")
-        .context("KYMO_LIVE_TEST_DATABASE_URL is required")?;
-    let ch_url = std::env::var("KYMO_LIVE_TEST_CLICKHOUSE_URL")
-        .context("KYMO_LIVE_TEST_CLICKHOUSE_URL is required")?;
-    ensure!(
-        !pg_url.trim().is_empty() && !ch_url.trim().is_empty(),
-        "both live-test URLs must be nonempty"
-    );
+    let pg_url = crate::pg::live_test_url("KYMO_LIVE_TEST_DATABASE_URL")?;
+    let ch_url = crate::pg::live_test_url("KYMO_LIVE_TEST_CLICKHOUSE_URL")?;
     let _suite_guard = crate::pg::live_database_suite_gate().lock().await;
     let mut fixture = Fixture::new(&pg_url, &ch_url).await?;
     let run = format!("{}-run", fixture.project);

@@ -1053,25 +1053,14 @@ mod tests {
         supervisor.abort();
     }
 
-    /// Opt-in end-to-end check for the irreversible path. It deliberately
-    /// requires test-specific URLs so an ordinary `cargo test -- --ignored`
-    /// cannot point at the service's production databases by accident.
+    /// Opt-in end-to-end check for the irreversible path.
     #[tokio::test]
     #[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL and KYMO_LIVE_TEST_CLICKHOUSE_URL"]
     async fn live_reaper_claims_resumes_evicts_and_physically_deletes() -> Result<()> {
         let _suite_guard = crate::pg::live_database_suite_gate().lock().await;
-        let pg_url = std::env::var("KYMO_LIVE_TEST_DATABASE_URL")
-            .context("KYMO_LIVE_TEST_DATABASE_URL is required")?;
-        let ch_url = std::env::var("KYMO_LIVE_TEST_CLICKHOUSE_URL")
-            .context("KYMO_LIVE_TEST_CLICKHOUSE_URL is required")?;
-        let suffix = format!(
-            "{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
+        let pg_url = crate::pg::live_test_url("KYMO_LIVE_TEST_DATABASE_URL")?;
+        let ch_url = crate::pg::live_test_url("KYMO_LIVE_TEST_CLICKHOUSE_URL")?;
+        let suffix = crate::pg::unique_suffix();
         // Spaces and quotes exercise bound predicates plus String-partition
         // lookup in the ClickHouse deletion-headroom guard.
         let project_id = format!("reaper live 'test-{suffix}");
@@ -1139,14 +1128,13 @@ mod tests {
         // Age both rows without weakening production's seven-day rule, then
         // preclaim one as if a previous process died; the other exercises a
         // fresh claim in the same pass.
-        let raw_pg = sqlx::PgPool::connect(&pg_url).await?;
         sqlx::query(
             "UPDATE runs SET deleted_at = NOW() - INTERVAL '8 days'
              WHERE project_id = $1 AND run_id = ANY($2)",
         )
         .bind(&project_id)
         .bind(&run_ids)
-        .execute(&raw_pg)
+        .execute(pg.test_pool())
         .await?;
         let expired_versions = pg.poll_versions(Some(&project_id), &run_ids).await?;
         for run_id in &run_ids {
@@ -1167,7 +1155,7 @@ mod tests {
         )
         .bind(&project_id)
         .bind(&resumed_run_id)
-        .execute(&raw_pg)
+        .execute(pg.test_pool())
         .await?;
 
         // Exercise the cache-eviction leg as well as both queue branches. An
@@ -1241,22 +1229,8 @@ mod tests {
             crate::series_cache::Lookup::Miss
         ));
 
-        // Keep repeated local runs tidy while retaining the production
-        // tombstone behavior in the code under test until verification ends.
-        sqlx::query("DELETE FROM purged_runs WHERE project_id = $1 AND run_id = ANY($2)")
-            .bind(&project_id)
-            .bind(&run_ids)
-            .execute(&raw_pg)
-            .await?;
-        sqlx::query("DELETE FROM run_ids WHERE project_id = $1 AND run_id = ANY($2)")
-            .bind(&project_id)
-            .bind(&run_ids)
-            .execute(&raw_pg)
-            .await?;
-        sqlx::query("DELETE FROM projects WHERE project_id = $1")
-            .bind(&project_id)
-            .execute(&raw_pg)
-            .await?;
+        ch.delete_live_project(&project_id).await?;
+        pg.delete_live_projects(&[project_id]).await?;
         Ok(())
     }
 

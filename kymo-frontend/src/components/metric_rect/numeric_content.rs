@@ -12,6 +12,7 @@ use crate::state::chart_sync::{self, ChartCacheEntry};
 use crate::state::layout_config::{ema_time_constant, MetricBinding, RectOptions};
 use crate::state::visibility::{self, Zone};
 use crate::state::{resolve_capped_bindings, DashboardState};
+use crate::util::resize_observer::ElementResizeObserver;
 
 /// What one run of the chart resource produced. `use_resource` keeps the
 /// stale value across restarts, so the render must be able to tell whether
@@ -388,15 +389,9 @@ pub(super) fn NumericContent(
     // ResizeObserver so drag-resizes and window resizes refetch at the new
     // width; one bucket per pixel is the most a screen can show. Quantized
     // upward to 250s so minor layout shifts don't refetch.
-    // 0 = not yet measured (the fetch falls back to 800).
+    // 0 = not yet measured (the fetch waits for the first measurement).
     let mut chart_px = use_signal(|| 0u32);
-    let measure_id = use_hook(|| {
-        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        format!(
-            "mrect-measure-{}",
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        )
-    });
+    let mut width_observer = use_hook(|| CopyValue::new(None::<ElementResizeObserver>));
 
     // Per-run invalidation: this rect refetches only when one of ITS runs'
     // versions changes (or its run set changes) — another run logging
@@ -460,10 +455,7 @@ pub(super) fn NumericContent(
                 if *loading.peek() {
                     loading.set(false);
                 }
-                // Wait for the first width measurement instead of fetching at
-                // the 800-bucket fallback and refetching at the real width a
-                // frame later — that doubled every chart's page-open query.
-                // The ResizeObserver fires right after mount.
+                // Wait for the first width measurement (delivered right after mount): fetching before it would refetch at the real width a frame later, doubling every chart's page-open query.
                 if measured_px == 0 {
                     return ChartFetch::Unmeasured;
                 }
@@ -845,72 +837,31 @@ pub(super) fn NumericContent(
     };
 
     // Observe the rect's width (all states render inside this wrapper, so
-    // the observer exists before the first chart draws — ResizeObserver
-    // fires once on observe, which provides the initial measurement).
-    use_drop({
-        let measure_id = measure_id.clone();
-        move || {
-            // Stop the observer BEFORE its channel's Rust side is gone —
-            // RO callbacks (including the detach-time delivery) would
-            // otherwise throw in dioxus's glue where no call-site catch
-            // can reach.
-            let js = format!(
-                "let ros=window.__kymo_ros;if(ros&&ros['{measure_id}']){{ros['{measure_id}'].disconnect();delete ros['{measure_id}'];}}"
-            );
-            // spawn() would park this on the scope being torn down, where it
-            // is never polled (dioxus drains the dying scope's tasks before
-            // dropping hooks) — root-scope it so it actually runs.
-            dioxus::core::spawn_forever(async move {
-                let _ = document::eval(&js).await;
-            });
-        }
-    });
-
+    // the observer exists before the first chart draws).
     rsx! {
         div {
-            id: "{measure_id}",
             style: "width:100%",
-            onmounted: {
-                let measure_id = measure_id.clone();
-                move |_| {
-                    let js = format!(
-                        r#"(()=>{{
-let el=document.getElementById('{measure_id}');
-if(!el||el.__kymo_ro)return;
-// Registered globally so the component's use_drop can disconnect it: the
-// Rust side of this channel dies at unmount, and a send from a callback
-// that outlives it throws inside dioxus's queued glue — uncatchable at
-// this call site. The try/catch below is only a residual-race belt.
-window.__kymo_ros=window.__kymo_ros||{{}};
-el.__kymo_ro=new ResizeObserver(es=>{{
-  for(let e of es){{
-    try{{dioxus.send(e.contentRect.width*devicePixelRatio);}}
-    catch(_){{el.__kymo_ro.disconnect();el.__kymo_ro=null;break;}}
-  }}
-}});
-window.__kymo_ros['{measure_id}']=el.__kymo_ro;
-el.__kymo_ro.observe(el);
-}})()"#
-                    );
-                    spawn(async move {
-                        let mut eval = document::eval(&js);
-                        while let Ok(w) = eval.recv::<f64>().await {
-                            // Width 0 = hidden / not laid out (display:none
-                            // ancestor), not "narrow" — clamping it to the
-                            // 400px floor made invisible charts fetch. Keep
-                            // the gate shut (or the last real width) until
-                            // the rect actually has pixels.
-                            if w < 1.0 {
-                                continue;
-                            }
-                            let px = w.clamp(400.0, 4000.0) as u32;
-                            let q = px.div_ceil(250) * 250;
-                            if *chart_px.peek() != q {
-                                chart_px.set(q);
-                            }
-                        }
-                    });
-                }
+            onmounted: move |event| {
+                let Some(element) = event.data().downcast::<web_sys::Element>().cloned() else {
+                    return;
+                };
+                width_observer.set(Some(ElementResizeObserver::new(&element, move |entry| {
+                    let dpr = web_sys::window().map_or(1.0, |window| window.device_pixel_ratio());
+                    let w = entry.content_rect().width() * dpr;
+                    // Width 0 = hidden / not laid out (display:none
+                    // ancestor), not "narrow" — clamping it to the
+                    // 400px floor made invisible charts fetch. Keep
+                    // the gate shut (or the last real width) until
+                    // the rect actually has pixels.
+                    if w < 1.0 {
+                        return;
+                    }
+                    let px = w.clamp(400.0, 4000.0) as u32;
+                    let q = px.div_ceil(250) * 250;
+                    if *chart_px.peek() != q {
+                        chart_px.set(q);
+                    }
+                })));
             },
             {body}
         }

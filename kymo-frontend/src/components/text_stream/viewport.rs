@@ -1,7 +1,8 @@
 //! Fixed-row request planning, restoration decisions, and DOM measurement.
 
 use dioxus::prelude::*;
-use wasm_bindgen::{closure::Closure, JsCast};
+
+use crate::util::resize_observer::ElementResizeObserver;
 
 pub(super) const DEFAULT_LINE_HEIGHT_PX: u32 = 16;
 const OVERSCAN_LINES: u64 = 80;
@@ -191,42 +192,18 @@ impl ScrollViewport {
     }
 }
 
-// Dioxus 0.7.9's onresize does not unobserve on component removal.
-pub(super) struct TextResizeObserver {
-    observer: web_sys::ResizeObserver,
-    _callback: Closure<dyn FnMut()>,
-}
-
-impl TextResizeObserver {
-    pub(super) fn new(
-        element: &web_sys::HtmlElement,
-        mut viewport: Signal<ScrollViewport>,
-    ) -> Self {
-        let target = element.clone();
-        let callback = Closure::<dyn FnMut()>::new(move || {
-            if !target.is_connected() {
-                return;
-            }
-            // clientHeight changes when a horizontal scrollbar appears.
-            let height = target.offset_height().max(0) as u32;
-            if viewport.peek().height != height {
-                viewport.write().resized(height);
-            }
-        });
-        let observer = web_sys::ResizeObserver::new(callback.as_ref().unchecked_ref())
-            .expect("browser supports ResizeObserver");
-        observer.observe(element);
-        Self {
-            observer,
-            _callback: callback,
+pub(super) fn observe_height(
+    element: &web_sys::HtmlElement,
+    mut viewport: Signal<ScrollViewport>,
+) -> ElementResizeObserver {
+    let target = element.clone();
+    ElementResizeObserver::new(element, move |_| {
+        // clientHeight changes when a horizontal scrollbar appears.
+        let height = target.offset_height().max(0) as u32;
+        if viewport.peek().height != height {
+            viewport.write().resized(height);
         }
-    }
-}
-
-impl Drop for TextResizeObserver {
-    fn drop(&mut self) {
-        self.observer.disconnect();
-    }
+    })
 }
 
 #[cfg(test)]

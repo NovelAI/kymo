@@ -474,6 +474,21 @@ impl ChClient {
         &self.client
     }
 
+    /// Deletes a green live case's rows for its project from the metric tables and the registry outbox; each delete waits for its mutation.
+    #[cfg(test)]
+    pub(crate) async fn delete_live_project(&self, project_id: &str) -> Result<()> {
+        for table in [METRICS_TABLE, RICH_METRICS_TABLE, REGISTRY_OUTBOX_TABLE] {
+            self.client
+                .query(&format!(
+                    "ALTER TABLE {table} DELETE WHERE project_id = ? SETTINGS mutations_sync = 2"
+                ))
+                .bind(project_id)
+                .execute()
+                .await?;
+        }
+        Ok(())
+    }
+
     pub fn new(url: &str) -> Result<Self> {
         // Auth: CLICKHOUSE_USER defaults to "default"; CLICKHOUSE_PASSWORD is
         // empty when unset (local dev / pre-auth clusters). In production both
@@ -2885,15 +2900,8 @@ mod registry_outbox_tests {
     #[ignore = "requires KYMO_LIVE_TEST_CLICKHOUSE_URL"]
     async fn live_outbox_flushes_and_collapses_type_precedence() -> Result<()> {
         let _suite_guard = crate::pg::live_database_suite_gate().lock().await;
-        let url = std::env::var("KYMO_LIVE_TEST_CLICKHOUSE_URL")
-            .context("KYMO_LIVE_TEST_CLICKHOUSE_URL is required")?;
-        let suffix = format!(
-            "{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_nanos()
-        );
+        let url = crate::pg::live_test_url("KYMO_LIVE_TEST_CLICKHOUSE_URL")?;
+        let suffix = crate::pg::unique_suffix();
         let database = format!("registry_outbox_test_{suffix}");
         let source = format!("{database}.source");
         let target = format!("{database}.target");
@@ -2905,89 +2913,84 @@ mod registry_outbox_tests {
             .with_option("wait_for_async_insert", "0")
             .with_option("async_insert_busy_timeout_ms", "60000");
 
-        let exercise = async {
-            client
-                .query(&format!("CREATE DATABASE {database}"))
-                .execute()
+        client
+            .query(&format!("CREATE DATABASE {database}"))
+            .execute()
+            .await?;
+        client
+            .query(&format!(
+                "CREATE TABLE {source} (
+                    project_id String,
+                    run_id String,
+                    metric_name String,
+                    value Nullable(Float32),
+                    text_data Nullable(String)
+                ) ENGINE = MergeTree ORDER BY tuple()"
+            ))
+            .execute()
+            .await?;
+        ch.ensure_metric_registry_outbox(&source, &target, &view)
+            .await?;
+
+        for (value, text_data) in [
+            (None, None),
+            (Some(1.0), None),
+            (None, Some("text".to_string())),
+        ] {
+            let mut insert = client.insert(&source)?;
+            insert
+                .write(&LiveSourceRow {
+                    project_id: "project".to_string(),
+                    run_id: "run".to_string(),
+                    metric_name: "metric".to_string(),
+                    value,
+                    text_data,
+                })
                 .await?;
-            client
-                .query(&format!(
-                    "CREATE TABLE {source} (
-                        project_id String,
-                        run_id String,
-                        metric_name String,
-                        value Nullable(Float32),
-                        text_data Nullable(String)
-                    ) ENGINE = MergeTree ORDER BY tuple()"
-                ))
-                .execute()
-                .await?;
-            ch.ensure_metric_registry_outbox(&source, &target, &view)
-                .await?;
-
-            for (value, text_data) in [
-                (None, None),
-                (Some(1.0), None),
-                (None, Some("text".to_string())),
-            ] {
-                let mut insert = client.insert(&source)?;
-                insert
-                    .write(&LiveSourceRow {
-                        project_id: "project".to_string(),
-                        run_id: "run".to_string(),
-                        metric_name: "metric".to_string(),
-                        value,
-                        text_data,
-                    })
-                    .await?;
-                insert.end().await?;
-                ch.barrier_metrics_inserts().await?;
-            }
-
-            let mut cursor = ch.metric_registry_outbox_at(&target)?;
-            let mut rows = Vec::new();
-            while let Some(row) = cursor.next().await? {
-                rows.push(row);
-            }
-            anyhow::ensure!(
-                rows.len() == 1
-                    && rows[0].project_id == "project"
-                    && rows[0].run_id == "run"
-                    && rows[0].metric_name == "metric"
-                    && rows[0].metric_type == 3,
-                "expected one type-3 TEXT_STREAM-precedence row, got {} rows with first type {:?}",
-                rows.len(),
-                rows.first().map(|row| row.metric_type)
-            );
-
-            let storage = ch.metric_registry_outbox_storage_at(&target).await?;
-            anyhow::ensure!(
-                storage.rows > 0 && storage.bytes > 0 && storage.parts > 0,
-                "expected non-empty outbox storage, got {storage:?}"
-            );
-
-            drop(cursor);
-            ch.clear_metric_registry_outbox_at(&target).await?;
-            let empty_storage = ch.metric_registry_outbox_storage_at(&target).await?;
-            anyhow::ensure!(
-                empty_storage.rows == 0 && empty_storage.bytes == 0 && empty_storage.parts == 0,
-                "expected empty outbox storage after truncate, got {empty_storage:?}"
-            );
-            let remaining = client
-                .query(&format!("SELECT count() AS val FROM {target}"))
-                .fetch_one::<SingleCount>()
-                .await?
-                .val;
-            anyhow::ensure!(remaining == 0, "outbox truncate left {remaining} rows");
-            Result::<()>::Ok(())
+            insert.end().await?;
+            ch.barrier_metrics_inserts().await?;
         }
-        .await;
 
-        let _ = client
+        let mut cursor = ch.metric_registry_outbox_at(&target)?;
+        let mut rows = Vec::new();
+        while let Some(row) = cursor.next().await? {
+            rows.push(row);
+        }
+        anyhow::ensure!(
+            rows.len() == 1
+                && rows[0].project_id == "project"
+                && rows[0].run_id == "run"
+                && rows[0].metric_name == "metric"
+                && rows[0].metric_type == 3,
+            "expected one type-3 TEXT_STREAM-precedence row, got {} rows with first type {:?}",
+            rows.len(),
+            rows.first().map(|row| row.metric_type)
+        );
+
+        let storage = ch.metric_registry_outbox_storage_at(&target).await?;
+        anyhow::ensure!(
+            storage.rows > 0 && storage.bytes > 0 && storage.parts > 0,
+            "expected non-empty outbox storage, got {storage:?}"
+        );
+
+        drop(cursor);
+        ch.clear_metric_registry_outbox_at(&target).await?;
+        let empty_storage = ch.metric_registry_outbox_storage_at(&target).await?;
+        anyhow::ensure!(
+            empty_storage.rows == 0 && empty_storage.bytes == 0 && empty_storage.parts == 0,
+            "expected empty outbox storage after truncate, got {empty_storage:?}"
+        );
+        let remaining = client
+            .query(&format!("SELECT count() AS val FROM {target}"))
+            .fetch_one::<SingleCount>()
+            .await?
+            .val;
+        anyhow::ensure!(remaining == 0, "outbox truncate left {remaining} rows");
+        client
             .query(&format!("DROP DATABASE IF EXISTS {database} SYNC"))
             .execute()
-            .await;
-        exercise
+            .await?;
+        Ok(())
     }
 }
 

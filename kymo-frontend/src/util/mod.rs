@@ -2,6 +2,7 @@ pub(crate) mod clipboard;
 pub(crate) mod js_bridge;
 mod live_apply;
 pub mod local_storage;
+pub(crate) mod resize_observer;
 pub mod sections;
 
 pub use live_apply::use_live_apply;

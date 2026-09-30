@@ -954,8 +954,7 @@ mod tests {
     #[ignore = "requires KYMO_LIVE_TEST_CLICKHOUSE_URL"]
     async fn live_key_pattern_is_the_route_grammar() -> Result<()> {
         let _suite_guard = crate::pg::live_database_suite_gate().lock().await;
-        let url = std::env::var("KYMO_LIVE_TEST_CLICKHOUSE_URL")
-            .context("KYMO_LIVE_TEST_CLICKHOUSE_URL is required")?;
+        let url = crate::pg::live_test_url("KYMO_LIVE_TEST_CLICKHOUSE_URL")?;
         let ch = ChClient::new(&url)?;
         for sample in [
             key('a', "png").as_str(),
@@ -1008,15 +1007,10 @@ mod tests {
         }
 
         let _suite_guard = crate::pg::live_database_suite_gate().lock().await;
-        let url = std::env::var("KYMO_LIVE_TEST_CLICKHOUSE_URL")
-            .context("KYMO_LIVE_TEST_CLICKHOUSE_URL is required")?;
+        let url = crate::pg::live_test_url("KYMO_LIVE_TEST_CLICKHOUSE_URL")?;
         let ch = ChClient::new(&url)?;
         ch.ensure_schema().await?;
-        let run = format!(
-            "{}-{}",
-            std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-        );
+        let run = crate::pg::unique_suffix();
         let project_id = format!("cdn key index live {run}");
         let row =
             |metric_name: &str, step: i64, cdn_key: Option<String>| crate::clickhouse::MetricRow {
@@ -1063,15 +1057,6 @@ mod tests {
                     .await?,
             );
         }
-        for table in ["mkdb2.metrics", "mkdb2.metric_registry_outbox"] {
-            ch.test_client()
-                .query(&format!(
-                    "ALTER TABLE {table} DELETE WHERE project_id = ? SETTINGS mutations_sync = 2"
-                ))
-                .bind(&project_id)
-                .execute()
-                .await?;
-        }
 
         fn cdn_key_index_granules(node: &serde_json::Value) -> Option<(u64, u64)> {
             match node {
@@ -1097,6 +1082,7 @@ mod tests {
         );
         assert!(root_sets[0].refs >= 1, "{root_sets:?}");
         assert_eq!(root_sets[0], root_sets[1]);
+        ch.delete_live_project(&project_id).await?;
         Ok(())
     }
 
@@ -1123,17 +1109,12 @@ mod tests {
     async fn live_pass_deletes_only_unreachable_objects_past_the_grace() -> Result<()> {
         use object_store::memory::InMemory;
         let _suite_guard = crate::pg::live_database_suite_gate().lock().await;
-        let url = std::env::var("KYMO_LIVE_TEST_CLICKHOUSE_URL")
-            .context("KYMO_LIVE_TEST_CLICKHOUSE_URL is required")?;
+        let url = crate::pg::live_test_url("KYMO_LIVE_TEST_CLICKHOUSE_URL")?;
         let ch = Arc::new(ChClient::new(&url)?);
         ch.ensure_schema().await?;
 
         // Unique content per run: keys are content addresses, and the ack log and the children cache outlive the run.
-        let run = format!(
-            "{}-{}",
-            std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-        );
+        let run = crate::pg::unique_suffix();
         let bucket = Arc::new(InMemory::new());
         let put = |body: String, ext: &str| {
             let bucket = bucket.clone();
@@ -1356,19 +1337,7 @@ mod tests {
         ch.record_cdn_ack("", start + 1).await?;
         assert_eq!(ch.cdn_ack_log_start().await?, Some(start + 1));
 
-        for table in [
-            "mkdb2.metrics",
-            "mkdb2.rich_metrics",
-            "mkdb2.metric_registry_outbox",
-        ] {
-            ch.test_client()
-                .query(&format!(
-                    "ALTER TABLE {table} DELETE WHERE project_id = ? SETTINGS mutations_sync = 2"
-                ))
-                .bind(&project_id)
-                .execute()
-                .await?;
-        }
+        ch.delete_live_project(&project_id).await?;
         Ok(())
     }
 }

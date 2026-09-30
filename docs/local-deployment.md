@@ -26,7 +26,7 @@ Consequences:
 - Dashboard HTTP and its WebSocket are unauthenticated on a loopback-only port.
 - CDN GETs are unauthenticated on a second loopback-only origin, so passive resources can use ordinary `<img src>` and links.
 - `kymo open` passes only a stable, non-secret URL to the operating-system browser helper. It adds a timed supervisor hold; there is no bootstrap token, per-tab session, renewal protocol, or authenticated-upgrade handshake.
-- An open WebSocket counts as frontend presence and prevents idle shutdown. The server pings local sockets, so a peer that vanished without closing (a dropped SSH tunnel, a sleeping client) stops holding the stack within about a minute and a half.
+- An open WebSocket counts as frontend presence and prevents idle shutdown. The server pings every dashboard socket and drops a local one that has sent nothing for 60 seconds, so a peer that vanished without closing (a dropped SSH tunnel, a sleeping client) stops holding the stack within about a minute and a half.
 
 The server bearer, supervisor and lifecycle credentials, private native/upload/control Unix sockets, per-generation rotation, strict managed-root validation, and pinned ClickHouse TLS remain as defense in depth and operational isolation. They prevent accidental misuse and port conflicts, not access by another process already inside the trusted boundary. Credentials are still redacted from normal logs and diagnostics. Both browser listeners answer only `Host: 127.0.0.1:<port>` or `localhost:<port>`, which cheaply refuses DNS-rebinding requests.
 

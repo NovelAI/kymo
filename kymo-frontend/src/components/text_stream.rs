@@ -6,7 +6,7 @@ use memory::{
     text_run_key, text_scroll_key, TextPanelState,
 };
 use viewport::{
-    MeasuredViewport, ScrollAnchor, ScrollViewport, TextResizeObserver, VirtualWindow,
+    observe_height, MeasuredViewport, ScrollAnchor, ScrollViewport, VirtualWindow,
     DEFAULT_LINE_HEIGHT_PX,
 };
 
@@ -20,6 +20,7 @@ use crate::state::app_state::find_run;
 use crate::state::layout_config::XAxisMode;
 use crate::state::visibility::{self, Zone};
 use crate::state::{run_ordinal_for, DashboardState, UserConfigState};
+use crate::util::resize_observer::ElementResizeObserver;
 use crate::util::{is_app_escape, primary};
 
 /// Format a step value based on the X-axis mode.
@@ -338,7 +339,7 @@ fn VirtualTextLog(
     // Wait for layout and deduplicate unchanged request windows.
     let requested = use_memo(move || viewport.read().window(*line_height.read()));
     let mut body = use_signal(|| None::<web_sys::HtmlElement>);
-    let mut resize_observer = use_hook(|| CopyValue::new(None::<TextResizeObserver>));
+    let mut resize_observer = use_hook(|| CopyValue::new(None::<ElementResizeObserver>));
     let mut content = use_signal(|| None::<TextResponse>);
     let mut retry_tick = use_signal(|| 0u64);
 
@@ -498,7 +499,7 @@ fn VirtualTextLog(
                 let Some(element) = event.data().downcast::<web_sys::Element>()
                     .and_then(|element| element.dyn_ref::<web_sys::HtmlElement>()).cloned()
                 else { return; };
-                resize_observer.set(Some(TextResizeObserver::new(&element, viewport)));
+                resize_observer.set(Some(observe_height(&element, viewport)));
                 body.set(Some(element));
             },
             onscroll: move |event: Event<ScrollData>| {

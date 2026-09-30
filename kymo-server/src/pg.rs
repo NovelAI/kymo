@@ -22,8 +22,27 @@ const MAX_RESTORABLE_RUN_VERSION: i64 = i64::MAX - RESTORE_VERSION_INCREMENT;
 /// Serializes opt-in tests against the shared live databases, including global ownership-table changes and the ClickHouse insert barrier.
 #[cfg(test)]
 pub(crate) fn live_database_suite_gate() -> &'static tokio::sync::Mutex<()> {
-    static GATE: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-    GATE.get_or_init(|| tokio::sync::Mutex::new(()))
+    static GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    &GATE
+}
+
+/// A live test's database URL, from its own `KYMO_LIVE_TEST_*` variable only: these tests drop tables and bulk-delete rows, so there is never a fallback.
+#[cfg(test)]
+pub(crate) fn live_test_url(var: &str) -> Result<String> {
+    std::env::var(var)
+        .ok()
+        .filter(|url| !url.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("{var} is required"))
+}
+
+/// A fixture-identity suffix unique across runs. Underscore-separated so it also works in a ClickHouse database name.
+#[cfg(test)]
+pub(crate) fn unique_suffix() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{}_{nanos}", std::process::id())
 }
 
 // Keep the canonical projections in one place. These queries use the runtime
@@ -476,6 +495,26 @@ impl PgStore {
     #[cfg(test)]
     pub(crate) fn test_pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Deletes a green live case's rows for its projects from every table with a `project_id` column, children first, so cleanup never depends on which cascades a database has.
+    #[cfg(test)]
+    pub(crate) async fn delete_live_projects(&self, project_ids: &[String]) -> Result<()> {
+        for table in [
+            "rich_mutation_heads",
+            "run_metrics",
+            "runs",
+            "run_ids",
+            "purged_runs",
+            "project_activity",
+            "projects",
+        ] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE project_id = ANY($1)"))
+                .bind(project_ids)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -2576,122 +2615,94 @@ mod live_pg_tests {
     #[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL"]
     async fn live_list_runs_version_handles_empty_and_concurrent_snapshots() -> Result<()> {
         let _suite_guard = live_database_suite_gate().lock().await;
-        let pg_url = std::env::var("KYMO_LIVE_TEST_DATABASE_URL")
-            .map_err(|_| anyhow::anyhow!("KYMO_LIVE_TEST_DATABASE_URL is required"))?;
-        let suffix = format!(
-            "{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_nanos()
-        );
+        let pg_url = live_test_url("KYMO_LIVE_TEST_DATABASE_URL")?;
+        let suffix = unique_suffix();
         let project_id = format!("list-snapshot-{suffix}");
         let run_id = format!("run-{suffix}");
         let store = PgStore::connect(&pg_url).await?;
 
-        let test_result: Result<()> = async {
-            let missing = store.list_runs(&project_id).await?;
-            anyhow::ensure!(missing.rows.is_empty());
-            anyhow::ensure!(missing.project_version.is_none());
+        let missing = store.list_runs(&project_id).await?;
+        anyhow::ensure!(missing.rows.is_empty());
+        anyhow::ensure!(missing.project_version.is_none());
 
-            sqlx::query("INSERT INTO projects (project_id, version) VALUES ($1, 7)")
-                .bind(&project_id)
-                .execute(&store.pool)
-                .await?;
-            let empty = store.list_runs(&project_id).await?;
-            anyhow::ensure!(empty.rows.is_empty());
-            anyhow::ensure!(empty.project_version.is_none());
+        sqlx::query("INSERT INTO projects (project_id, version) VALUES ($1, 7)")
+            .bind(&project_id)
+            .execute(&store.pool)
+            .await?;
+        let empty = store.list_runs(&project_id).await?;
+        anyhow::ensure!(empty.rows.is_empty());
+        anyhow::ensure!(empty.project_version.is_none());
 
-            let initialized = store.init_run(&project_id, &run_id, "0", None).await?;
-            let initial_version = initialized.bumped_project;
-            let start = tokio::sync::Barrier::new(2);
-            // Every committed rename makes the name exactly the offset from the initial project version. Overlap real production reads and writes: a response may show either side, never a mixed pair.
-            tokio::time::timeout(Duration::from_secs(30), async {
-                let writer = async {
-                    start.wait().await;
-                    for generation in 1..=64 {
-                        let renamed = store
-                            .rename_run(&project_id, &run_id, &generation.to_string())
-                            .await?
-                            .context("rename lost the snapshot fixture")?;
-                        anyhow::ensure!(
-                            renamed.bumped_project == Some(initial_version + generation)
-                        );
-                    }
-                    Ok::<_, anyhow::Error>(())
-                };
-                let reader = async {
-                    start.wait().await;
-                    for _ in 0..128 {
-                        let snapshot = store.list_runs(&project_id).await?;
-                        anyhow::ensure!(snapshot.rows.len() == 1);
-                        let project_version = snapshot
-                            .project_version
-                            .context("nonempty list omitted its version")?;
-                        anyhow::ensure!(snapshot.server_now_ms > 0);
-                        anyhow::ensure!(
-                            snapshot.rows[0].run_name
-                                == (project_version - initial_version).to_string(),
-                            "ListRuns paired name {} with version {} (initial {})",
-                            snapshot.rows[0].run_name,
-                            project_version,
-                            initial_version
-                        );
-                    }
-                    Ok::<_, anyhow::Error>(())
-                };
-                tokio::try_join!(writer, reader)?;
+        let initialized = store.init_run(&project_id, &run_id, "0", None).await?;
+        let initial_version = initialized.bumped_project;
+        let start = tokio::sync::Barrier::new(2);
+        // Every committed rename makes the name exactly the offset from the initial project version. Overlap real production reads and writes: a response may show either side, never a mixed pair.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let writer = async {
+                start.wait().await;
+                for generation in 1..=64 {
+                    let renamed = store
+                        .rename_run(&project_id, &run_id, &generation.to_string())
+                        .await?
+                        .context("rename lost the snapshot fixture")?;
+                    anyhow::ensure!(renamed.bumped_project == Some(initial_version + generation));
+                }
                 Ok::<_, anyhow::Error>(())
-            })
-            .await
-            .context("concurrent snapshot test stalled")??;
+            };
+            let reader = async {
+                start.wait().await;
+                for _ in 0..128 {
+                    let snapshot = store.list_runs(&project_id).await?;
+                    anyhow::ensure!(snapshot.rows.len() == 1);
+                    let project_version = snapshot
+                        .project_version
+                        .context("nonempty list omitted its version")?;
+                    anyhow::ensure!(snapshot.server_now_ms > 0);
+                    anyhow::ensure!(
+                        snapshot.rows[0].run_name
+                            == (project_version - initial_version).to_string(),
+                        "ListRuns paired name {} with version {} (initial {})",
+                        snapshot.rows[0].run_name,
+                        project_version,
+                        initial_version
+                    );
+                }
+                Ok::<_, anyhow::Error>(())
+            };
+            tokio::try_join!(writer, reader)?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("concurrent snapshot test stalled")??;
 
-            let final_snapshot = store.list_runs(&project_id).await?;
-            anyhow::ensure!(final_snapshot.project_version == Some(initial_version + 64));
-            anyhow::ensure!(final_snapshot.rows[0].run_name == "64");
+        let final_snapshot = store.list_runs(&project_id).await?;
+        anyhow::ensure!(final_snapshot.project_version == Some(initial_version + 64));
+        anyhow::ensure!(final_snapshot.rows[0].run_name == "64");
 
-            let second_run_id = format!("second-{suffix}");
-            store
-                .init_run(&project_id, &second_run_id, "second", None)
-                .await?;
-            let ordered = store.list_runs(&project_id).await?;
-            anyhow::ensure!(ordered.project_version == Some(initial_version + 65));
-            anyhow::ensure!(ordered.rows.len() == 2);
-            anyhow::ensure!(ordered.rows[0].run_id == second_run_id);
-            anyhow::ensure!(ordered.rows[1].run_id == run_id);
+        let second_run_id = format!("second-{suffix}");
+        store
+            .init_run(&project_id, &second_run_id, "second", None)
+            .await?;
+        let ordered = store.list_runs(&project_id).await?;
+        anyhow::ensure!(ordered.project_version == Some(initial_version + 65));
+        anyhow::ensure!(ordered.rows.len() == 2);
+        anyhow::ensure!(ordered.rows[0].run_id == second_run_id);
+        anyhow::ensure!(ordered.rows[1].run_id == run_id);
 
-            // Empty active membership has no token even when PollVersions knows the deletion's bump, preserving the conservative covering refresh for trash-only projects.
-            store
-                .trash_runs_chunk(
-                    &project_id,
-                    &[run_id.clone(), second_run_id],
-                    &HashMap::new(),
-                )
-                .await?;
-            let trashed = store.list_runs(&project_id).await?;
-            let polled = store.poll_versions(Some(&project_id), &[]).await?;
-            anyhow::ensure!(trashed.rows.is_empty());
-            anyhow::ensure!(trashed.project_version.is_none());
-            anyhow::ensure!(polled.project_version == initial_version + 66);
-            Ok(())
-        }
-        .await;
-        let cleanup_runs = sqlx::query("DELETE FROM runs WHERE project_id = $1")
-            .bind(&project_id)
-            .execute(&store.pool)
-            .await;
-        let cleanup_run_ids = sqlx::query("DELETE FROM run_ids WHERE project_id = $1")
-            .bind(&project_id)
-            .execute(&store.pool)
-            .await;
-        let cleanup_project = sqlx::query("DELETE FROM projects WHERE project_id = $1")
-            .bind(&project_id)
-            .execute(&store.pool)
-            .await;
-        test_result?;
-        cleanup_runs?;
-        cleanup_run_ids?;
-        cleanup_project?;
+        // Empty active membership has no token even when PollVersions knows the deletion's bump, preserving the conservative covering refresh for trash-only projects.
+        store
+            .trash_runs_chunk(
+                &project_id,
+                &[run_id.clone(), second_run_id],
+                &HashMap::new(),
+            )
+            .await?;
+        let trashed = store.list_runs(&project_id).await?;
+        let polled = store.poll_versions(Some(&project_id), &[]).await?;
+        anyhow::ensure!(trashed.rows.is_empty());
+        anyhow::ensure!(trashed.project_version.is_none());
+        anyhow::ensure!(polled.project_version == initial_version + 66);
+        store.delete_live_projects(&[project_id]).await?;
         Ok(())
     }
 
@@ -2699,91 +2710,69 @@ mod live_pg_tests {
     #[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL"]
     async fn live_rich_writer_epochs_and_mutation_cas_are_monotonic() -> Result<()> {
         let _suite_guard = live_database_suite_gate().lock().await;
-        let pg_url = std::env::var("KYMO_LIVE_TEST_DATABASE_URL")
-            .map_err(|_| anyhow::anyhow!("KYMO_LIVE_TEST_DATABASE_URL is required"))?;
-        let suffix = format!(
-            "{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
+        let pg_url = live_test_url("KYMO_LIVE_TEST_DATABASE_URL")?;
+        let suffix = unique_suffix();
         let project_id = format!("rich-order-{suffix}");
         let run_id = format!("run-{suffix}");
         let store = PgStore::connect(&pg_url).await?;
 
-        let test_result: Result<()> = async {
-            let first = store.init_run(&project_id, &run_id, "first", None).await?;
-            let second = store.init_run(&project_id, &run_id, "second", None).await?;
-            anyhow::ensure!(second.writer_epoch == first.writer_epoch + 1);
-            let low = (u64::from(first.writer_epoch) << 32) | 7;
-            let high = (u64::from(second.writer_epoch) << 32) | 1;
-            let unallocated = (u64::from(second.writer_epoch + 1) << 32) | 1;
-            macro_rules! candidate {
-                ($version:expr, $resource:expr) => {
-                    RichMutationCandidate {
-                        project_id: &project_id,
-                        run_id: &run_id,
-                        metric_name: "info/run_info",
-                        tag: "",
-                        step: 0,
-                        mutation_version: $version,
-                        public_resource_id: $resource,
-                    }
-                };
-            }
-            anyhow::ensure!(matches!(
-                store
-                    .compare_rich_mutation(candidate!(unallocated, "future.json"))
-                    .await?,
-                RichMutationDecision::UnallocatedEpoch { current_epoch }
-                    if current_epoch == second.writer_epoch
-            ));
-            anyhow::ensure!(matches!(
-                store
-                    .compare_rich_mutation(candidate!(low, "old.json"))
-                    .await?,
-                RichMutationDecision::Accepted
-            ));
-            anyhow::ensure!(matches!(
-                store
-                    .compare_rich_mutation(candidate!(low, "old.json"))
-                    .await?,
-                RichMutationDecision::Idempotent
-            ));
-            anyhow::ensure!(matches!(
-                store
-                    .compare_rich_mutation(candidate!(low, "different.json"))
-                    .await?,
-                RichMutationDecision::Conflict { .. }
-            ));
-            anyhow::ensure!(matches!(
-                store
-                    .compare_rich_mutation(candidate!(high, "new.json"))
-                    .await?,
-                RichMutationDecision::Accepted
-            ));
-            anyhow::ensure!(matches!(
-                store
-                    .compare_rich_mutation(candidate!(low, "old.json"))
-                    .await?,
-                RichMutationDecision::Superseded { stored_version } if stored_version == high
-            ));
-            Ok(())
+        let first = store.init_run(&project_id, &run_id, "first", None).await?;
+        let second = store.init_run(&project_id, &run_id, "second", None).await?;
+        anyhow::ensure!(second.writer_epoch == first.writer_epoch + 1);
+        let low = (u64::from(first.writer_epoch) << 32) | 7;
+        let high = (u64::from(second.writer_epoch) << 32) | 1;
+        let unallocated = (u64::from(second.writer_epoch + 1) << 32) | 1;
+        macro_rules! candidate {
+            ($version:expr, $resource:expr) => {
+                RichMutationCandidate {
+                    project_id: &project_id,
+                    run_id: &run_id,
+                    metric_name: "info/run_info",
+                    tag: "",
+                    step: 0,
+                    mutation_version: $version,
+                    public_resource_id: $resource,
+                }
+            };
         }
-        .await;
-        let cleanup_runs = sqlx::query("DELETE FROM runs WHERE project_id = $1")
-            .bind(&project_id)
-            .execute(&store.pool)
-            .await;
-        let cleanup_project = sqlx::query("DELETE FROM projects WHERE project_id = $1")
-            .bind(&project_id)
-            .execute(&store.pool)
-            .await;
-        test_result?;
-        cleanup_runs?;
-        cleanup_project?;
+        anyhow::ensure!(matches!(
+            store
+                .compare_rich_mutation(candidate!(unallocated, "future.json"))
+                .await?,
+            RichMutationDecision::UnallocatedEpoch { current_epoch }
+                if current_epoch == second.writer_epoch
+        ));
+        anyhow::ensure!(matches!(
+            store
+                .compare_rich_mutation(candidate!(low, "old.json"))
+                .await?,
+            RichMutationDecision::Accepted
+        ));
+        anyhow::ensure!(matches!(
+            store
+                .compare_rich_mutation(candidate!(low, "old.json"))
+                .await?,
+            RichMutationDecision::Idempotent
+        ));
+        anyhow::ensure!(matches!(
+            store
+                .compare_rich_mutation(candidate!(low, "different.json"))
+                .await?,
+            RichMutationDecision::Conflict { .. }
+        ));
+        anyhow::ensure!(matches!(
+            store
+                .compare_rich_mutation(candidate!(high, "new.json"))
+                .await?,
+            RichMutationDecision::Accepted
+        ));
+        anyhow::ensure!(matches!(
+            store
+                .compare_rich_mutation(candidate!(low, "old.json"))
+                .await?,
+            RichMutationDecision::Superseded { stored_version } if stored_version == high
+        ));
+        store.delete_live_projects(&[project_id]).await?;
         Ok(())
     }
 
@@ -2791,16 +2780,8 @@ mod live_pg_tests {
     #[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL"]
     async fn live_import_run_backdates_and_finalize_converges() -> Result<()> {
         let _suite_guard = live_database_suite_gate().lock().await;
-        let pg_url = std::env::var("KYMO_LIVE_TEST_DATABASE_URL")
-            .map_err(|_| anyhow::anyhow!("KYMO_LIVE_TEST_DATABASE_URL is required"))?;
-        let suffix = format!(
-            "{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
+        let pg_url = live_test_url("KYMO_LIVE_TEST_DATABASE_URL")?;
+        let suffix = unique_suffix();
         let project_id = format!("import-{suffix}");
         let run_id = format!("run-{suffix}");
         let store = PgStore::connect(&pg_url).await?;
@@ -2810,89 +2791,70 @@ mod live_pg_tests {
         const END_MS: i64 = 1_680_003_700_000;
         const CORRECTED_END_MS: i64 = 1_680_003_800_000;
 
-        let test_result: Result<()> = async {
-            let created = store
-                .init_run(&project_id, &run_id, "imported", Some(CREATED_MS))
-                .await?;
-            anyhow::ensure!(created.row.created_at_ms == CREATED_MS);
-            anyhow::ensure!(created.row.last_main_metric_at_ms.is_none());
+        let created = store
+            .init_run(&project_id, &run_id, "imported", Some(CREATED_MS))
+            .await?;
+        anyhow::ensure!(created.row.created_at_ms == CREATED_MS);
+        anyhow::ensure!(created.row.last_main_metric_at_ms.is_none());
 
-            // Idempotent re-import: stored identity wins wholesale, and no
-            // liveness baseline appears (a replayed run must never look live).
-            let again = store
-                .init_run(&project_id, &run_id, "renamed", Some(CREATED_MS + 5_000))
-                .await?;
-            anyhow::ensure!(again.row.created_at_ms == CREATED_MS);
-            anyhow::ensure!(again.row.run_name == "imported");
-            anyhow::ensure!(again.bumped_run.is_none());
-            anyhow::ensure!(again.row.last_main_metric_at_ms.is_none());
-            anyhow::ensure!(again.row.exit_code.is_none());
+        // Idempotent re-import: stored identity wins wholesale, and no
+        // liveness baseline appears (a replayed run must never look live).
+        let again = store
+            .init_run(&project_id, &run_id, "renamed", Some(CREATED_MS + 5_000))
+            .await?;
+        anyhow::ensure!(again.row.created_at_ms == CREATED_MS);
+        anyhow::ensure!(again.row.run_name == "imported");
+        anyhow::ensure!(again.bumped_run.is_none());
+        anyhow::ensure!(again.row.last_main_metric_at_ms.is_none());
+        anyhow::ensure!(again.row.exit_code.is_none());
 
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_millis() as i64;
-            let finalized = store
-                .terminate_run(&project_id, &run_id, 1, Some(now_ms), Some(END_MS))
-                .await?
-                .context("finalize should find the run")?;
-            let row = store
-                .list_runs(&project_id)
-                .await?
-                .rows
-                .into_iter()
-                .find(|row| row.run_id == run_id)
-                .context("finalize hid the fixture run")?;
-            anyhow::ensure!(row.exit_code == Some(1));
-            anyhow::ensure!(row.terminated_at_ms == Some(END_MS));
-            // Heartbeat columns stay NULL for imported runs: the data lane
-            // never marks them and finalize leaves them alone.
-            anyhow::ensure!(row.last_main_metric_at_ms.is_none());
-            anyhow::ensure!(row.last_system_metric_at_ms.is_none());
-            anyhow::ensure!(row.last_ingested_at_ms.is_some());
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis() as i64;
+        let finalized = store
+            .terminate_run(&project_id, &run_id, 1, Some(now_ms), Some(END_MS))
+            .await?
+            .context("finalize should find the run")?;
+        let row = store
+            .list_runs(&project_id)
+            .await?
+            .rows
+            .into_iter()
+            .find(|row| row.run_id == run_id)
+            .context("finalize hid the fixture run")?;
+        anyhow::ensure!(row.exit_code == Some(1));
+        anyhow::ensure!(row.terminated_at_ms == Some(END_MS));
+        // Heartbeat columns stay NULL for imported runs: the data lane
+        // never marks them and finalize leaves them alone.
+        anyhow::ensure!(row.last_main_metric_at_ms.is_none());
+        anyhow::ensure!(row.last_system_metric_at_ms.is_none());
+        anyhow::ensure!(row.last_ingested_at_ms.is_some());
 
-            // Unlike live TerminateRun's COALESCE-keep, an archived end time is
-            // set unconditionally so a re-finalize converges on it.
-            let corrected = store
-                .terminate_run(
-                    &project_id,
-                    &run_id,
-                    0,
-                    Some(now_ms),
-                    Some(CORRECTED_END_MS),
-                )
-                .await?
-                .context("re-finalize should find the run")?;
-            let row = store
-                .list_runs(&project_id)
-                .await?
-                .rows
-                .into_iter()
-                .find(|row| row.run_id == run_id)
-                .context("re-finalize hid the fixture run")?;
-            anyhow::ensure!(row.exit_code == Some(0));
-            anyhow::ensure!(row.terminated_at_ms == Some(CORRECTED_END_MS));
-            anyhow::ensure!(row.last_main_metric_at_ms.is_none());
-            anyhow::ensure!(row.last_system_metric_at_ms.is_none());
-            anyhow::ensure!(corrected.bumped_run > finalized.bumped_run);
-            Ok(())
-        }
-        .await;
-        let cleanup_metrics = sqlx::query("DELETE FROM run_metrics WHERE project_id = $1")
-            .bind(&project_id)
-            .execute(&store.pool)
-            .await;
-        let cleanup_runs = sqlx::query("DELETE FROM runs WHERE project_id = $1")
-            .bind(&project_id)
-            .execute(&store.pool)
-            .await;
-        let cleanup_project = sqlx::query("DELETE FROM projects WHERE project_id = $1")
-            .bind(&project_id)
-            .execute(&store.pool)
-            .await;
-        test_result?;
-        cleanup_metrics?;
-        cleanup_runs?;
-        cleanup_project?;
+        // Unlike live TerminateRun's COALESCE-keep, an archived end time is
+        // set unconditionally so a re-finalize converges on it.
+        let corrected = store
+            .terminate_run(
+                &project_id,
+                &run_id,
+                0,
+                Some(now_ms),
+                Some(CORRECTED_END_MS),
+            )
+            .await?
+            .context("re-finalize should find the run")?;
+        let row = store
+            .list_runs(&project_id)
+            .await?
+            .rows
+            .into_iter()
+            .find(|row| row.run_id == run_id)
+            .context("re-finalize hid the fixture run")?;
+        anyhow::ensure!(row.exit_code == Some(0));
+        anyhow::ensure!(row.terminated_at_ms == Some(CORRECTED_END_MS));
+        anyhow::ensure!(row.last_main_metric_at_ms.is_none());
+        anyhow::ensure!(row.last_system_metric_at_ms.is_none());
+        anyhow::ensure!(corrected.bumped_run > finalized.bumped_run);
+        store.delete_live_projects(&[project_id]).await?;
         Ok(())
     }
 
@@ -2900,8 +2862,7 @@ mod live_pg_tests {
     #[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL"]
     async fn live_status_watch_candidates_accepts_shared_window_bind() -> Result<()> {
         let _suite_guard = live_database_suite_gate().lock().await;
-        let pg_url = std::env::var("KYMO_LIVE_TEST_DATABASE_URL")
-            .map_err(|_| anyhow::anyhow!("KYMO_LIVE_TEST_DATABASE_URL is required"))?;
+        let pg_url = live_test_url("KYMO_LIVE_TEST_DATABASE_URL")?;
         let store = PgStore::connect(&pg_url).await?;
         store.status_watch_candidates().await?;
         Ok(())
@@ -2911,146 +2872,112 @@ mod live_pg_tests {
     #[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL"]
     async fn live_run_id_claim_is_global_concurrent_and_idempotent() -> Result<()> {
         let _suite_guard = live_database_suite_gate().lock().await;
-        let pg_url = std::env::var("KYMO_LIVE_TEST_DATABASE_URL")
-            .map_err(|_| anyhow::anyhow!("KYMO_LIVE_TEST_DATABASE_URL is required"))?;
-        let suffix = format!(
-            "{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
+        let pg_url = live_test_url("KYMO_LIVE_TEST_DATABASE_URL")?;
+        let suffix = unique_suffix();
         let project_a = format!("run-owner-a-{suffix}");
         let project_b = format!("run-owner-b-{suffix}");
         let run_id = format!("global-run-{suffix}");
         let store = PgStore::connect(&pg_url).await?;
 
-        let test_result: Result<()> = async {
-            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
-            let barrier_a = barrier.clone();
-            let initialize_a = async {
-                barrier_a.wait().await;
-                store.init_run(&project_a, &run_id, "owner a", None).await
-            };
-            let initialize_b = async {
-                barrier.wait().await;
-                store.init_run(&project_b, &run_id, "owner b", None).await
-            };
-            let (result_a, result_b) = tokio::join!(initialize_a, initialize_b);
+        let barrier = tokio::sync::Barrier::new(2);
+        let initialize_a = async {
+            barrier.wait().await;
+            store.init_run(&project_a, &run_id, "owner a", None).await
+        };
+        let initialize_b = async {
+            barrier.wait().await;
+            store.init_run(&project_b, &run_id, "owner b", None).await
+        };
+        let (result_a, result_b) = tokio::join!(initialize_a, initialize_b);
 
-            let (owner_project, conflicting_project, conflict) = match (result_a, result_b) {
-                (Ok(_), Err(error)) => (&project_a, &project_b, error),
-                (Err(error), Ok(_)) => (&project_b, &project_a, error),
-                (Ok(_), Ok(_)) => anyhow::bail!("both projects claimed the same run id"),
-                (Err(a), Err(b)) => {
-                    anyhow::bail!("neither project claimed the run id: {a}; {b}")
-                }
-            };
-            anyhow::ensure!(
-                matches!(
-                    conflict,
-                    InitRunError::RunIdOwned {
-                        run_id: ref claimed_run_id,
-                        ref requested_project_id,
-                    } if claimed_run_id == &run_id && requested_project_id == conflicting_project
-                ),
-                "loser returned the wrong error: {conflict}"
-            );
-
-            let retry = store
-                .init_run(owner_project, &run_id, "retry", None)
-                .await?;
-            let expected_name = if owner_project == &project_a {
-                "owner a"
-            } else {
-                "owner b"
-            };
-            anyhow::ensure!(
-                retry.row.run_name == expected_name,
-                "same-owner retry replaced the canonical run name"
-            );
-            anyhow::ensure!(
-                retry.row.last_main_metric_at_ms.is_some(),
-                "same-owner retry did not refresh its liveness baseline"
-            );
-            anyhow::ensure!(
-                retry.row.last_system_metric_at_ms.is_none(),
-                "same-owner retry retained the previous execution's system heartbeat"
-            );
-            let stored_owner: String =
-                sqlx::query_scalar("SELECT project_id FROM run_ids WHERE run_id = $1")
-                    .bind(&run_id)
-                    .fetch_one(&store.pool)
-                    .await?;
-            anyhow::ensure!(stored_owner == *owner_project);
-
-            sqlx::query(
-                "UPDATE runs SET purging_at = NOW()
-                 WHERE project_id = $1 AND run_id = $2",
-            )
-            .bind(owner_project)
-            .bind(&run_id)
-            .execute(&store.pool)
-            .await?;
-            anyhow::ensure!(
-                store
-                    .finalize_purged_runs(owner_project, &[run_id.as_str()])
-                    .await?
-                    .is_some(),
-                "fixture purge was not finalized"
-            );
-            let reservation_survived: bool = sqlx::query_scalar(
-                "SELECT EXISTS(
-                    SELECT 1 FROM run_ids WHERE run_id = $1 AND project_id = $2
-                 )",
-            )
-            .bind(&run_id)
-            .bind(owner_project)
-            .fetch_one(&store.pool)
-            .await?;
-            anyhow::ensure!(reservation_survived, "purge deleted global ownership");
-
-            let post_purge_error = match store
-                .init_run(conflicting_project, &run_id, "post-purge reuse", None)
-                .await
-            {
-                Err(error) => error,
-                Ok(_) => anyhow::bail!("purge allowed run-ID reuse through InitRun"),
-            };
-            anyhow::ensure!(matches!(
-                post_purge_error,
+        let (owner_project, conflicting_project, conflict) = match (result_a, result_b) {
+            (Ok(_), Err(error)) => (&project_a, &project_b, error),
+            (Err(error), Ok(_)) => (&project_b, &project_a, error),
+            (Ok(_), Ok(_)) => anyhow::bail!("both projects claimed the same run id"),
+            (Err(a), Err(b)) => {
+                anyhow::bail!("neither project claimed the run id: {a}; {b}")
+            }
+        };
+        anyhow::ensure!(
+            matches!(
+                conflict,
                 InitRunError::RunIdOwned {
                     run_id: ref claimed_run_id,
                     ref requested_project_id,
                 } if claimed_run_id == &run_id && requested_project_id == conflicting_project
-            ));
-            Ok(())
-        }
-        .await;
+            ),
+            "loser returned the wrong error: {conflict}"
+        );
 
-        let cleanup_result: Result<()> = async {
-            sqlx::query("DELETE FROM runs WHERE project_id = ANY($1)")
-                .bind(vec![project_a.clone(), project_b.clone()])
-                .execute(&store.pool)
-                .await?;
-            sqlx::query("DELETE FROM purged_runs WHERE run_id = $1")
+        let retry = store
+            .init_run(owner_project, &run_id, "retry", None)
+            .await?;
+        let expected_name = if owner_project == &project_a {
+            "owner a"
+        } else {
+            "owner b"
+        };
+        anyhow::ensure!(
+            retry.row.run_name == expected_name,
+            "same-owner retry replaced the canonical run name"
+        );
+        anyhow::ensure!(
+            retry.row.last_main_metric_at_ms.is_some(),
+            "same-owner retry did not refresh its liveness baseline"
+        );
+        anyhow::ensure!(
+            retry.row.last_system_metric_at_ms.is_none(),
+            "same-owner retry retained the previous execution's system heartbeat"
+        );
+        let stored_owner: String =
+            sqlx::query_scalar("SELECT project_id FROM run_ids WHERE run_id = $1")
                 .bind(&run_id)
-                .execute(&store.pool)
+                .fetch_one(&store.pool)
                 .await?;
-            sqlx::query("DELETE FROM projects WHERE project_id = ANY($1)")
-                .bind(vec![project_a, project_b])
-                .execute(&store.pool)
-                .await?;
-            sqlx::query("DELETE FROM run_ids WHERE run_id = $1")
-                .bind(&run_id)
-                .execute(&store.pool)
-                .await?;
-            Ok(())
-        }
-        .await;
-        test_result?;
-        cleanup_result?;
+        anyhow::ensure!(stored_owner == *owner_project);
+
+        sqlx::query(
+            "UPDATE runs SET purging_at = NOW()
+             WHERE project_id = $1 AND run_id = $2",
+        )
+        .bind(owner_project)
+        .bind(&run_id)
+        .execute(&store.pool)
+        .await?;
+        anyhow::ensure!(
+            store
+                .finalize_purged_runs(owner_project, &[run_id.as_str()])
+                .await?
+                .is_some(),
+            "fixture purge was not finalized"
+        );
+        let reservation_survived: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM run_ids WHERE run_id = $1 AND project_id = $2
+             )",
+        )
+        .bind(&run_id)
+        .bind(owner_project)
+        .fetch_one(&store.pool)
+        .await?;
+        anyhow::ensure!(reservation_survived, "purge deleted global ownership");
+
+        let post_purge_error = match store
+            .init_run(conflicting_project, &run_id, "post-purge reuse", None)
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => anyhow::bail!("purge allowed run-ID reuse through InitRun"),
+        };
+        anyhow::ensure!(matches!(
+            post_purge_error,
+            InitRunError::RunIdOwned {
+                run_id: ref claimed_run_id,
+                ref requested_project_id,
+            } if claimed_run_id == &run_id && requested_project_id == conflicting_project
+        ));
+
+        store.delete_live_projects(&[project_a, project_b]).await?;
         Ok(())
     }
 
@@ -3058,16 +2985,8 @@ mod live_pg_tests {
     #[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL"]
     async fn live_run_id_schema_backfills_and_aborts_ambiguous_history() -> Result<()> {
         let _suite_guard = live_database_suite_gate().lock().await;
-        let pg_url = std::env::var("KYMO_LIVE_TEST_DATABASE_URL")
-            .map_err(|_| anyhow::anyhow!("KYMO_LIVE_TEST_DATABASE_URL is required"))?;
-        let suffix = format!(
-            "{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
+        let pg_url = live_test_url("KYMO_LIVE_TEST_DATABASE_URL")?;
+        let suffix = unique_suffix();
         let project_a = format!("ownership-migration-a-{suffix}");
         let project_b = format!("ownership-migration-b-{suffix}");
         let active_run = format!("ownership-active-{suffix}");
@@ -3075,132 +2994,102 @@ mod live_pg_tests {
         let duplicate_run = format!("ownership-duplicate-{suffix}");
         let store = PgStore::connect(&pg_url).await?;
 
-        let test_result: Result<()> = async {
-            sqlx::query("DROP TABLE run_ids")
-                .execute(&store.pool)
-                .await?;
-            for project_id in [&project_a, &project_b] {
-                sqlx::query(
-                    "INSERT INTO projects (project_id) VALUES ($1)
-                     ON CONFLICT (project_id) DO NOTHING",
-                )
-                .bind(project_id)
-                .execute(&store.pool)
-                .await?;
-            }
+        sqlx::query("DROP TABLE run_ids")
+            .execute(&store.pool)
+            .await?;
+        for project_id in [&project_a, &project_b] {
             sqlx::query(
-                "INSERT INTO runs (project_id, run_id, run_name, ordinal)
-                 VALUES ($1, $2, 'active fixture', 1)",
+                "INSERT INTO projects (project_id) VALUES ($1)
+                 ON CONFLICT (project_id) DO NOTHING",
             )
-            .bind(&project_a)
+            .bind(project_id)
+            .execute(&store.pool)
+            .await?;
+        }
+        sqlx::query(
+            "INSERT INTO runs (project_id, run_id, run_name, ordinal)
+             VALUES ($1, $2, 'active fixture', 1)",
+        )
+        .bind(&project_a)
+        .bind(&active_run)
+        .execute(&store.pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO purged_runs (project_id, run_id)
+             VALUES ($1, $2)",
+        )
+        .bind(&project_b)
+        .bind(&purged_run)
+        .execute(&store.pool)
+        .await?;
+
+        store.ensure_schema().await?;
+        let owners: Vec<(String, String)> = sqlx::query_as(
+            "SELECT run_id, project_id FROM run_ids
+             WHERE run_id = ANY($1) ORDER BY run_id",
+        )
+        .bind(vec![active_run.clone(), purged_run.clone()])
+        .fetch_all(&store.pool)
+        .await?;
+        anyhow::ensure!(
+            owners
+                == vec![
+                    (active_run.clone(), project_a.clone()),
+                    (purged_run.clone(), project_b.clone()),
+                ]
+        );
+
+        sqlx::query("UPDATE run_ids SET project_id = $2 WHERE run_id = $1")
             .bind(&active_run)
-            .execute(&store.pool)
-            .await?;
-            sqlx::query(
-                "INSERT INTO purged_runs (project_id, run_id)
-                 VALUES ($1, $2)",
-            )
             .bind(&project_b)
-            .bind(&purged_run)
             .execute(&store.pool)
             .await?;
+        let error = store
+            .ensure_schema()
+            .await
+            .expect_err("a wrong registry owner passed ownership verification");
+        anyhow::ensure!(
+            error
+                .to_string()
+                .contains(&format!("1 run(s), first {active_run}")),
+            "unexpected ownership error: {error}"
+        );
 
-            store.ensure_schema().await?;
-            let owners: Vec<(String, String)> = sqlx::query_as(
-                "SELECT run_id, project_id FROM run_ids
-                 WHERE run_id = ANY($1) ORDER BY run_id",
-            )
-            .bind(vec![active_run.clone(), purged_run.clone()])
-            .fetch_all(&store.pool)
-            .await?;
-            anyhow::ensure!(
-                owners
-                    == vec![
-                        (active_run.clone(), project_a.clone()),
-                        (purged_run.clone(), project_b.clone()),
-                    ]
-            );
-
-            sqlx::query("UPDATE run_ids SET project_id = $2 WHERE run_id = $1")
-                .bind(&active_run)
-                .bind(&project_b)
-                .execute(&store.pool)
-                .await?;
-            let error = store
-                .ensure_schema()
-                .await
-                .expect_err("a wrong registry owner passed ownership verification");
-            anyhow::ensure!(
-                error
-                    .to_string()
-                    .contains(&format!("1 run(s), first {active_run}")),
-                "unexpected ownership error: {error}"
-            );
-
-            sqlx::query("DROP TABLE run_ids")
-                .execute(&store.pool)
-                .await?;
-            sqlx::query(
-                "INSERT INTO runs (project_id, run_id, run_name, ordinal)
-                 VALUES ($1, $3, 'duplicate a', 2),
-                        ($2, $3, 'duplicate b', 1)",
-            )
-            .bind(&project_a)
-            .bind(&project_b)
-            .bind(&duplicate_run)
+        sqlx::query("DROP TABLE run_ids")
             .execute(&store.pool)
             .await?;
+        sqlx::query(
+            "INSERT INTO runs (project_id, run_id, run_name, ordinal)
+             VALUES ($1, $3, 'duplicate a', 2),
+                    ($2, $3, 'duplicate b', 1)",
+        )
+        .bind(&project_a)
+        .bind(&project_b)
+        .bind(&duplicate_run)
+        .execute(&store.pool)
+        .await?;
 
-            let error = store
-                .ensure_schema()
-                .await
-                .expect_err("ambiguous history passed ownership migration");
-            anyhow::ensure!(error.to_string().contains("cross-project duplicate"));
-            let registry_exists: bool =
-                sqlx::query_scalar("SELECT to_regclass('public.run_ids') IS NOT NULL")
-                    .fetch_one(&store.pool)
-                    .await?;
-            anyhow::ensure!(
-                !registry_exists,
-                "failed ownership migration did not roll back"
-            );
-            Ok(())
-        }
-        .await;
+        let error = store
+            .ensure_schema()
+            .await
+            .expect_err("ambiguous history passed ownership migration");
+        anyhow::ensure!(error.to_string().contains("cross-project duplicate"));
+        let registry_exists: bool =
+            sqlx::query_scalar("SELECT to_regclass('public.run_ids') IS NOT NULL")
+                .fetch_one(&store.pool)
+                .await?;
+        anyhow::ensure!(
+            !registry_exists,
+            "failed ownership migration did not roll back"
+        );
 
-        let cleanup_result: Result<()> = async {
-            sqlx::query("DELETE FROM runs WHERE project_id = ANY($1)")
-                .bind(vec![project_a.clone(), project_b.clone()])
-                .execute(&store.pool)
-                .await?;
-            sqlx::query("DELETE FROM purged_runs WHERE project_id = ANY($1)")
-                .bind(vec![project_a.clone(), project_b.clone()])
-                .execute(&store.pool)
-                .await?;
-            let registry_exists: bool =
-                sqlx::query_scalar("SELECT to_regclass('public.run_ids') IS NOT NULL")
-                    .fetch_one(&store.pool)
-                    .await?;
-            if registry_exists {
-                sqlx::query("DELETE FROM run_ids WHERE run_id = ANY($1)")
-                    .bind(vec![active_run, purged_run, duplicate_run])
-                    .execute(&store.pool)
-                    .await?;
-            }
-            sqlx::query("DELETE FROM projects WHERE project_id = ANY($1)")
-                .bind(vec![project_a, project_b])
-                .execute(&store.pool)
-                .await?;
-            Ok(())
-        }
-        .await;
-        // Always attempt both cleanup and schema restoration. The deliberate
-        // duplicate must be gone before ensure_schema can reinstall the
-        // registry for the rest of the shared live suite.
-        let restore_result = store.ensure_schema().await;
-        test_result?;
-        cleanup_result?;
-        restore_result?;
+        // The run_ids registry is still dropped here, and the deliberate duplicate must be gone before ensure_schema can reinstall it for the rest of the shared live suite.
+        sqlx::query("DELETE FROM runs WHERE project_id = ANY($1)")
+            .bind(vec![project_a.clone(), project_b.clone()])
+            .execute(&store.pool)
+            .await?;
+        store.ensure_schema().await?;
+        store.delete_live_projects(&[project_a, project_b]).await?;
         Ok(())
     }
 
@@ -3208,95 +3097,66 @@ mod live_pg_tests {
     #[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL"]
     async fn live_registry_is_idempotent_upgrade_only_and_skips_orphans() -> Result<()> {
         let _suite_guard = live_database_suite_gate().lock().await;
-        let pg_url = std::env::var("KYMO_LIVE_TEST_DATABASE_URL")
-            .map_err(|_| anyhow::anyhow!("KYMO_LIVE_TEST_DATABASE_URL is required"))?;
-        let suffix = format!(
-            "{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
+        let pg_url = live_test_url("KYMO_LIVE_TEST_DATABASE_URL")?;
+        let suffix = unique_suffix();
         let project_id = format!("registry-{suffix}");
         let run_id = format!("run-{suffix}");
         let orphan_run_id = format!("orphan-{suffix}");
         let store = PgStore::connect(&pg_url).await?;
 
-        let test_result: Result<()> = async {
-            store
-                .init_run(&project_id, &run_id, "registry test", None)
-                .await?;
-            let cdn = (
-                project_id.clone(),
-                run_id.clone(),
-                "metric".to_string(),
-                "CDN".to_string(),
-            );
-            let orphan = (
-                project_id.clone(),
-                orphan_run_id.clone(),
-                "ghost".to_string(),
-                "TEXT_STREAM".to_string(),
-            );
-            anyhow::ensure!(
-                store.register_run_metrics(&[cdn.clone(), orphan]).await? == vec![run_id.clone()]
-            );
-            anyhow::ensure!(store
-                .register_run_metrics(std::slice::from_ref(&cdn))
-                .await?
-                .is_empty());
-
-            let numeric = (
-                project_id.clone(),
-                run_id.clone(),
-                "metric".to_string(),
-                "NUMERIC".to_string(),
-            );
-            anyhow::ensure!(store.register_run_metrics(&[numeric]).await? == vec![run_id.clone()]);
-            anyhow::ensure!(store.register_run_metrics(&[cdn]).await?.is_empty());
-
-            let text = (
-                project_id.clone(),
-                run_id.clone(),
-                "metric".to_string(),
-                "TEXT_STREAM".to_string(),
-            );
-            anyhow::ensure!(store.register_run_metrics(&[text]).await? == vec![run_id.clone()]);
-
-            let rows: Vec<(String, String, String)> = sqlx::query_as(
-                "SELECT run_id, metric_name, metric_type
-                 FROM run_metrics WHERE project_id = $1 ORDER BY run_id, metric_name",
-            )
-            .bind(&project_id)
-            .fetch_all(&store.pool)
+        store
+            .init_run(&project_id, &run_id, "registry test", None)
             .await?;
-            anyhow::ensure!(
-                rows == vec![(run_id.clone(), "metric".into(), "TEXT_STREAM".into())],
-                "registry rows were {rows:?}"
-            );
-            Ok(())
-        }
-        .await;
+        let cdn = (
+            project_id.clone(),
+            run_id.clone(),
+            "metric".to_string(),
+            "CDN".to_string(),
+        );
+        let orphan = (
+            project_id.clone(),
+            orphan_run_id.clone(),
+            "ghost".to_string(),
+            "TEXT_STREAM".to_string(),
+        );
+        anyhow::ensure!(
+            store.register_run_metrics(&[cdn.clone(), orphan]).await? == vec![run_id.clone()]
+        );
+        anyhow::ensure!(store
+            .register_run_metrics(std::slice::from_ref(&cdn))
+            .await?
+            .is_empty());
 
-        let cleanup_result: Result<()> = async {
-            sqlx::query("DELETE FROM runs WHERE project_id = $1")
-                .bind(&project_id)
-                .execute(&store.pool)
-                .await?;
-            sqlx::query("DELETE FROM run_ids WHERE project_id = $1")
-                .bind(&project_id)
-                .execute(&store.pool)
-                .await?;
-            sqlx::query("DELETE FROM projects WHERE project_id = $1")
-                .bind(&project_id)
-                .execute(&store.pool)
-                .await?;
-            Ok(())
-        }
-        .await;
-        test_result?;
-        cleanup_result?;
+        let numeric = (
+            project_id.clone(),
+            run_id.clone(),
+            "metric".to_string(),
+            "NUMERIC".to_string(),
+        );
+        anyhow::ensure!(store.register_run_metrics(&[numeric]).await? == vec![run_id.clone()]);
+        anyhow::ensure!(store.register_run_metrics(&[cdn]).await?.is_empty());
+
+        let text = (
+            project_id.clone(),
+            run_id.clone(),
+            "metric".to_string(),
+            "TEXT_STREAM".to_string(),
+        );
+        anyhow::ensure!(store.register_run_metrics(&[text]).await? == vec![run_id.clone()]);
+
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT run_id, metric_name, metric_type
+             FROM run_metrics WHERE project_id = $1 ORDER BY run_id, metric_name",
+        )
+        .bind(&project_id)
+        .fetch_all(&store.pool)
+        .await?;
+        anyhow::ensure!(
+            rows == vec![(run_id.clone(), "metric".into(), "TEXT_STREAM".into())],
+            "registry rows were {rows:?}"
+        );
+
+        store.delete_live_projects(&[project_id]).await?;
         Ok(())
     }
 
@@ -3304,195 +3164,163 @@ mod live_pg_tests {
     #[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL"]
     async fn live_rename_versions_and_concurrent_lifecycle_lock_order() -> Result<()> {
         let _suite_guard = live_database_suite_gate().lock().await;
-        let pg_url = std::env::var("KYMO_LIVE_TEST_DATABASE_URL")
-            .map_err(|_| anyhow::anyhow!("KYMO_LIVE_TEST_DATABASE_URL is required"))?;
-        let suffix = format!(
-            "{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
+        let pg_url = live_test_url("KYMO_LIVE_TEST_DATABASE_URL")?;
+        let suffix = unique_suffix();
         let project_id = format!("rename-{suffix}");
         let run_id = format!("run-{suffix}");
         let store = PgStore::connect(&pg_url).await?;
 
-        let test_result: Result<()> = async {
-            let initialized = store
-                .init_run(&project_id, &run_id, "original", None)
-                .await?;
+        let initialized = store
+            .init_run(&project_id, &run_id, "original", None)
+            .await?;
 
-            let renamed = store
-                .rename_run(&project_id, &run_id, "renamed")
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("rename did not find the fixture run"))?;
-            anyhow::ensure!(renamed.row.run_name == "renamed");
-            anyhow::ensure!(
-                renamed.bumped_project == Some(initialized.bumped_project + 1),
-                "rename project bump was {:?}, initialized at {}",
-                renamed.bumped_project,
-                initialized.bumped_project
-            );
+        let renamed = store
+            .rename_run(&project_id, &run_id, "renamed")
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("rename did not find the fixture run"))?;
+        anyhow::ensure!(renamed.row.run_name == "renamed");
+        anyhow::ensure!(
+            renamed.bumped_project == Some(initialized.bumped_project + 1),
+            "rename project bump was {:?}, initialized at {}",
+            renamed.bumped_project,
+            initialized.bumped_project
+        );
 
-            let unchanged = store
-                .rename_run(&project_id, &run_id, "renamed")
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("idempotent rename lost the fixture run"))?;
-            anyhow::ensure!(unchanged.row.run_name == "renamed");
-            anyhow::ensure!(
-                unchanged.bumped_project.is_none(),
-                "idempotent rename unexpectedly bumped the project"
-            );
+        let unchanged = store
+            .rename_run(&project_id, &run_id, "renamed")
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("idempotent rename lost the fixture run"))?;
+        anyhow::ensure!(unchanged.row.run_name == "renamed");
+        anyhow::ensure!(
+            unchanged.bumped_project.is_none(),
+            "idempotent rename unexpectedly bumped the project"
+        );
 
-            let final_ingested_at_ms = 1_700_000_000_123;
-            let terminated = store
-                .terminate_run(&project_id, &run_id, 0, Some(final_ingested_at_ms), None)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("termination did not find the fixture run"))?;
-            anyhow::ensure!(terminated.run_name == "renamed");
-            anyhow::ensure!(
-                terminated.bumped_project == initialized.bumped_project + 2,
-                "termination project bump was {}, initialized at {}",
-                terminated.bumped_project,
-                initialized.bumped_project
-            );
+        let final_ingested_at_ms = 1_700_000_000_123;
+        let terminated = store
+            .terminate_run(&project_id, &run_id, 0, Some(final_ingested_at_ms), None)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("termination did not find the fixture run"))?;
+        anyhow::ensure!(terminated.run_name == "renamed");
+        anyhow::ensure!(
+            terminated.bumped_project == initialized.bumped_project + 2,
+            "termination project bump was {}, initialized at {}",
+            terminated.bumped_project,
+            initialized.bumped_project
+        );
 
-            let versions = store
-                .poll_versions(Some(&project_id), std::slice::from_ref(&run_id))
-                .await?;
-            anyhow::ensure!(versions.project_version == terminated.bumped_project);
-            anyhow::ensure!(
-                versions.run_versions.get(&run_id) == Some(&terminated.bumped_run),
-                "stored run version did not match termination outcome"
-            );
-            let row = store
-                .list_runs(&project_id)
-                .await?
-                .rows
-                .into_iter()
-                .find(|row| row.run_id == run_id)
-                .ok_or_else(|| anyhow::anyhow!("terminated run disappeared"))?;
-            anyhow::ensure!(row.last_ingested_at_ms == Some(final_ingested_at_ms));
-            let first_terminated_at_ms = row
-                .terminated_at_ms
-                .context("termination did not record an end time")?;
+        let versions = store
+            .poll_versions(Some(&project_id), std::slice::from_ref(&run_id))
+            .await?;
+        anyhow::ensure!(versions.project_version == terminated.bumped_project);
+        anyhow::ensure!(
+            versions.run_versions.get(&run_id) == Some(&terminated.bumped_run),
+            "stored run version did not match termination outcome"
+        );
+        let row = store
+            .list_runs(&project_id)
+            .await?
+            .rows
+            .into_iter()
+            .find(|row| row.run_id == run_id)
+            .ok_or_else(|| anyhow::anyhow!("terminated run disappeared"))?;
+        anyhow::ensure!(row.last_ingested_at_ms == Some(final_ingested_at_ms));
+        let first_terminated_at_ms = row
+            .terminated_at_ms
+            .context("termination did not record an end time")?;
 
-            sqlx::query("SELECT pg_sleep(0.01)")
-                .execute(&store.pool)
-                .await?;
-            let repeated_ingested_at_ms = final_ingested_at_ms + 1_000;
-            let repeated_outcome = store
-                .terminate_run(&project_id, &run_id, 9, Some(repeated_ingested_at_ms), None)
-                .await?
-                .context("repeat termination lost the fixture run")?;
-            anyhow::ensure!(repeated_outcome.bumped_run == terminated.bumped_run + 1);
-            anyhow::ensure!(repeated_outcome.bumped_project == terminated.bumped_project + 1);
-            let repeated_versions = store
-                .poll_versions(Some(&project_id), std::slice::from_ref(&run_id))
-                .await?;
-            anyhow::ensure!(repeated_versions.project_version == repeated_outcome.bumped_project);
-            anyhow::ensure!(
-                repeated_versions.run_versions.get(&run_id) == Some(&repeated_outcome.bumped_run)
-            );
-            let repeated = store
-                .list_runs(&project_id)
-                .await?
-                .rows
-                .into_iter()
-                .find(|row| row.run_id == run_id)
-                .context("repeat termination hid the fixture run")?;
-            anyhow::ensure!(repeated.terminated_at_ms == Some(first_terminated_at_ms));
-            anyhow::ensure!(repeated.exit_code == Some(9));
-            anyhow::ensure!(repeated.last_ingested_at_ms == Some(repeated_ingested_at_ms));
+        sqlx::query("SELECT pg_sleep(0.01)")
+            .execute(&store.pool)
+            .await?;
+        let repeated_ingested_at_ms = final_ingested_at_ms + 1_000;
+        let repeated_outcome = store
+            .terminate_run(&project_id, &run_id, 9, Some(repeated_ingested_at_ms), None)
+            .await?
+            .context("repeat termination lost the fixture run")?;
+        anyhow::ensure!(repeated_outcome.bumped_run == terminated.bumped_run + 1);
+        anyhow::ensure!(repeated_outcome.bumped_project == terminated.bumped_project + 1);
+        let repeated_versions = store
+            .poll_versions(Some(&project_id), std::slice::from_ref(&run_id))
+            .await?;
+        anyhow::ensure!(repeated_versions.project_version == repeated_outcome.bumped_project);
+        anyhow::ensure!(
+            repeated_versions.run_versions.get(&run_id) == Some(&repeated_outcome.bumped_run)
+        );
+        let repeated = store
+            .list_runs(&project_id)
+            .await?
+            .rows
+            .into_iter()
+            .find(|row| row.run_id == run_id)
+            .context("repeat termination hid the fixture run")?;
+        anyhow::ensure!(repeated.terminated_at_ms == Some(first_terminated_at_ms));
+        anyhow::ensure!(repeated.exit_code == Some(9));
+        anyhow::ensure!(repeated.last_ingested_at_ms == Some(repeated_ingested_at_ms));
 
-            let reinitialized = store
-                .init_run(&project_id, &run_id, "renamed", None)
-                .await?;
-            anyhow::ensure!(reinitialized.row.terminated_at_ms.is_none());
-            anyhow::ensure!(reinitialized.row.exit_code.is_none());
-            store
-                .terminate_run(&project_id, &run_id, 0, None, None)
-                .await?
-                .context("post-reinit termination lost the fixture run")?;
-            let reterminated = store
-                .list_runs(&project_id)
-                .await?
-                .rows
-                .into_iter()
-                .find(|row| row.run_id == run_id)
-                .context("post-reinit termination hid the fixture run")?;
-            anyhow::ensure!(
-                reterminated.terminated_at_ms > Some(first_terminated_at_ms),
-                "reinitialized execution reused its prior end time"
-            );
+        let reinitialized = store
+            .init_run(&project_id, &run_id, "renamed", None)
+            .await?;
+        anyhow::ensure!(reinitialized.row.terminated_at_ms.is_none());
+        anyhow::ensure!(reinitialized.row.exit_code.is_none());
+        store
+            .terminate_run(&project_id, &run_id, 0, None, None)
+            .await?
+            .context("post-reinit termination lost the fixture run")?;
+        let reterminated = store
+            .list_runs(&project_id)
+            .await?
+            .rows
+            .into_iter()
+            .find(|row| row.run_id == run_id)
+            .context("post-reinit termination hid the fixture run")?;
+        anyhow::ensure!(
+            reterminated.terminated_at_ms > Some(first_terminated_at_ms),
+            "reinitialized execution reused its prior end time"
+        );
 
-            // These three methods share the same project -> run database lock
-            // order, so PostgreSQL must serialize them without a lock cycle.
-            // Start every round together and bound the whole
-            // stress pass: PostgreSQL reports a deadlock as an operation
-            // error, while an unreported lock stall trips the outer timeout.
-            tokio::time::timeout(Duration::from_secs(30), async {
-                for round in 0..24 {
-                    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
-                    let init_barrier = barrier.clone();
-                    let rename_barrier = barrier.clone();
-                    let terminate_barrier = barrier;
-                    let concurrent_name = format!("concurrent-{round}");
+        // These three methods share the same project -> run database lock
+        // order, so PostgreSQL must serialize them without a lock cycle.
+        // Start every round together and bound the whole
+        // stress pass: PostgreSQL reports a deadlock as an operation
+        // error, while an unreported lock stall trips the outer timeout.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            for round in 0..24 {
+                let barrier = tokio::sync::Barrier::new(3);
+                let concurrent_name = format!("concurrent-{round}");
 
-                    let reinitialize = async {
-                        init_barrier.wait().await;
-                        store
-                            .init_run(&project_id, &run_id, &concurrent_name, None)
-                            .await
-                    };
-                    let rename = async {
-                        rename_barrier.wait().await;
-                        store
-                            .rename_run(&project_id, &run_id, &concurrent_name)
-                            .await
-                    };
-                    let terminate = async {
-                        terminate_barrier.wait().await;
-                        store
-                            .terminate_run(&project_id, &run_id, round, None, None)
-                            .await
-                    };
-                    let (reinitialized, renamed, terminated) =
-                        tokio::join!(reinitialize, rename, terminate);
-                    reinitialized?;
-                    anyhow::ensure!(renamed?.is_some(), "concurrent rename lost the fixture run");
-                    anyhow::ensure!(
-                        terminated?.is_some(),
-                        "concurrent termination lost the fixture run"
-                    );
-                }
-                Ok::<(), anyhow::Error>(())
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("concurrent lifecycle mutations timed out"))??;
-            Ok(())
-        }
-        .await;
+                let reinitialize = async {
+                    barrier.wait().await;
+                    store
+                        .init_run(&project_id, &run_id, &concurrent_name, None)
+                        .await
+                };
+                let rename = async {
+                    barrier.wait().await;
+                    store
+                        .rename_run(&project_id, &run_id, &concurrent_name)
+                        .await
+                };
+                let terminate = async {
+                    barrier.wait().await;
+                    store
+                        .terminate_run(&project_id, &run_id, round, None, None)
+                        .await
+                };
+                let (reinitialized, renamed, terminated) =
+                    tokio::join!(reinitialize, rename, terminate);
+                reinitialized?;
+                anyhow::ensure!(renamed?.is_some(), "concurrent rename lost the fixture run");
+                anyhow::ensure!(
+                    terminated?.is_some(),
+                    "concurrent termination lost the fixture run"
+                );
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("concurrent lifecycle mutations timed out"))??;
 
-        let cleanup_result: Result<()> = async {
-            sqlx::query("DELETE FROM runs WHERE project_id = $1")
-                .bind(&project_id)
-                .execute(&store.pool)
-                .await?;
-            sqlx::query("DELETE FROM run_ids WHERE project_id = $1")
-                .bind(&project_id)
-                .execute(&store.pool)
-                .await?;
-            sqlx::query("DELETE FROM projects WHERE project_id = $1")
-                .bind(&project_id)
-                .execute(&store.pool)
-                .await?;
-            Ok(())
-        }
-        .await;
-        test_result?;
-        cleanup_result?;
+        store.delete_live_projects(&[project_id]).await?;
         Ok(())
     }
 
@@ -3500,80 +3328,47 @@ mod live_pg_tests {
     #[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL"]
     async fn live_trash_ingest_snapshot_handles_null_and_preserves_newer_value() -> Result<()> {
         let _suite_guard = live_database_suite_gate().lock().await;
-        let pg_url = std::env::var("KYMO_LIVE_TEST_DATABASE_URL")
-            .map_err(|_| anyhow::anyhow!("KYMO_LIVE_TEST_DATABASE_URL is required"))?;
-        let suffix = format!(
-            "{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
+        let pg_url = live_test_url("KYMO_LIVE_TEST_DATABASE_URL")?;
+        let suffix = unique_suffix();
         let project_id = format!("trash-ingest-{suffix}");
         let missing_id = format!("missing-{suffix}");
         let newer_id = format!("newer-{suffix}");
         let run_ids = vec![missing_id.clone(), newer_id.clone()];
         let store = PgStore::connect(&pg_url).await?;
 
-        let test_result: Result<()> = async {
-            for run_id in &run_ids {
-                store
-                    .init_run(&project_id, run_id, "trash ingest", None)
-                    .await?;
-            }
-            let stored_ingested_at_ms = 1_700_000_200_123;
+        for run_id in &run_ids {
             store
-                .bump_run_versions(&[TouchedRun {
-                    project_id: project_id.clone(),
-                    run_id: newer_id.clone(),
-                    max_main_metric_at_ms: None,
-                    max_system_metric_at_ms: None,
-                    last_ingested_at_ms: stored_ingested_at_ms,
-                }])
+                .init_run(&project_id, run_id, "trash ingest", None)
                 .await?;
-            let pending = HashMap::from([(newer_id.clone(), stored_ingested_at_ms - 1_000)]);
-
-            store
-                .trash_runs_chunk(&project_id, &run_ids, &pending)
-                .await?;
-
-            let (missing, _) = store
-                .get_run(&project_id, &missing_id)
-                .await?
-                .context("NULL-snapshot fixture disappeared")?;
-            anyhow::ensure!(missing.last_ingested_at_ms.is_none());
-            let (newer, _) = store
-                .get_run(&project_id, &newer_id)
-                .await?
-                .context("GREATEST fixture disappeared")?;
-            anyhow::ensure!(newer.last_ingested_at_ms == Some(stored_ingested_at_ms));
-            Ok(())
         }
-        .await;
+        let stored_ingested_at_ms = 1_700_000_200_123;
+        store
+            .bump_run_versions(&[TouchedRun {
+                project_id: project_id.clone(),
+                run_id: newer_id.clone(),
+                max_main_metric_at_ms: None,
+                max_system_metric_at_ms: None,
+                last_ingested_at_ms: stored_ingested_at_ms,
+            }])
+            .await?;
+        let pending = HashMap::from([(newer_id.clone(), stored_ingested_at_ms - 1_000)]);
 
-        let cleanup_result: Result<()> = async {
-            sqlx::query("DELETE FROM runs WHERE project_id = $1")
-                .bind(&project_id)
-                .execute(&store.pool)
-                .await?;
-            sqlx::query("DELETE FROM run_ids WHERE project_id = $1")
-                .bind(&project_id)
-                .execute(&store.pool)
-                .await?;
-            sqlx::query("DELETE FROM project_activity WHERE project_id = $1")
-                .bind(&project_id)
-                .execute(&store.pool)
-                .await?;
-            sqlx::query("DELETE FROM projects WHERE project_id = $1")
-                .bind(&project_id)
-                .execute(&store.pool)
-                .await?;
-            Ok(())
-        }
-        .await;
-        test_result?;
-        cleanup_result?;
+        store
+            .trash_runs_chunk(&project_id, &run_ids, &pending)
+            .await?;
+
+        let (missing, _) = store
+            .get_run(&project_id, &missing_id)
+            .await?
+            .context("NULL-snapshot fixture disappeared")?;
+        anyhow::ensure!(missing.last_ingested_at_ms.is_none());
+        let (newer, _) = store
+            .get_run(&project_id, &newer_id)
+            .await?
+            .context("GREATEST fixture disappeared")?;
+        anyhow::ensure!(newer.last_ingested_at_ms == Some(stored_ingested_at_ms));
+
+        store.delete_live_projects(&[project_id]).await?;
         Ok(())
     }
 
@@ -3594,20 +3389,11 @@ mod live_pg_tests {
             store.finalize_purged_runs(project_id, &[run_id]).await
         }
         let _suite_guard = live_database_suite_gate().lock().await;
-        let pg_url = std::env::var("KYMO_LIVE_TEST_DATABASE_URL")
-            .map_err(|_| anyhow::anyhow!("KYMO_LIVE_TEST_DATABASE_URL is required"))?;
-        let suffix = format!(
-            "{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
+        let pg_url = live_test_url("KYMO_LIVE_TEST_DATABASE_URL")?;
+        let suffix = unique_suffix();
         let live = format!("last-logged-live-{suffix}");
         let imported = format!("last-logged-imported-{suffix}");
         let silent = format!("last-logged-silent-{suffix}");
-        let projects = vec![live.clone(), imported.clone(), silent.clone()];
         let live_id = format!("live-{suffix}");
         let silent_id = format!("silent-{suffix}");
         let imported_id = format!("imported-{suffix}");
@@ -3618,112 +3404,93 @@ mod live_pg_tests {
         const ARCHIVED_END_MS: i64 = 1_680_003_700_000;
         const IMPORT_INGEST_MS: i64 = 1_700_000_000_000;
 
-        let test_result: Result<()> = async {
-            let listed = |listing: &ProjectListing, project: &str| {
-                listing
-                    .projects
-                    .iter()
-                    .find(|(id, _)| id == project)
-                    .map(|(_, at)| *at)
-            };
-            let beat = |project: &str, run_id: &str, ingested_ms: i64| TouchedRun {
-                project_id: project.to_string(),
-                run_id: run_id.to_string(),
-                max_main_metric_at_ms: None,
-                max_system_metric_at_ms: None,
-                last_ingested_at_ms: ingested_ms,
-            };
-            store.init_run(&live, &live_id, "live", None).await?;
-            store
-                .init_run(&imported, &imported_id, "imported", Some(1_680_000_000_000))
-                .await?;
-            store.init_run(&silent, &silent_id, "silent", None).await?;
+        let listed = |listing: &ProjectListing, project: &str| {
+            listing
+                .projects
+                .iter()
+                .find(|(id, _)| id == project)
+                .map(|(_, at)| *at)
+        };
+        let beat = |project: &str, run_id: &str, ingested_ms: i64| TouchedRun {
+            project_id: project.to_string(),
+            run_id: run_id.to_string(),
+            max_main_metric_at_ms: None,
+            max_system_metric_at_ms: None,
+            last_ingested_at_ms: ingested_ms,
+        };
+        store.init_run(&live, &live_id, "live", None).await?;
+        store
+            .init_run(&imported, &imported_id, "imported", Some(1_680_000_000_000))
+            .await?;
+        store.init_run(&silent, &silent_id, "silent", None).await?;
 
-            // The first heartbeat records; the rest of its clock minute writes nothing; the next clock minute rolls forward, even under 60 s later.
-            for (ingested_ms, expected_ms) in [
-                (LIVE_MS + 50_000, LIVE_MS + 50_000),
-                (LIVE_MS + 55_000, LIVE_MS + 50_000),
-                (LIVE_MS + 70_000, LIVE_MS + 70_000),
-            ] {
-                store
-                    .bump_run_versions(&[beat(&live, &live_id, ingested_ms)])
-                    .await?;
-                let listing = store.list_metric_projects().await?;
-                anyhow::ensure!(listed(&listing, &live) == Some(Some(expected_ms)));
-            }
-            // Trash keeps the project listed with its value; purging its last run delists it with a global bump; a new run relists it.
+        // The first heartbeat records; the rest of its clock minute writes nothing; the next clock minute rolls forward, even under 60 s later.
+        for (ingested_ms, expected_ms) in [
+            (LIVE_MS + 50_000, LIVE_MS + 50_000),
+            (LIVE_MS + 55_000, LIVE_MS + 50_000),
+            (LIVE_MS + 70_000, LIVE_MS + 70_000),
+        ] {
             store
-                .trash_runs_chunk(&live, std::slice::from_ref(&live_id), &HashMap::new())
+                .bump_run_versions(&[beat(&live, &live_id, ingested_ms)])
                 .await?;
             let listing = store.list_metric_projects().await?;
-            anyhow::ensure!(listed(&listing, &live) == Some(Some(LIVE_MS + 70_000)));
-            anyhow::ensure!(purge(&store, &live, &live_id).await?.is_some());
-            let listing = store.list_metric_projects().await?;
-            anyhow::ensure!(listed(&listing, &live).is_none());
-            let relisted = store
-                .init_run(&live, &format!("live-again-{suffix}"), "live again", None)
-                .await?;
-            anyhow::ensure!(relisted.bumped_global.is_some());
-            let listing = store.list_metric_projects().await?;
-            anyhow::ensure!(listed(&listing, &live) == Some(Some(LIVE_MS + 70_000)));
-            let third = format!("live-third-{suffix}");
-            anyhow::ensure!(store
-                .init_run(&live, &third, "live third", None)
-                .await?
-                .bumped_global
-                .is_none());
-            // Purging one of two runs keeps the project listed.
-            anyhow::ensure!(purge(&store, &live, &third).await?.is_some());
-            let listing = store.list_metric_projects().await?;
-            anyhow::ensure!(listed(&listing, &live) == Some(Some(LIVE_MS + 70_000)));
-
-            // A terminated run's import-time ingest clock is capped at its archived end.
-            store
-                .terminate_run(&imported, &imported_id, 0, None, Some(ARCHIVED_END_MS))
-                .await?
-                .context("finalize should find the imported run")?;
-            store
-                .bump_run_versions(&[beat(&imported, &imported_id, IMPORT_INGEST_MS)])
-                .await?;
-            let listing = store.list_metric_projects().await?;
-            anyhow::ensure!(listing.server_now_ms > LIVE_MS);
-            anyhow::ensure!(listed(&listing, &imported) == Some(Some(ARCHIVED_END_MS)));
-            anyhow::ensure!(listed(&listing, &silent) == Some(None));
-
-            // An empty table is seeded at boot from every runs row, Trash included (the disposable live-test database's table is emptied for this).
-            store
-                .trash_runs_chunk(&silent, std::slice::from_ref(&silent_id), &HashMap::new())
-                .await?;
-            sqlx::query("DELETE FROM project_activity")
-                .execute(&store.pool)
-                .await?;
-            let reseeded = PgStore::connect(&pg_url).await?;
-            let listing = reseeded.list_metric_projects().await?;
-            anyhow::ensure!(listed(&listing, &imported) == Some(Some(ARCHIVED_END_MS)));
-            anyhow::ensure!(listed(&listing, &live) == Some(None));
-            anyhow::ensure!(listed(&listing, &silent) == Some(None));
-            Ok(())
+            anyhow::ensure!(listed(&listing, &live) == Some(Some(expected_ms)));
         }
-        .await;
+        // Trash keeps the project listed with its value; purging its last run delists it with a global bump; a new run relists it.
+        store
+            .trash_runs_chunk(&live, std::slice::from_ref(&live_id), &HashMap::new())
+            .await?;
+        let listing = store.list_metric_projects().await?;
+        anyhow::ensure!(listed(&listing, &live) == Some(Some(LIVE_MS + 70_000)));
+        anyhow::ensure!(purge(&store, &live, &live_id).await?.is_some());
+        let listing = store.list_metric_projects().await?;
+        anyhow::ensure!(listed(&listing, &live).is_none());
+        let relisted = store
+            .init_run(&live, &format!("live-again-{suffix}"), "live again", None)
+            .await?;
+        anyhow::ensure!(relisted.bumped_global.is_some());
+        let listing = store.list_metric_projects().await?;
+        anyhow::ensure!(listed(&listing, &live) == Some(Some(LIVE_MS + 70_000)));
+        let third = format!("live-third-{suffix}");
+        anyhow::ensure!(store
+            .init_run(&live, &third, "live third", None)
+            .await?
+            .bumped_global
+            .is_none());
+        // Purging one of two runs keeps the project listed.
+        anyhow::ensure!(purge(&store, &live, &third).await?.is_some());
+        let listing = store.list_metric_projects().await?;
+        anyhow::ensure!(listed(&listing, &live) == Some(Some(LIVE_MS + 70_000)));
 
-        let cleanup_result: Result<()> = async {
-            for table in [
-                "runs",
-                "run_ids",
-                "purged_runs",
-                "project_activity",
-                "projects",
-            ] {
-                sqlx::query(&format!("DELETE FROM {table} WHERE project_id = ANY($1)"))
-                    .bind(&projects)
-                    .execute(&store.pool)
-                    .await?;
-            }
-            Ok(())
-        }
-        .await;
-        test_result?;
-        cleanup_result?;
+        // A terminated run's import-time ingest clock is capped at its archived end.
+        store
+            .terminate_run(&imported, &imported_id, 0, None, Some(ARCHIVED_END_MS))
+            .await?
+            .context("finalize should find the imported run")?;
+        store
+            .bump_run_versions(&[beat(&imported, &imported_id, IMPORT_INGEST_MS)])
+            .await?;
+        let listing = store.list_metric_projects().await?;
+        anyhow::ensure!(listing.server_now_ms > LIVE_MS);
+        anyhow::ensure!(listed(&listing, &imported) == Some(Some(ARCHIVED_END_MS)));
+        anyhow::ensure!(listed(&listing, &silent) == Some(None));
+
+        // An empty table is seeded at boot from every runs row, Trash included (the disposable live-test database's table is emptied for this).
+        store
+            .trash_runs_chunk(&silent, std::slice::from_ref(&silent_id), &HashMap::new())
+            .await?;
+        sqlx::query("DELETE FROM project_activity")
+            .execute(&store.pool)
+            .await?;
+        let reseeded = PgStore::connect(&pg_url).await?;
+        let listing = reseeded.list_metric_projects().await?;
+        anyhow::ensure!(listed(&listing, &imported) == Some(Some(ARCHIVED_END_MS)));
+        anyhow::ensure!(listed(&listing, &live) == Some(None));
+        anyhow::ensure!(listed(&listing, &silent) == Some(None));
+
+        store
+            .delete_live_projects(&[live, imported, silent])
+            .await?;
         Ok(())
     }
 
@@ -3731,28 +3498,20 @@ mod live_pg_tests {
     #[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL"]
     async fn live_query_gates_serialize_reverse_lifecycle_lock_orders() -> Result<()> {
         let _suite_guard = live_database_suite_gate().lock().await;
-        let pg_url = std::env::var("KYMO_LIVE_TEST_DATABASE_URL")
-            .map_err(|_| anyhow::anyhow!("KYMO_LIVE_TEST_DATABASE_URL is required"))?;
-        let suffix = format!(
-            "{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
+        let pg_url = live_test_url("KYMO_LIVE_TEST_DATABASE_URL")?;
+        let suffix = unique_suffix();
         let project_id = format!("rename-gates-{suffix}");
         let run_id = format!("run-{suffix}");
         let store = std::sync::Arc::new(PgStore::connect(&pg_url).await?);
         let (events, _events_rx) = tokio::sync::broadcast::channel(64);
-        let service = std::sync::Arc::new(crate::query::QueryService::new(
+        let service = crate::query::QueryService::new(
             std::sync::Arc::new(crate::clickhouse::ChClient::new("http://127.0.0.1:9").unwrap()),
             store.clone(),
             crate::ingest::BumpCoalescer::empty_for_test(),
             crate::lifecycle::LifecycleGates::new(),
             None,
             events,
-        ));
+        );
 
         let request_error = |operation: &str, status: tonic::Status| {
             anyhow::anyhow!(
@@ -3771,196 +3530,135 @@ mod live_pg_tests {
             .await
             .map_err(|status| request_error("fixture InitRun", status))?;
 
-        let test_result: Result<()> = async {
-            tokio::time::timeout(Duration::from_secs(30), async {
-                for round in 0..24 {
-                    // Trash locks the run row before the project row. These
-                    // three handlers lock project before run. Exercising the
-                    // public handlers proves their shared/exclusive lifecycle
-                    // gates keep the opposite database orders from overlapping.
-                    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(4));
-                    let init_barrier = barrier.clone();
-                    let rename_barrier = barrier.clone();
-                    let terminate_barrier = barrier.clone();
-                    let trash_barrier = barrier;
-                    let concurrent_name = format!("concurrent-{round}");
+        tokio::time::timeout(Duration::from_secs(30), async {
+            for round in 0..24 {
+                // Trash locks the run row before the project row. These
+                // three handlers lock project before run. Exercising the
+                // public handlers proves their shared/exclusive lifecycle
+                // gates keep the opposite database orders from overlapping.
+                let barrier = tokio::sync::Barrier::new(4);
+                let concurrent_name = format!("concurrent-{round}");
 
-                    let reinitialize = {
-                        let service = service.clone();
-                        let project_id = project_id.clone();
-                        let run_id = run_id.clone();
-                        let run_name = concurrent_name.clone();
-                        async move {
-                            init_barrier.wait().await;
-                            service
-                                .init_run(tonic::Request::new(crate::proto::InitRunRequest {
-                                    project_id,
-                                    run_id,
-                                    run_name,
-                                    local_hold_id: None,
-                                }))
-                                .await
-                                .map(|_| ())
-                        }
-                    };
-                    let rename = {
-                        let service = service.clone();
-                        let project_id = project_id.clone();
-                        let run_id = run_id.clone();
-                        let run_name = concurrent_name;
-                        async move {
-                            rename_barrier.wait().await;
-                            service
-                                .rename_run(tonic::Request::new(crate::proto::RenameRunRequest {
-                                    project_id,
-                                    run_id,
-                                    run_name,
-                                }))
-                                .await
-                                .map(|_| ())
-                        }
-                    };
-                    let terminate = {
-                        let service = service.clone();
-                        let project_id = project_id.clone();
-                        let run_id = run_id.clone();
-                        async move {
-                            terminate_barrier.wait().await;
-                            service
-                                .terminate_run(tonic::Request::new(
-                                    crate::proto::TerminateRunRequest {
-                                        project_id,
-                                        run_id,
-                                        exit_code: round,
-                                    },
-                                ))
-                                .await
-                                .map(|_| ())
-                        }
-                    };
-                    let trash = {
-                        let service = service.clone();
-                        let project_id = project_id.clone();
-                        let run_id = run_id.clone();
-                        async move {
-                            trash_barrier.wait().await;
-                            service
-                                .trash_runs(tonic::Request::new(crate::proto::TrashRunsRequest {
-                                    project_id,
-                                    run_ids: vec![run_id],
-                                }))
-                                .await
-                        }
-                    };
+                let reinitialize = async {
+                    barrier.wait().await;
+                    service
+                        .init_run(tonic::Request::new(crate::proto::InitRunRequest {
+                            project_id: project_id.clone(),
+                            run_id: run_id.clone(),
+                            run_name: concurrent_name.clone(),
+                            local_hold_id: None,
+                        }))
+                        .await
+                        .map(|_| ())
+                };
+                let rename = async {
+                    barrier.wait().await;
+                    service
+                        .rename_run(tonic::Request::new(crate::proto::RenameRunRequest {
+                            project_id: project_id.clone(),
+                            run_id: run_id.clone(),
+                            run_name: concurrent_name.clone(),
+                        }))
+                        .await
+                        .map(|_| ())
+                };
+                let terminate = async {
+                    barrier.wait().await;
+                    service
+                        .terminate_run(tonic::Request::new(crate::proto::TerminateRunRequest {
+                            project_id: project_id.clone(),
+                            run_id: run_id.clone(),
+                            exit_code: round,
+                        }))
+                        .await
+                        .map(|_| ())
+                };
+                let trash = async {
+                    barrier.wait().await;
+                    service
+                        .trash_runs(tonic::Request::new(crate::proto::TrashRunsRequest {
+                            project_id: project_id.clone(),
+                            run_ids: vec![run_id.clone()],
+                        }))
+                        .await
+                };
 
-                    let (reinitialized, renamed, terminated, trashed) =
-                        tokio::join!(reinitialize, rename, terminate, trash);
-                    for (operation, result) in [
-                        ("InitRun", reinitialized),
-                        ("RenameRun", renamed),
-                        ("TerminateRun", terminated),
-                    ] {
-                        match result {
-                            Ok(()) => {}
-                            Err(status) if status.code() == tonic::Code::FailedPrecondition => {}
-                            Err(status) => return Err(request_error(operation, status)),
-                        }
-                    }
-                    let trashed = trashed
-                        .map_err(|status| request_error("TrashRuns", status))?
-                        .into_inner();
-                    anyhow::ensure!(
-                        trashed.results.len() == 1
-                            && trashed.results[0].outcome
-                                == crate::proto::TrashRunOutcome::Trashed as i32,
-                        "round {round} did not end with the fixture in Trash: {:?}",
-                        trashed.results
-                    );
-
-                    // Restore has the same run-first/project-second database
-                    // order as Trash. Race it with Rename and require that the
-                    // pair completes with the fixture active for the next round.
-                    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
-                    let restore_barrier = barrier.clone();
-                    let rename_barrier = barrier;
-                    let restore = {
-                        let service = service.clone();
-                        let project_id = project_id.clone();
-                        let run_id = run_id.clone();
-                        async move {
-                            restore_barrier.wait().await;
-                            service
-                                .restore_run(tonic::Request::new(crate::proto::RestoreRunRequest {
-                                    project_id,
-                                    run_id,
-                                }))
-                                .await
-                        }
-                    };
-                    let rename = {
-                        let service = service.clone();
-                        let project_id = project_id.clone();
-                        let run_id = run_id.clone();
-                        async move {
-                            rename_barrier.wait().await;
-                            service
-                                .rename_run(tonic::Request::new(crate::proto::RenameRunRequest {
-                                    project_id,
-                                    run_id,
-                                    run_name: format!("restored-{round}"),
-                                }))
-                                .await
-                                .map(|_| ())
-                        }
-                    };
-                    let (restored, renamed) = tokio::join!(restore, rename);
-                    let restored = restored
-                        .map_err(|status| request_error("RestoreRun", status))?
-                        .into_inner();
-                    anyhow::ensure!(
-                        restored.outcome == crate::proto::RestoreRunOutcome::Restored as i32,
-                        "round {round} restore returned outcome {}: {}",
-                        restored.outcome,
-                        restored.error
-                    );
-                    match renamed {
+                let (reinitialized, renamed, terminated, trashed) =
+                    tokio::join!(reinitialize, rename, terminate, trash);
+                for (operation, result) in [
+                    ("InitRun", reinitialized),
+                    ("RenameRun", renamed),
+                    ("TerminateRun", terminated),
+                ] {
+                    match result {
                         Ok(()) => {}
                         Err(status) if status.code() == tonic::Code::FailedPrecondition => {}
-                        Err(status) => return Err(request_error("RenameRun after Trash", status)),
+                        Err(status) => return Err(request_error(operation, status)),
                     }
-                    store
-                        .ensure_runs_active(&[RunKey::new(&project_id, &run_id)])
-                        .await
-                        .map_err(|error| {
-                            anyhow::anyhow!("round {round} did not finish active: {error}")
-                        })?;
                 }
-                Ok::<(), anyhow::Error>(())
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("reverse-order lifecycle races timed out"))??;
-            Ok(())
-        }
-        .await;
+                let trashed = trashed
+                    .map_err(|status| request_error("TrashRuns", status))?
+                    .into_inner();
+                anyhow::ensure!(
+                    trashed.results.len() == 1
+                        && trashed.results[0].outcome
+                            == crate::proto::TrashRunOutcome::Trashed as i32,
+                    "round {round} did not end with the fixture in Trash: {:?}",
+                    trashed.results
+                );
 
-        let cleanup_result: Result<()> = async {
-            sqlx::query("DELETE FROM runs WHERE project_id = $1")
-                .bind(&project_id)
-                .execute(&store.pool)
-                .await?;
-            sqlx::query("DELETE FROM run_ids WHERE project_id = $1")
-                .bind(&project_id)
-                .execute(&store.pool)
-                .await?;
-            sqlx::query("DELETE FROM projects WHERE project_id = $1")
-                .bind(&project_id)
-                .execute(&store.pool)
-                .await?;
-            Ok(())
-        }
-        .await;
-        test_result?;
-        cleanup_result?;
+                // Restore has the same run-first/project-second database
+                // order as Trash. Race it with Rename and require that the
+                // pair completes with the fixture active for the next round.
+                let barrier = tokio::sync::Barrier::new(2);
+                let restore = async {
+                    barrier.wait().await;
+                    service
+                        .restore_run(tonic::Request::new(crate::proto::RestoreRunRequest {
+                            project_id: project_id.clone(),
+                            run_id: run_id.clone(),
+                        }))
+                        .await
+                };
+                let rename = async {
+                    barrier.wait().await;
+                    service
+                        .rename_run(tonic::Request::new(crate::proto::RenameRunRequest {
+                            project_id: project_id.clone(),
+                            run_id: run_id.clone(),
+                            run_name: format!("restored-{round}"),
+                        }))
+                        .await
+                        .map(|_| ())
+                };
+                let (restored, renamed) = tokio::join!(restore, rename);
+                let restored = restored
+                    .map_err(|status| request_error("RestoreRun", status))?
+                    .into_inner();
+                anyhow::ensure!(
+                    restored.outcome == crate::proto::RestoreRunOutcome::Restored as i32,
+                    "round {round} restore returned outcome {}: {}",
+                    restored.outcome,
+                    restored.error
+                );
+                match renamed {
+                    Ok(()) => {}
+                    Err(status) if status.code() == tonic::Code::FailedPrecondition => {}
+                    Err(status) => return Err(request_error("RenameRun after Trash", status)),
+                }
+                store
+                    .ensure_runs_active(&[RunKey::new(&project_id, &run_id)])
+                    .await
+                    .map_err(|error| {
+                        anyhow::anyhow!("round {round} did not finish active: {error}")
+                    })?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("reverse-order lifecycle races timed out"))??;
+
+        store.delete_live_projects(&[project_id]).await?;
         Ok(())
     }
 
@@ -3968,127 +3666,97 @@ mod live_pg_tests {
     #[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL"]
     async fn live_list_trash_pages_newest_first_across_ties() -> Result<()> {
         let _suite_guard = live_database_suite_gate().lock().await;
-        let pg_url = std::env::var("KYMO_LIVE_TEST_DATABASE_URL")
-            .map_err(|_| anyhow::anyhow!("KYMO_LIVE_TEST_DATABASE_URL is required"))?;
-        let suffix = format!(
-            "{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
+        let pg_url = live_test_url("KYMO_LIVE_TEST_DATABASE_URL")?;
+        let suffix = unique_suffix();
         let project_a = format!("trash-page-a-{suffix}");
         let project_b = format!("trash-page-b-{suffix}");
-        let projects = vec![project_a.clone(), project_b.clone()];
         let store = PgStore::connect(&pg_url).await?;
         let count_before: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE deleted_at IS NOT NULL")
                 .fetch_one(&store.pool)
                 .await?;
 
-        let test_result: Result<()> = async {
-            for (project_id, run_id) in [
-                (&project_a, "a1"),
-                (&project_a, "a2"),
-                (&project_a, "a3"),
-                (&project_b, "b1"),
-                (&project_b, "b2"),
-                (&project_b, "b3"),
-            ] {
-                store.init_run(project_id, run_id, run_id, None).await?;
-            }
+        for (project_id, run_id) in [
+            (&project_a, "a1"),
+            (&project_a, "a2"),
+            (&project_a, "a3"),
+            (&project_b, "b1"),
+            (&project_b, "b2"),
+            (&project_b, "b3"),
+        ] {
+            store.init_run(project_id, run_id, run_id, None).await?;
+        }
 
-            // Put the fixture far ahead of ordinary test data so these are the
-            // first three global pages even if the disposable DB is reused.
-            const OLDEST_MS: i64 = 253_402_000_000_000;
-            const TIED_MS: i64 = OLDEST_MS + 1_000;
-            const NEWEST_MS: i64 = TIED_MS + 1_000;
-            for (project_id, run_id, deleted_at_ms) in [
-                (&project_a, "a1", TIED_MS),
-                (&project_a, "a2", TIED_MS),
-                (&project_a, "a3", TIED_MS),
-                (&project_b, "b1", OLDEST_MS),
-                (&project_b, "b2", TIED_MS),
-                (&project_b, "b3", NEWEST_MS),
-            ] {
-                let updated = sqlx::query(
-                    "UPDATE runs
-                     SET deleted_at = to_timestamp($3::DOUBLE PRECISION / 1000.0)
-                     WHERE project_id = $1 AND run_id = $2",
-                )
-                .bind(project_id)
-                .bind(run_id)
-                .bind(deleted_at_ms)
-                .execute(&store.pool)
+        // Put the fixture far ahead of ordinary test data so these are the
+        // first three global pages even if the disposable DB is reused.
+        const OLDEST_MS: i64 = 253_402_000_000_000;
+        const TIED_MS: i64 = OLDEST_MS + 1_000;
+        const NEWEST_MS: i64 = TIED_MS + 1_000;
+        for (project_id, run_id, deleted_at_ms) in [
+            (&project_a, "a1", TIED_MS),
+            (&project_a, "a2", TIED_MS),
+            (&project_a, "a3", TIED_MS),
+            (&project_b, "b1", OLDEST_MS),
+            (&project_b, "b2", TIED_MS),
+            (&project_b, "b3", NEWEST_MS),
+        ] {
+            let updated = sqlx::query(
+                "UPDATE runs
+                 SET deleted_at = to_timestamp($3::DOUBLE PRECISION / 1000.0)
+                 WHERE project_id = $1 AND run_id = $2",
+            )
+            .bind(project_id)
+            .bind(run_id)
+            .bind(deleted_at_ms)
+            .execute(&store.pool)
+            .await?;
+            anyhow::ensure!(
+                updated.rows_affected() == 1,
+                "fixture row {project_id}/{run_id} was not updated"
+            );
+        }
+
+        let expected_pages = [
+            vec![format!("{project_b}/b3"), format!("{project_a}/a3")],
+            vec![format!("{project_a}/a2"), format!("{project_a}/a1")],
+            vec![format!("{project_b}/b2"), format!("{project_b}/b1")],
+        ];
+        let mut after = None;
+        for (page_index, expected) in expected_pages.iter().enumerate() {
+            let page = store
+                .list_trash(TrashListQuery::Page {
+                    page_size: 2,
+                    after,
+                })
                 .await?;
+            if page_index == 0 {
                 anyhow::ensure!(
-                    updated.rows_affected() == 1,
-                    "fixture row {project_id}/{run_id} was not updated"
+                    page.total_count == Some((count_before + 6) as u64),
+                    "first page count was {:?}",
+                    page.total_count
+                );
+            } else {
+                anyhow::ensure!(
+                    page.total_count.is_none(),
+                    "continuation repeated the total count"
                 );
             }
-
-            let expected_pages = [
-                vec![format!("{project_b}/b3"), format!("{project_a}/a3")],
-                vec![format!("{project_a}/a2"), format!("{project_a}/a1")],
-                vec![format!("{project_b}/b2"), format!("{project_b}/b1")],
-            ];
-            let mut after = None;
-            for (page_index, expected) in expected_pages.iter().enumerate() {
-                let page = store
-                    .list_trash(TrashListQuery::Page {
-                        page_size: 2,
-                        after,
-                    })
-                    .await?;
-                if page_index == 0 {
-                    anyhow::ensure!(
-                        page.total_count == Some((count_before + 6) as u64),
-                        "first page count was {:?}",
-                        page.total_count
-                    );
-                } else {
-                    anyhow::ensure!(
-                        page.total_count.is_none(),
-                        "continuation repeated the total count"
-                    );
-                }
-                let actual = page
-                    .rows
-                    .iter()
-                    .map(|row| format!("{}/{}", row.project_id, row.run_id))
-                    .collect::<Vec<_>>();
-                anyhow::ensure!(
-                    actual == *expected,
-                    "page {page_index} was {actual:?}, expected {expected:?}"
-                );
-                after = page.next;
-                if page_index + 1 < expected_pages.len() {
-                    anyhow::ensure!(after.is_some(), "page {page_index} had no cursor");
-                }
+            let actual = page
+                .rows
+                .iter()
+                .map(|row| format!("{}/{}", row.project_id, row.run_id))
+                .collect::<Vec<_>>();
+            anyhow::ensure!(
+                actual == *expected,
+                "page {page_index} was {actual:?}, expected {expected:?}"
+            );
+            after = page.next;
+            if page_index + 1 < expected_pages.len() {
+                anyhow::ensure!(after.is_some(), "page {page_index} had no cursor");
             }
-            Ok(())
         }
-        .await;
 
-        let cleanup_result: Result<()> = async {
-            sqlx::query("DELETE FROM runs WHERE project_id = ANY($1)")
-                .bind(&projects)
-                .execute(&store.pool)
-                .await?;
-            sqlx::query("DELETE FROM run_ids WHERE project_id = ANY($1)")
-                .bind(&projects)
-                .execute(&store.pool)
-                .await?;
-            sqlx::query("DELETE FROM projects WHERE project_id = ANY($1)")
-                .bind(&projects)
-                .execute(&store.pool)
-                .await?;
-            Ok(())
-        }
-        .await;
-        test_result?;
-        cleanup_result?;
+        store.delete_live_projects(&[project_a, project_b]).await?;
         Ok(())
     }
 }
