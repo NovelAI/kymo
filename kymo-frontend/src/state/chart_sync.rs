@@ -328,9 +328,11 @@ pub fn filter_response(resp: &DenseChart, keep: &HashSet<String>) -> DenseChart 
         .filter(|s| keep.contains(&s.run_id))
         .collect();
     let n = resp.x_values.len();
+    // Wire default: a marker without a kind is kind 1.
+    let kind = |s: &DenseSeries, j: usize| s.nan_kinds.get(j).copied().unwrap_or(1);
     let mut occupied = vec![false; n];
     for s in &kept {
-        // Any finite column marks the slot: values covers unsmoothed charts, raw/envelope cover smoothed and marker-evicted ones. Markers occupy their slot by definition.
+        // Any finite column marks the slot: values covers unsmoothed charts, raw/envelope cover smoothed and marker-evicted ones. Kinds 1-3 occupy their slot by definition. Kind 4 claims none: it rides its run's own finite column, except for a run with no plottable x, whose column-0 marker re-lands below.
         for col in [&s.values, &s.raw_values, &s.min_values] {
             for (i, v) in col.iter().enumerate() {
                 if !v.is_nan() {
@@ -338,9 +340,11 @@ pub fn filter_response(resp: &DenseChart, keep: &HashSet<String>) -> DenseChart 
                 }
             }
         }
-        for &i in &s.nan_indices {
-            if let Some(o) = occupied.get_mut(i as usize) {
-                *o = true;
+        for (j, &i) in s.nan_indices.iter().enumerate() {
+            if kind(s, j) != 4 {
+                if let Some(o) = occupied.get_mut(i as usize) {
+                    *o = true;
+                }
             }
         }
     }
@@ -362,12 +366,19 @@ pub fn filter_response(resp: &DenseChart, keep: &HashSet<String>) -> DenseChart 
     let series = kept
         .into_iter()
         .map(|s| {
-            // Markers remap through the compacted axis, index and kind dropping together on any slot the map lacks (in-range markers always land: they marked their slot occupied above).
+            // Markers remap through the compacted axis. A kind-4 marker whose slot left is the no-plottable-x marker: it re-lands on the first kept column, or leaves only its count on an empty axis.
             let (nan_indices, nan_kinds) = s
                 .nan_indices
                 .iter()
-                .zip(&s.nan_kinds)
-                .filter_map(|(&i, &k)| slot_map.get(i as usize).map(|&m| (m, k)))
+                .enumerate()
+                .filter_map(|(j, &i)| {
+                    let k = kind(s, j);
+                    match slot_map.get(i as usize) {
+                        Some(&m) if m != u32::MAX => Some((m, k)),
+                        _ if k == 4 && !x_values.is_empty() => Some((0, 4)),
+                        _ => None,
+                    }
+                })
                 .unzip();
             DenseSeries {
                 label: s.label.clone(),
@@ -714,6 +725,44 @@ mod tests {
         assert_eq!(out2.series[0].nan_indices, vec![0]);
     }
 
+    /// A run with no plottable x marks column 0 without owning it: the filter keeps only its kept neighbours' columns and re-lands the marker on the first of them, or leaves just its count when none remain (the server's all-unplottable answer).
+    #[test]
+    fn filter_relands_an_anchorless_marker_on_the_first_kept_column() {
+        let mut anchorless = dense("n", vec![f64::NAN; 3], vec![0], vec![4]);
+        anchorless.xnan_count = 3;
+        let resp = DenseChart {
+            x_values: vec![1.0, 2.0, 3.0],
+            xr_min: vec![f64::NAN; 3],
+            xr_max: vec![f64::NAN; 3],
+            series: vec![
+                anchorless,
+                dense("b", vec![5.0, f64::NAN, f64::NAN], vec![], vec![]),
+                dense("c", vec![f64::NAN, 6.0, 7.0], vec![], vec![]),
+            ],
+        };
+        let out = filter_response(&resp, &["n".to_string(), "c".to_string()].into());
+        assert_eq!(out.x_values, vec![2.0, 3.0], "b's column leaves with b");
+        assert_eq!(out.series[0].nan_indices, vec![0]);
+        assert_eq!(out.series[0].nan_kinds, vec![4]);
+
+        let alone = filter_response(&resp, &["n".to_string()].into());
+        assert!(alone.x_values.is_empty());
+        assert!(alone.series[0].nan_indices.is_empty());
+        assert_eq!(alone.series[0].xnan_count, 3, "the panel notice's count");
+
+        // A kind-4 marker on a run's own finite column is an ordinary slot owner.
+        let anchored = DenseChart {
+            series: vec![
+                dense("b", vec![5.0, f64::NAN, f64::NAN], vec![0], vec![4]),
+                dense("c", vec![f64::NAN, 6.0, 7.0], vec![], vec![]),
+            ],
+            ..resp.clone()
+        };
+        let out = filter_response(&anchored, &["b".to_string()].into());
+        assert_eq!(out.x_values, vec![1.0]);
+        assert_eq!(out.series[0].nan_indices, vec![0]);
+    }
+
     #[test]
     fn splice_rebuilds_the_full_model_and_refuses_violations() {
         let cached = DenseChart {
@@ -891,6 +940,43 @@ mod tests {
             inflate_response(&b).is_none(),
             "band values without segments on a band-less series"
         );
+    }
+
+    /// A chart with no plottable point ships its series' unplottable counts over an empty axis: it inflates to a column-less model and never offers continuation state.
+    #[test]
+    fn unplottable_counts_inflate_without_columns_and_never_echo() {
+        let full = ChartResponse {
+            series: vec![
+                ChartSeries {
+                    label: "a".into(),
+                    run_id: "a".into(),
+                    xnan_count: 3,
+                    ..Default::default()
+                },
+                ChartSeries {
+                    label: "b".into(),
+                    run_id: "b".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let out = inflate_response(&full).unwrap();
+        assert!(out.x_values.is_empty());
+        let counts: Vec<u32> = out.series.iter().map(|s| s.xnan_count).collect();
+        assert_eq!(counts, vec![3, 0]);
+        assert!(out.series.iter().all(|s| s.nan_indices.is_empty()));
+        let entry = ChartCacheEntry {
+            request: req(&["a", "b"], 500),
+            response: Rc::new(out),
+            data_seq: 1,
+            versions: Rc::new(HashMap::new()),
+            metrics_gen: Rc::new(HashMap::new()),
+            epoch: 0,
+            frontiers: Rc::new([("a\u{1f}loss".to_string(), 5i64)].into()),
+            noncontrib: Rc::new(HashSet::new()),
+        };
+        assert!(echo_state(&entry, &req(&["a", "b"], 500), 0).is_none());
     }
 
     #[test]

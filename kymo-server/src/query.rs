@@ -984,21 +984,20 @@ struct PreparedSeries {
     kinds: Vec<u8>,
     /// Carried positions for samples whose x is unplottable: non-finite
     /// custom-x, or negative x on an absolute log step/time axis. They become
-    /// kind-4 annotations on the nearest emitted row; they never own a row and
+    /// kind-4 annotations on the row holding their anchor sample; they never own a row and
     /// never evict one. Custom-x carries each gap from its last plottable
     /// position (ascending, deduped); negative log-x attaches to the first.
+    /// A run with no plottable x carries them to −∞, the chart's first column.
     xnan_xs: Vec<f64>,
     /// How many samples had an unplottable x (the samples behind `xnan_xs`,
     /// pre-dedup) — the tooltip's "×N" (DenseSeries::xnan_count).
     xnan_count: u32,
-    /// A verified-held unplottable log-x sample proves the held chart already had its kind-4 annotation, provided it also had a plottable anchor.
+    /// A verified-held unplottable log-x sample proves the held chart already carried this run's kind-4 marker (on column 0 when the run has no plottable x).
     xnan_held: bool,
     /// Per-sample [`chart::AGE_OLD`]/REACH/NEW relative to verified cutoffs (all NEW when none apply), parallel to `xs`.
     age: Vec<u8>,
-    /// Verified-held samples in the plotted range: the in-range half of Self::continues. The echoed held-series count still guards pairing after refs or tag groups change.
-    old_count: usize,
-    /// At least one verified-held fetched row existed before plotting filters. Preserves membership for all-gap series whose rows lie only in smoothing warmup or at unplottable x positions.
-    provably_held: bool,
+    /// Whether a delta may CONTINUE this series (name the held one it extends) rather than ship it complete: some in-range plottable sample is verified-held, or no plottable sample is in range and some fetched row (smoothing warmup, unplottable x) is. The second case keeps such all-gap series from failing the held-count gate; their only possible change is a column-0 kind-4 marker appearing, which the planner answers in full. A series whose in-range plottable samples are ALL new ships complete even when held rows exist: its held columns were empty, and the held-count gate answers full for that one poll. The echoed held-series count still guards pairing after refs or tag groups change.
+    continues: bool,
     /// The exact output-determining whole-series smoothing plan used for this response. `NoState` is explicit so margin-only series preserve positional alignment without computing or gating on discarded samples.
     smoothing_plan: chart::SmoothingPlan,
 }
@@ -1007,13 +1006,6 @@ struct PreparedSeries {
 struct Preparation {
     series: Vec<PreparedSeries>,
     audit_plans_aligned: bool,
-}
-
-impl PreparedSeries {
-    /// Whether a delta may CONTINUE this series (name the held one it extends) rather than ship it complete: some in-range sample is provably held, or the trimmed range is EMPTY and some fetch-range sample is. The empty case is trivially sound — the series is all-NaN columns in the held response and the new one alike, so the kept prefix continues bit-exactly — and it is what keeps margin-only series (see `provably_held`) from failing the held-count gate. A series with in-range samples that are ALL new stays complete even when provably_held: its held columns were all-NaN but its new prefix columns need not be, which no continuation can express — the held-count gate answers full for that one poll and deltas resume after.
-    fn continues(&self) -> bool {
-        self.old_count > 0 || (self.xs.is_empty() && self.provably_held)
-    }
 }
 
 /// Compare current continuing series against the exact semantic smoothing plans stamped on the response the client actually holds. The caller has already proved the held and continuing counts equal; new complete series do not participate. Missing state safely forces one full answer, which seeds plans for subsequent deltas.
@@ -1034,7 +1026,7 @@ fn smoothing_state_matches(
     };
     prepared
         .iter()
-        .filter(|ps| ps.continues())
+        .filter(|ps| ps.continues)
         .map(|ps| ps.smoothing_plan)
         .eq(held)
 }
@@ -1372,8 +1364,7 @@ fn prepare(
                 // the first), as a kind-4 annotation. Custom-x charts never
                 // take the delta path, so ages need not survive this arm.
                 let mut pts: Vec<(f64, f64, f64, u8)> = Vec::new();
-                let mut last_x: Option<f64> = None;
-                let mut leading_xnan = 0usize;
+                let mut leading_gap = false;
                 for i in (0..steps_v.len()).filter(|&i| in_range(i)) {
                     let Some(&x) = xm.and_then(|m| m.get(&steps_v[i])) else {
                         continue;
@@ -1381,23 +1372,20 @@ fn prepare(
                     // A non-finite x never plots; on a log axis a nonpositive x can't either — both become exceptional kind-4 markers carried to the run's last plottable x (docs/log-scale-buckets.md).
                     let plottable = x.is_finite() && !(p.spec.log_buckets && x <= 0.0);
                     if plottable {
-                        last_x = Some(x);
                         pts.push((x, plot_v[i], raw_v[i], chart::nan_kind(raw_v[i])));
                     } else {
                         xnan_count += 1;
-                        match last_x {
-                            Some(cx) => xnan_xs.push(cx),
-                            None => leading_xnan += 1,
+                        match pts.last() {
+                            Some(&(cx, ..)) => xnan_xs.push(cx),
+                            None => leading_gap = true,
                         }
                     }
                 }
-                if leading_xnan > 0 {
+                if leading_gap {
                     // First plottable x in step order = first pts entry
                     // (pts is still in step order here). A run whose x
-                    // metric was never finite has nowhere to anchor.
-                    if let Some(&(fx, ..)) = pts.first() {
-                        xnan_xs.push(fx);
-                    }
+                    // metric was never plottable anchors at the left edge.
+                    xnan_xs.push(pts.first().map_or(f64::NEG_INFINITY, |&(fx, ..)| fx));
                 }
                 xnan_xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 xnan_xs.dedup();
@@ -1434,16 +1422,13 @@ fn prepare(
                     age.push(age_v[i]);
                 }
                 if xnan_count > 0 {
-                    // A run with no plottable x has nowhere to anchor its markers.
-                    if let Some(&fx) = xs.first() {
-                        xnan_xs.push(fx);
-                    }
+                    // A run with no plottable x anchors its marker at the left edge.
+                    xnan_xs.push(xs.first().copied().unwrap_or(f64::NEG_INFINITY));
                 }
             }
         }
-        let old_count = age.iter().filter(|&&k| k != chart::AGE_NEW).count();
-        // Pre-trim: a held fetch-range sample proves membership even when the range trim leaves nothing (see the field docs).
-        let provably_held = age_v.iter().any(|&k| k != chart::AGE_NEW);
+        let held = |ages: &[u8]| ages.iter().any(|&k| k != chart::AGE_NEW);
+        let continues = held(&age) || (xs.is_empty() && held(&age_v));
         prepared.push(PreparedSeries {
             identity: rs.identity,
             label: rs.label,
@@ -1456,8 +1441,7 @@ fn prepare(
             xnan_count,
             xnan_held,
             age,
-            old_count,
-            provably_held,
+            continues,
             smoothing_plan,
         });
     }
@@ -1546,7 +1530,7 @@ fn prefix_matches(
     prepared: &[PreparedSeries],
 ) -> bool {
     let continuing: Vec<usize> = (0..prepared.len())
-        .filter(|&i| prepared[i].continues())
+        .filter(|&i| prepared[i].continues)
         .collect();
     if from_col > old.x_values.len() || old.series.len() != continuing.len() {
         return false;
@@ -1601,7 +1585,7 @@ fn to_delta(
         .iter()
         .zip(prepared)
         .map(|(s, ps)| {
-            if !ps.continues() {
+            if !ps.continues {
                 splice_from_cached.push(-1);
                 emit_series(s, 0) // complete: full-axis columns, as computed
             } else {
@@ -1629,48 +1613,31 @@ fn to_delta(
     }
 }
 
-/// Compose the interpolation, numeric, and marker prefix proofs for verified input history.
+/// Flag interpolation and kind-4 appearance dependencies for verified input history, then prove the numeric prefix.
 ///
-/// Interpolation marks OLD ages as REACH in place for the numeric planner, without changing continuation facts. Initial full builds and audit reconstruction skip this step. Kind-4 markers additionally depend on nearest-slot placement across cell boundaries.
-fn plan_delta_from_col(
-    prepared: &mut [PreparedSeries],
-    p: &ChartParams,
-    full: &DenseChart,
-) -> usize {
-    if p.is_smoothed {
-        for ps in prepared.iter_mut() {
+/// Flags turn OLD ages into REACH in place, without changing continuation facts. Initial full builds and audit reconstruction skip this step.
+fn plan_delta_from_col(prepared: &mut [PreparedSeries], p: &ChartParams) -> usize {
+    for ps in prepared.iter_mut() {
+        if p.is_smoothed {
             flag_lerp_dependency(&ps.plot, &ps.kinds, &mut ps.age);
+        }
+        // A kind-4 marker's appearance (the held rows had no unplottable sample) is the one change no numeric column shows. A run with no plottable x has its marker on column 0, so no prefix survives. Otherwise the marker sits on its anchor sample's slot, the run's first plottable x, and moves only with that sample's cell: dirty the anchor.
+        if ps.xnan_count == 0 || ps.xnan_held {
+            continue;
+        }
+        if ps.xs.is_empty() {
+            if ps.continues {
+                return 0;
+            }
+        } else if ps.age[0] == chart::AGE_OLD {
+            // Held rows exist only on standard axes, where every unplottable sample is carried to the first plottable x; custom-x ages are all NEW.
+            debug_assert_eq!(ps.xnan_xs.as_slice(), &ps.xs[..1]);
+            ps.age[0] = chart::AGE_REACH;
         }
     }
     let xs: Vec<&[f64]> = prepared.iter().map(|ps| ps.xs.as_slice()).collect();
     let ages: Vec<&[u8]> = prepared.iter().map(|ps| ps.age.as_slice()).collect();
-    let marker_dependencies: Vec<chart::XnanDependency> = prepared
-        .iter()
-        .filter(|ps| ps.continues() && ps.xnan_count > 0)
-        .filter_map(|ps| {
-            // The caller excludes custom-x. Standard log axes carry unplottable samples to the first plottable x.
-            debug_assert!(ps.xnan_xs.len() <= 1);
-            // The first current plottable x and first verified-held plottable x are the two carried anchors.
-            let &min_x = ps.xs.first()?;
-            // Interpolation marking preserves the non-NEW partition, so this still selects the first verified-held plottable sample.
-            let max_x = ps
-                .xs
-                .iter()
-                .zip(&ps.age)
-                .find(|(_, &age)| age != chart::AGE_NEW)
-                .map_or(f64::INFINITY, |(&x, _)| x);
-            Some(chart::XnanDependency {
-                min_x,
-                max_x,
-                held: ps.xnan_held && max_x.is_finite(),
-            })
-        })
-        .collect();
-    chart::bound_xnan_from_col(
-        &full.x_values,
-        chart::numeric_delta_from_col(&xs, &ages, p.spec),
-        &marker_dependencies,
-    )
+    chart::numeric_delta_from_col(&xs, &ages, p.spec)
 }
 
 /// Everything after the row fetches: build the full response, and shrink it to a frontier delta when the echoed cache state proves the client holds a prefix (anything unprovable answers in full). Pure — the wire tests drive it with fabricated rows; `audit` additionally reconstructs the held response outright and verifies the claimed prefix bit-for-bit ([`prefix_matches`]) — the sampled self-check; wire tests also exercise audit-off responses with independent full-model and hash checks. A failed audit answers in full with `audit_failed` stamped, which the client alerts on. (The end-to-end content check is the client's, on every delta: to_delta's result hashes.)
@@ -1694,12 +1661,12 @@ fn build_response(
         .and_then(|result| result.as_ref().ok());
     let mut prepared = prepare(req, &p, &all_rows, x_maps, held_rows, false, None)?.series;
     let mut kind = lineages.rejection().map(lineage::Rejection::label);
-    let resp = if prepared.iter().all(|ps| ps.xs.is_empty()) {
-        proto::ChartResponse::default()
+    let full = respond(&prepared, &p);
+    let resp = if full.x_values.is_empty() {
+        // No plottable point anywhere: series ship their unplottable counts over an empty axis, so the panel can say why it has nothing to draw, and nothing is stamped to continue from.
+        emit_full(&full)
     } else {
-        let full = respond(&prepared, &p);
-
-        let continuing = prepared.iter().filter(|ps| ps.continues()).count();
+        let continuing = prepared.iter().filter(|ps| ps.continues).count();
         // Verified lineages and shared-ref order prove that continuing groups were held. The client's output-series count still detects removed refs/tag groups and held groups that no longer continue, such as a margin-only group gaining in-range samples. Positional splicing requires that every held series is paired.
         let membership_matches = req
             .cache_state
@@ -1712,7 +1679,7 @@ fn build_response(
             && membership_matches
             && smoothing_state_matches(req, &p, &prepared, continuing);
         let mut resp = if deltable {
-            let from_col = plan_delta_from_col(&mut prepared, &p, &full);
+            let from_col = plan_delta_from_col(&mut prepared, &p);
             // from_col ≤ the new axis by construction; the bound turns a planner bug into a full answer, never a panic in to_delta's slice.
             let mut audit_bad = false;
             let verified = from_col > 0
@@ -1721,7 +1688,7 @@ fn build_response(
                     // The verified held reconstruction must not derive spacing because the exact gate proved the held/current plans equal. Pair each override with stable request/tag identity: `held_series` is client-controlled, so its count alone cannot prove that old-only and continuing groups align.
                     let audit_plans: Vec<(SeriesIdentity, chart::SmoothingPlan)> = prepared
                         .iter()
-                        .filter(|ps| ps.continues())
+                        .filter(|ps| ps.continues)
                         .map(|ps| (ps.identity.clone(), ps.smoothing_plan))
                         .collect();
                     let old = prepare(
@@ -1752,7 +1719,7 @@ fn build_response(
                 });
             if verified {
                 let unchanged =
-                    from_col == full.x_values.len() && prepared.iter().all(|ps| ps.continues());
+                    from_col == full.x_values.len() && prepared.iter().all(|ps| ps.continues);
                 kind = Some(if unchanged { "unchanged" } else { "delta" });
                 to_delta(&full, from_col, &prepared)
             } else {
@@ -2216,6 +2183,19 @@ mod frontier_delta_tests {
         out
     }
 
+    /// The slot whose raw x or bucket extent holds `x`.
+    fn slot_holding(chart: &DenseChart, x: f64) -> usize {
+        (0..chart.x_values.len())
+            .find(|&i| {
+                if chart.xr_min[i].is_nan() {
+                    chart.x_values[i] == x
+                } else {
+                    (chart.xr_min[i]..=chart.xr_max[i]).contains(&x)
+                }
+            })
+            .unwrap()
+    }
+
     /// Bit-level model equality.
     fn eq(a: &DenseChart, b: &DenseChart) -> bool {
         let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
@@ -2583,9 +2563,9 @@ mod frontier_delta_tests {
         assert!(eq(&splice(&inflate_full(&held), &out), &truth));
     }
 
-    /// A verified new negative timestamp can reuse earlier shared columns: causal influence is marked before filtering, and kind-4 placement is bounded separately. Here the centered smoothers answer in full because the timestamp changes their exact plan from Uniform to Median.
+    /// A verified new negative timestamp can reuse earlier shared columns: causal influence is marked before filtering, and the new kind-4 marker dirties its anchor's cell. Here the centered smoothers answer in full because the timestamp changes their exact plan from Uniform to Median.
     #[test]
-    fn verified_new_unplottable_timestamp_bounds_causal_influence_and_marker() {
+    fn verified_new_unplottable_timestamp_bounds_causal_influence_and_dirties_its_anchor() {
         let held_a = rows_shaped(10, |i| i, |i| 64 + 10 * i);
         let grown_a = rows_shaped(11, |i| i, |i| if i == 10 { -10 } else { 64 + 10 * i });
         let b = rows_shaped(301, |i| i, |i| i);
@@ -2627,72 +2607,12 @@ mod frontier_delta_tests {
             };
             assert!(eq(&rebuilt, &truth));
             assert_eq!(truth.series[0].nan_kinds, vec![4]);
-            let marker = truth.series[0].nan_indices[0] as usize;
-            assert!(
-                truth.x_values[marker] < 64.0,
-                "the nearest shared marker slot precedes A's first plotted cell"
+            assert_eq!(
+                truth.series[0].nan_indices,
+                vec![slot_holding(&truth, 64.0) as u32],
+                "the marker sits on the slot holding A's first plotted x"
             );
         }
-    }
-
-    /// A settled negative timestamp remains a kind-4 marker anchored at the run's first plottable x. Growing an ordinary neighboring envelope can move its center far enough that the unchanged marker remaps backward to a raw slot before the envelope cell. The marker-blind planner would splice at the changed envelope; a marker moving to column zero leaves no reusable prefix and must still answer in full.
-    #[test]
-    fn historical_log_marker_moving_to_first_slot_answers_full() {
-        let a = rows_shaped(3, |i| i, |i| if i == 0 { -1 } else { 8 });
-        // Final duplicates in the envelope leave raw x=6 settled and keep numeric dirt in column 1. The marker alone pulls the splice back to column 0.
-        let held_b = rows_shaped(
-            6,
-            |i| i,
-            |i| match i {
-                0 => 8,
-                1 => 9,
-                2 => 10,
-                3 => 11,
-                4 => 6,
-                _ => 11,
-            },
-        );
-        // Ordinary positive x=15 expands only that envelope: its center moves
-        // to 11.5, making A's anchor x=8 nearer raw x=6 than the envelope.
-        let grown_b = rows_shaped(
-            7,
-            |i| i,
-            |i| match i {
-                0 => 8,
-                1 => 9,
-                2 => 10,
-                3 => 11,
-                4 => 6,
-                5 => 11,
-                _ => 15,
-            },
-        );
-        let mut r = req(&["a", "b"], 1);
-        r.use_timestamp_axis = true;
-        r.log_buckets = true;
-
-        let held = build(&r, &[a.clone(), held_b]);
-        let held_model = inflate_full(&held);
-        assert_eq!(held_model.x_values, vec![6.0, 9.5]);
-        assert_eq!(held_model.series[0].nan_kinds, vec![4]);
-        assert_eq!(held_model.series[0].nan_indices, vec![1]);
-
-        let mut continued = r.clone();
-        continued.cache_state = echo(&held);
-        let out = build(&continued, &[a.clone(), grown_b.clone()]);
-        let truth = inflate_full(&build(&r, &[a, grown_b]));
-        assert_eq!(truth.x_values, vec![6.0, 11.5]);
-        assert_eq!(truth.series[0].nan_kinds, vec![4]);
-        assert_eq!(truth.series[0].nan_indices, vec![0]);
-        assert!(
-            !out.delta,
-            "a marker moving to column zero leaves no reusable prefix"
-        );
-        assert!(
-            !out.audit_failed,
-            "a correctness gate is not an audit failure"
-        );
-        assert!(eq(&inflate_full(&out), &truth));
     }
 
     #[test]
@@ -3275,7 +3195,7 @@ mod frontier_delta_tests {
 
     #[test]
     fn margin_only_series_keeps_the_delta_as_all_nan() {
-        // Run b's samples sit ONLY in the smoothing fetch margin of the zoomed range (steps 1010.., zoom [0, 1000], Savitzky–Golay window 20 → fetch to 1080): it ships as an all-NaN series the client holds and counts in held_series, while the range trim leaves it with old_count == 0. Verified pre-trim membership (PreparedSeries::provably_held) continues it; without that, the held-count gate answered full on EVERY poll for as long as the shape persisted — and with ascending steps a run parked past the zoom edge persists indefinitely.
+        // Run b's samples sit ONLY in the smoothing fetch margin of the zoomed range (steps 1010.., zoom [0, 1000], Savitzky–Golay window 20 → fetch to 1080): it ships as an all-NaN series the client holds and counts in held_series, while the range trim leaves it no in-range sample. Verified pre-trim membership (PreparedSeries::continues) continues it; without that, the held-count gate answered full on EVERY poll for as long as the shape persisted — and with ascending steps a run parked past the zoom edge persists indefinitely.
         let zoomed = |runs: &[&str]| {
             let mut q = savgol_req(runs, 300);
             q.step_min = Some(0);
@@ -3616,6 +3536,7 @@ mod frontier_delta_tests {
         ];
         let mut covered = [[[false; 2]; 2]; 3];
         let mut deltas = 0;
+        let mut marker_deltas = 0;
         for case in 0..90u32 {
             let smoothed = case % 3 != 0;
             let use_time = (case / 3) % 2 == 1;
@@ -3624,7 +3545,10 @@ mod frontier_delta_tests {
             let nruns = 1 + (rng() % 3) as usize;
             // Zero-less cases exercise the plain-log arm of the conditional +1 shift under the delta oracle.
             let start = if case % 4 == 3 { 5 } else { 0 };
-            let mk = move |n: i64, seed: u64| -> Arc<Vec<VersionedRawPoint>> {
+            // Negative x: step cases lead with two negative-step sentinels (always held: a lower-step backfill fails the lineage proof); time cases use absolute timestamps, some negative, logged throughout or (every fifth case) only by growth. On log axes they become kind-4 markers. Deltas here carry settled ones: the appearing ones anchor on column 0 and answer in full, so marker_delta_tests covers appearance deltas.
+            let negative = case % 5 >= 3;
+            let appearing = case % 5 == 4;
+            let mk = move |n: i64, seed: u64, neg_from: i64| -> Arc<Vec<VersionedRawPoint>> {
                 Arc::new(
                     (0..n)
                         .map(|s| {
@@ -3634,11 +3558,22 @@ mod frontier_delta_tests {
                                 1 => f32::INFINITY,
                                 _ => ((r % 90_000) as f32) / 11.0 - 2000.0,
                             };
+                            let negative_x = negative && s >= neg_from && r % 41 == 7;
+                            // Staggered run starts put carried marker anchors inside the chart, not only on its first column.
+                            let at = s + start + if negative { (seed % 4) as i64 * 300 } else { 0 };
                             VersionedRawPoint {
                                 tag: String::new(),
-                                step: s + start,
+                                step: if negative && !use_time && s < 2 {
+                                    s - 2
+                                } else {
+                                    at
+                                },
                                 // Deterministic jitter guarantees that every time-axis case exercises an irregular semantic plan.
-                                timestamp_ms: 1_000_000 + (s + start) * 7 + ((s % 9 == 0) as i64),
+                                timestamp_ms: if negative_x {
+                                    -1 - s
+                                } else {
+                                    1_000_000 + at * 7 + ((s % 9 == 0) as i64)
+                                },
                                 value,
                                 is_value: 1,
                                 inserted_ms: s * 10_000_000,
@@ -3649,19 +3584,23 @@ mod frontier_delta_tests {
             };
             let seeds: Vec<u64> = (0..nruns).map(|_| rng()).collect();
             let lens: Vec<i64> = (0..nruns).map(|_| 200 + (rng() % 2200) as i64).collect();
-            let held_rows: Vec<Arc<Vec<VersionedRawPoint>>> =
-                seeds.iter().zip(&lens).map(|(&sd, &n)| mk(n, sd)).collect();
+            let neg_from = |n: i64| if appearing { n } else { 0 };
+            let held_rows: Vec<Arc<Vec<VersionedRawPoint>>> = seeds
+                .iter()
+                .zip(&lens)
+                .map(|(&sd, &n)| mk(n, sd, neg_from(n)))
+                .collect();
             let grown_rows: Vec<Arc<Vec<VersionedRawPoint>>> = seeds
                 .iter()
                 .zip(&lens)
-                .map(|(&sd, &n)| mk(n + 5 + (sd % 60) as i64, sd))
+                .map(|(&sd, &n)| mk(n + 5 + (sd % 60) as i64, sd, neg_from(n)))
                 .collect();
             let mut r = req(
                 &(0..nruns).map(|i| ["a", "b", "c"][i]).collect::<Vec<_>>(),
                 target,
             );
             r.use_timestamp_axis = use_time;
-            r.relative_time = use_time;
+            r.relative_time = use_time && !negative;
             r.log_buckets = log;
             if smoothed {
                 // Mixed-radix dimensions: every 36 cases cover smoothing on/off and step/time × linear/log axes; among smoothed cases every algorithm sees every axis pair.
@@ -3681,6 +3620,9 @@ mod frontier_delta_tests {
             let truth = inflate_full(&build(&r, &grown_rows));
             if out.delta {
                 deltas += 1;
+                if truth.series.iter().any(|s| s.nan_kinds.contains(&4)) {
+                    marker_deltas += 1;
+                }
                 assert!(
                     eq(&splice(&inflate_full(&held), &out), &truth),
                     "case {case}: splice != truth (time={use_time} log={log} smoothed={smoothed})"
@@ -3703,6 +3645,10 @@ mod frontier_delta_tests {
         assert!(
             deltas > 40,
             "only {deltas}/90 cases actually took the delta path"
+        );
+        assert!(
+            marker_deltas >= 5,
+            "only {marker_deltas} deltas carried a kind-4 marker"
         );
     }
 }

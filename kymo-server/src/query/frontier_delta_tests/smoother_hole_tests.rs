@@ -75,7 +75,7 @@ fn synthetic_series(
     xnan: Option<f64>,
 ) -> PreparedSeries {
     let age: Vec<u8> = samples.iter().map(|sample| sample.2).collect();
-    let old_count = age.iter().filter(|&&a| a != NEW).count();
+    let continues = age.iter().any(|&a| a != NEW);
     let kinds = if kinds.is_empty() {
         vec![0; samples.len()]
     } else {
@@ -107,8 +107,7 @@ fn synthetic_series(
         xnan_count: u32::from(xnan.is_some()),
         xnan_held: xnan.is_some(),
         age,
-        old_count,
-        provably_held: old_count != 0,
+        continues,
         smoothing_plan: chart::SmoothingPlan::NoState,
     }
 }
@@ -155,7 +154,7 @@ fn assert_prepared_wire_continuation(
     let p = synthetic_params();
     let held = respond(&held, &p);
     let full = respond(&current, &p);
-    let from = plan_delta_from_col(&mut current, &p, &full);
+    let from = plan_delta_from_col(&mut current, &p);
     assert_eq!(from, expected_from);
     assert_eq!(full.x_values.len(), 16, "fixture must use envelope cells");
     assert!(prefix_matches(&held, &full, from, &current));
@@ -389,7 +388,7 @@ fn randomized_smoother_hole_histories_splice_to_the_independent_full_model() {
         let held = respond(&synthetic_chart(&held_samples), &p);
         let mut current = synthetic_chart(&current_samples);
         let full = respond(&current, &p);
-        let from = plan_delta_from_col(&mut current, &p, &full);
+        let from = plan_delta_from_col(&mut current, &p);
         assert!(
             from >= 2,
             "seed {seed}: unrelated leading columns remain reusable"

@@ -302,46 +302,46 @@ pub fn UPlotChart(
             // Envelope columns ship as wire truth, including mins <= 0 on log-y charts: those CLIP at the bottom border instead of gapping (uPlot's log scale clamps non-positive values a decade under the scale min, so the band visibly runs into the border), yNiceLog keeps them from driving the y-range, and the tooltip prints the real number. The wire never carries a non-finite value other than NaN; logged ±inf render as marker circles at the border they exceed.
             // Raw/envelope blocks first, values lines after, matching build_create_js's series opts (see the top-of-file comment).
             let mut all_series = Vec::new();
-            // Slots whose min the log axis clips get a synthesized kind-5 border circle below.
+            // Slots where the log axis clips a run's lowest drawn evidence get a synthesized kind-5 border circle below.
             let mut synth_marks: Vec<Vec<u32>> = Vec::with_capacity(chart.series.len());
             for s in chart.series.iter() {
-                let mut synth: Vec<u32> = Vec::new();
+                let samples = if s.raw_values.len() == s.values.len() {
+                    &s.raw_values
+                } else {
+                    &s.values
+                };
                 if has_raw {
-                    let src = if s.raw_values.len() == s.values.len() {
-                        &s.raw_values
-                    } else {
-                        &s.values
-                    };
-                    all_series.push(col(src));
+                    all_series.push(col(samples));
                 }
+                // The run's lowest drawn evidence: its envelope min, else its samples.
+                let mut floor = samples;
                 if has_range {
                     // A missing envelope on an enveloped chart means the run has no finite sample at all (the server ships envelopes dense, never sparse or all-NaN): NaN columns, nothing to band.
                     if s.min_values.len() == s.values.len() && s.max_values.len() == s.values.len()
                     {
-                        let min_col = col(&s.min_values);
-                        let max_col = col(&s.max_values);
-                        if log_y {
-                            for (i, &mn) in min_col.iter().enumerate() {
-                                // NaN gap slots fail the comparison and stay unmarked.
-                                if mn <= 0.0 {
-                                    synth.push(i as u32);
-                                }
-                            }
-                        }
-                        all_series.push(min_col);
-                        all_series.push(max_col);
+                        all_series.push(col(&s.min_values));
+                        all_series.push(col(&s.max_values));
+                        floor = &s.min_values;
                     } else {
                         all_series.push(vec![f64::NAN; n_axis]);
                         all_series.push(vec![f64::NAN; n_axis]);
                     }
                 }
-                synth_marks.push(synth);
+                // NaN gap slots fail the comparison and stay unmarked.
+                synth_marks.push(if log_y {
+                    (0..floor.len())
+                        .filter(|&i| floor[i] <= 0.0)
+                        .map(|i| i as u32)
+                        .collect()
+                } else {
+                    Vec::new()
+                });
             }
             for s in chart.series.iter() {
                 all_series.push(col(&s.values));
             }
 
-            // Append one NaN-marker column per real series, marking where the run LOGGED a non-finite value (server-computed nan_indices, indexing the shared axis) or where the log axis clipped its envelope. Only when a marker exists somewhere, so healthy charts pay nothing. The value is the marker KIND (1 NaN, 2 +inf, 3 -inf, 4 non-finite custom-x, 5 log-clipped envelope — frontend-only, never on the wire): markers live on a dummy scale and the draw hook pins their circles to the plot's border (top for +inf, bottom for the rest), so the kind value never plots.
+            // Append one NaN-marker column per real series, marking where the run LOGGED a non-finite value (server-computed nan_indices, indexing the shared axis) or where the log axis clipped its envelope or sample. Only when a marker exists somewhere, so healthy charts pay nothing. The value is the marker KIND (1 NaN, 2 +inf, 3 -inf, 4 unplottable x, 5 log-clipped envelope or sample — frontend-only, never on the wire): markers live on a dummy scale and the draw hook pins their circles to the plot's border (top for +inf, bottom for the rest), so the kind value never plots.
             let needs_markers = chart.series.iter().any(|s| !s.nan_indices.is_empty())
                 || synth_marks.iter().any(|v| !v.is_empty());
             let nan_markers = if needs_markers {

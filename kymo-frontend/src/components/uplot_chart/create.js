@@ -259,7 +259,7 @@ let u=new uPlot({
       // the y range on every chart with a logged NaN.
       let ctx=u.ctx,dpr=devicePixelRatio;
       let r=markR*dpr;
-      // +∞ (kind 2) seats at the TOP border — the side its data exceeds; everything else (NaN, -∞, non-finite custom-x, log-clipped envelope) at the bottom.
+      // +∞ (kind 2) seats at the TOP border — the side its data exceeds; every other kind at the bottom.
       let cyB=u.bbox.top+u.bbox.height-r-markGap*dpr;
       let cyT=u.bbox.top+r+markGap*dpr;
       ctx.save();
@@ -270,14 +270,15 @@ let u=new uPlot({
       ctx.rect(u.bbox.left,u.bbox.top,u.bbox.width,u.bbox.height);
       ctx.clip();
       ctx.lineWidth=1.5*dpr;
+      // Each marker column's filled slots, indexed once per immutable u.data array (like hover's point lookup), so a repaint visits the markers, not the whole axis.
+      let marks=u.data.__kymo_marks||(u.data.__kymo_marks=u.data.slice(nanBase,nanBase+nanCols).map(col=>{let js=[];if(col)for(let j=0;j<col.length;j++)if(col[j]!=null)js.push(j);return js;}));
       for(let i=0;i<nanCols;i++){
         let col=u.data[nanBase+i];
         let s=u.series[nanBase+i];
         if(!col||!s||s.show===false)continue;
         ctx.globalAlpha=s.alpha==null?1:s.alpha;
         ctx.strokeStyle=colors[i];
-        for(let j=0;j<col.length;j++){
-          if(col[j]==null)continue;
+        for(let j of marks[i]){
           let cx=u.valToPos(u.data[0][j],'x',true);
           if(cx<u.bbox.left-r||cx>u.bbox.left+u.bbox.width+r)continue;
           ctx.beginPath();

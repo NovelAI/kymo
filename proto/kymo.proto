@@ -515,11 +515,11 @@ message ChartSeries {
   repeated uint32 band_seg_lens = 8;
   repeated float band_min = 9;
   repeated float band_max = 10;
-  // Columns where the run LOGGED a non-finite value (display as markers). For kinds 1-3 the column normally has no value entry (the non-finite sample won its slot) — EXCEPT when a duplicate x carries both a finite and a non-finite sample into one raw slot: the finite value keeps the entry and the marker rides alongside (chart.rs shared_passthrough and bucket_run raw slots deliberately skip non-finite-wins on duplicate-x collisions; inside an envelope bucket the marker still wins and the finite evidence rides the band). Kind 4 rides a finite column (see nan_kinds).
+  // Columns where the run LOGGED a non-finite value (display as markers). For kinds 1-3 the column normally has no value entry (the non-finite sample won its slot) — EXCEPT when a duplicate x carries both a finite and a non-finite sample into one raw slot: the finite value keeps the entry and the marker rides alongside (chart.rs shared_passthrough and bucket_run raw slots deliberately skip non-finite-wins on duplicate-x collisions; inside an envelope bucket the marker still wins and the finite evidence rides the band). Kind 4 annotates (see nan_kinds).
   repeated uint32 nan_indices = 11;
-  // Parallel to nan_indices: 1 = NaN, 2 = +inf, 3 = -inf, 4 = this run's custom-x metric logged a non-finite value — the marker is carried to the run's last plottable column, which keeps its finite value (kind 4 annotates; it does not evict). Empty = all kind 1.
+  // Parallel to nan_indices: 1 = NaN, 2 = +inf, 3 = -inf, 4 = an unplottable x (a non-finite custom x, or an x outside a log axis's domain) — the marker is carried to a column holding one of the run's plottable samples, which keeps its value (kind 4 annotates; it does not evict); a run with no plottable x carries it to column 0, and an entirely unplottable chart ships only xnan_count. Empty = all kind 1.
   repeated uint32 nan_kinds = 12;
-  // How many of this run's samples have an unplottable x (non-finite custom-x, negative x on a log axis) — the samples behind the kind-4 markers, whose per-slot counts collapse when markers dedup. Tooltip garnish ("×N"); ships complete on every series like label, excluded from the result hashes.
+  // How many of this run's samples have an unplottable x (a non-finite custom x, or an x outside a log axis's domain) — the samples behind the kind-4 markers, whose per-slot counts collapse when markers dedup. The tooltip's "×N" and the all-unplottable panel's count; ships complete on every series like label, excluded from the result hashes.
   uint32 xnan_count = 13;
 }
 
@@ -527,7 +527,8 @@ message ChartResponse {
   // THE shared X axis: ascending, unique, one per chart. Every ChartSeries'
   // columns align to it (via its occupancy segments), so clients render
   // directly against it with no per-series join. Populated for all charts
-  // (step, timestamp, custom-x); empty only when the chart has no data.
+  // (step, timestamp, custom-x); empty only when the chart has no plottable
+  // point (series then carry just their xnan_count).
   // Slots are a MIXTURE of raw points (the exact logged x) and downsampled
   // buckets (x = the midpoint of the first and last point aggregated):
   // a bucket only downsamples when it expects >= 4 points (chart.rs).

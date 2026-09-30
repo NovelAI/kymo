@@ -34,7 +34,7 @@ function updateHover(u){
     let has=pi>=0;
     idxs.push(pi);
     let v=has?u.data[di][pi]:null;
-    // Kinds 1-3 have only a marker after gap mapping; restore a NaN sentinel to display their kind. Kind 4 marks non-finite custom x on a finite row and keeps that value.
+    // Kinds 1-3 have only a marker after gap mapping; restore a NaN sentinel to display their kind. Kind 4 marks unplottable x and keeps its anchor's finite value, except for a run with no plottable x, whose column-0 marker has none.
     if(v==null&&has&&nc&&nc[pi]!=null)v=NaN;
     nks.push(isNaN(v)&&v!=null&&nc?nc[pi]:0);
     vals.push(v);
@@ -88,7 +88,7 @@ function updateHover(u){
       let i=order[oi];
       let pi=idxs[i];
       let v=vals[i];
-      let vs=isNaN(v)?(nks[i]===2?'+∞':nks[i]===3?'-∞':'NaN'):v.toPrecision(4);
+      let vs=isNaN(v)?(nks[i]===2?'+∞':nks[i]===3?'-∞':nks[i]===4?'no plottable x':'NaN'):v.toPrecision(4);
       // A kind-4 marker collapses this run's unplottable-x samples onto one anchor slot: surface how many when it's more than one.
       if(xnanC[i]>1&&nanCols>0){let nci=u.data[nanBase+i];if(nci&&nci[pi]===4)vs+=' ×'+xnanC[i];}
       let rowOpen='<div class="kymo-tip-row" data-r="'+i+'">';

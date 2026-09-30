@@ -30,7 +30,8 @@ let buildText=function(chart,idx){
     let marker=m.nanCols&&chart.data[m.nanBase+i]?chart.data[m.nanBase+i][idx]:null;
     let cell='';
     if(value!=null&&!Number.isNaN(value))cell=String(value);
-    else if(marker!=null&&!Number.isNaN(marker))cell=marker===2?'Infinity':marker===3?'-Infinity':'NaN';
+    // A kind-4 marker without a value (a run with no plottable x) has no sample at this x to copy.
+    else if(marker!=null&&!Number.isNaN(marker)&&marker!==4)cell=marker===2?'Infinity':marker===3?'-Infinity':'NaN';
     if(cell!=='')rows.push(textCell(series&&series.label!=null?series.label:'')+'\t'+cell);
   }
   return rows.length?textCell(m.xLabel)+': '+xCell+'\n\n'+rows.join('\n'):null;

@@ -86,9 +86,30 @@ fn newly_present_marker_right_of_last_envelope_resends_its_slot() {
     }
 }
 
+/// The same appearance on a passthrough chart: the anchor x=5 is an exact raw slot, and marking it REACH starts the delta there.
 #[test]
-fn other_series_envelope_growth_moves_marker_before_the_changed_cell() {
-    // A's negative timestamp and x=8 samples are held. B's append changes the envelope center; only the marker dependency invalidates the earlier raw x=6.
+fn newly_present_marker_on_a_passthrough_chart_resends_its_anchor_slot() {
+    let b = timestamp_rows(&[1, 2, 3, 4]);
+    let mut request = absolute_log_request();
+    request.target_resolution = 10_000;
+    let held = build(&request, &[timestamp_rows(&[5, 7, 9]), b.clone()]);
+    assert_eq!(
+        inflate_full(&held).x_values,
+        vec![1.0, 2.0, 3.0, 4.0, 5.0, 7.0, 9.0]
+    );
+    let current = [timestamp_rows(&[5, 7, 9, -1]), b];
+    assert_eq!(
+        inflate_full(&build(&request, &current)).series[0].nan_indices,
+        vec![4]
+    );
+    for audit in [false, true] {
+        assert_eq!(checked_delta(&request, &held, &current, audit).from_col, 4);
+    }
+}
+
+#[test]
+fn other_series_envelope_growth_keeps_marker_on_its_anchor_cell() {
+    // A's negative timestamp and x=8 samples are held. B's append moves the envelope center to 11.5, nearer raw x=6 than A's anchor, but A's marker stays on its own envelope, and only that changed envelope is resent.
     let a = timestamp_rows(&[-1, 8, 8]);
     let held_b = timestamp_rows(&[1, 6, 8, 9, 10, 11, 11]);
     let grown_b = timestamp_rows(&[1, 6, 8, 9, 10, 11, 11, 15]);
@@ -101,18 +122,18 @@ fn other_series_envelope_growth_moves_marker_before_the_changed_cell() {
     let current = [a, grown_b];
     let truth = inflate_full(&build(&request, &current));
     assert_eq!(truth.x_values, vec![1.0, 6.0, 11.5]);
-    assert_eq!(truth.series[0].nan_indices, vec![1]);
+    assert_eq!(truth.series[0].nan_indices, vec![2]);
     assert_eq!(truth.series[0].nan_kinds, vec![4]);
     for audit in [false, true] {
         let out = checked_delta(&request, &held, &current, audit);
-        assert_eq!(out.from_col, 1, "the preceding marker slot must be resent");
+        assert_eq!(out.from_col, 2, "raw x=6 stays reusable");
     }
 }
 
 #[test]
-fn raw_to_envelope_transition_moves_marker_into_the_preceding_cell() {
+fn raw_to_envelope_transition_carries_marker_into_the_new_envelope() {
     let a = timestamp_rows(&[-1, 8, 8]);
-    // The [16,32) envelope exists on both sides, preserving the chart's emission shape. The fourth distinct x in [8,16) replaces its three raw slots with center 11.5, so A's x=8 marker moves backward to x=6. The final duplicate in [16,32) leaves all affected raw slots settled.
+    // The [16,32) envelope exists on both sides, preserving the chart's emission shape. The fourth distinct x in [8,16) replaces its three raw slots with center 11.5, and A's x=8 marker follows its anchor into that envelope. The final duplicate in [16,32) leaves the earlier raw slots settled.
     let held_b = timestamp_rows(&[1, 6, 8, 13, 14, 16, 17, 18, 19, 19]);
     let grown_b = timestamp_rows(&[1, 6, 8, 13, 14, 16, 17, 18, 19, 19, 15]);
     let request = absolute_log_request();
@@ -124,17 +145,17 @@ fn raw_to_envelope_transition_moves_marker_into_the_preceding_cell() {
     let current = [a, grown_b];
     let truth = inflate_full(&build(&request, &current));
     assert_eq!(truth.x_values, vec![1.0, 6.0, 11.5, 17.5]);
-    assert_eq!(truth.series[0].nan_indices, vec![1]);
+    assert_eq!(truth.series[0].nan_indices, vec![2]);
     assert_eq!(truth.series[0].nan_kinds, vec![4]);
     for audit in [false, true] {
         let out = checked_delta(&request, &held, &current, audit);
-        assert_eq!(out.from_col, 1, "mode changes also bound marker placement");
+        assert_eq!(out.from_col, 2, "the mode change starts the delta");
     }
 }
 
 #[test]
 fn earlier_positive_timestamp_changes_the_held_markers_carried_anchor() {
-    // A's settled sentinel was carried at its first positive timestamp 10. A later step arrives with timestamp 8, moving that carried position. The planner must compare current anchor x=8 with held anchor x=10, even though the negative sentinel itself is unchanged.
+    // A's settled sentinel was carried at its first positive timestamp 10. A later step arrives with timestamp 8 and becomes the anchor; its inserted slot starts the delta, which also drops the held marker at x=10.
     let held_a = timestamp_rows(&[-1, 10, 12]);
     let grown_a = timestamp_rows(&[-1, 10, 12, 8]);
     let b = timestamp_rows(&[1, 6, 20, 22]);
@@ -157,39 +178,7 @@ fn earlier_positive_timestamp_changes_the_held_markers_carried_anchor() {
     assert_eq!(truth.series[0].nan_kinds, vec![4]);
     for audit in [false, true] {
         let out = checked_delta(&request, &held, &current, audit);
-        assert_eq!(
-            out.from_col, 1,
-            "keep the safe slot before the anchor range"
-        );
-    }
-}
-
-#[test]
-fn multiple_marker_dependencies_choose_the_earliest_bound_in_either_order() {
-    // A's held marker stays at x=4. B's marker moves to x=6. Only B tightens the numeric bound, regardless of series order.
-    let a = timestamp_rows(&[4, 4, -1]);
-    let b = timestamp_rows(&[-1, 8, 8]);
-    let held_axis = timestamp_rows(&[1, 4, 6, 8, 9, 10, 11, 11]);
-    let grown_axis = timestamp_rows(&[1, 4, 6, 8, 9, 10, 11, 11, 15]);
-    for (runs, markers, expected_from) in [
-        (vec!["a", "axis"], vec![a.clone()], 3),
-        (vec!["b", "axis"], vec![b.clone()], 2),
-        (vec!["a", "b", "axis"], vec![a.clone(), b.clone()], 2),
-        (vec!["b", "a", "axis"], vec![b.clone(), a.clone()], 2),
-    ] {
-        let mut request = req(&runs, 1);
-        request.use_timestamp_axis = true;
-        request.log_buckets = true;
-        let mut held_rows = markers.clone();
-        held_rows.push(held_axis.clone());
-        let held = build(&request, &held_rows);
-        assert_eq!(inflate_full(&held).x_values, vec![1.0, 4.0, 6.0, 9.5]);
-        let mut current = markers;
-        current.push(grown_axis.clone());
-        for audit in [false, true] {
-            let out = checked_delta(&request, &held, &current, audit);
-            assert_eq!(out.from_col, expected_from, "series order {runs:?}");
-        }
+        assert_eq!(out.from_col, 2, "the new anchor's inserted slot");
     }
 }
 
@@ -203,7 +192,8 @@ fn anchorless_negative_series_updates_its_count_while_continuing() {
     let held = build(&request, &held_rows);
     let held_model = inflate_full(&held);
     assert_eq!(held_model.series[0].xnan_count, 3);
-    assert!(held_model.series[0].nan_indices.is_empty());
+    assert_eq!(held_model.series[0].nan_indices, vec![0], "left edge");
+    assert_eq!(held_model.series[0].nan_kinds, vec![4]);
 
     for audit in [false, true] {
         let out = checked_delta(&request, &held, &current, audit);
@@ -214,13 +204,137 @@ fn anchorless_negative_series_updates_its_count_while_continuing() {
     }
 }
 
+/// A continuing run with no plottable x whose held rows lie only in the smoothing warmup margin gains its first in-range unplottable sample. Its marker appears on column 0 while every column is numerically unchanged, so no prefix can be reused.
+#[test]
+fn anchorless_marker_appearance_answers_full() {
+    let held_a = rows_shaped(3, |i| 97 + i, |i| 5 + i);
+    let grown_a = rows_shaped(4, |i| 97 + i, |i| if i == 3 { -1 } else { 5 + i });
+    let axis = rows_shaped(6, |i| 100 + i, |i| i + 1);
+    for algorithm in [
+        Algorithm::Ema,
+        Algorithm::Triangular,
+        Algorithm::SavitzkyGolay,
+    ] {
+        let mut request = absolute_log_request();
+        request.target_resolution = 10_000;
+        request.step_min = Some(100);
+        request.smoothing = Some(proto::SmoothingConfig {
+            algorithm: algorithm as i32,
+            window_size: 5,
+            time_constant: std::f64::consts::LOG2_E,
+            poly_order: 1,
+        });
+        let held = build(&request, &[held_a.clone(), axis.clone()]);
+        let held_model = inflate_full(&held);
+        assert_eq!(
+            held.series.len(),
+            2,
+            "{algorithm:?}: the margin-only run is held"
+        );
+        assert_eq!(held_model.x_values.len(), 6);
+        assert!(held_model.series[0].nan_indices.is_empty());
+        assert_eq!(held_model.series[0].xnan_count, 0);
+
+        let current = [grown_a.clone(), axis.clone()];
+        let truth = inflate_full(&build(&request, &current));
+        assert_eq!(truth.series[0].nan_indices, vec![0]);
+        assert_eq!(truth.series[0].nan_kinds, vec![4]);
+        assert_eq!(truth.series[0].xnan_count, 1);
+        assert_full_response(&request, &held, &current, None);
+    }
+}
+
+/// Unplottable samples of a run with no plottable x mark the chart's first column, for negative log-x (step and timestamp) and non-finite custom x alike, without disturbing the other run's data or its own logged-y precedence elsewhere.
+#[test]
+fn anchorless_runs_mark_the_first_column() {
+    for use_time in [false, true] {
+        let marker = rows_shaped(3, |i| if use_time { i } else { -3 + i }, |i| -3 + i);
+        let axis = rows_shaped(40, |i| i + 5, |i| 100 + 10 * i);
+        for algorithm in ALGORITHMS {
+            let mut request = req(&["a", "b"], 12);
+            request.use_timestamp_axis = use_time;
+            request.log_buckets = true;
+            request.smoothing = (algorithm != Algorithm::None).then_some(proto::SmoothingConfig {
+                algorithm: algorithm as i32,
+                window_size: 5,
+                time_constant: std::f64::consts::LOG2_E,
+                poly_order: 1,
+            });
+            let full = inflate_full(&build(&request, &[marker.clone(), axis.clone()]));
+            assert!(full.xr_min.iter().any(|v| v.is_finite()), "downsampled");
+            assert_eq!(full.series[0].nan_indices, vec![0]);
+            assert_eq!(full.series[0].nan_kinds, vec![4]);
+            assert_eq!(full.series[0].xnan_count, 3);
+            assert!(full.series[0].values.iter().all(|v| v.is_nan()));
+            assert!(full.series[1].nan_indices.is_empty());
+        }
+    }
+
+    let mut request = req(&["a", "b"], 10_000);
+    request.x_series = Some(proto::SeriesRef {
+        metric_name: "x".into(),
+        ..Default::default()
+    });
+    let rows = rows_shaped(4, |i| i, |i| i);
+    for (log, bad) in [(false, f64::NAN), (false, f64::INFINITY), (true, -2.0)] {
+        request.log_buckets = log;
+        let x_maps = std::collections::HashMap::from([
+            ("a".to_string(), (0..4).map(|s| (s, bad)).collect()),
+            (
+                "b".to_string(),
+                (0..4).map(|s| (s, (s + 1) as f64)).collect(),
+            ),
+        ]);
+        let full =
+            build_response(&request, &[rows.clone(), rows.clone()], Some(&x_maps), true).unwrap();
+        let full = inflate_full(&full);
+        assert_eq!(full.x_values, vec![1.0, 2.0, 3.0, 4.0], "log={log} x={bad}");
+        assert_eq!(full.series[0].nan_indices, vec![0]);
+        assert_eq!(full.series[0].nan_kinds, vec![4]);
+        assert_eq!(full.series[0].xnan_count, 4);
+    }
+}
+
+/// With no plottable point anywhere, the response keeps each series' unplottable count over an empty axis and carries no continuation state (the client never echoes an empty axis either). The first plottable point brings back an axis whose column 0 holds both markers. A chart with nothing in range ships zero counts, which the panel reads as "No data".
+#[test]
+fn all_unplottable_chart_ships_counts_without_columns() {
+    let request = absolute_log_request();
+    let only_negative = [timestamp_rows(&[-3, -2]), timestamp_rows(&[-5])];
+    let resp = build(&request, &only_negative);
+    assert!(resp.x_values.is_empty());
+    assert!(resp.frontiers.is_empty(), "nothing to continue from");
+    let counts: Vec<u32> = resp.series.iter().map(|s| s.xnan_count).collect();
+    assert_eq!(counts, vec![2, 1]);
+    let model = inflate_full(&resp);
+    assert!(model.series.iter().all(|s| s.nan_indices.is_empty()));
+
+    let first_point = build(
+        &request,
+        &[timestamp_rows(&[-3, -2, 4]), timestamp_rows(&[-5])],
+    );
+    let model = inflate_full(&first_point);
+    assert_eq!(model.x_values, vec![4.0]);
+    assert_eq!(model.series[0].nan_indices, vec![0]);
+    assert_eq!(model.series[1].nan_indices, vec![0]);
+    assert_eq!(model.series[1].xnan_count, 1);
+
+    let mut out_of_range = request.clone();
+    out_of_range.step_min = Some(10);
+    let empty = build(&out_of_range, &only_negative);
+    assert!(empty.x_values.is_empty());
+    assert!(
+        empty.series.iter().all(|s| s.xnan_count == 0),
+        "\"No data\""
+    );
+}
+
 #[test]
 fn first_plottable_points_seed_a_full_response_then_resume_deltas() {
     let axis = timestamp_rows(&[1, 2, 3, 4, 5, 6, 7, 8, 9]);
     let mut request = absolute_log_request();
     request.target_resolution = 10_000;
     let held = build(&request, &[timestamp_rows(&[-8, -4, -1]), axis.clone()]);
-    assert!(inflate_full(&held).series[0].nan_indices.is_empty());
+    assert_eq!(inflate_full(&held).series[0].nan_indices, vec![0]);
 
     let current = [timestamp_rows(&[-8, -4, -1, 3, 5]), axis.clone()];
     let truth = inflate_full(&build(&request, &current));
@@ -421,47 +535,104 @@ fn uniform_savgol_append_reemits_the_resized_final_block() {
     }
 }
 
+/// Custom x on a downsampled chart, linear and log: every gap's marker sits on the slot holding the last plottable x before it, and a run with no plottable x marks column 0.
 #[test]
-fn log_marker_bound_composes_with_a_real_causal_interpolation_dependency() {
-    let marker = timestamp_rows(&[-1, 8, 16, 17]);
-    let curve = |points: &[(i64, f32)]| {
+fn custom_x_markers_sit_on_their_anchor_slots() {
+    let rows = rows_shaped(400, |i| i, |i| i);
+    let mut request = req(&["a", "b", "c"], 40);
+    request.x_series = Some(proto::SeriesRef {
+        metric_name: "x".into(),
+        ..Default::default()
+    });
+    // A's x skips every 50th step (a gap).
+    let a_x = |s: i64| {
+        if s % 50 == 25 {
+            f64::NAN
+        } else {
+            (s * s) as f64 / 40.0 + 1.0
+        }
+    };
+    let x_maps = std::collections::HashMap::from([
+        ("a".to_string(), (0..400).map(|s| (s, a_x(s))).collect()),
+        (
+            "b".to_string(),
+            (0..400).map(|s| (s, (s * 10 + 3) as f64)).collect(),
+        ),
+        ("c".to_string(), (0..400).map(|s| (s, f64::NAN)).collect()),
+    ]);
+    for log in [false, true] {
+        request.log_buckets = log;
+        let full = inflate_full(
+            &build_response(
+                &request,
+                &[rows.clone(), rows.clone(), rows.clone()],
+                Some(&x_maps),
+                true,
+            )
+            .unwrap(),
+        );
+        assert!(
+            full.xr_min.iter().any(|v| v.is_finite()),
+            "log={log}: downsampled"
+        );
+        let mut expected: Vec<u32> = (0..400)
+            .filter(|s| s % 50 == 25)
+            .map(|s| slot_holding(&full, a_x(s - 1)) as u32)
+            .collect();
+        expected.dedup();
+        let a = &full.series[0];
+        assert_eq!(a.nan_indices, expected, "log={log}");
+        assert!(a.nan_kinds.iter().all(|&k| k == 4));
+        assert_eq!(a.xnan_count, 8);
+        let c = &full.series[2];
+        assert_eq!((c.nan_indices.as_slice(), c.xnan_count), (&[0][..], 400));
+    }
+}
+
+/// Duplicate refs pair positionally through a continuation, and a logged y-kind at the anchor keeps the slot's marker precedence over kind 4.
+#[test]
+fn duplicate_refs_and_logged_y_kind_precedence() {
+    let rows = |points: &[(i64, i64, f32)]| {
         Arc::new(
             points
                 .iter()
                 .enumerate()
-                .map(|(step, &(timestamp_ms, value))| VersionedRawPoint {
+                .map(|(i, &(step, timestamp_ms, value))| VersionedRawPoint {
                     timestamp_ms,
-                    ..scalar_row(step as i64, value)
+                    inserted_ms: i as i64 * 10_000_000,
+                    ..scalar_row(step, value)
                 })
                 .collect(),
         )
     };
-    let held_curve = curve(&[(8, 1.0), (9, 4.0), (16, f32::NAN)]);
-    let grown_curve = curve(&[(8, 1.0), (9, 4.0), (16, f32::NAN), (24, 20.0)]);
-    let axis = timestamp_rows(&[1, 6, 8, 9, 10, 11, 16, 17, 18, 19, 19]);
-    let mut request = req(&["marker", "curve", "axis"], 1);
-    request.use_timestamp_axis = true;
-    request.log_buckets = true;
-    request.smoothing = Some(proto::SmoothingConfig {
-        algorithm: Algorithm::Ema as i32,
-        time_constant: std::f64::consts::LOG2_E,
-        poly_order: 1,
-        ..Default::default()
-    });
-    let held = build(&request, &[marker.clone(), held_curve, axis.clone()]);
+    // (step, timestamp, value): the negative timestamp is carried to the first plottable x=5, whose y is logged NaN, so kind 4 and the y-kind share one slot.
+    let series = |extra: bool, bias: f32| {
+        let mut points = vec![
+            (0i64, -1i64, 1.0 + bias),
+            (1, 5, f32::NAN),
+            (2, 10, 3.0 + bias),
+        ];
+        if extra {
+            points.push((3, 20, 4.0 + bias));
+        }
+        rows(&points)
+    };
+    let mut request = absolute_log_request();
+    request.target_resolution = 10_000;
+    request.y_series = vec![request.y_series[0].clone(), request.y_series[0].clone()];
+    let held = build(&request, &[series(false, 0.0), series(false, 100.0)]);
     let held_model = inflate_full(&held);
-    assert_eq!(held_model.x_values, vec![1.0, 6.0, 9.5, 17.5]);
-    assert_eq!(held_model.series[0].nan_indices, vec![2]);
+    assert_eq!(held_model.x_values, vec![5.0, 10.0]);
+    for s in &held_model.series {
+        assert_eq!(s.nan_indices, vec![0]);
+        assert_eq!(s.nan_kinds, vec![1], "the logged y-kind beats kind 4");
+        assert_eq!(s.xnan_count, 1);
+    }
 
-    let current = [marker, grown_curve, axis];
-    let truth = inflate_full(&build(&request, &current));
-    // The new endpoint changes the curve at column 2 even though all new rows occupy column 3. Once interpolation invalidates column 2, its potentially changing center requires the preceding marker slot at column 1 to join the tail.
-    assert_ne!(
-        held_model.series[1].values[2].to_bits(),
-        truth.series[1].values[2].to_bits()
-    );
+    let current = [series(true, 0.0), series(true, 100.0)];
     for audit in [false, true] {
         let out = checked_delta(&request, &held, &current, audit);
-        assert_eq!(out.from_col, 1);
+        assert_eq!(out.splice_from_cached, vec![0, 1]);
+        assert_eq!(out.from_col, 2, "only the appended x=20 resends");
     }
 }

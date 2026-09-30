@@ -201,6 +201,15 @@ const logTime = {
 logTime.data[0][0] = 1.001;
 assert.match(window.__kymo_chartCopy.buildText(logTime, 0), /^time: 1\n\n/);
 
+// A kind-4 marker without a value (a run with no plottable x) has no sample at this x.
+const anchorless = {
+  ...chart,
+  data: [[42], [1.25], [null], [null], [4]],
+  series: [{}, { label: "a" }, { label: "n" }],
+  __kymo_copy: { ...chart.__kymo_copy, seriesCount: 2, nanBase: 3, nanCols: 2 },
+};
+assert.equal(window.__kymo_chartCopy.buildText(anchorless, 0), "'=custom x: 41\n\na\t1.25");
+
 let event = copyEvent();
 copyListener(event);
 assert.equal(copiedText, expected);

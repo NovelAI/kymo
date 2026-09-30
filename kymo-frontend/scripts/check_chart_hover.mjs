@@ -402,6 +402,19 @@ test("kind-4 counts and log-time rendering shifts use the selected index", () =>
   assert.equal(tooltipCell(f.tip, 1, "x").text, "@ 0");
 });
 
+test("a kind-4 marker without a value reads as no plottable x", () => {
+  // A run with no plottable x has only its column-0 marker; nearest-point readouts borrow it.
+  const f = fixture({ nanCols: 2, xnanC: [0, 3] });
+  f.enable();
+  f.chart.data = [
+    [0, 10, 20], [100, 100, 100], [null, null, null],
+    [null, null, null], [4, null, null],
+  ];
+  f.run();
+  assert.equal(tooltipCell(f.tip, 1, "val").text, "no plottable x ×3");
+  assert.equal(tooltipCell(f.tip, 1, "x").text, "@ 0");
+});
+
 test("log charts borrow by data-x while highlighting the hovered column", () => {
   const f = fixture();
   f.enable();

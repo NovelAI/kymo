@@ -653,7 +653,7 @@ pub(super) fn NumericContent(
                     }
                 };
                 loading.set(false);
-                // Runs absent from a complete linear response without custom X have no data on this metric; remember them so their version bumps stop probing. An all-empty custom-X join or an all-negative log-X series loses every identity on the wire even though later ordinary data can make it plottable.
+                // Runs absent from a complete linear response without custom X have no data on this metric; remember them so their version bumps stop probing. An all-empty custom-X join loses every identity on the wire even though later ordinary data can make it plottable. So does an all-negative log-X chart from a server that predates shipping unplottable counts (AI-1491), which keeps log-X excluded until that server is gone.
                 let nc_new = noncontributors_from_response(&request, &full);
                 // Freshness snapshots for the request's runs (fresh_for looks nothing else up), from the pre-send peeks above.
                 let snap_for = |map: &std::collections::HashMap<String, u64>| {
@@ -817,9 +817,20 @@ pub(super) fn NumericContent(
         }
         // An empty answer is knowledge, and a refetch in flight doesn't
         // un-know it — these arms hold steady across restarts.
-        Some(_) => rsx! {
-            div { class: "rect-empty", style: "height: {chart_height}px;", "No data" }
-        },
+        Some(ChartAnswer {
+            response: chart, ..
+        }) => {
+            // Samples whose x this axis can't place still ship their counts over an empty axis.
+            let unplottable: u64 = chart.series.iter().map(|s| u64::from(s.xnan_count)).sum();
+            let message = match unplottable {
+                0 => "No data".to_string(),
+                1 => "No plottable data: 1 sample has an x this axis can't show".to_string(),
+                n => format!("No plottable data: {n} samples have an x this axis can't show"),
+            };
+            rsx! {
+                div { class: "rect-empty", style: "height: {chart_height}px;", "{message}" }
+            }
+        }
         None if unavailable.is_some() => {
             let message = unavailable.as_deref().unwrap_or_default();
             rsx! {

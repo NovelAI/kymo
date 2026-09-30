@@ -1325,6 +1325,16 @@ struct MixedAxis {
     xr_max: Vec<f64>,
 }
 
+impl MixedAxis {
+    /// The slot holding a run's own sample at `x`: its envelope cell's slot, else its exact raw slot — where [`bucket_run`] put it.
+    fn anchor_slot(&self, x: f64) -> usize {
+        match self.plan.grid.index(x).filter(|&c| self.plan.env[c]) {
+            Some(c) => self.slot_of_cell[c],
+            None => self.x.partition_point(|&v| v < x),
+        }
+    }
+}
+
 fn mixed_axis(plan: AxisPlan) -> MixedAxis {
     let mut x = Vec::with_capacity(plan.raw_xs.len() + plan.grid.cells);
     let mut slot_of_cell = vec![usize::MAX; plan.grid.cells];
@@ -1371,7 +1381,7 @@ pub const AGE_OLD: u8 = 0;
 pub const AGE_REACH: u8 = 1;
 pub const AGE_NEW: u8 = 2;
 
-/// Prove a prefix for numeric columns and logged-y markers: axis and every CONTINUING series (any held sample; all-new series ship complete and constrain nothing). Callers must first flag interpolation dependencies and then apply [`bound_xnan_from_col`] for carried kind-4 markers before using this as a splice point. Zero means answer in full.
+/// Prove a prefix for numeric columns and logged-y markers: axis and every CONTINUING series (any held sample; all-new series ship complete and constrain nothing). Callers must first flag interpolation and kind-4 marker dependencies before using this as a splice point. Zero means answer in full.
 ///
 /// The non-NEW reconstruction is exactly the held input.
 ///
@@ -1415,45 +1425,6 @@ pub fn numeric_delta_from_col(xs: &[&[f64]], age: &[&[u8]], spec: GridSpec) -> u
         // Passthrough <-> grid flip: structurally different axes.
         _ => 0,
     }
-}
-
-/// Bound the current and verified held kind-4 marker anchors of a continuing series.
-///
-/// With verified input history, held rows are retained in the current rows. On absolute log axes min_x is the first current plottable x and max_x is the first verified-held plottable x.
-///
-/// held records whether the verified-held rows contained a marker with a plottable anchor. The upper bound proves stable placement only when held is true. With no held plottable x, use max_x = INFINITY and held = false.
-#[derive(Clone, Copy, Debug)]
-pub struct XnanDependency {
-    pub min_x: f64,
-    pub max_x: f64,
-    pub held: bool,
-}
-
-/// Restrict a proven numeric prefix for kind-4 nearest-slot placement.
-///
-/// Every held axis has the leading slots proved by numeric_delta_from_col. A dirty slot can move a marker onto or off the preceding slot. A marker is stable only when both anchors choose the same prefix slot and a fixed right neighbor, or the anchor itself, excludes competition from the suffix. Otherwise the earliest possible affected prefix slot starts the delta.
-///
-/// This needs no held-chart reconstruction and examines O(log from_col) axis entries per dependency.
-pub fn bound_xnan_from_col(axis: &[f64], from_col: usize, deps: &[XnanDependency]) -> usize {
-    if from_col == 0 || from_col > axis.len() {
-        return 0;
-    }
-    let prefix = &axis[..from_col];
-    let mut bound = from_col;
-    for dep in deps {
-        if !dep.min_x.is_finite() || dep.max_x.is_nan() || dep.max_x < dep.min_x {
-            return 0;
-        }
-        let first = nearest_axis_slot(prefix, dep.min_x);
-        // A complete numeric prefix leaves no competing suffix: retained rows cannot supply an extra held column, and any new plottable sample of a continuing series would already dirty its column.
-        let stable = dep.held
-            && first == nearest_axis_slot(prefix, dep.max_x)
-            && (first + 1 < from_col || dep.max_x <= prefix[first] || from_col == axis.len());
-        if !stable {
-            bound = bound.min(first);
-        }
-    }
-    bound
 }
 
 /// Borrow a contiguous held (non-NEW) x prefix, or filter into an owned buffer when timestamp ordering interleaves new rows. Cache lineage preserves a held step prefix within each tag, including after eviction recovery.
@@ -1753,136 +1724,6 @@ mod delta_planner_tests {
     }
 
     #[test]
-    fn kind4_stable_placement_keeps_the_numeric_prefix() {
-        let axis = [0.0, 10.0, 20.0, 30.0];
-        for (min_x, max_x) in [(5.0, 5.0), (11.0, 14.0), (20.0, 20.0)] {
-            assert_eq!(
-                bound_xnan_from_col(
-                    &axis,
-                    3,
-                    &[XnanDependency {
-                        min_x,
-                        max_x,
-                        held: true,
-                    }],
-                ),
-                3,
-                "stable marker anchor range [{min_x}, {max_x}]"
-            );
-        }
-    }
-
-    #[test]
-    fn kind4_dirty_center_or_mode_can_move_marker_to_preceding_slot() {
-        // The first two numeric columns are identical. The changing envelope center, or a raw-to-envelope cell flip, can nevertheless move the marker into column 1, which the numeric planner would retain.
-        for (old_axis, new_axis, anchor) in [
-            (
-                vec![0.0, 10.0, 18.0, 40.0],
-                vec![0.0, 10.0, 28.0, 40.0],
-                18.0,
-            ),
-            (
-                vec![0.0, 10.0, 16.0, 20.0, 24.0, 40.0],
-                vec![0.0, 10.0, 20.0, 40.0],
-                14.0,
-            ),
-        ] {
-            let mut old = DenseSeries::default();
-            let mut new = DenseSeries::default();
-            fold_xnan(&mut old, &[anchor], &old_axis);
-            fold_xnan(&mut new, &[anchor], &new_axis);
-            assert_eq!(old.nan_indices, [2]);
-            assert_eq!(new.nan_indices, [1]);
-            assert_eq!(
-                bound_xnan_from_col(
-                    &new_axis,
-                    2,
-                    &[XnanDependency {
-                        min_x: anchor,
-                        max_x: anchor,
-                        held: true,
-                    }],
-                ),
-                1
-            );
-        }
-    }
-
-    #[test]
-    fn kind4_bound_includes_uncertain_presence_and_carried_anchor() {
-        let axis = [0.0, 10.0, 20.0, 30.0];
-        for (min_x, max_x, held, expected) in [
-            (1.0, 19.0, true, 0),
-            (10.0, 10.0, false, 1),
-            (20.0, f64::INFINITY, false, 2),
-        ] {
-            assert_eq!(
-                bound_xnan_from_col(&axis, axis.len(), &[XnanDependency { min_x, max_x, held }]),
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn kind4_bound_covers_intermediate_held_axes_and_anchors() {
-        let current_axis = [0.0, 10.0, 20.0, 30.0, 40.0];
-        let prefix_markers = |s: &DenseSeries, bound: usize| {
-            s.nan_indices
-                .iter()
-                .copied()
-                .filter(|&i| (i as usize) < bound)
-                .collect::<Vec<_>>()
-        };
-        // The first three columns are guaranteed; any held snapshot may have a different tail and a carried anchor anywhere within the bounds.
-        for min_x in (0..=40).step_by(5) {
-            for max_x in (min_x..=45).step_by(5) {
-                for held in [false, true] {
-                    let bound = bound_xnan_from_col(
-                        &current_axis,
-                        3,
-                        &[XnanDependency {
-                            min_x: min_x as f64,
-                            max_x: max_x as f64,
-                            held,
-                        }],
-                    );
-                    let mut current = DenseSeries::default();
-                    fold_xnan(&mut current, &[min_x as f64], &current_axis);
-                    let tails: &[&[f64]] = &[
-                        &[],
-                        &[21.0],
-                        &[25.0],
-                        &[30.0],
-                        &[40.0],
-                        &[50.0],
-                        &[21.0, 25.0, 50.0],
-                    ];
-                    for tail in tails {
-                        // A held axis can end at the fixed prefix: no right neighbor from the current suffix may be assumed to have existed then.
-                        let old_axis: Vec<f64> = current_axis[..3]
-                            .iter()
-                            .chain(tail.iter())
-                            .copied()
-                            .collect();
-                        for old_x in min_x..=max_x {
-                            let mut old = DenseSeries::default();
-                            fold_xnan(&mut old, &[old_x as f64], &old_axis);
-                            assert_eq!(
-                                prefix_markers(&old, bound),
-                                prefix_markers(&current, bound),
-                                "anchors=[{min_x}, {max_x}] old_x={old_x} tail={tail:?} held={held}"
-                            );
-                        }
-                        if !held {
-                            assert!(prefix_markers(&current, bound).is_empty());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
     fn tail_appends_keep_most_of_a_downsampled_chart() {
         let (xa, ya) = series(3000, 1);
         let (xb, yb) = series(2400, 8);
@@ -2076,8 +1917,9 @@ mod delta_planner_tests {
 /// Bucket every run onto one shared slot axis. `xs`/`plot`/`kinds` are parallel
 /// per run (ascending x); `raw` is the pre-smoothing values, used per run only
 /// when `is_smoothed` (else pass empty slices and `plot` is the value source).
-/// `xnan` is the per-run "unplottable x" positions (kind-4 markers: non-finite
-/// custom-x, or negative x on a log axis; empty otherwise). `spec` is the
+/// `xnan` is each run's kind-4 anchors: the plottable x its unplottable samples
+/// (non-finite custom-x, or negative x on a log axis) are carried to, or −∞ for
+/// a run with no plottable x (column 0); empty otherwise. `spec` is the
 /// request's axis geometry — labels/run_ids on the result are left empty for
 /// the caller to fill.
 pub fn shared_chart(
@@ -2122,7 +1964,7 @@ pub fn shared_chart(
                     is_smoothed,
                     &ma,
                 );
-                fold_xnan(&mut a, xnan[i], &ma.x);
+                fold_xnan(&mut a, xnan[i], |x| ma.anchor_slot(x));
                 series.push(a);
             }
             DenseChart {
@@ -2136,11 +1978,11 @@ pub fn shared_chart(
 }
 
 /// Merge "unplottable x" annotations (kind 4: non-finite custom-x, negative x
-/// on a log axis) into a run's markers, each pinned to the nearest axis slot. A
-/// y-kind already at that slot wins (it says strictly more). Also the single
-/// place markers are sorted and de-duplicated by slot. No work when `xnan` is
-/// empty and the run produced no markers.
-fn fold_xnan(a: &mut DenseSeries, xnan: &[f64], axis: &[f64]) {
+/// on a log axis) into a run's markers, each on the slot holding its anchor
+/// sample (`slot_of`). A y-kind already at that slot wins (it says strictly
+/// more). Also the single place markers are sorted and de-duplicated by slot.
+/// No work when `xnan` is empty and the run produced no markers.
+fn fold_xnan(a: &mut DenseSeries, xnan: &[f64], slot_of: impl Fn(f64) -> usize) {
     if a.nan_indices.is_empty() && xnan.is_empty() {
         return;
     }
@@ -2150,29 +1992,18 @@ fn fold_xnan(a: &mut DenseSeries, xnan: &[f64], axis: &[f64]) {
         .copied()
         .zip(a.nan_kinds.iter().copied())
         .collect();
-    if !axis.is_empty() {
-        for &x in xnan {
-            let slot = nearest_axis_slot(axis, x);
-            pairs.push((slot as u32, 4));
-        }
+    for &x in xnan {
+        // −∞ (a run with no plottable x) is column 0 on any axis.
+        let slot = if x == f64::NEG_INFINITY {
+            0
+        } else {
+            slot_of(x)
+        };
+        pairs.push((slot as u32, 4));
     }
     pairs.sort_unstable();
     pairs.dedup_by_key(|&mut (p, _)| p);
     (a.nan_indices, a.nan_kinds) = pairs.into_iter().unzip();
-}
-
-/// Nearest slot on a nonempty ascending axis. Ties go left, identically for marker emission and the delta dependency proof.
-fn nearest_axis_slot(axis: &[f64], x: f64) -> usize {
-    let p = axis.partition_point(|&v| v < x);
-    if p == 0 {
-        0
-    } else if p >= axis.len() {
-        axis.len() - 1
-    } else if (x - axis[p - 1]).abs() <= (axis[p] - x).abs() {
-        p - 1
-    } else {
-        p
-    }
 }
 
 /// No-downsample axis = the union of distinct x. Each run drops its values onto
@@ -2238,7 +2069,7 @@ fn shared_passthrough(
                 s.nan_kinds.push(kinds[i][k] as u32);
             }
         }
-        fold_xnan(&mut s, xnan[i], &axis);
+        fold_xnan(&mut s, xnan[i], |x| axis.partition_point(|&v| v < x));
         bands.push((y_min, y_max));
         series.push(s);
     }
@@ -2420,8 +2251,9 @@ fn bucket_run(
 
 /// Wire kind of a sample's logged value: 0 = finite (never shipped as a
 /// marker), 1 = NaN, 2 = +∞, 3 = -∞. Kind 4 — an unplottable x, carried to
-/// the preceding plottable custom-x (or the first for a leading gap) or the
-/// first plottable absolute-log x — is assigned in query.rs; it never describes
+/// the preceding plottable custom-x (or the first for a leading gap), the
+/// first plottable log-axis x, or column 0 for a run with no plottable x — is
+/// assigned in query.rs; it never describes
 /// a y value. THE single
 /// classification: emission derives both row eviction and the wire
 /// `nan_kinds` from it, so a row cannot be marked one thing and ship another.
@@ -2974,17 +2806,28 @@ mod shared_chart_tests {
         smoothed: bool,
         spec: GridSpec,
     ) -> DenseChart {
+        let empty: Vec<Vec<f64>> = xs.iter().map(|_| Vec::new()).collect();
+        run_xnan(xs, plot, kinds, &empty, smoothed, spec)
+    }
+
+    fn run_xnan(
+        xs: &[Vec<f64>],
+        plot: &[Vec<f64>],
+        kinds: &[Vec<u8>],
+        xnan: &[Vec<f64>],
+        smoothed: bool,
+        spec: GridSpec,
+    ) -> DenseChart {
         let raw: Vec<Vec<f64>> = if smoothed {
             plot.to_vec()
         } else {
             xs.iter().map(|_| Vec::new()).collect()
         };
-        let empty: Vec<Vec<f64>> = xs.iter().map(|_| Vec::new()).collect();
         let xs_s: Vec<&[f64]> = xs.iter().map(|v| v.as_slice()).collect();
         let plot_s: Vec<&[f64]> = plot.iter().map(|v| v.as_slice()).collect();
         let raw_s: Vec<&[f64]> = raw.iter().map(|v| v.as_slice()).collect();
         let kinds_s: Vec<&[u8]> = kinds.iter().map(|v| v.as_slice()).collect();
-        let xnan_s: Vec<&[f64]> = empty.iter().map(|v| v.as_slice()).collect();
+        let xnan_s: Vec<&[f64]> = xnan.iter().map(|v| v.as_slice()).collect();
         shared_chart(&xs_s, &plot_s, &raw_s, &kinds_s, &xnan_s, smoothed, spec)
     }
 
@@ -3260,29 +3103,37 @@ mod shared_chart_tests {
         assert!(b.min_values[1].is_nan(), "gap slots stay gaps");
     }
 
+    /// A kind-4 marker takes the slot holding its anchor sample even when another slot is nearer in x: anchor 8 opens the [8,16) envelope centred at 11.5, while the [0,8) envelope centre 5.5 is nearer. A raw anchor keeps its exact slot, where a logged y-kind wins.
+    #[test]
+    fn kind4_marks_its_anchor_cell_not_the_nearest_slot() {
+        let xs = [
+            vec![8.0, 20.0],
+            vec![4.0, 5.0, 6.0, 7.0, 13.0, 14.0, 15.0, 17.0],
+        ];
+        let plot = [vec![1.0, f64::NAN], vec![2.0; 8]];
+        let kinds = [vec![0u8, 1], vec![0u8; 8]];
+        let xnan = [vec![8.0f64, 20.0], vec![]];
+        let sc = run_xnan(&xs, &plot, &kinds, &xnan, false, spec_of(2, false));
+        assert_eq!(sc.x_values, vec![5.5, 11.5, 17.0, 20.0]);
+        let s = &sc.series[0];
+        assert_eq!(s.nan_indices, vec![1, 3]);
+        assert_eq!(
+            s.nan_kinds,
+            vec![4, 1],
+            "the logged NaN at x=20 wins its slot"
+        );
+        assert!(s.values[1].is_finite(), "kind 4 annotates, does not evict");
+    }
+
     /// Custom-x sample whose X was logged non-finite becomes a kind-4 marker
-    /// at the nearest slot, without evicting that slot's value.
+    /// on its anchor's slot, without evicting that slot's value.
     #[test]
     fn custom_x_nonfinite_x_becomes_kind4_marker() {
         let xs = [vec![0.0, 1.0, 2.0, 3.0]];
         let plot = [vec![10.0, 20.0, 30.0, 40.0]];
-        let raw: [Vec<f64>; 1] = [vec![]];
         let kinds = [vec![0u8; 4]];
         let xnan = [vec![2.0f64]];
-        let xs_s: Vec<&[f64]> = xs.iter().map(|v| v.as_slice()).collect();
-        let plot_s: Vec<&[f64]> = plot.iter().map(|v| v.as_slice()).collect();
-        let raw_s: Vec<&[f64]> = raw.iter().map(|v| v.as_slice()).collect();
-        let kinds_s: Vec<&[u8]> = kinds.iter().map(|v| v.as_slice()).collect();
-        let xnan_s: Vec<&[f64]> = xnan.iter().map(|v| v.as_slice()).collect();
-        let sc = shared_chart(
-            &xs_s,
-            &plot_s,
-            &raw_s,
-            &kinds_s,
-            &xnan_s,
-            false,
-            spec_of(100, false),
-        );
+        let sc = run_xnan(&xs, &plot, &kinds, &xnan, false, spec_of(100, false));
         let s = &sc.series[0];
         assert_eq!(s.nan_indices, vec![2]);
         assert_eq!(s.nan_kinds, vec![4], "kind 4 = unplottable x");
