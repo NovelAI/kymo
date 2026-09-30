@@ -27,6 +27,7 @@ mod pg;
 mod private_file;
 mod query;
 mod refresh_locks;
+mod registry_cache;
 mod registry_reconcile;
 #[path = "../../shared/retired_env.rs"]
 pub mod retired_env;

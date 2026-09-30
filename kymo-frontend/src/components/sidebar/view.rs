@@ -1,5 +1,6 @@
 use super::*;
 use crate::util::{focus_on_mount, is_app_escape, js_bridge::js_string, TOP_LAYER_SELECTOR};
+use dioxus::core::{current_scope_id, Runtime};
 
 /// A run's liveness glyph: shape tells the kind of state, CSS color its severity.
 #[component]
@@ -65,9 +66,9 @@ pub fn Sidebar() -> Element {
     let mut state = use_context::<DashboardState>();
     let project_id = state.project_id.read().clone();
     // Run links carry the focused chart along, so a run click under an open maximize overlay lands with the same chart focused.
-    let chart_focus = use_route::<Route>().chart_param();
-    let runs = state.runs.read().clone();
-    let selected = state.selected_runs.read().clone();
+    // Only the links read it, through a memo that notifies them when the chart changes.
+    let chart_focus = use_memo(|| router().current::<Route>().chart_param());
+    let runs = state.runs.read();
     let mut filter = use_signal(String::new);
     let mut picking_color_for = use_signal(|| None::<ColorPickerTarget>);
     // Deletion selection is deliberately transient and completely separate
@@ -75,9 +76,9 @@ pub fn Sidebar() -> Element {
     let mut trash_pick = use_signal(|| None::<HashSet<String>>);
     // One drag-paint gesture at a time, whichever mode armed it: bulk mode
     // paints the deletion selection, normal mode paints `selected_runs`.
-    let mut paint = use_signal(|| None::<SelectionPaint>);
+    let paint = use_signal(|| None::<SelectionPaint>);
     let trash_busy = use_signal(|| false);
-    let mut action_feedback = use_signal(String::new);
+    let action_feedback = use_signal(String::new);
     let action_feedback_timer = use_signal(|| None::<Task>);
     let mut trash_feedback = use_signal(String::new);
     let mut rename_target = use_signal(|| None::<RenameRunTarget>);
@@ -172,51 +173,68 @@ pub fn Sidebar() -> Element {
         }
     });
 
-    let filter_text = filter.read().to_lowercase();
-    let show_run_ordinals = sidebar_needs_run_ordinals(&runs);
-    let filtered_runs: Vec<crate::grpc::proto::RunInfo> = if filter_text.is_empty() {
-        runs.clone()
-    } else {
-        runs.iter()
+    let listed = use_memo(move || {
+        let filter_text = filter.read().to_lowercase();
+        let runs: Vec<Rc<RunInfo>> = state
+            .runs
+            .read()
+            .iter()
             .filter(|r| {
-                r.run_name.to_lowercase().contains(&filter_text)
+                filter_text.is_empty()
+                    || r.run_name.to_lowercase().contains(&filter_text)
                     || r.run_id.to_lowercase().contains(&filter_text)
                     || r.ordinal.to_string().contains(&filter_text)
             })
-            .cloned()
-            .collect()
-    };
-    let filtered_run_ids: Rc<[String]> = filtered_runs
-        .iter()
-        .map(|run| run.run_id.clone())
-        .collect::<Vec<_>>()
-        .into();
+            .map(|run| Rc::new(run.clone()))
+            .collect();
+        let run_ids = runs.iter().map(|run| run.run_id.clone()).collect();
+        ListedRuns { runs, run_ids }
+    });
+    use_context_provider(|| RowContext {
+        listed,
+        mutation_ui,
+        rename_target,
+        picking_color_for,
+        action_feedback,
+        action_feedback_timer,
+        chart_focus,
+        sidebar: current_scope_id(),
+    });
+    let show_run_ordinals =
+        *use_memo(move || sidebar_needs_run_ordinals(&state.runs.read())).read();
+    let listed_now = listed.read();
+    let filtered_runs = &listed_now.runs;
+    let filtered_run_ids = &listed_now.run_ids;
 
+    let in_trash_mode = trash_pick.read().is_some();
+    let mut pending_trash = trash_pick.read().clone().unwrap_or_default();
     // A push or a locally confirmed partial mutation can remove runs while
     // bulk mode is open. Never leave those stale identities commit-able.
-    let active_ids: HashSet<&str> = runs.iter().map(|run| run.run_id.as_str()).collect();
-    let pending_needs_prune = trash_pick.peek().as_ref().is_some_and(|pick| {
-        pick.iter()
-            .any(|run_id| !active_ids.contains(run_id.as_str()))
-    });
-    if pending_needs_prune {
-        end_paint_if_active(paint);
-        if let Some(pick) = trash_pick.write().as_mut() {
-            pick.retain(|run_id| active_ids.contains(run_id.as_str()));
+    if !pending_trash.is_empty() {
+        let active_ids: HashSet<&str> = runs.iter().map(|run| run.run_id.as_str()).collect();
+        let picked = pending_trash.len();
+        pending_trash.retain(|run_id| active_ids.contains(run_id.as_str()));
+        if pending_trash.len() < picked {
+            end_paint_if_active(paint);
+            trash_pick.set(Some(pending_trash.clone()));
         }
     }
 
-    let in_trash_mode = trash_pick.read().is_some();
-    let pending_trash = trash_pick.read().clone().unwrap_or_default();
     // Close the picker when its anchor, the row's ⋯ trigger, unmounts (filtering, a run-list change, Trash mode); merely skipping its render would reopen it with the row.
+    let row_gone = |run_id: &String| in_trash_mode || !filtered_run_ids.contains(run_id);
     let mut color_picker_target = picking_color_for.read().clone();
-    if let Some(orphan) = color_picker_target
-        .take_if(|target| in_trash_mode || !filtered_run_ids.contains(&target.run_id))
-    {
+    if let Some(orphan) = color_picker_target.take_if(|target| row_gone(&target.run_id)) {
         picking_color_for.set(None);
         // The picker may own focus; fall back like any other close.
         focus_run_overflow_trigger(orphan.ordinal, true);
     }
+    // The rename editor closes the same way, including one armed after its row unmounted.
+    let mut active_rename = rename_target.read().clone();
+    if let Some(orphan) = active_rename.take_if(|target| row_gone(&target.run_id)) {
+        rename_target.set(None);
+        focus_run_overflow_trigger(orphan.ordinal, true);
+    }
+    let selected = state.selected_runs.read();
     let pending_count = pending_trash.len();
     let active_selected_count = if in_trash_mode {
         pending_count
@@ -232,12 +250,16 @@ pub fn Sidebar() -> Element {
     } else {
         action_feedback_text.as_str()
     };
-    let active_rename = rename_target.read().clone();
-    let pending_shown = filtered_runs
-        .iter()
-        .filter(|run| pending_trash.contains(&run.run_id))
-        .count();
-    let live_warning = live_trash_warning(&runs, &pending_trash);
+    // The Trash footer's text; nothing else reads it.
+    let (pending_shown, live_warning) = if in_trash_mode {
+        let shown = filtered_runs
+            .iter()
+            .filter(|run| pending_trash.contains(&run.run_id))
+            .count();
+        (shown, live_trash_warning(&runs, &pending_trash))
+    } else {
+        (0, String::new())
+    };
     rsx! {
         div {
             class: if in_trash_mode && *trash_busy.read() {
@@ -253,20 +275,18 @@ pub fn Sidebar() -> Element {
                     class: "btn-link",
                     disabled: (active_selected_count == 0 && filtered_run_ids.is_empty())
                         || (in_trash_mode && *trash_busy.read()),
-                    onmousedown: primary({
-                        let listed_run_ids = filtered_run_ids.clone();
-                        move |_| {
-                            end_paint_if_active(paint);
-                            if in_trash_mode {
-                                if let Some(pick) = trash_pick.write().as_mut() {
-                                    all_or_none_selection(pick, &listed_run_ids);
-                                }
-                            } else {
-                                all_or_none_selection(&mut state.selected_runs.write(), &listed_run_ids);
+                    onmousedown: primary(move |_| {
+                        end_paint_if_active(paint);
+                        let listed_run_ids = &listed.read().run_ids;
+                        if in_trash_mode {
+                            if let Some(pick) = trash_pick.write().as_mut() {
+                                all_or_none_selection(pick, listed_run_ids);
                             }
+                        } else {
+                            all_or_none_selection(&mut state.selected_runs.write(), listed_run_ids);
                         }
                     }),
-                    {selection_action_label(active_selected_count, !filter_text.is_empty(), in_trash_mode)}
+                    {selection_action_label(active_selected_count, !filter.read().is_empty(), in_trash_mode)}
                 }
                 div { class: "sidebar-actions-end",
                     span {
@@ -334,357 +354,15 @@ pub fn Sidebar() -> Element {
                 if let Some(message) = run_list_empty_message(runs.len(), filtered_runs.len()) {
                     p { class: "sidebar-empty", "{message}" }
                 }
-                for (visible_index, run) in filtered_runs.iter().enumerate() {
-                    {
-                        let is_selected = selected.contains(&run.run_id);
-                        let is_pending_trash = pending_trash.contains(&run.run_id);
-                        let run_id_toggle = run.run_id.clone();
-                        let run_id_visibility_start = run.run_id.clone();
-                        let run_id_hover = run.run_id.clone();
-                        let run_id_link = run.run_id.clone();
-                        let run_id_select = run.run_id.clone();
-                        let run_id_key = run.run_id.clone();
-                        let visible_run_ids_start = filtered_run_ids.clone();
-                        let visible_run_ids_paint = filtered_run_ids.clone();
-                        let run_id_menu = run.run_id.clone();
-                        let ordinal_menu = run.ordinal;
-                        let menu_id = format!("run-overflow-menu-{ordinal_menu}");
-                        let color = run_color(&run.run_id, run.ordinal);
-                        let hover_name = run.run_name.clone();
-                        let run_name = run.run_name.clone();
-                        let display_name = sidebar_run_label(run, show_run_ordinals);
-                        let visibility_title = if is_selected {
-                            format!("Hide {display_name} from charts")
-                        } else {
-                            format!("Show {display_name} on charts")
-                        };
-                        let visibility_label = format!("{display_name} visible on charts");
-                        let status = run.status();
-                        let row_class = if in_trash_mode && is_pending_trash {
-                            "sidebar-run sidebar-run-trash sidebar-run-trash-selected"
-                        } else if in_trash_mode {
-                            "sidebar-run sidebar-run-trash"
-                        } else {
-                            "sidebar-run"
-                        };
-                        rsx! {
-                            div {
-                                key: "{run.run_id}",
-                                class: "{row_class}",
-                                // Chart hover matches the raw run ID or name.
-                                "data-run-id": "{run.run_id}",
-                                "data-run-name": "{run.run_name}",
-                                role: in_trash_mode.then_some("checkbox"),
-                                tabindex: (in_trash_mode && !*trash_busy.read()).then_some("0"),
-                                aria_checked: if in_trash_mode { Some(is_pending_trash) } else { None },
-                                aria_disabled: if in_trash_mode { Some(*trash_busy.read()) } else { None },
-                                aria_label: if in_trash_mode {
-                                    Some(format!("Select {display_name} for Trash"))
-                                } else {
-                                    None
-                                },
-                                // main.rs's detail-zero activation bridge sends
-                                // ARIA checkboxes a paired down/up. Physical
-                                // presses come here directly and keep paint armed.
-                                onmousedown: primary(move |_| {
-                                    if !in_trash_mode || *trash_busy.peek() {
-                                        return;
-                                    }
-                                    let mut trash = trash_pick.write();
-                                    let Some(pick) = trash.as_mut() else {
-                                        return;
-                                    };
-                                    paint.set(SelectionPaint::begin(
-                                        pick,
-                                        &run_id_select,
-                                        visible_run_ids_start.clone(),
-                                        visible_index,
-                                    ));
-                                }),
-                                onkeydown: move |e: Event<KeyboardData>| {
-                                    if in_trash_mode
-                                        && !*trash_busy.peek()
-                                        && !e.is_auto_repeating()
-                                        && (e.key() == Key::Enter
-                                            || e.key() == Key::Character(" ".to_string()))
-                                    {
-                                        e.prevent_default();
-                                        end_paint_if_active(paint);
-                                        let mut trash = trash_pick.write();
-                                        let Some(pick) = trash.as_mut() else {
-                                            return;
-                                        };
-                                        toggle_membership(pick, &run_id_key);
-                                    }
-                                },
-                                // In normal mode hover highlights this run on
-                                // every chart. Trash mode keeps hover local to
-                                // the deletion-selection row.
-                                onmouseenter: move |e: Event<MouseData>| {
-                                    if !e.held_buttons().contains(MouseButton::Primary)
-                                        || paint.peek().is_none()
-                                    {
-                                        // The window bridge delivers release asynchronously; hover without a held primary button clears stale paint.
-                                        end_paint_if_active(paint);
-                                    } else if in_trash_mode {
-                                        if let Some(pick) = trash_pick.write().as_mut() {
-                                            continue_selection_paint(
-                                                &mut paint.write(),
-                                                pick,
-                                                visible_run_ids_paint.as_ref(),
-                                                visible_index,
-                                            );
-                                        }
-                                    } else {
-                                        continue_selection_paint(
-                                            &mut paint.write(),
-                                            &mut state.selected_runs.write(),
-                                            visible_run_ids_paint.as_ref(),
-                                            visible_index,
-                                        );
-                                    }
-                                    if in_trash_mode {
-                                        return;
-                                    }
-                                    let rid = js_string(&run_id_hover);
-                                    let name = js_string(&hover_name);
-                                    let _ = js_sys::eval(&format!("window.__kymo_setHl({rid},{name})"));
-                                },
-                                onmouseleave: move |_| {
-                                    if !in_trash_mode {
-                                        let _ = js_sys::eval("window.__kymo_setHl(null)");
-                                    }
-                                },
-                                if in_trash_mode {
-                                    span { class: "run-marker-toggle",
-                                        "aria-hidden": "true",
-                                        span {
-                                            // Keep chart visibility visible in Trash mode;
-                                            // the selected row class adds deletion fill and
-                                            // its warning halo without a second state check.
-                                            class: if is_selected {
-                                                "run-marker run-marker-filled"
-                                            } else {
-                                                "run-marker"
-                                            },
-                                            style: "--run-color: {color};",
-                                        }
-                                    }
-                                } else {
-                                    // Native checkbox semantics stay intact while the
-                                    // specialized CSS presents the run color as a filled
-                                    // (visible) or hollow (hidden) circle. The label owns
-                                    // the full-height hit target and the row's left padding.
-                                    label {
-                                        class: "run-marker-toggle",
-                                        onmousedown: primary({
-                                            let visible_run_ids = filtered_run_ids.clone();
-                                            move |e: Event<MouseData>| {
-                                                // Paint visibility without taking keyboard focus from another control.
-                                                e.prevent_default();
-                                                paint.set(SelectionPaint::begin(
-                                                    &mut state.selected_runs.write(),
-                                                    &run_id_visibility_start,
-                                                    visible_run_ids.clone(),
-                                                    visible_index,
-                                                ));
-                                            }
-                                        }),
-                                        // Cancel the originating pointer click on the label: WebKit forwards it to the input with detail 0, indistinguishable from keyboard activation. This prevents a second toggle after painting on press.
-                                        onclick: move |e: Event<MouseData>| {
-                                            if e.data().as_web_event().detail() != 0 {
-                                                e.prevent_default();
-                                            }
-                                        },
-                                        // WebKit also activates native checkboxes on auxiliary clicks.
-                                        onauxclick: move |e: Event<PointerData>| e.prevent_default(),
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "run-marker run-marker-input",
-                                            checked: is_selected,
-                                            style: "--run-color: {color};",
-                                            title: "{visibility_title}",
-                                            aria_label: "{visibility_label}",
-                                            onchange: move |_| {
-                                                toggle_membership(&mut state.selected_runs.write(), &run_id_toggle);
-                                            },
-                                        }
-                                    }
-                                }
-                                if in_trash_mode {
-                                    span { class: "run-details",
-                                        RunStatusIcon { status }
-                                        span { class: "run-name-host fade-overflow",
-                                            span { class: "run-name", "{display_name}" }
-                                        }
-                                    }
-                                } else {
-                                    if let Some(target) = active_rename
-                                        .as_ref()
-                                        .filter(|target| target.run_id == run.run_id)
-                                        .cloned()
-                                    {
-                                        {
-                                            let return_focus_ordinal = target.ordinal;
-                                            rsx! {
-                                                span { class: "run-details",
-                                                    RunStatusIcon { status }
-                                                    InlineRunRename {
-                                                        key: "{target.run_id}",
-                                                        target,
-                                                        on_close: move |restore_focus: bool| {
-                                                            rename_target.set(None);
-                                                            if restore_focus {
-                                                                focus_run_overflow_trigger(return_focus_ordinal, false);
-                                                            }
-                                                        },
-                                                        on_renamed: move |run_name: String| {
-                                                            flash_feedback(
-                                                                action_feedback,
-                                                                action_feedback_timer,
-                                                                format!("Renamed to “{run_name}”"),
-                                                            );
-                                                        },
-                                                        on_error: move |message: String| {
-                                                            action_feedback.set(message);
-                                                        },
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    } else {
-                                        Link {
-                                            class: "run-details run-details-link",
-                                            to: Route::RunPage {
-                                                project_id: project_id.clone(),
-                                                run_id: run_id_link.clone(),
-                                                chart: chart_focus.clone().into(),
-                                            },
-                                            RunStatusIcon { status }
-                                            // The shared host stays in flow while its
-                                            // pointer-transparent name pops out on hover.
-                                            span { class: "run-name-host fade-overflow",
-                                                span { class: "run-name", "{display_name}" }
-                                            }
-                                        }
-                                    }
-                                    button {
-                                        id: "run-overflow-trigger-{ordinal_menu}",
-                                        class: "run-overflow-trigger icon-button",
-                                        style: "anchor-name: --run-overflow-{ordinal_menu};",
-                                        title: "More actions for {display_name}",
-                                        aria_label: "More actions for {display_name}",
-                                        aria_haspopup: "dialog",
-                                        aria_controls: "{menu_id}",
-                                        popovertarget: "{menu_id}",
-                                        popovertargetaction: "toggle",
-                                        onmousedown: primary(move |e: Event<MouseData>| {
-                                            e.stop_propagation();
-                                        }),
-                                        MoreIcon {}
-                                    }
-                                    div {
-                                        id: "{menu_id}",
-                                        class: "run-overflow-menu",
-                                        style: "position-anchor: --run-overflow-{ordinal_menu};",
-                                        popover: "auto",
-                                        role: "dialog",
-                                        aria_label: "Actions for {display_name}",
-                                        button {
-                                            autofocus: true,
-                                            popovertarget: "{menu_id}",
-                                            popovertargetaction: "hide",
-                                            onmousedown: primary({
-                                                let copied_name = run_name.clone();
-                                                move |_| crate::util::clipboard::write_text(&copied_name)
-                                            }),
-                                            "Copy run name"
-                                        }
-                                        button {
-                                            onmousedown: primary({
-                                                let target = RenameRunTarget {
-                                                    project_id: project_id.clone(),
-                                                    run_id: run_id_menu.clone(),
-                                                    current_name: run_name.clone(),
-                                                    display_label: display_name.clone(),
-                                                    ordinal: ordinal_menu,
-                                                };
-                                                let menu_id = menu_id.clone();
-                                                move |_| {
-                                                    trash_feedback.set(String::new());
-                                                    action_feedback.set(String::new());
-                                                    let target = target.clone();
-                                                    let menu_id = menu_id.clone();
-                                                    spawn(async move {
-                                                        // Finish native popover
-                                                        // dismissal before replacing
-                                                        // the row label with its input.
-                                                        hide_run_popover(&menu_id).await;
-                                                        rename_target.set(Some(target));
-                                                    });
-                                                }
-                                            }),
-                                            "Rename"
-                                        }
-                                        button {
-                                            onmousedown: primary({
-                                                let target = ColorPickerTarget {
-                                                    run_id: run_id_menu.clone(),
-                                                    run_label: display_name.clone(),
-                                                    ordinal: ordinal_menu,
-                                                };
-                                                let menu_id = menu_id.clone();
-                                                move |_| {
-                                                    action_feedback.set(String::new());
-                                                    let target = target.clone();
-                                                    let menu_id = menu_id.clone();
-                                                    spawn(async move {
-                                                        // The picker is anchored to the
-                                                        // row trigger, so pointer and
-                                                        // keyboard activation place it
-                                                        // identically after the menu exits.
-                                                        hide_run_popover(&menu_id).await;
-                                                        picking_color_for.set(Some(target));
-                                                    });
-                                                }
-                                            }),
-                                            span {
-                                                class: "run-menu-color-swatch",
-                                                style: "background: {color};",
-                                                aria_hidden: "true",
-                                            }
-                                            "Change color…"
-                                        }
-                                        div { class: "run-overflow-divider" }
-                                        button {
-                                            disabled: *trash_busy.read(),
-                                            popovertarget: "{menu_id}",
-                                            popovertargetaction: "hide",
-                                            onmousedown: primary({
-                                                let project_id = project_id.clone();
-                                                let run_id = run_id_menu.clone();
-                                                let menu_id = menu_id.clone();
-                                                move |_| {
-                                                    let project_id = project_id.clone();
-                                                    let run_id = run_id.clone();
-                                                    let menu_id = menu_id.clone();
-                                                    spawn(async move {
-                                                        hide_run_popover(&menu_id).await;
-                                                        submit_trash_runs(
-                                                            project_id,
-                                                            vec![run_id],
-                                                            mutation_ui,
-                                                        );
-                                                    });
-                                                }
-                                            }),
-                                            TrashIcon {}
-                                            "Trash"
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                for run in filtered_runs.iter() {
+                    RunRow {
+                        key: "{run.run_id}",
+                        run: run.clone(),
+                        is_selected: selected.contains(&run.run_id),
+                        is_pending_trash: pending_trash.contains(&run.run_id),
+                        in_trash_mode,
+                        show_run_ordinals,
+                        renaming: active_rename.as_ref().filter(|target| target.run_id == run.run_id).cloned(),
                     }
                 }
             }
@@ -748,6 +426,7 @@ pub fn Sidebar() -> Element {
         if let Some(ColorPickerTarget { run_id, run_label, ordinal }) = color_picker_target {
             {
                 let color = run_color(&run_id, ordinal);
+                let (color_run_id, opened_color) = (run_id.clone(), color.clone());
                 rsx! {
                     ColorPicker {
                         run_id,
@@ -756,8 +435,11 @@ pub fn Sidebar() -> Element {
                         anchor_ordinal: ordinal,
                         on_close: move |_| {
                             picking_color_for.set(None);
-                            let v = *state.color_version.read();
-                            state.color_version.set(v + 1);
+                            // Only a changed color repaints the run markers and charts.
+                            if run_color(&color_run_id, ordinal) != opened_color {
+                                let v = *state.color_version.read();
+                                state.color_version.set(v + 1);
+                            }
                             // Pointer light-dismiss may already have moved focus
                             // to another control; do not steal it back.
                             focus_run_overflow_trigger(ordinal, true);
@@ -779,5 +461,385 @@ pub fn Sidebar() -> Element {
             }
         }
 
+    }
+}
+
+/// The filtered run list, shared by the rendered rows and the drag-paint handlers.
+#[derive(PartialEq)]
+struct ListedRuns {
+    runs: Vec<Rc<RunInfo>>,
+    run_ids: Vec<String>,
+}
+
+/// Sidebar state the rows share, provided once instead of passed to each row.
+#[derive(Clone, Copy)]
+struct RowContext {
+    listed: Memo<ListedRuns>,
+    mutation_ui: TrashMutationUi,
+    rename_target: Signal<Option<RenameRunTarget>>,
+    picking_color_for: Signal<Option<ColorPickerTarget>>,
+    action_feedback: Signal<String>,
+    action_feedback_timer: Signal<Option<Task>>,
+    chart_focus: Memo<Option<String>>,
+    sidebar: ScopeId,
+}
+
+impl RowContext {
+    /// Run `f` in the sidebar's scope, so the tasks it spawns survive their row's removal (a trashed run's row unmounts at once).
+    fn in_sidebar(self, f: impl FnOnce()) {
+        Runtime::current().in_scope(self.sidebar, f)
+    }
+
+    /// Finish the native dismissal of a row's overflow menu, then `act`.
+    fn after_menu_hides(self, ordinal: u64, act: impl FnOnce() + 'static) {
+        self.in_sidebar(|| {
+            spawn(async move {
+                hide_run_popover(&format!("run-overflow-menu-{ordinal}")).await;
+                act();
+            });
+        });
+    }
+}
+
+/// A row's link to its run page, carrying the focused chart.
+/// It renders the anchor itself and reads only the chart-focus memo, since the router's `Link` reads the whole route and so re-renders on every navigation, a maximize included.
+#[component]
+fn RunLink(project_id: String, run_id: String, children: Element) -> Element {
+    let RowContext { chart_focus, .. } = use_context();
+    let route = Route::RunPage {
+        project_id,
+        run_id,
+        chart: chart_focus().into(),
+    };
+    let href = router().prefix().unwrap_or_default() + &route.to_string();
+    rsx! {
+        a {
+            class: "run-details run-details-link",
+            href,
+            // Like `Link`: a plain primary click navigates in place; modified and other clicks keep the browser's behavior.
+            onclick: move |e: MouseEvent| {
+                if e.modifiers().is_empty() && e.trigger_button() == Some(MouseButton::Primary) {
+                    e.prevent_default();
+                    navigator().push(route.clone());
+                }
+            },
+            {children}
+        }
+    }
+}
+
+/// One run row, its own component so a selection change re-renders only the rows whose props it changes.
+#[component]
+fn RunRow(
+    run: Rc<RunInfo>,
+    is_selected: bool,
+    is_pending_trash: bool,
+    in_trash_mode: bool,
+    show_run_ordinals: bool,
+    renaming: Option<RenameRunTarget>,
+) -> Element {
+    let row = use_context::<RowContext>();
+    let RowContext {
+        listed,
+        mutation_ui,
+        mut rename_target,
+        mut picking_color_for,
+        mut action_feedback,
+        action_feedback_timer,
+        ..
+    } = row;
+    let TrashMutationUi {
+        dashboard: mut state,
+        picker: mut trash_pick,
+        mut paint,
+        busy: trash_busy,
+        feedback: mut trash_feedback,
+    } = mutation_ui;
+    // Marker colors come from localStorage; a changed color bumps this version to repaint them.
+    let _ = state.color_version.read();
+    let run_id_toggle = run.run_id.clone();
+    let run_id_visibility_start = run.run_id.clone();
+    let run_id_hover = run.run_id.clone();
+    let run_id_select = run.run_id.clone();
+    let run_id_key = run.run_id.clone();
+    let ordinal = run.ordinal;
+    let menu_id = format!("run-overflow-menu-{ordinal}");
+    let color = run_color(&run.run_id, ordinal);
+    let hover_name = run.run_name.clone();
+    let display_name = sidebar_run_label(&run, show_run_ordinals);
+    let visibility_title = if is_selected {
+        format!("Hide {display_name} from charts")
+    } else {
+        format!("Show {display_name} on charts")
+    };
+    let visibility_label = format!("{display_name} visible on charts");
+    let status = run.status();
+    let row_class = if in_trash_mode && is_pending_trash {
+        "sidebar-run sidebar-run-trash sidebar-run-trash-selected"
+    } else if in_trash_mode {
+        "sidebar-run sidebar-run-trash"
+    } else {
+        "sidebar-run"
+    };
+    rsx! {
+        div {
+            class: "{row_class}",
+            // Chart hover matches the raw run ID or name.
+            "data-run-id": "{run.run_id}",
+            "data-run-name": "{run.run_name}",
+            role: in_trash_mode.then_some("checkbox"),
+            tabindex: (in_trash_mode && !*trash_busy.read()).then_some("0"),
+            aria_checked: if in_trash_mode { Some(is_pending_trash) } else { None },
+            aria_disabled: if in_trash_mode { Some(*trash_busy.read()) } else { None },
+            aria_label: if in_trash_mode {
+                Some(format!("Select {display_name} for Trash"))
+            } else {
+                None
+            },
+            // main.rs's detail-zero activation bridge sends ARIA checkboxes a paired down/up.
+            // Physical presses come here directly and keep paint armed.
+            onmousedown: primary(move |_| {
+                if !in_trash_mode || *trash_busy.peek() {
+                    return;
+                }
+                let mut trash = trash_pick.write();
+                let Some(pick) = trash.as_mut() else {
+                    return;
+                };
+                paint.set(Some(SelectionPaint::begin(pick, &run_id_select)));
+            }),
+            onkeydown: move |e: Event<KeyboardData>| {
+                if in_trash_mode
+                    && !*trash_busy.peek()
+                    && !e.is_auto_repeating()
+                    && (e.key() == Key::Enter
+                        || e.key() == Key::Character(" ".to_string()))
+                {
+                    e.prevent_default();
+                    end_paint_if_active(paint);
+                    let mut trash = trash_pick.write();
+                    let Some(pick) = trash.as_mut() else {
+                        return;
+                    };
+                    toggle_membership(pick, &run_id_key);
+                }
+            },
+            // In normal mode hover highlights this run on every chart.
+            // Trash mode keeps hover local to the deletion-selection row.
+            onmouseenter: move |e: Event<MouseData>| {
+                if !e.held_buttons().contains(MouseButton::Primary)
+                    || paint.peek().is_none()
+                {
+                    // The window bridge delivers release asynchronously; hover without a held primary button clears stale paint.
+                    end_paint_if_active(paint);
+                } else if in_trash_mode {
+                    if let Some(pick) = trash_pick.write().as_mut() {
+                        continue_selection_paint(
+                            &mut paint.write(),
+                            pick,
+                            &listed.read().run_ids,
+                            &run_id_hover,
+                        );
+                    }
+                } else {
+                    continue_selection_paint(
+                        &mut paint.write(),
+                        &mut state.selected_runs.write(),
+                        &listed.read().run_ids,
+                        &run_id_hover,
+                    );
+                }
+                if in_trash_mode {
+                    return;
+                }
+                let rid = js_string(&run_id_hover);
+                let name = js_string(&hover_name);
+                let _ = js_sys::eval(&format!("window.__kymo_setHl({rid},{name})"));
+            },
+            onmouseleave: move |_| {
+                if !in_trash_mode {
+                    let _ = js_sys::eval("window.__kymo_setHl(null)");
+                }
+            },
+            if in_trash_mode {
+                span { class: "run-marker-toggle",
+                    "aria-hidden": "true",
+                    span {
+                        // Keep chart visibility visible in Trash mode; the selected row class adds deletion fill and its warning halo without a second state check.
+                        class: if is_selected {
+                            "run-marker run-marker-filled"
+                        } else {
+                            "run-marker"
+                        },
+                        style: "--run-color: {color};",
+                    }
+                }
+            } else {
+                // Native checkbox semantics stay intact while the specialized CSS presents the run color as a filled (visible) or hollow (hidden) circle.
+                // The label owns the full-height hit target and the row's left padding.
+                label {
+                    class: "run-marker-toggle",
+                    onmousedown: primary(move |e: Event<MouseData>| {
+                        // Paint visibility without taking keyboard focus from another control.
+                        e.prevent_default();
+                        paint.set(Some(SelectionPaint::begin(
+                            &mut state.selected_runs.write(),
+                            &run_id_visibility_start,
+                        )));
+                    }),
+                    // Cancel the originating pointer click on the label: WebKit forwards it to the input with detail 0, indistinguishable from keyboard activation. This prevents a second toggle after painting on press.
+                    onclick: move |e: Event<MouseData>| {
+                        if e.data().as_web_event().detail() != 0 {
+                            e.prevent_default();
+                        }
+                    },
+                    // WebKit also activates native checkboxes on auxiliary clicks.
+                    onauxclick: move |e: Event<PointerData>| e.prevent_default(),
+                    input {
+                        r#type: "checkbox",
+                        class: "run-marker run-marker-input",
+                        checked: is_selected,
+                        style: "--run-color: {color};",
+                        title: "{visibility_title}",
+                        aria_label: "{visibility_label}",
+                        onchange: move |_| {
+                            toggle_membership(&mut state.selected_runs.write(), &run_id_toggle);
+                        },
+                    }
+                }
+            }
+            if in_trash_mode {
+                span { class: "run-details",
+                    RunStatusIcon { status }
+                    span { class: "run-name-host fade-overflow",
+                        span { class: "run-name", "{display_name}" }
+                    }
+                }
+            } else {
+                if let Some(target) = renaming {
+                    span { class: "run-details",
+                        RunStatusIcon { status }
+                        InlineRunRename {
+                            target,
+                            on_close: move |restore_focus: bool| {
+                                rename_target.set(None);
+                                if restore_focus {
+                                    row.in_sidebar(|| focus_run_overflow_trigger(ordinal, false));
+                                }
+                            },
+                            on_renamed: move |run_name: String| {
+                                row.in_sidebar(|| {
+                                    flash_feedback(
+                                        action_feedback,
+                                        action_feedback_timer,
+                                        format!("Renamed to “{run_name}”"),
+                                    )
+                                });
+                            },
+                            on_error: move |message: String| {
+                                action_feedback.set(message);
+                            },
+                        }
+                    }
+                } else {
+                    RunLink { project_id: run.project_id.clone(), run_id: run.run_id.clone(),
+                        RunStatusIcon { status }
+                        // The shared host stays in flow while its pointer-transparent name pops out on hover.
+                        span { class: "run-name-host fade-overflow",
+                            span { class: "run-name", "{display_name}" }
+                        }
+                    }
+                }
+                button {
+                    id: "run-overflow-trigger-{ordinal}",
+                    class: "run-overflow-trigger icon-button",
+                    style: "anchor-name: --run-overflow-{ordinal};",
+                    title: "More actions for {display_name}",
+                    aria_label: "More actions for {display_name}",
+                    aria_haspopup: "dialog",
+                    aria_controls: "{menu_id}",
+                    popovertarget: "{menu_id}",
+                    popovertargetaction: "toggle",
+                    onmousedown: primary(move |e: Event<MouseData>| {
+                        e.stop_propagation();
+                    }),
+                    MoreIcon {}
+                }
+                div {
+                    id: "{menu_id}",
+                    class: "run-overflow-menu",
+                    style: "position-anchor: --run-overflow-{ordinal};",
+                    popover: "auto",
+                    role: "dialog",
+                    aria_label: "Actions for {display_name}",
+                    button {
+                        autofocus: true,
+                        popovertarget: "{menu_id}",
+                        popovertargetaction: "hide",
+                        onmousedown: primary({
+                            let copied_name = run.run_name.clone();
+                            move |_| crate::util::clipboard::write_text(&copied_name)
+                        }),
+                        "Copy run name"
+                    }
+                    button {
+                        onmousedown: primary({
+                            let target = RenameRunTarget {
+                                project_id: run.project_id.clone(),
+                                run_id: run.run_id.clone(),
+                                current_name: run.run_name.clone(),
+                                display_label: display_name.clone(),
+                                ordinal,
+                            };
+                            move |_| {
+                                trash_feedback.set(String::new());
+                                action_feedback.set(String::new());
+                                let target = target.clone();
+                                row.after_menu_hides(ordinal, move || rename_target.set(Some(target)));
+                            }
+                        }),
+                        "Rename"
+                    }
+                    button {
+                        onmousedown: primary({
+                            let target = ColorPickerTarget {
+                                run_id: run.run_id.clone(),
+                                run_label: display_name.clone(),
+                                ordinal,
+                            };
+                            move |_| {
+                                action_feedback.set(String::new());
+                                let target = target.clone();
+                                // The picker is anchored to the row trigger, so pointer and keyboard activation place it identically after the menu exits.
+                                row.after_menu_hides(ordinal, move || picking_color_for.set(Some(target)));
+                            }
+                        }),
+                        span {
+                            class: "run-menu-color-swatch",
+                            style: "background: {color};",
+                            aria_hidden: "true",
+                        }
+                        "Change color…"
+                    }
+                    div { class: "run-overflow-divider" }
+                    button {
+                        popovertarget: "{menu_id}",
+                        popovertargetaction: "hide",
+                        onmousedown: primary({
+                            let project_id = run.project_id.clone();
+                            let run_id = run.run_id.clone();
+                            move |_| {
+                                let (project_id, run_id) = (project_id.clone(), run_id.clone());
+                                row.after_menu_hides(ordinal, move || {
+                                    submit_trash_runs(project_id, vec![run_id], mutation_ui)
+                                });
+                            }
+                        }),
+                        TrashIcon {}
+                        "Trash"
+                    }
+                }
+            }
+        }
     }
 }

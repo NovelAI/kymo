@@ -432,6 +432,9 @@ input[type="checkbox"]:checked::before {
        because WebKit still begins one from a user-select:none origin. */
     user-select: none;
 }
+/* Offscreen rows skip style, layout and paint, which dominate a large project's run list. */
+/* Containment would clip the hovered row's name pop-out (and trap its fixed position) and a focused control's ring, so hovered and focused rows stay uncontained. */
+.sidebar-run:not(:hover, :focus-within) { content-visibility: auto; contain-intrinsic-size: auto 1lh; }
 /* Hover, or chart hover mirrored into the run list (toggled by
    __kymo_setHl): same look either way. */
 .sidebar-run:hover, .sidebar-run-hl { background: var(--bg2); --row-bg: var(--bg2); }

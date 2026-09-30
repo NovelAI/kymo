@@ -393,6 +393,7 @@ message ListRunSetMetricsRequest {
   // The dashboard passes its VISIBLE runs (the selected ones, or the run
   // page's run) — a chart exists only when a visible run logged its
   // metric. Empty => empty response.
+  // Names come back in byte order; clients sort them for display.
   repeated string run_ids = 2;
 }
 

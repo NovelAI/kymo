@@ -60,7 +60,7 @@ With `gcs`, restoring ClickHouse from a backup or running a server older than th
 
 ## Run exactly one server
 
-Run one `kymo-server` per pair of databases, never two, not even briefly during an upgrade. The server keeps deletion fences in memory and truncates its ClickHouse registry outbox at startup, both of which assume it is the only writer. Upgrade by stopping the old server before starting the new one. There is no health endpoint; the listeners open once startup work is done, so a TCP check on port 50051 or 8080 serves as readiness.
+Run one `kymo-server` per pair of databases, never two, not even briefly during an upgrade. The server keeps deletion fences and a copy of the metric registry in memory, and truncates its ClickHouse registry outbox at startup, all of which assume it is the only writer. For the same reason, restart the server after editing the `run_metrics` table by hand. Upgrade by stopping the old server before starting the new one. There is no health endpoint; the listeners open once startup work is done, so a TCP check on port 50051 or 8080 serves as readiness.
 
 ## Trash
 

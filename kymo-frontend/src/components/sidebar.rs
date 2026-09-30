@@ -27,8 +27,7 @@ const MAX_RUN_NAME_BYTES: usize = 2_048;
 
 struct SelectionPaint {
     value: bool,
-    last_index: usize,
-    visible_run_ids: Rc<[String]>,
+    last_run_id: String,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -104,9 +103,10 @@ fn restored_json_run_selection(saved: &str, runs: &[RunInfo]) -> Option<HashSet<
 }
 
 fn filtered_run_selection(saved_run_ids: Vec<String>, runs: &[RunInfo]) -> Option<HashSet<String>> {
+    let known: HashSet<&str> = runs.iter().map(|run| run.run_id.as_str()).collect();
     let valid = saved_run_ids
         .into_iter()
-        .filter(|run_id| runs.iter().any(|run| run.run_id == *run_id))
+        .filter(|run_id| known.contains(run_id.as_str()))
         .collect::<HashSet<_>>();
     (!valid.is_empty()).then_some(valid)
 }
@@ -449,45 +449,33 @@ fn run_list_empty_message(total: usize, visible: usize) -> Option<&'static str> 
 }
 
 impl SelectionPaint {
-    fn begin(
-        selected: &mut HashSet<String>,
-        run_id: &str,
-        visible_run_ids: Rc<[String]>,
-        visible_index: usize,
-    ) -> Option<Self> {
-        if visible_run_ids.get(visible_index).map(String::as_str) != Some(run_id) {
-            return None;
-        }
-        Some(Self {
+    fn begin(selected: &mut HashSet<String>, run_id: &str) -> Self {
+        Self {
             value: toggle_membership(selected, run_id),
-            last_index: visible_index,
-            visible_run_ids,
-        })
+            last_run_id: run_id.to_string(),
+        }
     }
 }
 
+/// Paint every listed run between the gesture's last row and `run_id`, in the list as it is now; a gesture whose rows left the list ends.
 fn continue_selection_paint(
     paint: &mut Option<SelectionPaint>,
     selected: &mut HashSet<String>,
     visible_run_ids: &[String],
-    visible_index: usize,
+    run_id: &str,
 ) {
     let Some(active) = paint.as_mut() else {
         return;
     };
-    // A gesture records the visible ordering it was armed against and dies when
-    // that changes, so a newly arrived run cannot inherit an old index.
-    if active.visible_run_ids.as_ref() != visible_run_ids || visible_index >= visible_run_ids.len()
-    {
+    let position = |id: &str| visible_run_ids.iter().position(|listed| listed == id);
+    let (Some(from), Some(to)) = (position(&active.last_run_id), position(run_id)) else {
         *paint = None;
         return;
-    }
-    let first = active.last_index.min(visible_index);
-    let last = active.last_index.max(visible_index);
-    for run_id in &visible_run_ids[first..=last] {
+    };
+    for run_id in &visible_run_ids[from.min(to)..=from.max(to)] {
         set_membership(selected, run_id, active.value);
     }
-    active.last_index = visible_index;
+    active.last_run_id = run_id.to_string();
 }
 
 /// Ends drag-paint on any primary release, pointer cancellation, or window blur, and handles bulk-mode Escape below native top-layer surfaces. `js_bridge` owns predecessor eviction and late-drop fencing.
@@ -852,7 +840,7 @@ const SIDEBAR_RESIZE_JS: &str = r#"(function(){
 
 #[cfg(test)]
 mod selection_pick_tests {
-    use std::{collections::HashSet, rc::Rc};
+    use std::collections::HashSet;
 
     use crate::grpc::proto::{RunInfo, RunStatus, TrashRunOutcome, TrashRunResult};
 
@@ -916,36 +904,32 @@ mod selection_pick_tests {
     #[test]
     fn drag_paints_one_value_across_skipped_rows_and_backtracking() {
         let mut selected = HashSet::new();
-        let visible: Rc<[String]> = vec!["a".to_string(), "b".to_string(), "c".to_string()].into();
+        let visible = ["a", "b", "c"].map(String::from);
 
-        let mut paint = SelectionPaint::begin(&mut selected, "a", visible.clone(), 0);
-        continue_selection_paint(&mut paint, &mut selected, visible.as_ref(), 2);
-        continue_selection_paint(&mut paint, &mut selected, visible.as_ref(), 0);
+        let mut paint = Some(SelectionPaint::begin(&mut selected, "a"));
+        continue_selection_paint(&mut paint, &mut selected, &visible, "c");
+        continue_selection_paint(&mut paint, &mut selected, &visible, "a");
         assert_eq!(selected.len(), 3);
 
         // Starting on a selected run paints the opposite value across the range.
-        let mut paint = SelectionPaint::begin(&mut selected, "a", visible.clone(), 0);
-        continue_selection_paint(&mut paint, &mut selected, visible.as_ref(), 2);
-        continue_selection_paint(&mut paint, &mut selected, visible.as_ref(), 0);
+        let mut paint = Some(SelectionPaint::begin(&mut selected, "a"));
+        continue_selection_paint(&mut paint, &mut selected, &visible, "c");
+        continue_selection_paint(&mut paint, &mut selected, &visible, "a");
         assert!(selected.is_empty());
     }
 
     #[test]
-    fn drag_ends_if_the_live_visible_list_no_longer_matches() {
+    fn drag_follows_the_live_list_and_ends_when_its_rows_leave_it() {
         let mut selected = HashSet::new();
-        let original: Rc<[String]> = vec!["a".to_string(), "b".to_string()].into();
-        let refreshed = vec!["new".to_string(), "a".to_string(), "b".to_string()];
+        // Runs list newest first, so one that arrives mid-gesture lands above the gesture's rows and the gesture carries on.
+        let refreshed = ["new", "a", "b"].map(String::from);
 
-        let mut paint = SelectionPaint::begin(&mut selected, "a", original.clone(), 0);
-        continue_selection_paint(&mut paint, &mut selected, &refreshed, 2);
-        continue_selection_paint(&mut paint, &mut selected, original.as_ref(), 1);
-        assert_eq!(selected, HashSet::from(["a".to_string()]));
-        assert!(paint.is_none());
-
-        // An index past the end of the live list ends the gesture the same way.
-        let mut paint = SelectionPaint::begin(&mut selected, "b", original.clone(), 1);
-        continue_selection_paint(&mut paint, &mut selected, original.as_ref(), 5);
+        let mut paint = Some(SelectionPaint::begin(&mut selected, "a"));
+        continue_selection_paint(&mut paint, &mut selected, &refreshed, "b");
         assert_eq!(selected, HashSet::from(["a".to_string(), "b".to_string()]));
+
+        // A run missing from the live list ends the gesture.
+        continue_selection_paint(&mut paint, &mut selected, &refreshed, "gone");
         assert!(paint.is_none());
     }
 

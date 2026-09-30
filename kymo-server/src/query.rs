@@ -4474,9 +4474,6 @@ impl QueryService {
             .map(|run_id| RunKey::new(req.project_id.clone(), run_id.clone()))
             .collect();
         let _guards = self.readable_guards(&keys).await?;
-        // One registry read for the whole visible run set, collapsed in SQL
-        // — the dashboard's layout discovery, replacing a ListMetrics
-        // round trip per run.
         let rows = self
             .pg
             .list_run_set_metrics(&req.project_id, &req.run_ids)

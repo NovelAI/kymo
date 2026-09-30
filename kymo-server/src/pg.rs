@@ -5,11 +5,14 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use anyhow::Result;
+use futures::stream::BoxStream;
+use futures::TryStreamExt;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::FromRow;
 
 use crate::lifecycle::RunKey;
 use crate::liveness::STATUS_WATCH_WINDOW;
+use crate::registry_cache::{Attempted, Fetched, Merger, MetricKind, RegistryCache};
 
 /// Standard run-metric registry rows per Postgres UNNEST statement. Shared by
 /// ordinary write-behind and boot reconciliation.
@@ -486,9 +489,28 @@ impl From<sqlx::Error> for InitRunError {
     }
 }
 
-#[derive(Clone)]
+/// At this many uncached runs or more, a registry fill reads the whole project.
+/// Probing a large project's rows, scattered across the heap, costs about 1.1 ms a run cold; scanning all 11,830 runs of the largest (production) takes 2.2 s.
+/// That breaks even near 2,000 runs; the threshold is half that, since the scan also caches the project's other runs.
+const WHOLE_PROJECT_MIN_MISSES: usize = 1_000;
+
+/// Merge `rows` for the runs `wanted` keeps.
+async fn merge_rows(
+    mut rows: BoxStream<'_, sqlx::Result<(String, String, String)>>,
+    wanted: impl Fn(&str) -> bool,
+    merger: &mut Merger,
+) -> Result<()> {
+    while let Some((run_id, metric_name, metric_type)) = rows.try_next().await? {
+        if wanted(&run_id) {
+            merger.add(&metric_name, MetricKind::parse(&metric_type));
+        }
+    }
+    Ok(())
+}
+
 pub struct PgStore {
     pool: PgPool,
+    registry: RegistryCache,
 }
 
 impl PgStore {
@@ -523,6 +545,7 @@ impl PgStore {
             pool: PgPoolOptions::new()
                 .connect_lazy("postgres://localhost/mkdb2_test")
                 .expect("valid test Postgres URL"),
+            registry: RegistryCache::new(),
         }
     }
 
@@ -532,7 +555,10 @@ impl PgStore {
             .acquire_timeout(Duration::from_secs(10))
             .connect(url)
             .await?;
-        let store = Self { pool };
+        let store = Self {
+            pool,
+            registry: RegistryCache::new(),
+        };
         store.ensure_schema().await?;
         Ok(store)
     }
@@ -1565,6 +1591,14 @@ impl PgStore {
         let rids: Vec<&str> = rows.iter().map(|r| r.1.as_str()).collect();
         let names: Vec<&str> = rows.iter().map(|r| r.2.as_str()).collect();
         let types: Vec<&str> = rows.iter().map(|r| r.3.as_str()).collect();
+        let mut attempted = Attempted::new();
+        for (project_id, run_id, metric_name, metric_type) in rows {
+            attempted
+                .entry((project_id, run_id))
+                .or_default()
+                .push((metric_name, MetricKind::parse(metric_type)));
+        }
+        let registration = self.registry.begin_registration(attempted);
         let changed: Vec<(String,)> = sqlx::query_as(
             "INSERT INTO run_metrics (project_id, run_id, metric_name, metric_type)
              SELECT incoming.project_id, incoming.run_id,
@@ -1587,37 +1621,118 @@ impl PgStore {
         .bind(&types)
         .fetch_all(&self.pool)
         .await?;
+        registration.succeeded();
         let mut ids: Vec<String> = changed.into_iter().map(|(r,)| r).collect();
         ids.sort_unstable();
         ids.dedup();
         Ok(ids)
     }
 
-    /// Distinct metric (name, collapsed type) across a SET of runs — the dashboard's layout base, scoped to the visible runs. Types collapse by the registry's CDN < NUMERIC < TEXT_STREAM precedence; name ordered; empty `run_ids` yields no rows.
+    /// Distinct metric (name, collapsed type) across a SET of runs — the dashboard's layout base, scoped to the visible runs.
+    /// Types collapse by the registry's CDN < NUMERIC < TEXT_STREAM precedence; names come in byte order; empty `run_ids` yields no rows.
+    /// Served from [`RegistryCache`].
     pub async fn list_run_set_metrics(
         &self,
         project_id: &str,
         run_ids: &[String],
     ) -> Result<Vec<(String, String)>> {
-        if run_ids.is_empty() {
-            return Ok(Vec::new());
+        let lookup = self.registry.lookup(project_id, run_ids);
+        metrics::counter!("mkdb2_registry_cache_lookups_total", "result" => "hit")
+            .increment(lookup.hits.len() as u64);
+        metrics::counter!("mkdb2_registry_cache_lookups_total", "result" => "miss")
+            .increment(lookup.misses.len() as u64);
+        let mut merger = Merger::default();
+        merger.add_lists(lookup.hits);
+        if !lookup.misses.is_empty() {
+            self.merge_misses(project_id, &lookup.misses, &mut merger)
+                .await?;
         }
-        let rids: Vec<&str> = run_ids.iter().map(String::as_str).collect();
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT metric_name,
-                CASE max(CASE metric_type
-                             WHEN 'TEXT_STREAM' THEN 3 WHEN 'NUMERIC' THEN 2 ELSE 1 END)
-                     WHEN 3 THEN 'TEXT_STREAM' WHEN 2 THEN 'NUMERIC' ELSE 'CDN' END
-             FROM run_metrics
-             WHERE project_id = $1 AND run_id = ANY($2)
-             GROUP BY metric_name
-             ORDER BY metric_name",
-        )
-        .bind(project_id)
-        .bind(&rids)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
+        Ok(merger.into_rows())
+    }
+
+    /// Merge the runs the cache missed, caching their lists unless the project is oversized.
+    async fn merge_misses(
+        &self,
+        project_id: &str,
+        misses: &[String],
+        merger: &mut Merger,
+    ) -> Result<()> {
+        if !self.registry.oversized(project_id) {
+            let fill_lease = self.registry.fill_lock(project_id);
+            let fill_guard = fill_lease.lock().await;
+            // A fill that overflowed while this request waited marked the project; merge directly instead of repeating it.
+            if !self.registry.oversized(project_id) {
+                let retry = self.registry.lookup(project_id, misses);
+                merger.add_lists(retry.hits);
+                if retry.misses.is_empty() {
+                    return Ok(());
+                }
+                return self
+                    .fill(project_id, &retry.misses, retry.since, fill_guard, merger)
+                    .await;
+            }
+        }
+        // A project too large to cache merges its rows directly, without holding the fill lock; the query reads only the missed runs, so every row is wanted.
+        let rows = self.registry_rows(project_id, misses, false);
+        merge_rows(rows, |_| true, merger).await
+    }
+
+    /// Merge the `misses` runs' registry rows as they arrive, and read them into per-run lists to install.
+    /// Once the lists outgrow their share of the fill limit, drop the lists, the share and the fill lock, and merge the rest uncached.
+    async fn fill(
+        &self,
+        project_id: &str,
+        misses: &[String],
+        since: u64,
+        fill_guard: tokio::sync::MutexGuard<'_, ()>,
+        merger: &mut Merger,
+    ) -> Result<()> {
+        let requested: HashSet<&str> = misses.iter().map(String::as_str).collect();
+        let whole_project = requested.len() >= WHOLE_PROJECT_MIN_MISSES;
+        let mut rows = self.registry_rows(project_id, misses, whole_project);
+        let mut fetched = Fetched::default();
+        for run_id in misses {
+            fetched.include(run_id);
+        }
+        let mut share = self.registry.fill_share(project_id);
+        while share.hold(fetched.bytes()) {
+            let Some((run_id, metric_name, metric_type)) = rows.try_next().await? else {
+                self.registry
+                    .install(project_id, fetched, since, &requested);
+                return Ok(());
+            };
+            let kind = MetricKind::parse(&metric_type);
+            if requested.contains(run_id.as_str()) {
+                merger.add(&metric_name, kind);
+            }
+            fetched.push(run_id, &metric_name, kind);
+        }
+        drop((fetched, share, fill_guard));
+        merge_rows(rows, |run_id| requested.contains(run_id), merger).await
+    }
+
+    /// Registry rows of `run_ids`, or of every run in the project when `whole_project`: a fill caches the rest, while a direct merge would discard them.
+    fn registry_rows<'a>(
+        &'a self,
+        project_id: &'a str,
+        run_ids: &'a [String],
+        whole_project: bool,
+    ) -> BoxStream<'a, sqlx::Result<(String, String, String)>> {
+        let query = if whole_project {
+            sqlx::query_as(
+                "SELECT run_id, metric_name, metric_type FROM run_metrics WHERE project_id = $1",
+            )
+            .bind(project_id)
+        } else {
+            sqlx::query_as(
+                "SELECT run_id, metric_name, metric_type FROM run_metrics
+                 WHERE project_id = $1 AND run_id = ANY($2)",
+            )
+            .bind(project_id)
+            .bind(run_ids)
+        };
+        // Not cached as a prepared statement: a cached generic plan guesses one row count for every project and run set, so it cannot pick a scan for a large project and index probes for a small one.
+        query.persistent(false).fetch(&self.pool)
     }
 
     /// (metric_name, metric_type) for one run, name-ordered.
@@ -2343,6 +2458,7 @@ impl PgStore {
         if run_ids.is_empty() {
             return Ok(None);
         }
+        let _purge = self.registry.begin_purge(project_id, run_ids);
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO purged_runs (project_id, run_id, terminal_version)
@@ -3122,6 +3238,9 @@ mod live_pg_tests {
         anyhow::ensure!(
             store.register_run_metrics(&[cdn.clone(), orphan]).await? == vec![run_id.clone()]
         );
+        let listed = |metric_type: &str| vec![("metric".to_string(), metric_type.to_string())];
+        let runs = std::slice::from_ref(&run_id);
+        anyhow::ensure!(store.list_run_set_metrics(&project_id, runs).await? == listed("CDN"));
         anyhow::ensure!(store
             .register_run_metrics(std::slice::from_ref(&cdn))
             .await?
@@ -3134,6 +3253,7 @@ mod live_pg_tests {
             "NUMERIC".to_string(),
         );
         anyhow::ensure!(store.register_run_metrics(&[numeric]).await? == vec![run_id.clone()]);
+        anyhow::ensure!(store.list_run_set_metrics(&project_id, runs).await? == listed("NUMERIC"));
         anyhow::ensure!(store.register_run_metrics(&[cdn]).await?.is_empty());
 
         let text = (
@@ -3143,6 +3263,9 @@ mod live_pg_tests {
             "TEXT_STREAM".to_string(),
         );
         anyhow::ensure!(store.register_run_metrics(&[text]).await? == vec![run_id.clone()]);
+        anyhow::ensure!(
+            store.list_run_set_metrics(&project_id, runs).await? == listed("TEXT_STREAM")
+        );
 
         let rows: Vec<(String, String, String)> = sqlx::query_as(
             "SELECT run_id, metric_name, metric_type
@@ -3156,6 +3279,173 @@ mod live_pg_tests {
             "registry rows were {rows:?}"
         );
 
+        store.delete_live_projects(&[project_id]).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL"]
+    async fn live_registry_cache_matches_sql_through_registration_and_purge() -> Result<()> {
+        let _suite_guard = live_database_suite_gate().lock().await;
+        let pg_url = live_test_url("KYMO_LIVE_TEST_DATABASE_URL")?;
+        let suffix = unique_suffix();
+        let project_id = format!("registry-cache-{suffix}");
+        let store = PgStore::connect(&pg_url).await?;
+        // Server startup installs the purge cascade; a fresh test database has not seen one.
+        store.ensure_run_metrics_run_fk().await?;
+        // Enough runs that a fill of most of them reads the whole project.
+        let run_ids: Vec<String> = (0..WHOLE_PROJECT_MIN_MISSES + 30)
+            .map(|i| format!("run-{i:04}-{suffix}"))
+            .collect();
+
+        let sql = |run_ids: Vec<String>| {
+            let pool = store.pool.clone();
+            let project_id = project_id.clone();
+            async move {
+                let rows: Vec<(String, String)> = sqlx::query_as(
+                    "SELECT metric_name,
+                        CASE max(CASE metric_type
+                                     WHEN 'TEXT_STREAM' THEN 3 WHEN 'NUMERIC' THEN 2 ELSE 1 END)
+                             WHEN 3 THEN 'TEXT_STREAM' WHEN 2 THEN 'NUMERIC' ELSE 'CDN' END
+                     FROM run_metrics
+                     WHERE project_id = $1 AND run_id = ANY($2)
+                     GROUP BY metric_name
+                     ORDER BY metric_name COLLATE \"C\"",
+                )
+                .bind(&project_id)
+                .bind(&run_ids)
+                .fetch_all(&pool)
+                .await?;
+                anyhow::Ok(rows)
+            }
+        };
+        let row = |run_id: &str, name: &str, metric_type: &str| {
+            (
+                project_id.clone(),
+                run_id.to_string(),
+                name.to_string(),
+                metric_type.to_string(),
+            )
+        };
+        let mut rows = Vec::new();
+        for (i, run_id) in run_ids.iter().enumerate() {
+            store
+                .init_run(&project_id, run_id, "cache test", None)
+                .await?;
+            rows.push(row(run_id, "loss", "NUMERIC"));
+            rows.push(row(run_id, &format!("only/{i}"), "CDN"));
+            if i % 7 == 0 {
+                rows.push(row(run_id, "Log", "TEXT_STREAM"));
+            }
+            // One name logged as different types by different runs lists as the highest.
+            rows.push(row(
+                run_id,
+                "mixed",
+                if i % 2 == 0 { "CDN" } else { "NUMERIC" },
+            ));
+        }
+        store.register_run_metrics(&rows).await?;
+        let fresh = |budget| PgStore {
+            pool: store.pool.clone(),
+            registry: RegistryCache::with_budget(budget),
+        };
+
+        let subset = run_ids[..30].to_vec();
+        // Both fill shapes answer alike; the whole-project one caches every run.
+        for set in [subset.clone(), run_ids[..WHOLE_PROJECT_MIN_MISSES].to_vec()] {
+            let filled = fresh(64 << 20);
+            anyhow::ensure!(
+                filled.list_run_set_metrics(&project_id, &set).await? == sql(set.clone()).await?
+            );
+            let cached = run_ids.len() - filled.registry.lookup(&project_id, &run_ids).misses.len();
+            anyhow::ensure!(
+                cached
+                    == if set.len() >= WHOLE_PROJECT_MIN_MISSES {
+                        run_ids.len()
+                    } else {
+                        set.len()
+                    }
+            );
+        }
+        for set in [run_ids.clone(), subset.clone(), run_ids[5..6].to_vec()] {
+            let cached = store.list_run_set_metrics(&project_id, &set).await?;
+            anyhow::ensure!(
+                cached == sql(set.clone()).await?,
+                "cache disagrees for {} runs",
+                set.len()
+            );
+        }
+
+        // A registration reaches the cached lists: a new name, and an upgrade of an existing one.
+        store
+            .register_run_metrics(&[
+                row(&run_ids[3], "new", "CDN"),
+                row(&run_ids[4], "only/4", "NUMERIC"),
+            ])
+            .await?;
+        let cached = store.list_run_set_metrics(&project_id, &subset).await?;
+        anyhow::ensure!(cached == sql(subset.clone()).await?);
+        anyhow::ensure!(cached.contains(&("new".into(), "CDN".into())));
+        anyhow::ensure!(cached.contains(&("only/4".into(), "NUMERIC".into())));
+
+        // Purging cascades the registry rows away and drops the cached lists.
+        let purged: Vec<&str> = run_ids[..10].iter().map(String::as_str).collect();
+        sqlx::query(
+            "UPDATE runs SET purging_at = now() WHERE project_id = $1 AND run_id = ANY($2)",
+        )
+        .bind(&project_id)
+        .bind(&purged)
+        .execute(&store.pool)
+        .await?;
+        store.finalize_purged_runs(&project_id, &purged).await?;
+        let cached = store.list_run_set_metrics(&project_id, &subset).await?;
+        anyhow::ensure!(cached == sql(subset.clone()).await?);
+        anyhow::ensure!(!cached.contains(&("new".into(), "CDN".into())));
+
+        // A fill over the limit merges instead, answers as the cache does, leaves nothing cached, and marks the project so later requests merge directly.
+        let remaining = run_ids[10..70].to_vec();
+        let expected = store.list_run_set_metrics(&project_id, &remaining).await?;
+        anyhow::ensure!(expected == sql(remaining.clone()).await?);
+        anyhow::ensure!(expected.contains(&("mixed".into(), "NUMERIC".into())));
+        let requested = run_ids[10..WHOLE_PROJECT_MIN_MISSES + 10].to_vec();
+        // The smaller limit overflows on the empty lists alone; the larger one mid-stream.
+        for budget in [1_000, 30_000] {
+            let small = fresh(budget);
+            let listed = small.list_run_set_metrics(&project_id, &remaining).await?;
+            anyhow::ensure!(listed == expected, "budget {budget}");
+            anyhow::ensure!(small
+                .registry
+                .lookup(&project_id, &remaining)
+                .hits
+                .is_empty());
+            anyhow::ensure!(small.registry.oversized(&project_id));
+            anyhow::ensure!(small.list_run_set_metrics(&project_id, &remaining).await? == expected);
+            // A whole-project fill that overflows merges only the requested runs.
+            anyhow::ensure!(
+                fresh(budget)
+                    .list_run_set_metrics(&project_id, &requested)
+                    .await?
+                    == sql(requested.clone()).await?
+            );
+        }
+
+        // A fill refused only because other fills hold the budget answers the same, caches nothing, and leaves the project cacheable.
+        let crowded = fresh(64 << 20);
+        let mut other = crowded.registry.fill_share("other");
+        anyhow::ensure!(other.hold(32 << 20));
+        anyhow::ensure!(
+            crowded
+                .list_run_set_metrics(&project_id, &remaining)
+                .await?
+                == expected
+        );
+        anyhow::ensure!(crowded
+            .registry
+            .lookup(&project_id, &remaining)
+            .hits
+            .is_empty());
+        anyhow::ensure!(!crowded.registry.oversized(&project_id));
+        drop(other);
         store.delete_live_projects(&[project_id]).await?;
         Ok(())
     }

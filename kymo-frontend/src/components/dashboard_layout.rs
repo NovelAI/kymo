@@ -350,6 +350,25 @@ pub fn DashboardLayout(project_id: String) -> Element {
         )
     });
 
+    // A run page's layout gates on its run's readability alone, so a GetRun refresh that leaves the run readable does not re-list its metrics.
+    let scope_readable = use_memo({
+        let project_id = project_id.clone();
+        move || {
+            let Some(run_id) = &*scope_signal.read() else {
+                return true;
+            };
+            match &*state.direct_run.read() {
+                DirectRunLoad::Loaded(view) if view.matches(&project_id, run_id) => matches!(
+                    crate::state::trash::effective_lifecycle(
+                        &view.record,
+                        view.authoritative_now_ms()
+                    ),
+                    RunLifecycleState::Active | RunLifecycleState::Trashed
+                ),
+                _ => false,
+            }
+        }
+    });
     let _layout_fetch = use_resource({
         let grpc = state.grpc;
         let project_id = project_id.clone();
@@ -363,24 +382,10 @@ pub fn DashboardLayout(project_id: String) -> Element {
             let _mk = *metrics_key.read();
             let runs_loaded = *runs_loaded.read();
             let _gen = *layout_gen.read();
-            let direct_run = state.direct_run.read().clone();
+            let scope_readable = *scope_readable.read();
             async move {
-                if let Some(run_id) = scope_signal.peek().as_ref() {
-                    let readable = match &direct_run {
-                        DirectRunLoad::Loaded(view) if view.matches(&project_id, run_id) => {
-                            matches!(
-                                crate::state::trash::effective_lifecycle(
-                                    &view.record,
-                                    view.authoritative_now_ms(),
-                                ),
-                                RunLifecycleState::Active | RunLifecycleState::Trashed
-                            )
-                        }
-                        _ => false,
-                    };
-                    if !readable {
-                        return;
-                    }
+                if !scope_readable {
+                    return;
                 }
                 // Surface a corrupt saved diff before anything else — even
                 // the runs gate: the recovery page must be reachable when
