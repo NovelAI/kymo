@@ -16,6 +16,9 @@ use crate::state::trash::{
 use crate::util::{local_time, primary};
 
 const TRASH_PAGE_SIZE: u32 = 100;
+const RESTORE: &str = "Restore";
+const RESTORING: &str = "Restoring…";
+const UNAVAILABLE: &str = "Unavailable";
 
 fn run_key(project_id: &str, run_id: &str) -> String {
     serde_json::to_string(&(project_id, run_id))
@@ -351,8 +354,13 @@ pub fn TrashPage() -> Element {
                                     role: "columnheader",
                                     "Deletes permanently"
                                 }
-                                th { scope: "col", role: "columnheader",
+                                th { scope: "col", role: "columnheader", class: "trash-run-action",
                                     span { class: "visually-hidden", "Actions" }
+                                    span { class: "btn trash-restore-sizer", aria_hidden: "true",
+                                        span { "{RESTORE}" }
+                                        span { "{RESTORING}" }
+                                        span { "{UNAVAILABLE}" }
+                                    }
                                 }
                             }
                         }
@@ -467,6 +475,13 @@ fn trash_row(
         lifecycle,
         RunLifecycleState::Expired | RunLifecycleState::Purging
     );
+    let label = if is_restoring {
+        RESTORING
+    } else if is_expired {
+        UNAVAILABLE
+    } else {
+        RESTORE
+    };
     let (expires_at, expires_datetime) = expiry_time(record.purge_at_ms);
     let expires_in = if is_expired {
         "Expired — deleting…".to_string()
@@ -622,7 +637,7 @@ fn trash_row(
                             });
                         }
                     }),
-                    if is_restoring { "Restoring…" } else if is_expired { "Unavailable" } else { "Restore" }
+                    "{label}"
                 }
             }
         }

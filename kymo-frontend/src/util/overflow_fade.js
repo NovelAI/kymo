@@ -1,15 +1,18 @@
-// Keeps data-overflow on each .fade-overflow element while its content is wider than its box (kymo.css fades the text only then). Elements are tracked from insertion to removal, children included, so text that changes in place re-marks its box.
+// Keeps data-overflow on each .fade-overflow element while its content reaches past its right edge (kymo.css fades the text only then). Boxes and their direct children are tracked from insertion to removal, so a child whose text changes in place re-marks its box.
 (() => {
   if (window.__kymo_overflowFade) return;
   window.__kymo_overflowFade = true;
   const TRACKED = '.fade-overflow, .fade-overflow > *';
+  // One Range for the script's lifetime: each Range left for garbage collection stays live and slows every DOM mutation until then.
+  const range = document.createRange();
 
   const resize = new ResizeObserver(entries => {
     const boxes = new Set(entries.map(({target}) => target.closest('.fade-overflow')).filter(Boolean));
-    // Children count at their own width, so a child popped out of the flow (a hover reveal) still overflows. Child and box both use rounded rendered widths, so zoom and transforms cancel (WebKit's offsetWidth reads an exactly fitting inline child 1px too wide). Read every width before the first write.
+    // A box overflows when its content (text at any depth and its direct children's boxes, so a child popped out of the flow for a hover reveal still counts) reaches more than half a pixel past the box's right edge. Both edges come from rendered rects, so zoom and transforms cancel; WebKit rounds scrollWidth, clientWidth and an inline child's offsetWidth apart, marking text that fits. Boxes are left-to-right, unscrolled and have no right border. Read every rect before the first write.
     const marks = [...boxes].map(box => {
-      const boxWidth = Math.round(box.getBoundingClientRect().width);
-      return [box, box.scrollWidth > box.clientWidth || [...box.children].some(child => Math.round(child.getBoundingClientRect().width) > boxWidth)];
+      const edge = box.getBoundingClientRect().right;
+      range.selectNodeContents(box);
+      return [box, [...range.getClientRects()].some(r => r.right - edge > 0.5)];
     });
     for (const [box, overflows] of marks) box.toggleAttribute('data-overflow', overflows);
   });

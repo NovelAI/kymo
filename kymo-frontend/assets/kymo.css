@@ -649,7 +649,6 @@ input[type="checkbox"]:checked::before {
 .trash-table {
     width: 100%;
     border-collapse: collapse;
-    table-layout: fixed;
 }
 .trash-table th {
     padding: var(--spacing-xs) var(--spacing-md) var(--spacing-xs) 0;
@@ -662,9 +661,10 @@ input[type="checkbox"]:checked::before {
 }
 /* Cells pad only their right side, so columns sit 16px apart as in the projects list; the first cell also pads the table's left edge. */
 .trash-table :is(th, td):first-child { padding-left: var(--spacing-md); }
-/* Fits the widest date and countdown on one line. At large fonts the vw cap lets the date wrap to keep room for run names; a % inside min() leaves a fixed-layout column unsized. */
+/* Fits the widest date and countdown on one line. At large fonts the vw cap lets the date wrap to keep room for run names; a % inside min() doesn't size a table column. */
 .trash-table th:nth-child(2) { width: min(19rem, 40vw); }
-.trash-table th:nth-child(3) { width: 9rem; }
+/* The Restore column shrinks to its button. */
+.trash-table th:nth-child(3) { width: 1%; }
 .trash-table-title {
     display: flex;
     flex-wrap: wrap;
@@ -694,10 +694,11 @@ input[type="checkbox"]:checked::before {
     vertical-align: baseline;
 }
 .trash-run:last-child td { border-bottom: 0; }
-/* The run name and project share the line: the shorter keeps its full width, the longer fades. */
+/* The run name and project share the line: the shorter keeps its full width, the longer fades, and the project sits at the right end. */
 .trash-run-title-line {
     display: grid;
     grid-template-columns: minmax(0, max-content) minmax(0, max-content);
+    justify-content: space-between;
     align-items: baseline;
     gap: 12px;
 }
@@ -762,6 +763,7 @@ input[type="checkbox"]:checked::before {
 }
 .trash-run-action { text-align: right; }
 .trash-run-action .btn {
+    width: 100%;
     min-height: 32px;
     padding: var(--spacing-xs) 12px;
     color: var(--text-headings);
@@ -773,6 +775,16 @@ input[type="checkbox"]:checked::before {
 .trash-run-action .btn:hover:not(:disabled) {
     border-color: var(--text-headings);
     background: var(--bg2);
+}
+/* The header's zero-height copy of the button holds every label, so the column fits the widest in whichever font draws it, with or without rows; the buttons fill the column. */
+.trash-run-action .trash-restore-sizer {
+    display: grid;
+    min-height: 0;
+    height: 0;
+    padding-block: 0;
+    border-block-width: 0;
+    overflow: hidden;
+    visibility: hidden;
 }
 .trash-run-action .btn:disabled {
     color: var(--text-disabled);
@@ -808,7 +820,7 @@ input[type="checkbox"]:checked::before {
         grid-template-columns: minmax(0, 1fr) auto;
     }
     .trash-table th:first-child, .trash-run td:first-child { grid-column: 1 / -1; }
-    .trash-table th:nth-child(2), .trash-table th:nth-child(3) { width: auto; }
+    .trash-table th:nth-child(2) { width: auto; }
     .trash-run td:first-child { border-bottom: 0; }
     .trash-run-title-line {
         grid-template-columns: minmax(0, 1fr);
@@ -828,6 +840,8 @@ input[type="checkbox"]:checked::before {
     .trash-run-name-placeholder { display: none; }
     .trash-run-expiry { flex-direction: column; align-items: flex-start; }
     .trash-run-action { align-self: end; }
+    /* Natural-width buttons: an equal width wraps the date on narrow phones. */
+    .trash-run-action .trash-restore-sizer { display: none; }
 }
 
 .trash-error,
