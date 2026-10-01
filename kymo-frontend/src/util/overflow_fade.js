@@ -2,41 +2,30 @@
 (() => {
   if (window.__kymo_overflowFade) return;
   window.__kymo_overflowFade = true;
-  const CLASS = 'fade-overflow';
-  const isBox = node => node?.classList?.contains(CLASS);
+  const TRACKED = '.fade-overflow, .fade-overflow > *';
 
   const resize = new ResizeObserver(entries => {
-    const boxes = new Set();
-    for (const {target} of entries) {
-      const box = isBox(target) ? target : target.parentElement;
-      if (isBox(box)) boxes.add(box);
-    }
-    // Children count at their own width, so a child popped out of the flow (a hover reveal) still overflows. Read every width before the first write.
-    const marks = [...boxes].map(box => [box, Math.max(box.scrollWidth, ...Array.from(box.children, child => child.offsetWidth)) > box.clientWidth]);
+    const boxes = new Set(entries.map(({target}) => target.closest('.fade-overflow')).filter(Boolean));
+    // Children count at their own width, so a child popped out of the flow (a hover reveal) still overflows. Child and box both use rounded rendered widths, so zoom and transforms cancel (WebKit's offsetWidth reads an exactly fitting inline child 1px too wide). Read every width before the first write.
+    const marks = [...boxes].map(box => {
+      const boxWidth = Math.round(box.getBoundingClientRect().width);
+      return [box, box.scrollWidth > box.clientWidth || [...box.children].some(child => Math.round(child.getBoundingClientRect().width) > boxWidth)];
+    });
     for (const [box, overflows] of marks) box.toggleAttribute('data-overflow', overflows);
   });
 
-  const track = (box, method) => {
-    resize[method](box);
-    for (const child of box.children) resize[method](child);
-  };
-  const scan = (node, method) => {
-    if (isBox(node)) track(node, method);
-    for (const box of node.getElementsByClassName(CLASS)) track(box, method);
-  };
-
   new MutationObserver(records => {
-    for (const {target, addedNodes, removedNodes} of records) {
-      const inBox = isBox(target);
+    for (const {addedNodes, removedNodes} of records) {
       for (const node of removedNodes) {
         if (node.nodeType !== Node.ELEMENT_NODE) continue;
-        if (inBox) resize.unobserve(node);
-        scan(node, 'unobserve');
+        // A removed node has left its box, so it no longer matches: unobserve it regardless (a no-op if it was never observed).
+        resize.unobserve(node);
+        for (const el of node.querySelectorAll(TRACKED)) resize.unobserve(el);
       }
       for (const node of addedNodes) {
         if (node.nodeType !== Node.ELEMENT_NODE) continue;
-        if (inBox) resize.observe(node);
-        scan(node, 'observe');
+        if (node.matches(TRACKED)) resize.observe(node);
+        for (const el of node.querySelectorAll(TRACKED)) resize.observe(el);
       }
     }
   }).observe(document.documentElement, {childList: true, subtree: true});
