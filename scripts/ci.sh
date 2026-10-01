@@ -36,7 +36,7 @@ client() {
     cd python_client
     python generate_proto.py --check
     python -m unittest test_env test_generate_proto test_local_runtime test_local_integration \
-        test_pipelined_upload test_spool_replay test_graceful_shutdown test_manual_workloads
+        test_pipelined_upload test_spool_replay test_graceful_shutdown test_manual_workloads test_api
 }
 
 [ $# -gt 0 ] || set -- root wasm local-runtime qualification client

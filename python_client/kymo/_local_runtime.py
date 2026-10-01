@@ -247,13 +247,13 @@ def endpoint_from_worker_config(config: dict) -> LocalEndpoint:
         raise RuntimeError("invalid local endpoint passed to upload worker") from error
 
 
-def grpc_channel(endpoint: LocalEndpoint):
+def grpc_channel(endpoint: LocalEndpoint, options=()):
     # grpcio otherwise derives an empty/UDS-shaped :authority on macOS and
     # tonic rejects the HTTP/2 stream. This exact convention is qualified in
     # tools/local-transport-qualification/qualify_python_uds.py.
     base = grpc.insecure_channel(
         endpoint.grpc_target,
-        options=(("grpc.default_authority", "localhost"),),
+        options=(("grpc.default_authority", "localhost"), *options),
     )
     return grpc.intercept_channel(base, _BearerInterceptor(endpoint.server_bearer))
 

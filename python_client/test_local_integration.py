@@ -3,6 +3,7 @@
 import os
 import uuid
 import unittest
+from unittest import mock
 
 import grpc
 import kymo
@@ -129,6 +130,18 @@ class LocalRuntimeIntegrationTests(unittest.TestCase):
             self.assertTrue(kymo.finish(flush_timeout=30))
         finally:
             kymo.finish(flush_timeout=5)
+
+        # Read back through the public API: its channel, bearer and receive limit, and the loopback CDN origin. The patch restores the fork-guard flag afterwards, so later client tests in this process can still call kymo.init().
+        with (
+            mock.patch.object(kymo.api, "_channel_opened", False),
+            kymo.Api(mode="local") as api,
+        ):
+            project = "local-client-integration"
+            self.assertIn(run_id, [run.run_id for run in api.runs(project)])
+            self.assertEqual(api.history(project, run_id, "loss"), {"": [(1, 1.25)]})
+            self.assertEqual(
+                api.run_info(project, run_id)["config"], {"phase": "updated"}
+            )
 
         final_endpoint = ensure_local_endpoint(
             expected_installation_uuid=initial_endpoint.installation_uuid

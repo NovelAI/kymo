@@ -51,6 +51,7 @@ except (ImportError, RuntimeError) as e:
 from kymo import _gpu
 from kymo._cdn import gallery_item, gallery_manifest, metadata_manifest
 from kymo._log import logger as _log
+from kymo.api import _check_fork_safe
 from kymo._wire import (
     _CDN_RPC_TIMEOUT,
     _F32_OVERFLOW,
@@ -214,14 +215,35 @@ def _normalize_step(step) -> int:
     return int(normalized)
 
 
-def _resolve_mode(mode: Optional[str]) -> str:
+def _resolve_server(
+    caller: str, mode: Optional[str], server_address: Optional[str], **endpoints
+) -> Optional[str]:
+    """The hosted gRPC address (argument, then ``$KYMO_SERVER``), or None in local mode, whose runtime owns every endpoint."""
     value = _env_string("KYMO_MODE", "MKDB2_MODE", "hosted") if mode is None else mode
     if not isinstance(value, str):
-        raise TypeError("kymo.init: mode must be a string")
+        raise TypeError(f"{caller}: mode must be a string")
     value = value.strip().lower()
     if value not in ("hosted", "local"):
-        raise ValueError("kymo.init: mode must be 'hosted' or 'local'")
-    return value
+        raise ValueError(f"{caller}: mode must be 'hosted' or 'local'")
+    if value == "local":
+        if server_address is not None or any(v is not None for v in endpoints.values()):
+            names = "/".join(["server_address", *endpoints])
+            raise ValueError(
+                f"{caller}: {names} cannot override local runtime endpoints"
+            )
+        return None
+    server_address = server_address or _env_string("KYMO_SERVER", "MKDB2_SERVER")
+    if not server_address:
+        raise ValueError(
+            f"{caller}: hosted mode needs a server address; pass server_address, "
+            "set KYMO_SERVER, or use mode='local'"
+        )
+    return server_address
+
+
+def _cdn_address_for(server_address: str) -> str:
+    """The hosted CDN origin: port 8080 on the gRPC server's host."""
+    return f"http://{server_address.rsplit(':', 1)[0]}:8080"
 
 
 # ---------------------------------------------------------------------------
@@ -433,24 +455,14 @@ def init(
         )
 
     validate_client_settings()
-    mode = _resolve_mode(mode)
     if url_base is not None and not isinstance(url_base, str):
         raise TypeError("kymo.init: url_base must be a string")
-    if mode == "local" and (
-        server_address is not None or cdn_address is not None or url_base is not None
-    ):
-        raise ValueError(
-            "kymo.init: server_address/cdn_address/url_base cannot override local runtime endpoints"
-        )
-    if mode == "hosted":
-        server_address = server_address or _env_string("KYMO_SERVER", "MKDB2_SERVER")
-        if not server_address:
-            raise ValueError(
-                "kymo.init: hosted mode needs a server address; pass server_address, "
-                "set KYMO_SERVER, or use mode='local'"
-            )
-        if url_base is None:
-            url_base = _env_string("KYMO_URL_BASE", "MKDB2_URL_BASE")
+    server_address = _resolve_server(
+        "kymo.init", mode, server_address, cdn_address=cdn_address, url_base=url_base
+    )
+    mode = "local" if server_address is None else "hosted"
+    if mode == "hosted" and url_base is None:
+        url_base = _env_string("KYMO_URL_BASE", "MKDB2_URL_BASE")
     if not project_id:
         raise ValueError("kymo.init: project_id is required")
     run_name = _normalize_run_name(run_name)
@@ -467,6 +479,7 @@ def init(
     # Own and validate caller config before a re-init can stop the current run.
     if config is not None:
         config = _snapshot_config(config)
+    _check_fork_safe()
     # The upload child inherits this cwd, while the parent can change cwd before shutdown inventory/salvage. Freeze one shared location now.
     spool_dir = os.path.abspath(spool_dir or default_spool_dir())
 
@@ -503,12 +516,9 @@ def init(
         local_endpoint.installation_uuid if local_endpoint is not None else ""
     )
 
-    # Derive CDN address from gRPC address if not provided
-    if cdn_address is None:
-        host = server_address.rsplit(":", 1)[0]
-        _cdn_address = f"http://{host}:8080"
-    else:
-        _cdn_address = cdn_address
+    _cdn_address = (
+        _cdn_address_for(server_address) if cdn_address is None else cdn_address
+    )
 
     # Synchronously register the run before starting the upload worker. The
     # clean control process is load-bearing on Linux: forking after this RPC ran

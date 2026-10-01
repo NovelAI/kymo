@@ -20,9 +20,13 @@ from kymo.client import (
     update_config,
     wait_for_upload,
 )
+
+# After client, whose import wraps a stub mismatch in a clear ImportError.
+from kymo.api import Api
 from kymo.types import Image, Metadata, Resource
 
 __all__ = [
+    "Api",
     "finish",
     "init",
     "is_initialized",
