@@ -39,6 +39,10 @@ cargo run --locked -- \
 
 Pass `--state-dir PATH` to retain the downloaded PostgreSQL installation between runs. Use a short path because filesystem Unix sockets have a platform-specific path-length limit.
 
+## Runtime qualification
+
+`runtime_qualification.py` qualifies an installed `kymo-local-runtime` wheel end to end: installation, the open hold, port conflicts and crash recovery, the live client integration, and the offline dashboard with frontend-aware idle shutdown. Its docstring lists the phases; the wheel must be built with the CI-only `test-idle-timeout` feature.
+
 ## Browser fences
 
 The editor dialog checks run locally with Playwright and a project containing a numeric chart, at least two sections, and an active sidebar run for the colour-picker case:
@@ -53,10 +57,10 @@ Run them after editor, focus, or dialog changes. They cover native modality, dis
 
 | Target | Status | Evidence |
 |---|---|---|
-| macOS arm64 | Qualified | CI run 31419177340 and a local macOS 26.5.2 run, 2026-08-10. |
+| macOS arm64 | Qualified | CI run 31419177340 and a local macOS 26.5.2 run, 2026-08-10; a local macOS 27.0 run, 2026-09-30. |
 | Linux x86_64 | Qualified | CI run 31419177340, 2026-08-10. |
 
-Linux x86_64 runs on every relevant push and pull request. macOS arm64 remains available through the `macos_arm64` workflow-dispatch input and the local command above, but does not run automatically. Every artifact-catalog pin change must be followed by a successful opt-in macOS arm64 dispatch before the recorded macOS qualification is considered current. A target is not supported by the launcher until its qualification passes with the frozen database artifacts. Do not replace a failing private transport with unauthenticated loopback.
+Linux x86_64 runs in the internal CI on every relevant push. macOS arm64 runs in the public repository's release workflow on every exported snapshot, and a release publishes only after it passes. A target is not supported by the launcher until its qualification passes with the frozen database artifacts. Do not replace a failing private transport with unauthenticated loopback.
 
 ## Frontend checks
 

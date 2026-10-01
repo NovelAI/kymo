@@ -186,7 +186,7 @@ The accepted installed footprint is roughly 700 MB, dominated by the irreducible
 Required automated or release-qualification coverage:
 
 1. Fresh install with neither database present; exact versions/digests; socket-only PostgreSQL; pinned-HTTPS ClickHouse; default user disabled.
-2. Linux x86-64 wheel on every relevant change; opt-in macOS arm64 qualification on catalog changes and before release. Unsupported target builds fail closed.
+2. Linux x86-64 wheel qualification on every relevant change; macOS arm64 qualification on every exported snapshot, which gates release. Unsupported target builds fail closed.
 3. Concurrent `ensure` calls converge on one generation. Hard-kill recovery (of the supervisor, a component, or a launch in progress) and idle shutdown leave no process group or socket behind, and the next `ensure` starts a new generation.
 4. The persisted dashboard/CDN ports survive stop/start and compatible reinstall. A port conflict produces an actionable error without mutating the pinned URL; `kymo ports` replaces ports only while stopped.
 5. `run_url()` remains unchanged across restart and does not wake a stopped stack. `open_run()` wakes it, checks the installation UUID, returns the URL, and its timed hold prevents shutdown during browser launch.

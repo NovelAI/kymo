@@ -63,6 +63,7 @@ def click_without_native_menu(page, target, **options) -> None:
 
 def run_fences(page) -> None:
     """Check drag focus and both mode transitions in a sidebar with at least two runs."""
+    page.wait_for_selector(".sidebar-run", timeout=30_000)
     rows = page.locator(".sidebar-run")
     if rows.count() < 2:
         raise AssertionError("gesture fences need a project with at least two runs")
@@ -321,7 +322,6 @@ def main() -> None:
         page = browser.new_page()
         try:
             page.goto(args.url, wait_until="domcontentloaded")
-            page.wait_for_selector(".sidebar-run", timeout=30_000)
             run_fences(page)
         finally:
             browser.close()

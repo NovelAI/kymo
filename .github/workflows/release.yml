@@ -182,9 +182,70 @@ jobs:
       - run: python scripts/check_artifacts.py local-runtime/dist
       - run: scripts/smoke.sh local-runtime/dist dist-client
 
+  # macOS arm64 end-to-end qualification of a wheel built with the CI-only test-idle-timeout feature, which is never uploaded, so it cannot be published. The internal CI runs the same phases on Linux x86-64.
+  runtime-qualification:
+    needs: frontend
+    # macOS runners are free only in public repos.
+    if: github.event.repository.private == false
+    name: runtime qualification (macos-arm64)
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      KYMO_FRONTEND_BUNDLE_DIR: ${{ github.workspace }}/local-runtime/.frontend-bundle
+    steps:
+      # The runner context is not available in a job-level env.
+      - run: echo "KYMO_LOCAL_ROOT=$RUNNER_TEMP/kymo-local-runtime" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+      - uses: actions/download-artifact@v8
+        with:
+          name: frontend
+          path: ${{ env.KYMO_FRONTEND_BUNDLE_DIR }}
+      - run: python -m pip install 'maturin==1.14.1'
+      # Built like the shipped macOS wheel, plus the CI-only feature.
+      - working-directory: local-runtime
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
+        run: maturin build --locked --release --features test-idle-timeout --compatibility pypi --out dist
+      - run: python -m pip install local-runtime/dist/*.whl ./python_client playwright==1.61.0
+      - run: python -m playwright install chromium
+      - run: python tools/local-transport-qualification/runtime_qualification.py install
+      - run: python tools/local-transport-qualification/runtime_qualification.py open-hold
+      - run: python tools/local-transport-qualification/runtime_qualification.py recovery
+      - run: python tools/local-transport-qualification/runtime_qualification.py integration
+      - run: python tools/local-transport-qualification/runtime_qualification.py seed
+      - run: python tools/local-transport-qualification/runtime_qualification.py browser
+
+  # The internal CI qualifies the transports on Linux x86-64.
+  transport-qualification:
+    if: github.event.repository.private == false
+    name: transport qualification (macos-arm64)
+    runs-on: macos-15
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: tools/local-transport-qualification
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@3.36
+      - run: python -m pip install 'grpcio>=1.81.0,<2' 'httpx>=0.27.0'
+      - run: python download_clickhouse.py --output "$RUNNER_TEMP/clickhouse"
+      - env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: cargo run --locked -- --clickhouse-binary "$RUNNER_TEMP/clickhouse" --python "$(command -v python)" --state-dir "$RUNNER_TEMP/m2q"
+
   # One job per project and index: a pending publisher is unique per workflow and environment, so each new project needs its own environment.
   testpypi:
-    needs: [meta, ci, runtime]
+    needs: [meta, ci, runtime, runtime-qualification, transport-qualification]
     if: needs.meta.outputs.release != ''
     name: testpypi (${{ matrix.project }})
     strategy: &publish-strategy
