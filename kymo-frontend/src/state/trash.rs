@@ -142,18 +142,6 @@ pub fn compact_duration(mut millis: i64) -> String {
     }
 }
 
-pub fn moved_ago(deleted_at_ms: Option<i64>, now_ms: i64) -> String {
-    let Some(deleted_at) = deleted_at_ms else {
-        return "Moved to Trash".to_string();
-    };
-    let elapsed = now_ms.saturating_sub(deleted_at).max(0);
-    if elapsed < 60_000 {
-        "Moved to Trash just now".to_string()
-    } else {
-        format!("Moved to Trash {} ago", compact_duration(elapsed))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -652,14 +652,18 @@ input[type="checkbox"]:checked::before {
     table-layout: fixed;
 }
 .trash-table th {
-    padding: var(--spacing-sm) var(--spacing-md);
+    padding: var(--spacing-xs) var(--spacing-md) var(--spacing-xs) 0;
     border-bottom: 1px solid var(--bg3);
     color: var(--text-disabled);
     font-size: var(--font-size-13);
     font-weight: 400;
     text-align: left;
+    vertical-align: baseline;
 }
-.trash-table th:nth-child(2) { width: 35%; }
+/* Cells pad only their right side, so columns sit 16px apart as in the projects list; the first cell also pads the table's left edge. */
+.trash-table :is(th, td):first-child { padding-left: var(--spacing-md); }
+/* Fits the widest date and countdown on one line. At large fonts the vw cap lets the date wrap to keep room for run names; a % inside min() leaves a fixed-layout column unsized. */
+.trash-table th:nth-child(2) { width: min(19rem, 40vw); }
 .trash-table th:nth-child(3) { width: 9rem; }
 .trash-table-title {
     display: flex;
@@ -685,32 +689,24 @@ input[type="checkbox"]:checked::before {
     anchor-scope: --trash-run-name;
 }
 .trash-run td {
-    padding: var(--spacing-xs) var(--spacing-md);
+    padding: var(--spacing-sm) var(--spacing-md) var(--spacing-sm) 0;
     border-bottom: 1px solid var(--bg3);
-    vertical-align: middle;
+    vertical-align: baseline;
 }
 .trash-run:last-child td { border-bottom: 0; }
+/* The run name and project share the line: the shorter keeps its full width, the longer fades. */
 .trash-run-title-line {
-    display: flex;
+    display: grid;
+    grid-template-columns: minmax(0, max-content) minmax(0, max-content);
     align-items: baseline;
     gap: 12px;
-    overflow: hidden;
-    white-space: nowrap;
 }
 .trash-run-link {
-    display: inline-flex;
-    align-items: baseline;
-    gap: 8px;
-    min-width: 0;
-}
-.trash-run-link:focus-visible { outline: none; }
-.trash-run-meta {
     display: flex;
     align-items: baseline;
-    gap: 6px;
-    min-width: 0;
-    overflow: hidden;
+    gap: 8px;
 }
+.trash-run-link:focus-visible { outline: none; }
 .trash-run-name-host {
     anchor-name: --trash-run-name;
     position: relative;
@@ -741,13 +737,11 @@ input[type="checkbox"]:checked::before {
 }
 .trash-run-link:hover .trash-run-name-host,
 .trash-run-link:focus-visible .trash-run-name-host { mask-image: none; }
-.trash-run-ordinal,
-.trash-run-project,
-.trash-run-deleted {
+.trash-run-ordinal {
     color: var(--text-disabled);
     font-size: var(--font-size-14);
 }
-.trash-run-project { color: var(--text-headings); }
+.trash-run-project { font-size: var(--font-size-14); }
 .trash-run-project:hover { text-decoration: underline; }
 .trash-run-project:focus-visible {
     outline: none;
@@ -755,7 +749,6 @@ input[type="checkbox"]:checked::before {
     text-decoration: underline 2px;
     text-underline-offset: 2px;
 }
-.trash-run-meta-separator { color: var(--text-disabled); }
 .trash-run-expiry {
     display: flex;
     flex-wrap: wrap;
@@ -818,14 +811,11 @@ input[type="checkbox"]:checked::before {
     .trash-table th:nth-child(2), .trash-table th:nth-child(3) { width: auto; }
     .trash-run td:first-child { border-bottom: 0; }
     .trash-run-title-line {
-        flex-direction: column;
-        align-items: stretch;
+        grid-template-columns: minmax(0, 1fr);
         gap: var(--spacing-xs);
-        white-space: normal;
     }
-    .trash-run-meta { flex-wrap: wrap; }
-    .trash-run-project { overflow-wrap: anywhere; }
-    .trash-run-ordinal { flex-shrink: 0; }
+    .trash-table :is(th, td):nth-child(2) { padding-left: var(--spacing-md); }
+    .trash-run-project { white-space: normal; overflow-wrap: anywhere; }
     .trash-run-name-host { white-space: normal; }
     .trash-run-link .trash-run-name,
     .trash-run-link:hover .trash-run-name,
@@ -833,7 +823,6 @@ input[type="checkbox"]:checked::before {
         /* inline, not the fade's inline-block, so the ordinal aligns with the first line */
         display: inline;
         position: static;
-        width: auto;
         overflow-wrap: anywhere;
     }
     .trash-run-name-placeholder { display: none; }

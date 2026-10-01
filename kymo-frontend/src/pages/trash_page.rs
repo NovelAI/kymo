@@ -11,7 +11,7 @@ use crate::grpc::GrpcClient;
 use crate::route::Route;
 use crate::state::trash::{
     clock_wait_ms, compact_duration, effective_lifecycle, extrapolated_now_ms, lookup_trashed_runs,
-    monotonic_now_ms, moved_ago,
+    monotonic_now_ms,
 };
 use crate::util::{local_time, primary};
 
@@ -458,7 +458,7 @@ fn trash_row(
     };
     let project_id = run.project_id.clone();
     let run_id = run.run_id.clone();
-    let run_name = run.run_name.clone();
+    let run_name = &run.run_name;
     let ordinal = run.ordinal;
     let key = run_key(&project_id, &run_id);
     let is_restoring = restoring.read().contains(&key);
@@ -467,10 +467,9 @@ fn trash_row(
         lifecycle,
         RunLifecycleState::Expired | RunLifecycleState::Purging
     );
-    let moved = moved_ago(record.deleted_at_ms, now_ms);
     let (expires_at, expires_datetime) = expiry_time(record.purge_at_ms);
     let expires_in = if is_expired {
-        "Recovery expired — deleting…".to_string()
+        "Expired — deleting…".to_string()
     } else {
         record
             .purge_at_ms
@@ -511,18 +510,11 @@ fn trash_row(
                         }
                         span { class: "trash-run-ordinal", "#{ordinal}" }
                     }
-                    span { class: "trash-run-meta",
-                        Link {
-                            to: Route::ProjectPage { project_id: project_id.clone(), chart: None.into() },
-                            class: "trash-run-project",
-                            "{project_id}"
-                        }
-                        span { class: "trash-run-meta-separator", aria_hidden: "true", "·" }
-                        span {
-                            class: "trash-run-deleted fade-overflow",
-                            title: "{moved}",
-                            span { "{moved}" }
-                        }
+                    Link {
+                        to: Route::ProjectPage { project_id: project_id.clone(), chart: None.into() },
+                        class: "trash-run-project fade-overflow",
+                        title: "{project_id}",
+                        "{project_id}"
                     }
                 }
             }
