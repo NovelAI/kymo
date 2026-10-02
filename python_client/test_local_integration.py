@@ -1,6 +1,7 @@
 """Opt-in live test for the packaged local supervisor and server."""
 
 import os
+import subprocess
 import uuid
 import unittest
 from unittest import mock
@@ -9,7 +10,7 @@ import grpc
 import kymo
 
 from kymo._generated import kymo_pb2, kymo_pb2_grpc
-from kymo._local_runtime import ensure_local_endpoint, grpc_channel
+from kymo._local_runtime import _launcher_path, ensure_local_endpoint, grpc_channel
 
 
 @unittest.skipUnless(
@@ -34,6 +35,7 @@ class LocalRuntimeIntegrationTests(unittest.TestCase):
                 f"{initial_endpoint.dashboard_origin}/local-client-integration/{run_id}",
             )
             kymo.log({"loss": 1.25}, step=1)
+            print(f"live-marker-{run_id}")
             kymo.update_config({"phase": "updated"})
 
             channel = grpc_channel(initial_endpoint)
@@ -131,7 +133,7 @@ class LocalRuntimeIntegrationTests(unittest.TestCase):
         finally:
             kymo.finish(flush_timeout=5)
 
-        # Read back through the public API: its channel, bearer and receive limit, and the loopback CDN origin. The patch restores the fork-guard flag afterwards, so later client tests in this process can still call kymo.init().
+        # Reading through Api covers its channel, bearer, receive limit and loopback CDN. The patch restores the fork-guard flag these reads set, so later init() tests still run, as they already did after grpc_channel above started gRPC here.
         with (
             mock.patch.object(kymo.api, "_channel_opened", False),
             kymo.Api(mode="local") as api,
@@ -142,14 +144,37 @@ class LocalRuntimeIntegrationTests(unittest.TestCase):
             self.assertEqual(
                 api.run_info(project, run_id)["config"], {"phase": "updated"}
             )
+            # One stream: a merged read splices a partial line of one stream (the runner's unterminated "test ... ") onto the other's next chunk.
+            marked = api.logs(
+                project,
+                run_id,
+                streams=["logs/std_out"],
+                search=f"live-marker-{run_id}",
+            )
+            self.assertEqual(
+                [ln.text for ln in marked.lines], [f"live-marker-{run_id}"]
+            )
 
-        final_endpoint = ensure_local_endpoint(
-            expected_installation_uuid=initial_endpoint.installation_uuid
-        )
-        self.assertEqual(
-            final_endpoint.endpoint_generation,
-            initial_endpoint.endpoint_generation,
-        )
+            final_endpoint = ensure_local_endpoint(
+                expected_installation_uuid=initial_endpoint.installation_uuid
+            )
+            self.assertEqual(
+                final_endpoint.endpoint_generation,
+                initial_endpoint.endpoint_generation,
+            )
+
+            # A read right after the stack stops starts it again and succeeds, though the reconnected channel shares a connection still backing off from the stop.
+            subprocess.run([_launcher_path(), "stop"], check=True, capture_output=True)
+            self.assertEqual(api.history(project, run_id, "loss"), {"": [(1, 1.25)]})
+
+            # A restart while idle keeps the socket path but rotates the bearer: the next read reconnects, and its CDN fetch follows the new endpoint.
+            for command in (["stop"], ["ensure", "--json"]):
+                subprocess.run(
+                    [_launcher_path(), *command], check=True, capture_output=True
+                )
+            self.assertEqual(
+                api.run_info(project, run_id)["config"], {"phase": "updated"}
+            )
 
 
 if __name__ == "__main__":

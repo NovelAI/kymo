@@ -7,6 +7,7 @@ import json
 import math
 import multiprocessing
 import os
+import threading
 from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import quote
@@ -27,7 +28,7 @@ _MAX_EXACT_STEP = 2**53
 # Marker kinds 1-3 are logged non-finite values. Kind 4 annotates an unplottable custom x, which these reads never request.
 _NONFINITE = {1: math.nan, 2: math.inf, 3: -math.inf}
 
-# Set once this process opens an Api channel; kymo.init() reads it (_check_fork_safe).
+# True once this process opens, or is about to open, an Api channel; kymo.init() reads it (_check_fork_safe).
 _channel_opened = False
 
 
@@ -81,9 +82,9 @@ class Logs:
 class Api:
     """Read-only client for a kymo server or the local stack.
 
-    Arguments resolve as in ``kymo.init``: ``mode`` falls back to ``$KYMO_MODE``, hosted mode needs ``server_address`` or ``$KYMO_SERVER``, and the CDN defaults to port 8080 on the server's host. ``timeout`` bounds every RPC and CDN fetch.
+    Arguments resolve as in ``kymo.init``: ``mode`` falls back to ``$KYMO_MODE``, hosted mode needs ``server_address`` or ``$KYMO_SERVER``, and the CDN defaults to port 8080 on the server's host (pass ``cdn_address`` when ``server_address`` is a resolver-form target or the CDN is elsewhere). ``timeout`` bounds each RPC, and each connect, read and write of a CDN fetch. In local mode a read starts a stopped stack and waits for it, up to ``$KYMO_LOCAL_ENSURE_TIMEOUT``.
 
-    An Api works only in the process that created it, and not after ``close()``.
+    Threads may share an Api, but call ``close()`` only after every other call has returned: in local mode a call racing ``close()`` can crash the process. An Api works only in the process that created it.
     """
 
     def __init__(
@@ -107,7 +108,12 @@ class Api:
                 "/"
             )
         # Opened on first use: creating a channel starts gRPC's threads, which _check_fork_safe guards init() against.
-        self._channel = self._stub = None
+        self._stub = None
+        # Kept until close(): another thread may still use an old channel, and calling a closed intercepted channel crashes the process (grpcio 1.84).
+        self._channels = []
+        self._connect_lock = threading.Lock()
+        # The local endpoint generation the current channel reaches.
+        self._generation = None
         self._pid = os.getpid()
         import httpx  # not at module scope: every `import kymo` loads this module
 
@@ -116,28 +122,39 @@ class Api:
             timeout=timeout, follow_redirects=True, trust_env=not self._local
         )
 
+    def _live_stub(self, failed=None):
+        """The current stub. Connects only while the stored stub is still ``failed`` (None on first use), so threads that raced or failed together connect once rather than each opening a channel or re-running ``kymo ensure``."""
+        with self._connect_lock:
+            if self._stub is failed:
+                self._connect()
+            return self._stub
+
     def _connect(self) -> None:
         global _channel_opened
         if self._local:
             from kymo._local_runtime import ensure_local_endpoint, grpc_channel
 
             endpoint = ensure_local_endpoint()
+            # The same generation means the stack never restarted (the server answered UNAVAILABLE itself), so the current channel still reaches it.
+            if endpoint.endpoint_generation == self._generation:
+                return
+            # Set before opening the channel, so init() refuses from the moment gRPC starts; a failed ensure above opened nothing, so init() stays free.
+            _channel_opened = True
             channel = grpc_channel(endpoint, _CHANNEL_OPTIONS)
             self._cdn = endpoint.cdn_origin
+            self._generation = endpoint.endpoint_generation
         else:
+            _channel_opened = True
             channel = grpc.insecure_channel(
                 self._server_address, options=_CHANNEL_OPTIONS
             )
-        _channel_opened = True
-        # The old channel closes only once its replacement exists: a stub left on a closed channel crashes the process on its next call when the channel is intercepted (local mode, grpcio 1.84).
-        if self._channel is not None:
-            self._channel.close()
-        self._channel, self._stub = channel, kymo_pb2_grpc.KymoStub(channel)
+        self._channels.append(channel)
+        self._stub = kymo_pb2_grpc.KymoStub(channel)
 
     def _require_usable(self) -> None:
         if self._http.is_closed:
             raise RuntimeError("kymo.Api: used after close()")
-        # A forked child shares its parent's pooled sockets and channel: interleaved responses hand a process another key's bytes, and gRPC is unsafe after fork.
+        # A forked child shares its parent's pooled sockets and channels: interleaved responses hand a process another key's bytes, and gRPC is unsafe after fork.
         if os.getpid() != self._pid:
             raise RuntimeError(
                 "kymo.Api: an Api cannot be used across fork; create one in each process"
@@ -145,10 +162,9 @@ class Api:
 
     def _rpc(self, method: str, request):
         self._require_usable()
-        if self._stub is None:
-            self._connect()
+        stub = self._live_stub()
         try:
-            return getattr(self._stub, method)(request, timeout=self._timeout)
+            return getattr(stub, method)(request, timeout=self._timeout)
         except grpc.RpcError as error:
             # The local stack stops after an idle hour (UNAVAILABLE), and a restarted stack keeps its socket path but rotates the bearer (UNAUTHENTICATED); ensure_local_endpoint starts or finds it.
             if not self._local or error.code() not in (
@@ -156,13 +172,21 @@ class Api:
                 grpc.StatusCode.UNAUTHENTICATED,
             ):
                 raise
-        self._connect()
-        return getattr(self._stub, method)(request, timeout=self._timeout)
+            # Inside the handler, so a failed reconnect or retry keeps `error` as its context.
+            stub = self._live_stub(stub)
+            # Channels to one socket share gRPC's connection, which can still be backing off from the stop when the stack is back: wait for it rather than fail at once.
+            return getattr(stub, method)(
+                request, timeout=self._timeout, wait_for_ready=True
+            )
 
     def close(self) -> None:
-        if self._channel is not None:
-            self._channel.close()
+        # A forked child leaves its parent's channels and sockets alone: closing them can deadlock on a lock held at fork time.
+        if os.getpid() != self._pid:
+            return
+        # The HTTP client first: its closed state is what refuses later calls, before any can reach a closing channel.
         self._http.close()
+        for channel in self._channels:
+            channel.close()
 
     def __enter__(self):
         return self
@@ -195,7 +219,7 @@ class Api:
         ]
 
     def metrics(self, project_id: str, run_id: str) -> dict[str, str]:
-        """Metric name to kind: ``numeric``, ``cdn`` (images, files, metadata) or ``text_stream``.
+        """Metric name to kind, sorted by name: ``numeric``, ``cdn`` (images, files, metadata) or ``text_stream``.
 
         The server registers a name a couple of seconds after its first point arrives, so a brand-new metric can be readable before it is listed.
         """
@@ -218,9 +242,11 @@ class Api:
     ) -> dict[str, list[tuple[int, float]]]:
         """Every logged point of a numeric metric: tag to ``[(step, value), ...]``.
 
-        An untagged metric has the single tag ``""``; a metric logged as a list has tags ``"0"``, ``"1"``, .... Values are f32-exact floats, and logged NaN/inf come back as ``nan``/``inf``. A step re-logged later holds its latest value.
+        An untagged metric has the single tag ``""``; a metric logged as a list has tags ``"0"``, ``"1"``, ..., in string order (``"10"`` before ``"2"``). Values are f32-exact floats, and logged NaN/inf come back as ``nan``/``inf``. A step re-logged later holds its latest value.
 
         Server limits: a metric with list entries in the requested range hides its scalar entries there, a list metric with more than 64 tags is refused, and steps must stay below 2**53 in magnitude.
+
+        A long metric the server has not cached can answer DEADLINE_EXCEEDED while the server keeps loading it; asking again joins that load.
         """
 
         def query(tags):
@@ -267,7 +293,7 @@ class Api:
         step_min: Optional[int] = None,
         step_max: Optional[int] = None,
     ) -> list[tuple[int, Optional[str]]]:
-        """A cdn metric's ``(step, key)`` entries, ascending; ``key`` is None while that step's upload is still in flight.
+        """A cdn metric's ``(step, key)`` entries, ascending, one per step and tag (kymo's own client never tags media); ``key`` is None while that step's upload is still in flight.
 
         Fetch a key with ``fetch``. Image and metadata metrics store JSON manifests: ``{"class": "image_gallery", "items": [{"resource": key, ...}]}`` or ``{"class": "metadata", "data": {...}}``.
         """
@@ -285,8 +311,7 @@ class Api:
         )
         return [
             (e.step, None if e.cdn_key.startswith("pending:") else e.cdn_key)
-            for s in resp.series
-            for e in s.entries
+            for e in resp.series[0].entries
         ]
 
     def fetch(self, key: str) -> bytes:
@@ -294,20 +319,22 @@ class Api:
         import httpx
 
         self._require_usable()
-        if self._local and self._stub is None:
-            self._connect()  # the local CDN origin comes from the endpoint
-        # Encoded whole, as the dashboard requests it: a raw `?`, `#`, `%` or `/` would reach some other object.
-        path = f"/cdn/{quote(key, safe='')}"
+        # In local mode the CDN origin comes from the endpoint, so connect first; that stub is the retry's staleness token, so it reconnects only if no other thread already has.
+        stub = self._live_stub() if self._local else None
         try:
-            resp = self._http.get(self._cdn + path)
+            resp = self._http.get(self._cdn_url(key))
         except httpx.ConnectError:
             if not self._local:
                 raise
             # The local stack stops after an idle hour; ensure_local_endpoint restarts it, on new ports if `kymo ports` changed them.
-            self._connect()
-            resp = self._http.get(self._cdn + path)
+            self._live_stub(stub)
+            resp = self._http.get(self._cdn_url(key))
         resp.raise_for_status()
         return resp.content
+
+    def _cdn_url(self, key: str) -> str:
+        # Encoded whole, as the dashboard requests it: a raw `?`, `#`, `%` or `/` would reach some other object.
+        return f"{self._cdn}/cdn/{quote(key, safe='')}"
 
     def run_info(self, project_id: str, run_id: str) -> Optional[dict]:
         """The run's metadata as logged by ``kymo.init``/``update_config`` (``meta`` and ``config``), or None until it has been uploaded."""
@@ -328,13 +355,15 @@ class Api:
     ) -> Logs:
         """Captured console lines from the named streams, merged as the server orders them: by step (capture time), then stream name.
 
-        ``offset=None`` reads the tail; ``limit=None`` reads to the end. ``search`` is a case-insensitive substring filter applied by the server, and indexes then count filtered lines; the server scans the whole stream for every page of a search, so bound ``limit`` on long runs.
+        ``offset=None`` reads the last ``limit`` lines; ``limit=None`` reads to the end, so with neither it reads the whole stream. ``search`` is a case-insensitive substring filter applied by the server, and indexes then count filtered lines; the server scans the whole stream for every page of a search, so bound ``limit`` on long runs.
         """
         if isinstance(streams, str):
             raise TypeError("kymo.Api.logs: streams must be a sequence of metric names")
+        if not streams:
+            raise ValueError("kymo.Api.logs: no streams named")
         if (offset is not None and offset < 0) or (limit is not None and limit < 0):
             raise ValueError("kymo.Api.logs: offset and limit must be >= 0")
-        # Any offset past the end returns the total with no payload read; an in-range probe could trip the window byte cap on an oversized chunk.
+        # Without a search, any offset past the end returns the total with no payload read; an in-range probe could trip the window byte cap on an oversized chunk.
         req = pb.QueryTextWindowRequest(
             project_id=project_id,
             run_id=run_id,
@@ -344,15 +373,15 @@ class Api:
             line_limit=1,
         )
         total = self._rpc("QueryTextWindow", req).total_lines
-        if limit is None:
-            limit = total
         if offset is None:
-            offset = max(0, total - limit)
+            offset = 0 if limit is None else max(0, total - limit)
+        # Indexes bound the window, so lines that vanish mid-read leave a gap rather than pull in lines past its end.
+        end = total if limit is None else offset + limit
         lines = []
         page = _TEXT_WINDOW_LINES
-        while len(lines) < limit:
+        while offset < end:
             req.line_offset = offset
-            req.line_limit = min(limit - len(lines), page)
+            req.line_limit = min(end - offset, page)
             try:
                 resp = self._rpc("QueryTextWindow", req)
             except grpc.RpcError as error:
@@ -364,12 +393,15 @@ class Api:
                     raise
                 page = req.line_limit // 2
                 continue
+            page = min(page * 2, _TEXT_WINDOW_LINES)  # regrow once past the long lines
             lines.extend(
                 LogLine(ln.line_index, ln.metric_name, ln.step, ln.text)
                 for ln in resp.lines
             )
-            # A short page is not the end: line_index is the cursor, and only the response's total, or a cursor that fails to advance, ends the stream.
-            cursor = resp.lines[-1].line_index + 1 if resp.lines else offset
+            # A short page is not the end: line_index is the cursor, an empty page (every line vanished mid-read) is a gap to step over, and only the response's total, or a cursor that fails to advance, ends the stream.
+            cursor = (
+                resp.lines[-1].line_index + 1 if resp.lines else offset + req.line_limit
+            )
             if cursor >= resp.total_lines or cursor <= offset:
                 break
             offset = cursor

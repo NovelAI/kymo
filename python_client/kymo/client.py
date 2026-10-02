@@ -397,6 +397,7 @@ def init(
     """Initialise the kymo client.
 
     Can be called multiple times — shuts down the previous worker first.
+    Under the ``fork`` start method it raises RuntimeError once a ``kymo.Api`` has opened a gRPC channel in this process, since it forks its upload worker.
 
     Args:
         server_address: gRPC server address (``host:port``). If None, falls

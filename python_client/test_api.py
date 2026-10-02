@@ -1,9 +1,12 @@
-"""Offline tests for kymo.Api: decode and paging rules, record mapping, CDN fetch, construction, local reconnect, the channel lifecycle, and init()'s fork guard. The gRPC layer is faked; nothing connects."""
+"""Offline tests for kymo.Api. The gRPC layer is faked; nothing connects."""
 
+import concurrent.futures
 import json
 import math
 import multiprocessing
 import sys
+import threading
+import time
 import unittest
 from types import SimpleNamespace as NS
 from unittest import mock
@@ -118,6 +121,11 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(api.history("p", "r", "loss"), {"": [(1, 1.25)]})
         self.assertEqual(answers, [])
 
+    def test_lone_tagged_series_keys_by_its_tag(self):
+        resp = chart([0], ("0", [0], [1], [1.0], [], []))
+        self.assertEqual(self.history(resp, tagged=True), {"0": [(0, 1.0)]})
+        self.assertEqual(self.requests, 2)
+
     def test_steps_beyond_f64_precision_are_refused(self):
         ok = chart([2**53 - 1], ("r", [0], [1], [1.0], [], []))
         self.assertEqual(self.history(ok), {"": [(2**53 - 1, 1.0)]})
@@ -162,9 +170,14 @@ class RecordTests(unittest.TestCase):
         )
         resp.metrics.add(metric_name="eval/images", metric_type=pb.MetricInfo.CDN)
         kinds = offline_api(NS(ListMetrics=lambda req, timeout: resp)).metrics("p", "r")
+        # sorted by name, an order the CLI's listing and default summary rely on
         self.assertEqual(
-            kinds,
-            {"eval/images": "cdn", "logs/std_out": "text_stream", "loss": "numeric"},
+            list(kinds.items()),
+            [
+                ("eval/images", "cdn"),
+                ("logs/std_out", "text_stream"),
+                ("loss", "numeric"),
+            ],
         )
 
     def test_media_marks_pending_uploads(self):
@@ -229,54 +242,84 @@ class LogsTests(unittest.TestCase):
         ]
         lines, calls = self.read(200, pages, limit=200)
         self.assertEqual([ln.index for ln in lines], list(range(100, 200)))
-        self.assertEqual([c[:2] for c in calls[1:]], [(0, 200), (102, 198)])
+        self.assertEqual([c[:2] for c in calls[1:]], [(0, 200), (102, 98)])
+
+    def test_explicit_window_ends_at_its_end_across_a_gap(self):
+        # lines 100-119 vanished mid-read: the window keeps its gap rather than read lines past index 149
+        page = [(120 + i, f"L{120 + i}") for i in range(30)]
+        lines, calls = self.read(4000, [page], offset=100, limit=50)
+        self.assertEqual([c[:2] for c in calls[1:]], [(100, 50)])
+        self.assertEqual([ln.index for ln in lines], list(range(120, 150)))
+
+    def test_empty_page_is_a_gap(self):
+        # every line of the middle page vanished mid-read: the read steps over it rather than end there
+        pages = [[(i, f"L{i}") for i in range(a, a + 2000)] for a in (0, 4000)]
+        pages.insert(1, [])
+        lines, calls = self.read(6000, pages)
+        self.assertEqual(
+            [ln.index for ln in lines], [*range(0, 2000), *range(4000, 6000)]
+        )
+        self.assertEqual(
+            [c[:2] for c in calls[1:]], [(0, 2000), (2000, 2000), (4000, 2000)]
+        )
 
     def test_no_progress_stops(self):
-        lines, calls = self.read(100, [[]], limit=50)
-        self.assertEqual((lines, len(calls)), ([], 2))
+        # a page that re-anchored behind the cursor cannot advance it
+        lines, calls = self.read(100, [[(40, "L40")]], offset=50, limit=50)
+        self.assertEqual(([ln.index for ln in lines], len(calls)), ([40], 2))
 
-    def test_whole_stream_and_explicit_window(self):
+    def test_whole_stream_and_offset_only_window(self):
         lines, _ = self.read(3, [[(i, f"L{i}") for i in range(3)]])
         self.assertEqual([ln.text for ln in lines], ["L0", "L1", "L2"])
-        lines, calls = self.read(
-            4000, [[(100, "L100"), (101, "L101")]], offset=100, limit=2
-        )
-        self.assertEqual(calls[1][:2], (100, 2))
-        self.assertEqual([ln.index for ln in lines], [100, 101])
+        # with no limit the window ends at the probed total, as Logs.total_lines reports, even while the stream grows
+        _, calls = self.read(100, [[(i, f"L{i}") for i in range(40, 100)]], offset=40)
+        self.assertEqual(calls[1][:2], (40, 60))
 
-    def test_oversized_window_halves_its_page(self):
-        # the server caps a window at 8 MiB, which 2000 long lines can exceed
-        seen = []
-
+    def stream(self, total, seen, refuse):
+        # a stream that holds still; the server refuses the windows `refuse` picks for its 8 MiB cap, which 2000 long lines can exceed
         def qtw(req, timeout):
-            seen.append(req.line_limit)
+            seen.append((req.line_offset, req.line_limit))
             if req.line_offset == 2**63:
-                return NS(total_lines=600, lines=[])
-            if req.line_limit > 500:
+                return NS(total_lines=total, lines=[])
+            if refuse(req):
                 raise RpcError(grpc.StatusCode.RESOURCE_EXHAUSTED)
+            end = min(total, req.line_offset + req.line_limit)
             lines = [
                 NS(line_index=i, metric_name="logs/std_out", step=0, text=f"L{i}")
-                for i in range(
-                    req.line_offset, min(600, req.line_offset + req.line_limit)
-                )
+                for i in range(req.line_offset, end)
             ]
-            return NS(total_lines=600, lines=lines)
+            return NS(total_lines=total, lines=lines)
 
-        logs = offline_api(NS(QueryTextWindow=qtw)).logs("p", "r")
+        return offline_api(NS(QueryTextWindow=qtw)).logs("p", "r")
+
+    def test_oversized_window_halves_its_page(self):
+        seen = []
+        logs = self.stream(600, seen, lambda req: req.line_limit > 500)
         self.assertEqual(len(logs.lines), 600)
-        self.assertEqual(seen, [1, 600, 300, 300])
-
-        def single_line_too_big(req, timeout):
-            if req.line_offset == 2**63:
-                return NS(total_lines=1, lines=[])
-            raise RpcError(grpc.StatusCode.RESOURCE_EXHAUSTED)
-
+        self.assertEqual([limit for _, limit in seen], [1, 600, 300, 300])
         with self.assertRaises(RpcError):
-            offline_api(NS(QueryTextWindow=single_line_too_big)).logs("p", "r")
+            self.stream(1, [], lambda req: True)
 
-    def test_negative_offset_or_limit_is_refused_before_any_request(self):
-        for kw in ({"offset": -5, "limit": 3}, {"limit": -1}):
-            with self.assertRaises(ValueError):
+    def test_page_regrows_after_the_long_lines(self):
+        # only the window over the long lines is refused; later pages grow back toward the server's cap
+        seen = []
+        logs = self.stream(
+            3000, seen, lambda req: req.line_offset == 0 and req.line_limit > 500
+        )
+        self.assertEqual(len(logs.lines), 3000)
+        self.assertEqual(
+            seen[1:], [(0, 2000), (0, 1000), (0, 500), (500, 1000), (1500, 1500)]
+        )
+
+    def test_bad_arguments_are_refused_before_any_request(self):
+        # a bare string: protobuf would split it into one-letter stream names and the server would answer an empty stream
+        for kw, error in (
+            ({"offset": -5, "limit": 3}, ValueError),
+            ({"limit": -1}, ValueError),
+            ({"streams": ()}, ValueError),
+            ({"streams": "logs/std_out"}, TypeError),
+        ):
+            with self.assertRaises(error):
                 offline_api(NS()).logs("p", "r", **kw)
 
     def test_huge_limit_pages_within_the_window_cap(self):
@@ -285,11 +328,6 @@ class LogsTests(unittest.TestCase):
         )
         self.assertEqual(calls[1][:2], (0, 2000))
         self.assertEqual(len(lines), 3)
-
-    def test_bare_stream_name_is_refused(self):
-        # protobuf would split the string into one-letter stream names and the server would answer an empty stream
-        with self.assertRaises(TypeError):
-            offline_api(NS()).logs("p", "r", streams="logs/std_out")
 
 
 class FetchTests(unittest.TestCase):
@@ -309,6 +347,23 @@ class FetchTests(unittest.TestCase):
 
         self.assertEqual(self.cdn_api(handler).fetch("a?b/c.png"), b"x")
         self.assertEqual(seen, [b"/cdn/a%3Fb%2Fc.png"])
+
+    def test_local_fetch_first_connects_for_the_origin(self):
+        # the local CDN origin comes from the endpoint, so a fetch before any RPC connects first
+        def connect(api):
+            api._cdn, api._stub = "http://c.example:9", NS()
+
+        seen = []
+
+        def handler(request):
+            seen.append(request.url.port)
+            return httpx.Response(200, content=b"x")
+
+        api = self.cdn_api(handler, local=True)
+        api._stub = None
+        with mock.patch.object(kymo_api.Api, "_connect", connect):
+            self.assertEqual(api.fetch("k.png"), b"x")
+        self.assertEqual(seen, [9])
 
     def test_local_retry_follows_a_moved_origin(self):
         seen = []
@@ -353,13 +408,53 @@ class LocalReconnectTests(unittest.TestCase):
                 calls.append("old")
                 raise RpcError(code)
 
+            def retried(req, timeout, wait_for_ready):
+                # the new channel shares gRPC's connection to the socket, which may still be backing off from the stop
+                calls.append(("new", wait_for_ready))
+                return NS(project_ids=["p"])
+
             api = offline_api(NS(ListProjects=projects), local=True)
-            fresh = NS(ListProjects=lambda req, timeout: NS(project_ids=["p"]))
+            fresh = NS(ListProjects=retried)
             with mock.patch.object(
                 kymo_api.Api, "_connect", lambda self: setattr(self, "_stub", fresh)
             ):
                 self.assertEqual(api.projects(), ["p"])
-            self.assertEqual(calls, ["old"])
+            self.assertEqual(calls, ["old", ("new", True)])
+
+    def test_reconnect_keeps_the_channel_while_the_stack_did_not_restart(self):
+        # a server-side UNAVAILABLE re-ensures the same generation: a new channel could not help, and every one stays open until close()
+        g1 = NS(endpoint_generation="g1", cdn_origin="http://c.example:9")
+        endpoints = [
+            g1,
+            g1,
+            NS(endpoint_generation="g2", cdn_origin="http://c.example:9"),
+        ]
+        api = offline_api(None, local=True)
+        with (
+            mock.patch(
+                "kymo._local_runtime.ensure_local_endpoint",
+                side_effect=endpoints,
+            ),
+            mock.patch(
+                "kymo._local_runtime.grpc_channel", side_effect=lambda *a: mock.Mock()
+            ),
+            mock.patch.object(
+                kymo_api.kymo_pb2_grpc,
+                "KymoStub",
+                side_effect=lambda channel: mock.Mock(),
+            ),
+            mock.patch.object(kymo_api, "_channel_opened", False),
+        ):
+            first = api._live_stub()
+            self.assertIs(api._live_stub(first), first)
+            second = api._live_stub(first)
+            self.assertIsNot(second, first)
+            # another thread that failed on `first` takes the new stub without a fourth ensure, which would exhaust `endpoints`
+            self.assertIs(api._live_stub(first), second)
+        # the restart's new channel leaves the old one open: another thread may still be calling through it
+        self.assertEqual([c.close.called for c in api._channels], [False, False])
+        api.close()
+        self.assertEqual([c.close.called for c in api._channels], [True, True])
 
     def test_hosted_does_not_retry(self):
         def projects(req, timeout):
@@ -372,19 +467,64 @@ class LocalReconnectTests(unittest.TestCase):
 
 
 class ChannelLifecycleTests(unittest.TestCase):
-    def test_failed_reconnect_keeps_the_open_channel(self):
-        # a stub left on a closed intercepted channel crashes the process on its next call
-        closed = []
-        api = offline_api(NS(), local=True)
-        old_stub = api._stub
-        api._channel = NS(close=lambda: closed.append(True))
-        with mock.patch(
-            "kymo._local_runtime.ensure_local_endpoint",
-            side_effect=RuntimeError("stack failed to start"),
+    def test_failed_local_start_leaves_init_free(self):
+        # no channel opened, so falling back to hosted logging must not be refused by the fork guard
+        api = offline_api(None, local=True)
+        with (
+            mock.patch.object(kymo_api, "_channel_opened", False),
+            mock.patch(
+                "kymo._local_runtime.ensure_local_endpoint",
+                side_effect=RuntimeError("stack failed to start"),
+            ),
         ):
-            with self.assertRaises(RuntimeError):
-                api._connect()
-        self.assertEqual((closed, api._stub), ([], old_stub))
+            with self.assertRaisesRegex(RuntimeError, "failed to start"):
+                api.projects()
+            self.assertFalse(kymo_api._channel_opened)
+
+    def test_concurrent_first_calls_connect_once(self):
+        # racing first calls share one connect: unlocked, each would open its own channel (and in local mode run ensure_local_endpoint)
+        connects = []
+        started = threading.Barrier(8)
+
+        def connect(api):
+            connects.append(True)
+            time.sleep(0.05)
+            api._stub = NS(ListProjects=lambda req, timeout: NS(project_ids=["p"]))
+
+        def call(_):
+            started.wait()
+            return api.projects()
+
+        api = offline_api(None)
+        with (
+            mock.patch.object(kymo_api.Api, "_connect", connect),
+            concurrent.futures.ThreadPoolExecutor(8) as pool,
+        ):
+            results = list(pool.map(call, range(8)))
+        self.assertEqual((results, len(connects)), ([["p"]] * 8, 1))
+
+    def test_hosted_channel_raises_the_receive_limit(self):
+        with (
+            mock.patch("grpc.insecure_channel") as channel,
+            mock.patch.object(kymo_api, "_channel_opened", False),
+        ):
+            api = kymo_api.Api("h.example:1", mode="hosted")
+            api._connect()
+            api.close()
+        self.assertEqual(
+            channel.call_args.kwargs["options"],
+            (("grpc.max_receive_message_length", 256 * 1024 * 1024),),
+        )
+
+    def test_close_in_a_forked_child_leaves_the_parent_alone(self):
+        closed = []
+        api = offline_api(NS())
+        api._channels = [NS(close=lambda: closed.append(True))]
+        with mock.patch("os.getpid", return_value=api._pid + 1):
+            api.close()
+        self.assertEqual((closed, api._http.is_closed), ([], False))
+        api.close()
+        self.assertEqual((closed, api._http.is_closed), ([True], True))
 
     def test_closed_or_forked_api_refuses_before_any_socket(self):
         # after close() the channel is closed (a call through it can crash the process), and a forked child shares its parent's sockets
@@ -398,20 +538,6 @@ class ChannelLifecycleTests(unittest.TestCase):
             for call in (api.projects, lambda: api.fetch("k.png")):
                 with self.assertRaisesRegex(RuntimeError, "after close"):
                     call()
-
-    def test_hosted_channel_raises_the_receive_limit(self):
-        # _connect raises the process-wide fork-guard flag; the patch restores it for later tests in this process
-        with (
-            mock.patch("grpc.insecure_channel") as channel,
-            mock.patch.object(kymo_api, "_channel_opened", False),
-        ):
-            api = kymo_api.Api("h.example:1", mode="hosted")
-            api._connect()
-            api.close()
-        self.assertEqual(
-            channel.call_args.kwargs["options"],
-            (("grpc.max_receive_message_length", 256 * 1024 * 1024),),
-        )
 
 
 @mock.patch.object(kymo_api, "_channel_opened", True)
@@ -447,7 +573,12 @@ class ForkGuardTests(unittest.TestCase):
             ),
         ):
             with self.assertRaisesRegex(RuntimeError, "forks its upload worker"):
-                kymo.init(server_address="h.example:1", project_id="p", run_name="n")
+                kymo.init(
+                    server_address="h.example:1",
+                    project_id="p",
+                    run_name="n",
+                    mode="hosted",
+                )
         self.assertFalse(kymo.is_initialized())
 
     def test_unused_api_never_refuses(self):
@@ -479,7 +610,7 @@ class ConstructionTests(unittest.TestCase):
     def test_construction_opens_no_channel(self):
         # a trainer may build its Api before kymo.init() and read after it
         with mock.patch.object(kymo_api, "_channel_opened", False):
-            kymo_api.Api("h.example:50051").close()
+            kymo_api.Api("h.example:50051", mode="hosted").close()
             self.assertFalse(kymo_api._channel_opened)
 
     def test_local_rejects_endpoint_overrides(self):

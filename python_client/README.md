@@ -37,7 +37,7 @@ Leave out `mode="local"` and pass the server's gRPC address as `server_address="
 
 ## Reading runs back
 
-`kymo.Api` reads what runs logged. It takes the same `server_address`, `mode` and `cdn_address` as `kymo.init` and falls back to the same environment variables.
+`kymo.Api` reads what runs logged. It takes the same `server_address`, `mode` and `cdn_address` as `kymo.init` and falls back to the same environment variables (`cdn_address` has none).
 
 ```python
 import kymo
@@ -51,9 +51,9 @@ errors = api.logs("my-project", run.run_id, search="Traceback", limit=100).lines
 
 `history` returns every point it can read, with NaN and inf as logged. A metric logged as a list has one series per index tag (`"0"`, `"1"`, ...), and an untagged metric has the tag `""`. Its docstring lists the server's limits. `media` lists a media metric's stored keys and `fetch` downloads one.
 
-An `Api` works only in the process that created it: create one in each worker process.
+An `Api` can be shared between threads (close it only after their calls return), but works only in the process that created it: create one in each worker process. Importing `kymo` tees stdout and stderr into a bounded capture buffer, even in a script that only reads.
 
-If one script both reads and logs, every `kymo.init()` must come before the first read: `init()` forks its upload worker, which is unsafe once gRPC runs in the process, so after a read it refuses under the `fork` start method (Linux's default before Python 3.14). Calling `multiprocessing.set_start_method("spawn")` before the first `kymo.init()` also lifts it.
+Under the `fork` start method (Linux's default before Python 3.14), start worker processes and call every `kymo.init()` before the first read: gRPC is unsafe in a process forked after it started, so `init()`, which forks its upload worker, refuses once an Api has opened its gRPC channel. Selecting `spawn` or `forkserver` with `multiprocessing.set_start_method()` before the first `kymo.init()` lifts this.
 
 ## wandb importing
 
