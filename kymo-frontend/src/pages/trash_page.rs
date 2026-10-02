@@ -288,9 +288,7 @@ pub fn TrashPage() -> Element {
 
     let page = data.read().clone();
     let now_ms = page.now_ms();
-    let runs = page.runs;
-    let loaded_count = runs.len();
-    let total_count = page.total_count;
+    let loaded_count = page.runs.len();
     let count_label = if page.total_count == 1 {
         "1 run".to_string()
     } else {
@@ -349,7 +347,6 @@ pub fn TrashPage() -> Element {
                                     }
                                 }
                                 th {
-                                    id: "trash-expiry-heading",
                                     scope: "col",
                                     role: "columnheader",
                                     "Deletes permanently"
@@ -364,9 +361,9 @@ pub fn TrashPage() -> Element {
                                 }
                             }
                         }
-                        if page.loaded && !runs.is_empty() {
+                        if !page.runs.is_empty() {
                             tbody { role: "rowgroup",
-                                for record in runs {
+                                for record in page.runs {
                                     {trash_row(record, now_ms, restoring, action_message, data, refresh)}
                                 }
                             }
@@ -384,7 +381,7 @@ pub fn TrashPage() -> Element {
                             if let Some(error) = page.load_more_error.as_ref() {
                                 span { role: "alert", "Couldn’t load more: {error}" }
                             } else {
-                                span { "Showing {loaded_count} of {total_count}" }
+                                span { "Showing {loaded_count} of {page.total_count}" }
                             }
                             button {
                                 class: "btn btn-ghost",
@@ -464,37 +461,42 @@ fn trash_row(
     let Some(run) = record.run.as_ref() else {
         return rsx! {};
     };
-    let project_id = run.project_id.clone();
-    let run_id = run.run_id.clone();
+    let project_id = &run.project_id;
+    let run_id = &run.run_id;
     let run_name = &run.run_name;
     let ordinal = run.ordinal;
-    let key = run_key(&project_id, &run_id);
+    let key = run_key(project_id, run_id);
     let is_restoring = restoring.read().contains(&key);
     let lifecycle = effective_lifecycle(&record, now_ms);
     let is_expired = matches!(
         lifecycle,
         RunLifecycleState::Expired | RunLifecycleState::Purging
     );
-    let label = if is_restoring {
-        RESTORING
+    // The accessible name starts with the visible label's words.
+    let (label, button_name) = if is_restoring {
+        (
+            RESTORING,
+            format!("Restoring {run_name} #{ordinal} to project {project_id}"),
+        )
     } else if is_expired {
-        UNAVAILABLE
+        (
+            UNAVAILABLE,
+            format!("Unavailable: {run_name} #{ordinal} in project {project_id} has expired"),
+        )
     } else {
-        RESTORE
+        (
+            RESTORE,
+            format!("Restore {run_name} #{ordinal} to project {project_id}"),
+        )
     };
     let (expires_at, expires_datetime) = expiry_time(record.purge_at_ms);
-    let expires_in = if is_expired {
-        "Expired — deleting…".to_string()
-    } else {
-        record
-            .purge_at_ms
-            .map(|purge_at| {
-                format!(
-                    "{} remaining",
-                    compact_duration(purge_at.saturating_sub(now_ms))
-                )
-            })
-            .unwrap_or_else(|| "Deletion scheduled".to_string())
+    let expires_in = match record.purge_at_ms {
+        _ if is_expired => "Expired — deleting…".to_string(),
+        Some(purge_at) => format!(
+            "{} remaining",
+            compact_duration(purge_at.saturating_sub(now_ms))
+        ),
+        None => "Deletion scheduled".to_string(),
     };
 
     rsx! {
@@ -529,12 +531,12 @@ fn trash_row(
                         to: Route::ProjectPage { project_id: project_id.clone(), chart: None.into() },
                         class: "trash-run-project fade-overflow",
                         title: "{project_id}",
-                        "{project_id}"
+                        span { "{project_id}" }
                     }
                 }
             }
             td { role: "cell",
-                div { class: "trash-run-expiry", aria_labelledby: "trash-expiry-heading",
+                div { class: "trash-run-expiry",
                     time { datetime: "{expires_datetime}", "{expires_at}" }
                     span { class: "trash-expiry-relative", "{expires_in}" }
                 }
@@ -544,13 +546,13 @@ fn trash_row(
                     class: "btn btn-ghost",
                     r#type: "button",
                     disabled: is_expired || is_restoring,
-                    aria_label: "Restore {run_name} #{ordinal} to project {project_id}",
+                    aria_label: "{button_name}",
                     onmousedown: primary({
                         let project_id = project_id.clone();
                         let run_id = run_id.clone();
                         let key = key.clone();
                         move |_| {
-                            if is_expired || restoring.peek().contains(&key) {
+                            if restoring.peek().contains(&key) {
                                 return;
                             }
                             restoring.write().insert(key.clone());

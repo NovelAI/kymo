@@ -8,7 +8,7 @@
 
   const resize = new ResizeObserver(entries => {
     const boxes = new Set(entries.map(({target}) => target.closest('.fade-overflow')).filter(Boolean));
-    // A box overflows when its content (text at any depth and its direct children's boxes, so a child popped out of the flow for a hover reveal still counts) reaches more than half a pixel past the box's right edge. Both edges come from rendered rects, so zoom and transforms cancel; WebKit rounds scrollWidth, clientWidth and an inline child's offsetWidth apart, marking text that fits. Boxes are left-to-right, unscrolled and have no right border. Read every rect before the first write.
+    // A box overflows when text at any depth or a direct child's box (so a child popped out of the flow for a hover reveal still counts) ends more than half a pixel past the box's right edge. Both edges come from rendered rects, so zoom and transforms cancel; comparing scrollWidth, clientWidth or an inline child's offsetWidth instead marks text that fits, because WebKit rounds those apart. Boxes are left-to-right, unscrolled and have no right border. Read every rect before the first write: each write makes the next read recalculate style, about 15 times slower over the Trash page's 200 boxes when their marks flip.
     const marks = [...boxes].map(box => {
       const edge = box.getBoundingClientRect().right;
       range.selectNodeContents(box);
@@ -21,7 +21,7 @@
     for (const {addedNodes, removedNodes} of records) {
       for (const node of removedNodes) {
         if (node.nodeType !== Node.ELEMENT_NODE) continue;
-        // A removed node has left its box, so it no longer matches: unobserve it regardless (a no-op if it was never observed).
+        // Unobserve without matching: a child removed from its box no longer matches TRACKED, and unobserving an element that was never observed is a no-op.
         resize.unobserve(node);
         for (const el of node.querySelectorAll(TRACKED)) resize.unobserve(el);
       }
