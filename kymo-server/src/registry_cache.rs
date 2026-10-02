@@ -197,7 +197,7 @@ impl FillShare<'_> {
         let reserved = self
             .cache
             .filling
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |filling| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |filling| {
                 (filling + grown <= limit).then_some(filling + grown)
             })
             .is_ok();
