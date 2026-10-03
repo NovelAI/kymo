@@ -1,0 +1,24 @@
+name: retry
+
+# Re-runs a failed release run's failed jobs and their dependents once, so a flaky job doesn't cost the day's release. A re-run build job rebuilds its artifact, which is harmless: nothing reaches an index until every gate passes. A failed snapshot run is left alone; the next push runs it again. A timed-out job ends the run cancelled, like a manual cancel, so it isn't retried.
+
+on:
+  workflow_run:
+    workflows: [release]
+    types: [completed]
+
+jobs:
+  rerun:
+    # A release is a pushed commit with a Kymo-Release trailer; a manual run never publishes.
+    if: >-
+      github.event.workflow_run.event == 'push'
+      && github.event.workflow_run.run_attempt == 1
+      && github.event.workflow_run.conclusion == 'failure'
+      && contains(github.event.workflow_run.head_commit.message, 'Kymo-Release:')
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run rerun ${{ github.event.workflow_run.id }} --failed --repo "$GITHUB_REPOSITORY"
