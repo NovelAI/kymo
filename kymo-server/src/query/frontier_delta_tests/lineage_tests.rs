@@ -20,7 +20,7 @@ fn cache_append(
 fn recovered_evicted_lineages_keep_real_wire_deltas_for_every_smoother() {
     use crate::series_cache::{Lookup, SeriesCache};
     for algorithm in ALGORITHMS {
-        let cache = SeriesCache::with_test_budget(1_024);
+        let cache = SeriesCache::with_budget(1_024);
         let key = crate::series_cache::SeriesKey::new("p", "a", "loss");
         let other = crate::series_cache::SeriesKey::new("p", "other", "loss");
         let original = cache.insert_full(

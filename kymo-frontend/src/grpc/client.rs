@@ -169,13 +169,13 @@ impl GrpcClient {
     /// Batched CDN-key lookup. One round-trip covers any number of
     /// (project_id, run_id, metric_name) tuples. The response carries one
     /// CdnSeries per input ref, in the same order, with empty entries for
-    /// refs that have no CDN data.
+    /// refs that have no CDN data, plus the data-version echo
+    /// (QueryCdnKeysResponse.run_versions).
     pub async fn query_cdn_keys(
         &self,
         refs: Vec<SeriesRef>,
-    ) -> Result<Vec<CdnSeries>, tonic::Status> {
-        let resp: QueryCdnKeysResponse = self
-            .ws
+    ) -> Result<QueryCdnKeysResponse, tonic::Status> {
+        self.ws
             .unary_route(
                 routes::QUERY_CDN_KEYS,
                 QueryCdnKeysRequest {
@@ -184,8 +184,7 @@ impl GrpcClient {
                     step_max: None,
                 },
             )
-            .await?;
-        Ok(resp.series)
+            .await
     }
 
     pub async fn query_text_window(

@@ -981,8 +981,9 @@ mod tests {
 
     /// The operator's root-set check (docs/cdn-gcs-migration.md § Enabling deletes): the collector's roots SELECT verbatim under the collector's settings, with `?` still the hosted key pattern, reduced to a count and a key-hash sum. Runs with `use_skip_indexes` on and off must return the same row.
     fn root_set_check(use_skip_indexes: bool) -> String {
-        let settings: Vec<String> = crate::clickhouse::CDN_GC_SETTINGS
+        let settings: Vec<String> = crate::clickhouse::COMPLETE_READ_SETTINGS
             .into_iter()
+            .chain(crate::clickhouse::CDN_GC_SETTINGS)
             .map(|(name, value)| match value.parse::<u64>() {
                 Ok(_) => format!("{name} = {value}"),
                 Err(_) => format!("{name} = '{value}'"),

@@ -14,10 +14,6 @@ pub fn RunPage(project_id: String, run_id: String, chart: ChartQuery) -> Element
     // it is a prop only because route fields are.
     let _ = chart;
 
-    use_effect(use_reactive((&run_id,), move |(run_id,)| {
-        state.current_run.set(Some(run_id));
-    }));
-
     // Re-render at the authoritative expiry boundary (and once a minute for
     // the relative label). This is a display clock only: the server remains
     // the admission authority for Restore and data reads.

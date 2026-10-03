@@ -15,11 +15,11 @@ use wasm_bindgen::JsCast;
 
 use crate::components::sidebar::{names_repeat, sidebar_run_label};
 use crate::components::uplot_chart::{hash_color, run_color};
-use crate::grpc::proto::{RunInfo, RunStatus, TextLine};
+use crate::grpc::proto::{RunInfo, RunStatus, SeriesRef, TextLine};
 use crate::state::app_state::find_run;
 use crate::state::layout_config::XAxisMode;
 use crate::state::visibility::{self, Zone};
-use crate::state::{run_ordinal_for, DashboardState, UserConfigState};
+use crate::state::{run_ordinal_for, stamp_covers, DashboardState, UserConfigState};
 use crate::util::resize_observer::ElementResizeObserver;
 use crate::util::{is_app_escape, primary};
 
@@ -54,12 +54,26 @@ fn stream_failure_is_permanent(status: &tonic::Status) -> bool {
     )
 }
 
-#[derive(Clone, Debug, PartialEq)]
+/// The text skip rule: a fetch-resource re-run for the window and search revision on screen does not query while that answer's version stamp covers the run's known version ([`stamp_covers`]). Any other cause — a new window, a search resubmit, or a version above the stamp (a retry repeats one of these) — queries as before; the last keeps a live log following new lines. An error on screen answers nothing, so it never skips.
+fn text_skip_query(
+    shown: Option<&WindowData>,
+    window: VirtualWindow,
+    revision: u64,
+    known: Option<u64>,
+) -> bool {
+    shown.is_some_and(|data| {
+        data.window == window && data.revision == revision && stamp_covers(data.version, known)
+    })
+}
+
 struct WindowData {
     window: VirtualWindow,
     total_lines: u64,
     first_step: i64,
     lines: Vec<TextLine>,
+    /// The search revision and the run's version stamp this window answered at, for the text skip.
+    revision: u64,
+    version: Option<u64>,
 }
 
 type TextResponse = Result<WindowData, String>;
@@ -104,7 +118,7 @@ fn metric_label<'a>(metric_names: &[String], line_metric_name: &'a str) -> Optio
 /// One tab per run over the active run's log, fetching only the visible lines plus an overscan band.
 #[component]
 pub fn TextStreamViewer(
-    stream_refs: Vec<(String, String, String)>, // (project_id, run_id, metric_name)
+    stream_refs: Vec<SeriesRef>,
     #[props(default = 280)] height: u32,
     #[props(default)] x_axis_mode: XAxisMode,
     /// Viewport zone from the owning rect: out-of-band viewers freeze and catch up on re-entry; None always fetches.
@@ -116,7 +130,13 @@ pub fn TextStreamViewer(
 ) -> Element {
     let state = use_context::<DashboardState>();
     let mut runs = Vec::<RunStreams>::new();
-    for (project_id, run_id, metric_name) in stream_refs {
+    for SeriesRef {
+        project_id,
+        run_id,
+        metric_name,
+        ..
+    } in stream_refs
+    {
         if let Some(run) = runs
             .iter_mut()
             .find(|run| run.project_id == project_id && run.run_id == run_id)
@@ -361,7 +381,7 @@ fn VirtualTextLog(
         let window = *requested.read();
         let line_height_px = *line_height.peek();
         // Resubmitting refreshes in place.
-        let _search_revision = *search_revision.read();
+        let revision = *search_revision.read();
         // Searches are snapshots; live versions refresh only unfiltered logs.
         if fetch_search.is_empty() {
             let _version = *data_seq.read();
@@ -372,15 +392,23 @@ fn VirtualTextLog(
         let search = fetch_search.clone();
         let log_key = log_key.clone();
         async move {
-            if *loading.peek() {
-                loading.set(false);
-            }
+            crate::state::heal_loading(loading);
             if !allowed {
                 return;
             }
             let Some(window) = window else {
                 return;
             };
+            // The skip answers a version propagation with the window already on screen instead of re-querying (text_skip_query).
+            let known = state.run_versions.peek().get(&source.run_id).copied();
+            if text_skip_query(
+                content.peek().as_ref().and_then(|c| c.as_ref().ok()),
+                window,
+                revision,
+                known,
+            ) {
+                return;
+            }
             let first_paint = !matches!(*content.peek(), Some(Ok(_)));
             let _admission = visibility::admit_fetch(
                 || zone.map(|z| *z.peek()).unwrap_or(Zone::Visible),
@@ -389,6 +417,8 @@ fn VirtualTextLog(
             .await;
             loading.set(true);
 
+            let sent =
+                crate::state::versions_of(&state.run_versions.peek(), [source.run_id.as_str()]);
             let result = grpc
                 .query_text_window(
                     &source.project_id,
@@ -411,11 +441,18 @@ fn VirtualTextLog(
                         loading.set(false);
                         return;
                     }
+                    let stamps = crate::state::answer_stamps(
+                        state.run_versions,
+                        response.run_versions,
+                        sent,
+                    );
                     Some(Ok(WindowData {
                         window,
                         total_lines: response.total_lines,
                         first_step: response.first_step,
                         lines: response.lines,
+                        revision,
+                        version: stamps.get(&source.run_id).copied(),
                     }))
                 }
                 Err(status) if visibility::is_terminal_run_status(&status) => {
@@ -486,7 +523,7 @@ fn VirtualTextLog(
         }
     });
 
-    let response = content.read().clone();
+    let response = content.read();
     let is_loading = *loading.read();
 
     rsx! {
@@ -513,9 +550,9 @@ fn VirtualTextLog(
                     viewport.write().scrolled(data.scroll_top(), measured, line_height_px, live);
                 }
             },
-            if let Some(Err(message)) = &response {
+            if let Some(Err(message)) = &*response {
                 div { class: "rect-empty", "{message}" }
-            } else if let Some(Ok(value)) = response {
+            } else if let Some(Ok(value)) = &*response {
                 if value.total_lines == 0 {
                     div { class: "rect-empty",
                         if search.is_empty() { "No logs yet" } else { "No matching lines" }
@@ -572,7 +609,11 @@ fn VirtualTextLog(
 
 #[cfg(test)]
 mod tests {
-    use super::{metric_label, stream_failure_is_permanent, text_run_labels, RunStreams};
+    use super::{
+        metric_label, stream_failure_is_permanent, text_run_labels, text_skip_query, RunStreams,
+        WindowData,
+    };
+    use crate::components::text_stream::viewport::VirtualWindow;
     use crate::grpc::proto::RunInfo;
     use crate::state::visibility::is_terminal_run_status;
 
@@ -647,6 +688,38 @@ mod tests {
         for (text, full) in labels {
             assert!(full.starts_with(&text), "{full:?} lacks {text:?}");
         }
+    }
+
+    #[test]
+    fn text_skip_needs_the_same_window_revision_and_a_covering_stamp() {
+        let window = VirtualWindow {
+            offset: 80,
+            limit: 480,
+        };
+        let shown = WindowData {
+            window,
+            total_lines: 0,
+            first_step: 0,
+            lines: vec![],
+            revision: 2,
+            version: Some(5),
+        };
+        // Same window and revision with the run's knowledge at or below the stamp: the answered window serves.
+        assert!(text_skip_query(Some(&shown), window, 2, Some(3)));
+        // A version above the stamp refetches — that is how a live log follows new lines.
+        assert!(!text_skip_query(Some(&shown), window, 2, Some(6)));
+        // A new window, a search resubmit (a new revision), and nothing answered all query as before.
+        assert!(!text_skip_query(
+            Some(&shown),
+            VirtualWindow {
+                offset: 160,
+                limit: 480,
+            },
+            2,
+            Some(5)
+        ));
+        assert!(!text_skip_query(Some(&shown), window, 3, Some(5)));
+        assert!(!text_skip_query(None, window, 2, Some(5)));
     }
 
     #[test]

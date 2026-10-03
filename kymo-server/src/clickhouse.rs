@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{ensure, Context, Result};
 use clickhouse::Client;
@@ -582,7 +582,7 @@ impl ChClient {
         // write still errors the stream that sent it. Pinning the async data
         // ceiling above ingest's maximum cut prevents large requests from
         // falling back to synchronous streaming. Options are client-wide;
-        // they're no-ops on SELECTs and DDL.
+        // the insert ones are no-ops on SELECTs and DDL.
         let client = client
             .with_url(url)
             .with_user(user)
@@ -597,6 +597,11 @@ impl ChClient {
                 "async_insert_max_data_size",
                 ASYNC_INSERT_MAX_DATA_SIZE_BYTES.to_string(),
             );
+        let client = COMPLETE_READ_SETTINGS
+            .into_iter()
+            .fold(client, |client, (name, value)| {
+                client.with_option(name, value)
+            });
         // Strict because this is an emergency ablation control: a typo while
         // trying to disable retention must not silently leave it enabled.
         let series_cache_enabled = crate::env::required_bool("KYMO_SERIES_CACHE", true)?;
@@ -1436,12 +1441,8 @@ impl ChClient {
                     run_id,
                     metric_name,
                 } = &refresh_key;
-                // Taken BEFORE the ClickHouse read: freshness must date from a
-                // moment when the fetched rows were provably complete, or a
-                // slow select can stamp pre-insert data as fresh (see the full-store bump gate).
-                let fetch_started = std::time::Instant::now();
                 let origin = if let Lookup::Stale { watermark_ms, gen } = lookup {
-                    let increment = ch
+                    let (fetch_started, increment) = ch
                         .fetch_increment(
                             project_id,
                             run_id,
@@ -1461,11 +1462,10 @@ impl ChClient {
                 };
 
                 // Miss, or an incremental refresh whose base was rewritten, evicted, or replaced: rebuild from the full series.
-                let full = ch
+                let (fetch_started, mut series) = ch
                     .fetch_full_many(project_id, metric_name, std::slice::from_ref(run_id))
-                    .await?
-                    .swap_remove(0);
-                Ok(ch.store_full(refresh_key, full, fetch_started, origin))
+                    .await?;
+                Ok(ch.store_full(refresh_key, series.swap_remove(0), fetch_started, origin))
             })
             .await
     }
@@ -1473,12 +1473,13 @@ impl ChClient {
     /// The authoritative read of one metric's whole series for each of `run_ids` (one project) in one statement, in `run_ids` order.
     /// FINAL dedups every series, and with project and metric fixed, ORDER BY (run, tag, step) is the table's sorting-key order, so ClickHouse streams it.
     /// On prod, one read of 12 series cost about a third of the ClickHouse time of their 12 separate reads and opened 17 parts instead of 76.
+    /// Returns its start, taken before the query is sent, with the rows: the bump gate and [`crate::series_cache::watermark_cap`] count the stored rows from it. The other cached reads return theirs the same way.
     async fn fetch_full_many(
         &self,
         project_id: &str,
         metric_name: &str,
         run_ids: &[String],
-    ) -> Result<Vec<Vec<VersionedRawPoint>>> {
+    ) -> Result<(Instant, Vec<Vec<VersionedRawPoint>>)> {
         #[derive(Deserialize, clickhouse::Row)]
         struct Row<'a> {
             run_id: &'a str,
@@ -1488,6 +1489,7 @@ impl ChClient {
             value: f32,
             inserted_ms: i64,
         }
+        let started = Instant::now();
         let mut cursor = self
             .client
             .query(
@@ -1515,7 +1517,7 @@ impl ChClient {
                 inserted_ms: row.inserted_ms,
             });
         }
-        Ok(series)
+        Ok((started, series))
     }
 
     /// The (tag, step)-ordered rows of one series inserted after `after_inserted_ms`.
@@ -1530,7 +1532,8 @@ impl ChClient {
         run_id: &str,
         metric_name: &str,
         after_inserted_ms: i64,
-    ) -> Result<Vec<VersionedRawPoint>> {
+    ) -> Result<(Instant, Vec<VersionedRawPoint>)> {
+        let started = Instant::now();
         let rows = self
             .client
             .query(
@@ -1549,7 +1552,7 @@ impl ChClient {
             .bind(after_inserted_ms)
             .fetch_all::<VersionedRawPoint>()
             .await?;
-        Ok(rows)
+        Ok((started, rows))
     }
 
     /// Retain a full read; under cache ablation (`KYMO_SERIES_CACHE=0`) it is only shared with the requests already waiting for it.
@@ -1557,7 +1560,7 @@ impl ChClient {
         &self,
         key: SeriesKey,
         rows: Vec<VersionedRawPoint>,
-        fetch_started: std::time::Instant,
+        fetch_started: Instant,
         origin: LineageOrigin,
     ) -> Arc<SeriesSnapshot> {
         if self.series_cache_enabled {
@@ -1583,8 +1586,6 @@ impl ChClient {
     ) -> impl std::future::Future<Output = Result<Vec<(SeriesKey, Arc<SeriesSnapshot>)>, RefreshError>>
     {
         use futures::FutureExt;
-        // Taken before the read exists, so it predates the query for every key: the bump gate's fetch start.
-        let started = std::time::Instant::now();
         let project_id = elected[0].key.project_id.clone();
         let metric_name = elected[0].key.metric_name.clone();
         let run_ids: Vec<String> = elected.iter().map(|miss| miss.key.run_id.clone()).collect();
@@ -1593,30 +1594,33 @@ impl ChClient {
         let read = {
             let ch = ch.clone();
             async move {
-                let series = ch
+                let (fetch_started, series) = ch
                     .fetch_full_many(&project_id, &metric_name, &run_ids)
                     .await
                     .map_err(|e| format!("{e:#}"))?;
-                Ok::<_, String>(Arc::new(
-                    series
-                        .into_iter()
-                        .map(|rows| std::sync::Mutex::new(Some(rows)))
-                        .collect::<Vec<_>>(),
+                Ok::<_, String>((
+                    fetch_started,
+                    Arc::new(
+                        series
+                            .into_iter()
+                            .map(|rows| std::sync::Mutex::new(Some(rows)))
+                            .collect::<Vec<_>>(),
+                    ),
                 ))
             }
         }
         .shared();
         self.series_refresh_locks
-            .spawn_batch(elected, Arc::new(ctx), started, move |index, key| {
+            .spawn_batch(elected, Arc::new(ctx), move |index, key| {
                 let (read, ch, key) = (read.clone(), ch.clone(), key.clone());
                 async move {
-                    let series = read.await.map_err(anyhow::Error::msg)?;
+                    let (fetch_started, series) = read.await.map_err(anyhow::Error::msg)?;
                     let rows = series[index]
                         .lock()
                         .unwrap()
                         .take()
                         .expect("each run's rows are taken once, by its own task");
-                    Ok(ch.store_full(key, rows, started, LineageOrigin::Miss))
+                    Ok(ch.store_full(key, rows, fetch_started, LineageOrigin::Miss))
                 }
             })
     }
@@ -1681,13 +1685,15 @@ impl ChClient {
 
     // --- Text stream queries ---
 
+    /// Returns its start like `fetch_full_many`, the rows, and for a full read the frontier from its later max query (0 for an increment).
     async fn fetch_text_index_rows(
         &self,
         project_id: &str,
         run_id: &str,
         metric_names: &[String],
         after_inserted_ms: Option<i64>,
-    ) -> Result<(Vec<TextIndexRow>, i64)> {
+    ) -> Result<(Instant, Vec<TextIndexRow>, i64)> {
+        let started = Instant::now();
         let placeholders = metric_names
             .iter()
             .map(|_| "?")
@@ -1733,7 +1739,7 @@ impl ChClient {
         }
         let rows = query.fetch_all::<TextIndexRow>().await?;
         if incremental {
-            return Ok((rows, 0));
+            return Ok((started, rows, 0));
         }
 
         // The full row query deliberately excludes current non-text values.
@@ -1757,7 +1763,7 @@ impl ChClient {
             watermark_query = watermark_query.bind(metric_name);
         }
         let observed_max_inserted_ms = watermark_query.fetch_one::<SingleI64>().await?.val;
-        Ok((rows, observed_max_inserted_ms))
+        Ok((started, rows, observed_max_inserted_ms))
     }
 
     async fn text_stream_index(
@@ -1789,8 +1795,7 @@ impl ChClient {
                 watermark_ms,
                 generation,
             } => {
-                let fetch_started = std::time::Instant::now();
-                let (increment, _) = self
+                let (fetch_started, increment, _) = self
                     .fetch_text_index_rows(project_id, run_id, metric_names, Some(watermark_ms))
                     .await?;
                 if let Ok(index) = self.text_index_cache.apply_increment(
@@ -1805,8 +1810,7 @@ impl ChClient {
             TextIndexLookup::Miss => {}
         }
         // Miss, or an increment the cache refused: another request replaced the base while it was in flight (merging would use that old generation's watermark), or it holds equal-version rows only FINAL can order.
-        let fetch_started = std::time::Instant::now();
-        let (rows, observed_max_inserted_ms) = self
+        let (fetch_started, rows, observed_max_inserted_ms) = self
             .fetch_text_index_rows(project_id, run_id, metric_names, None)
             .await?;
         Ok(self
@@ -2226,8 +2230,8 @@ impl ChClient {
     }
 }
 
-/// The GC's heavy statements: a memory cap fails the statement rather than the server (a ClickHouse OOM takes concurrent ingest with it), and two threads keep full scans off the dashboards' cores. No server profile may shorten a result, since a short referenced set deletes reachable objects: every overflow mode throws instead of `break`, and `limit` and `offset` are 0. The scratch table's sort key would make each `IN` set be built twice, once more for index analysis that prunes nothing here, which doubles set memory. Sync inserts: scratch batches are large, one part each.
-pub(crate) const CDN_GC_SETTINGS: [(&str, &str); 17] = [
+/// Every reader takes a result as complete and current, so no server profile may shorten one or answer from an older snapshot: the caches would store a partial series as whole, under a watermark above the missing rows, and the CDN collector would delete reachable objects. Every overflow mode throws instead of `break`, `limit` and `offset` are 0, and the query cache is off (ClickHouse's defaults). Every client carries these (`ChClient::configured`).
+pub(crate) const COMPLETE_READ_SETTINGS: [(&str, &str); 14] = [
     ("read_overflow_mode", "throw"),
     ("read_overflow_mode_leaf", "throw"),
     ("set_overflow_mode", "throw"),
@@ -2241,6 +2245,11 @@ pub(crate) const CDN_GC_SETTINGS: [(&str, &str); 17] = [
     ("timeout_overflow_mode_leaf", "throw"),
     ("limit", "0"),
     ("offset", "0"),
+    ("use_query_cache", "0"),
+];
+
+/// The GC's heavy statements, on top of [`COMPLETE_READ_SETTINGS`]: a memory cap fails the statement rather than the server (a ClickHouse OOM takes concurrent ingest with it), and two threads keep full scans off the dashboards' cores. The scratch table's sort key would make each `IN` set be built twice, once more for index analysis that prunes nothing here, which doubles set memory. Sync inserts: scratch batches are large, one part each.
+pub(crate) const CDN_GC_SETTINGS: [(&str, &str); 4] = [
     ("use_index_for_in_with_subqueries", "0"),
     ("async_insert", "0"),
     ("max_memory_usage", "4294967296"), // 4 GiB
@@ -2810,6 +2819,40 @@ mod schema_tests {
         );
     }
 
+    /// Correctness rides every request's settings, so a server profile can't change it: inserts acked only once committed and never streamed synchronously (the visibility margin relies on both), dependent views that fail the insert, and reads that are complete and current ([`COMPLETE_READ_SETTINGS`]).
+    #[tokio::test]
+    async fn every_request_pins_the_settings_correctness_depends_on() {
+        use tokio::io::AsyncBufReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = ChClient::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let query =
+            tokio::spawn(async move { client.test_client().query("SELECT 1").execute().await });
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut request_line = String::new();
+        tokio::io::BufReader::new(socket)
+            .read_line(&mut request_line)
+            .await
+            .unwrap();
+        query.abort();
+        let target = request_line.split(' ').nth(1).unwrap_or_default();
+        let pairs: Vec<&str> = target.split(['?', '&']).skip(1).collect();
+        let max_data_size = ASYNC_INSERT_MAX_DATA_SIZE_BYTES.to_string();
+        let pinned = [
+            ("async_insert", "1"),
+            ("wait_for_async_insert", "1"),
+            ("async_insert_max_data_size", max_data_size.as_str()),
+            ("materialized_views_ignore_errors", "0"),
+            ("use_query_cache", "0"),
+        ];
+        for (name, value) in pinned.into_iter().chain(COMPLETE_READ_SETTINGS) {
+            let pair = format!("{name}={value}");
+            assert!(
+                pairs.contains(&pair.as_str()),
+                "{pair} missing: {request_line}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn required_alter_failure_prevents_schema_readiness() {
         let mock = ::clickhouse::test::Mock::new();
@@ -2885,7 +2928,6 @@ mod schema_tests {
     #[tokio::test]
     async fn inserts_note_their_runs_in_the_series_cache() {
         use crate::series_cache::Lookup;
-        use std::time::Instant;
         let mock = ::clickhouse::test::Mock::new();
         let client = ChClient::new(mock.url()).unwrap();
         let cache = client.series_cache();
@@ -2929,7 +2971,7 @@ mod schema_tests {
     }
 
     #[tokio::test]
-    async fn a_batch_stamps_its_series_before_its_read_and_maps_rows_by_run() {
+    async fn a_batch_maps_rows_by_run_and_dates_them_from_the_reads_start() {
         use crate::series_cache::Lookup;
         #[derive(Serialize, ::clickhouse::Row)]
         struct Row {
@@ -2949,28 +2991,41 @@ mod schema_tests {
             inserted_ms: 1,
         };
         let mock = ::clickhouse::test::Mock::new();
-        let client = ChClient::new(mock.url()).unwrap();
+        mock.add(::clickhouse::test::handlers::provide(vec![
+            row("b", 2.0),
+            row("c", 3.0),
+            row("a", 1.0),
+        ]));
+        // A relay in front of the mock notes a bump for run "a" once the read's request is in flight.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = ChClient::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let upstream = mock.url().trim_start_matches("http://").to_owned();
+        let noting = client.clone();
+        tokio::spawn(async move {
+            let (mut inbound, _) = listener.accept().await.unwrap();
+            noting.series_cache().note_bumps(std::iter::once("a"));
+            let mut outbound = tokio::net::TcpStream::connect(upstream).await.unwrap();
+            let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+        });
         let cache = client.series_cache();
-        let keys: Vec<SeriesKey> = ["a", "b"]
+        let keys: Vec<SeriesKey> = ["a", "b", "c"]
             .into_iter()
             .map(|run| SeriesKey::new("p", run, "m"))
             .collect();
-        mock.add(::clickhouse::test::handlers::provide(vec![
-            row("b", 2.0),
-            row("a", 1.0),
-        ]));
 
         let batch =
             client.spawn_full_read_batch(client.elect_full_reads(&keys, usize::MAX), Vec::new());
-        // The current-thread runtime runs the batch's tasks only at the await below, so this note lands after the batch's stamp and before its read.
-        cache.note_bumps(std::iter::once("a"));
+        // The current-thread runtime starts the read only at the await below, so this note precedes it: the read sees that insert, and "c" stays fresh.
+        cache.note_bumps(std::iter::once("c"));
         let rows = batch.await.unwrap();
 
-        for ((key, rows), value) in rows.into_iter().zip([1.0, 2.0]) {
+        for ((key, rows), value) in rows.into_iter().zip([1.0, 2.0, 3.0]) {
             assert_eq!(rows[0].value, value, "{key:?}");
         }
+        // The rows date from before the query, so the note made while it was in flight leaves "a" stale.
         assert!(matches!(cache.lookup(&keys[0]), Lookup::Stale { .. }));
         assert!(matches!(cache.lookup(&keys[1]), Lookup::Fresh(_)));
+        assert!(matches!(cache.lookup(&keys[2]), Lookup::Fresh(_)));
     }
 }
 

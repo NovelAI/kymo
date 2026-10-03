@@ -215,6 +215,7 @@ pub struct DashboardState {
     /// visible-tab minute poll plus reconnect resync. Charts key their refetch
     /// off the versions of the runs THEY render, so one run logging does not
     /// refetch every chart.
+    /// Chart, gallery and text replies fold in their stamps too ([`crate::state::answer_stamps`]).
     pub run_versions: Signal<std::collections::HashMap<String, u64>>,
     /// Latest observed run-list/metadata version for every project in this
     /// dashboard's binding scope. Cross-project Specific bindings key their
@@ -256,6 +257,8 @@ pub struct DashboardState {
     pub grpc: CopyValue<GrpcClient>,
     /// [`Self::display_runs()`]'s merge, computed once per change of its sources rather than once per reading panel. Readers subscribe to the merged list alone, so a source write that leaves it equal re-renders nothing.
     display_runs: Memo<Rc<Vec<RunInfo>>>,
+    /// [`Self::display_runs()`]'s identities plus every settled explicit-run entry (Present or Absent alike): the runs this page can NAME. Backs the panel readiness rule (components/metric_rect.rs) so thousands of panels each check their few refs against a set instead of scanning the run list.
+    known_runs: Memo<Rc<HashSet<ExplicitRunKey>>>,
     /// [`Self::view_context()`], built once per change of the page, selection or run list rather than once per resolving panel, and equal contexts notify no one.
     view_context: Memo<Rc<ViewContext>>,
 }
@@ -293,12 +296,22 @@ impl DashboardState {
                 &display_run_cache.read(),
             ))
         });
+        let known_runs = Memo::new(move || {
+            let mut known: HashSet<ExplicitRunKey> = display_runs
+                .read()
+                .iter()
+                .map(|run| (run.project_id.clone(), run.run_id.clone()))
+                .collect();
+            known.extend(explicit_run_metadata.read().keys().cloned());
+            Rc::new(known)
+        });
         Self {
             project_id,
             runs,
             display_run_cache,
             explicit_run_metadata,
             display_runs,
+            known_runs,
             view_context: Memo::new(move || {
                 Rc::new(ViewContext::new(
                     project_id.read().clone(),
@@ -375,6 +388,11 @@ impl DashboardState {
     /// See [`merge_display_sources`] for why the sources rank the way they do.
     pub fn display_runs(&self) -> Rc<Vec<RunInfo>> {
         self.display_runs.read().clone()
+    }
+
+    /// The `known_runs` memo's set. Subscribes the caller.
+    pub fn known_runs(&self) -> Rc<HashSet<ExplicitRunKey>> {
+        self.known_runs.read().clone()
     }
 
     /// What bindings resolve against: the page's project, its direct run, the sidebar selection and the active run ids. Subscribes the caller.
@@ -647,6 +665,50 @@ pub fn versions_key<'a>(
     h
 }
 
+/// The one freshness comparison behind the chart, gallery and text caches: a stamp covers what the client knows while `stamp >= known` (the answer holds every row its stamp counts; a version above it may count rows the answer predates). With either side unknown only both unknown match: a client that knows no version can't vouch for an entry from an earlier visit, and a version the answer never stamped is unvouched for.
+pub fn stamp_covers(stamp: Option<u64>, known: Option<u64>) -> bool {
+    match (stamp, known) {
+        (Some(stamp), Some(known)) => stamp >= known,
+        (stamp, known) => stamp == known,
+    }
+}
+
+/// `known` restricted to `runs`.
+pub fn versions_of<'a>(
+    known: &std::collections::HashMap<String, u64>,
+    runs: impl IntoIterator<Item = &'a str>,
+) -> std::collections::HashMap<String, u64> {
+    runs.into_iter()
+        .filter_map(|run| known.get(run).map(|version| (run.to_string(), *version)))
+        .collect()
+}
+
+#[cfg(test)]
+mod stamp_covers_tests {
+    use super::*;
+
+    #[test]
+    fn a_stamp_covers_knowledge_at_or_below_it() {
+        assert!(stamp_covers(Some(5), Some(5)));
+        assert!(stamp_covers(Some(5), Some(3)));
+        assert!(stamp_covers(Some(5), Some(0)));
+    }
+
+    #[test]
+    fn knowledge_above_the_stamp_never_serves() {
+        assert!(!stamp_covers(Some(5), Some(6)));
+        assert!(!stamp_covers(Some(0), Some(1)));
+    }
+
+    #[test]
+    fn unknown_sides_match_only_each_other() {
+        assert!(stamp_covers(None, None));
+        assert!(!stamp_covers(Some(5), None));
+        assert!(!stamp_covers(None, Some(5)));
+        assert!(!stamp_covers(None, Some(0)));
+    }
+}
+
 /// Floor between push-driven refetches of one panel. Version bumps arrive
 /// per ingest flush (~2s per live run) but a warm refresh still costs the
 /// server real work (incremental read + smoothing/bucketing recompute), and
@@ -668,6 +730,13 @@ mod refresh_floor_tests {
         assert_eq!(refresh_floor_wait_ms(now, now - MIN_REFRESH_MS), None);
         assert_eq!(refresh_floor_wait_ms(now + 2_000.0, now), Some(3_000));
         assert_eq!(refresh_floor_wait_ms(now + MIN_REFRESH_MS, now), None);
+    }
+}
+
+/// Clear a shared `loading` flag a dropped fetch left set: stuck true it strands the spinner and freezes the version bridge. Fetch bodies call it first; a render that mounts no leaf calls it because no leaf body will.
+pub fn heal_loading(mut loading: Signal<bool>) {
+    if *loading.peek() {
+        loading.set(false);
     }
 }
 

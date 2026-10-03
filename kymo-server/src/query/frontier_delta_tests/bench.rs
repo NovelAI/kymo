@@ -8,7 +8,7 @@ fn response_builder_benchmark() {
     use std::time::Instant;
 
     let runs = ["a", "b", "c", "d", "e", "f", "g", "h"];
-    let cache = crate::series_cache::SeriesCache::with_test_budget(64 * 1024 * 1024);
+    let cache = crate::series_cache::SeriesCache::with_budget(64 * 1024 * 1024);
     let keys: Vec<_> = runs
         .iter()
         .map(|run| crate::series_cache::SeriesKey::new("p", *run, "loss"))

@@ -12,7 +12,7 @@ use prost::Message as _;
 
 use crate::grpc::chart_delta::{self, DenseChart, DenseSeries};
 use crate::grpc::proto::{ChartCacheState, ChartRequest, ChartResponse, ChartSeries, SeriesRef};
-use crate::state::versions_key;
+use crate::state::{stamp_covers, versions_key};
 
 /// One panel's cached chart, module-level so it survives body unmounts (see metric_rect.rs). `response` is always the FULL dense model — deltas splice before storing — so it serves subset filters, delta splices, and instant remount renders alike.
 #[derive(Clone)]
@@ -22,7 +22,7 @@ pub struct ChartCacheEntry {
     pub response: Rc<DenseChart>,
     /// Identity stamp of `response` (metric_rect NEXT_DATA_SEQ): uplot_chart keys data-change detection on this, so it must change exactly when `response` is a different model.
     pub data_seq: u64,
-    /// Pre-send snapshots of the change signals this response depended on, for [`Self::fresh_for`]: per-run data versions and registry counters (request runs), and the resync epoch.
+    /// The change signals this response depended on, for [`Self::fresh_for`], over the request's runs: data versions ([`crate::state::answer_stamps`]); send-time registry counters; and the resync epoch.
     pub versions: Rc<HashMap<String, u64>>,
     pub metrics_gen: Rc<HashMap<String, u64>>,
     pub epoch: u64,
@@ -46,7 +46,7 @@ impl ChartCacheEntry {
             .saturating_add(string_set_heap_bytes(&self.noncontrib))
     }
 
-    /// Whether this entry still answers a query over `runs` — the one freshness rule behind both the exact-request and run-subset serves in metric_rect.rs. A contributing run's data version must be unchanged; a known non-contributing run has no data here, so only what could make it START contributing (its metrics_gen counter, the resync epoch) must be. Snapshot-vs-current comparison, absent-vs-present included: a version learned only after the fetch means the response may predate its data.
+    /// Whether this entry still answers a query over `runs` — the one freshness rule behind both the exact-request and run-subset serves in metric_rect.rs. A contributing run's data version stamp must cover what the client knows ([`stamp_covers`]). A known non-contributing run has no data here, so only what could make it START contributing (its metrics_gen counter, the resync epoch) must be unchanged.
     pub fn fresh_for<'a>(
         &self,
         runs: impl IntoIterator<Item = &'a str>,
@@ -60,7 +60,7 @@ impl ChartCacheEntry {
                 any_noncontrib = true;
                 self.metrics_gen.get(r) == metrics_gen.get(r)
             } else {
-                self.versions.get(r) == run_versions.get(r)
+                stamp_covers(self.versions.get(r).copied(), run_versions.get(r).copied())
             };
             if !ok {
                 return false;
@@ -95,7 +95,7 @@ fn dense_chart_heap_bytes(chart: &DenseChart) -> usize {
     bytes
 }
 
-fn string_map_heap_bytes<V>(map: &HashMap<String, V>) -> usize {
+pub(crate) fn string_map_heap_bytes<V>(map: &HashMap<String, V>) -> usize {
     let bucket_bytes = std::mem::size_of::<(String, V)>().saturating_add(1);
     map.capacity()
         .saturating_mul(bucket_bytes)
@@ -404,23 +404,23 @@ pub fn filter_response(resp: &DenseChart, keep: &HashSet<String>) -> DenseChart 
 /// The version key a chart panel refetches on: the bound runs' versions its data actually depends on. Known non-contributors are excluded — their ingest bumps can't change this chart — with their registry counters and the resync epoch mixed into the seed instead, so a first registry event (the run might have just logged this very metric) or a reconnect gap re-probes. With nothing excluded this reduces exactly to the plain bound-runs key (epoch bumps don't refetch settled panels).
 pub fn panel_version_key(
     epoch: u64,
-    bound: &[String],
+    bound: &[&str],
     metrics_gen: &HashMap<String, u64>,
     versions: &HashMap<String, u64>,
     noncontrib: Option<&HashSet<String>>,
 ) -> u64 {
     let excluded = |id: &str| noncontrib.is_some_and(|nc| nc.contains(id));
     if !bound.iter().any(|id| excluded(id)) {
-        return versions_key(0, bound.iter().map(String::as_str), versions);
+        return versions_key(0, bound.iter().copied(), versions);
     }
     let seed = versions_key(
         epoch,
-        bound.iter().map(String::as_str).filter(|id| excluded(id)),
+        bound.iter().copied().filter(|id| excluded(id)),
         metrics_gen,
     );
     versions_key(
         seed,
-        bound.iter().map(String::as_str).filter(|id| !excluded(id)),
+        bound.iter().copied().filter(|id| !excluded(id)),
         versions,
     )
 }
@@ -1020,7 +1020,7 @@ mod tests {
 
     #[test]
     fn version_key_ignores_excluded_runs_until_rearmed() {
-        let bound = vec!["a".to_string(), "b".to_string()];
+        let bound = ["a", "b"];
         let mut versions: HashMap<String, u64> = [("a".into(), 3u64), ("b".into(), 7u64)].into();
         let mg: HashMap<String, u64> = HashMap::new();
         let nc: HashSet<String> = ["b".to_string()].into();
@@ -1052,7 +1052,7 @@ mod tests {
 
         // With nothing excluded the key is the plain bound-runs key: the
         // epoch must NOT leak in (a reconnect can't refetch settled panels).
-        let plain = versions_key(0, bound.iter().map(String::as_str), &versions);
+        let plain = versions_key(0, bound, &versions);
         assert_eq!(panel_version_key(1, &bound, &mg, &versions, None), plain);
         assert_eq!(
             panel_version_key(2, &bound, &mg, &versions, Some(&HashSet::new())),
@@ -1072,7 +1072,8 @@ mod tests {
             frontiers: Rc::new(HashMap::new()),
             noncontrib: Rc::new(["b".to_string()].into()),
         };
-        let versions: HashMap<String, u64> = [("a".into(), 3u64), ("b".into(), 99u64)].into();
+        // "a" known below its stamp: a catch-up poll landing after the send reports what the reply already holds.
+        let versions: HashMap<String, u64> = [("a".into(), 2u64), ("b".into(), 99u64)].into();
         let mg: HashMap<String, u64> = [("b".into(), 2u64)].into();
         let runs = || ["a", "b"].into_iter();
 
@@ -1081,7 +1082,7 @@ mod tests {
         assert!(entry.fresh_for(runs(), &versions, &mg, 7));
         assert!(!entry.fresh_for(runs(), &versions, &HashMap::new(), 7));
         assert!(!entry.fresh_for(runs(), &versions, &mg, 8));
-        // A contributing run's version moving (or vanishing) invalidates.
+        // A contributing run's version rising above its stamp invalidates.
         let moved: HashMap<String, u64> = [("a".into(), 4u64)].into();
         assert!(!entry.fresh_for(runs(), &moved, &mg, 7));
         // Epoch only matters when a non-contributing run is in scope.

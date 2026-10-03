@@ -1772,31 +1772,37 @@ impl PgStore {
         })
     }
 
-    /// Classify run identities against the canonical rows and permanent
-    /// tombstones in one bounded query. Missing keys are explicitly returned
-    /// as `Missing`, which makes callers safe against accidental omission.
+    /// Classify run identities against the canonical rows and permanent tombstones in one bounded query. The UNNEST drives the join, so every key comes back, unknown ones as `Missing`. Each class comes with the run's data version (`runs.version`, 0 without a canonical row).
     pub async fn classify_runs(
         &self,
         keys: &[RunKey],
-    ) -> Result<HashMap<RunKey, RunLifecycleClass>> {
+    ) -> Result<HashMap<RunKey, (RunLifecycleClass, u64)>> {
         if keys.is_empty() {
             return Ok(HashMap::new());
         }
         let project_ids: Vec<&str> = keys.iter().map(|key| key.project_id.as_str()).collect();
         let run_ids: Vec<&str> = keys.iter().map(|key| key.run_id.as_str()).collect();
-        type ClassifiedRunRow = (String, String, Option<i64>, Option<i64>, bool, bool, bool);
+        type ClassifiedRunRow = (
+            String,
+            String,
+            Option<i64>,
+            Option<i64>,
+            bool,
+            bool,
+            Option<i64>,
+        );
         let rows: Vec<ClassifiedRunRow> = sqlx::query_as(
             "SELECT wanted.project_id, wanted.run_id,
                     (EXTRACT(EPOCH FROM runs.deleted_at) * 1000)::BIGINT AS deleted_at_ms,
                     (EXTRACT(EPOCH FROM runs.purging_at) * 1000)::BIGINT AS purging_at_ms,
-                    runs.run_id IS NOT NULL AS canonical_exists,
                     COALESCE(
                       runs.deleted_at + ($3::BIGINT * INTERVAL '1 millisecond')
                         <= clock_timestamp(),
                       FALSE
                     )
                       AS is_expired,
-                    purged_runs.run_id IS NOT NULL AS was_purged
+                    purged_runs.run_id IS NOT NULL AS was_purged,
+                    runs.version
              FROM UNNEST($1::TEXT[], $2::TEXT[]) AS wanted(project_id, run_id)
              LEFT JOIN runs ON runs.project_id = wanted.project_id
                            AND runs.run_id = wanted.run_id
@@ -1810,29 +1816,21 @@ impl PgStore {
         .await?;
 
         let mut classes = HashMap::with_capacity(keys.len());
-        for (
-            project_id,
-            run_id,
-            deleted_at_ms,
-            purging_at_ms,
-            canonical_exists,
-            is_expired,
-            was_purged,
-        ) in rows
+        for (project_id, run_id, deleted_at_ms, purging_at_ms, is_expired, was_purged, version) in
+            rows
         {
+            // runs.version is NOT NULL, so it is present exactly when the canonical row is.
             let class = classify_lifecycle(
-                canonical_exists,
+                version.is_some(),
                 was_purged,
                 deleted_at_ms,
                 purging_at_ms,
                 is_expired,
             );
-            classes.insert(RunKey::new(project_id, run_id), class);
-        }
-        for key in keys {
-            classes
-                .entry(key.clone())
-                .or_insert(RunLifecycleClass::Missing);
+            classes.insert(
+                RunKey::new(project_id, run_id),
+                (class, version.unwrap_or(0) as u64),
+            );
         }
         Ok(classes)
     }
@@ -1843,10 +1841,10 @@ impl PgStore {
             .await
             .map_err(RunAccessError::Store)?;
         for key in keys {
-            let state = classes
+            let (state, _) = classes
                 .get(key)
                 .copied()
-                .unwrap_or(RunLifecycleClass::Missing);
+                .unwrap_or((RunLifecycleClass::Missing, 0));
             if state != RunLifecycleClass::Active {
                 return Err(RunAccessError::NotActive {
                     key: key.clone(),
@@ -1857,16 +1855,21 @@ impl PgStore {
         Ok(())
     }
 
-    pub async fn ensure_runs_readable(&self, keys: &[RunKey]) -> Result<(), RunAccessError> {
+    /// Returns each readable run's data version (`runs.version`) by run_id, read in the same statement as the lifecycle check.
+    pub async fn ensure_runs_readable(
+        &self,
+        keys: &[RunKey],
+    ) -> Result<HashMap<String, u64>, RunAccessError> {
         let classes = self
             .classify_runs(keys)
             .await
             .map_err(RunAccessError::Store)?;
+        let mut versions = HashMap::with_capacity(keys.len());
         for key in keys {
-            let state = classes
+            let (state, version) = classes
                 .get(key)
                 .copied()
-                .unwrap_or(RunLifecycleClass::Missing);
+                .unwrap_or((RunLifecycleClass::Missing, 0));
             if !matches!(
                 state,
                 RunLifecycleClass::Active | RunLifecycleClass::Trashed
@@ -1876,8 +1879,9 @@ impl PgStore {
                     state,
                 });
             }
+            versions.insert(key.run_id.clone(), version);
         }
-        Ok(())
+        Ok(versions)
     }
 
     pub async fn lifecycle_snapshot(&self) -> Result<LifecycleSnapshot> {

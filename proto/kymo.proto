@@ -552,6 +552,8 @@ message ChartResponse {
   repeated uint64 result_series_hashes = 13;  // parallel to the delta's series
   // The chart carries envelopes (any bucket downsampled, or a passthrough duplicate-x collision): every series' model envelope is DENSE over its occupancy, and the client re-derives min == max == value at occupied columns the wire's band entries skip. Chart-wide because the contract is (a band-less run on a banded chart would blank under envelope rendering); it only flips alongside a full answer (numeric_delta_from_col gates band flips), so a delta's bit always matches the held response's.
   bool banded = 14;
+  // Per distinct requested run_id: the run's data version (runs.version, the value PollVersions reports for a readable run), read before any of this answer's data, so the answer is complete for what it requested as of that version.
+  map<string, uint64> run_versions = 15;
 }
 
 // === CDN queries ===
@@ -566,6 +568,8 @@ message QueryCdnKeysRequest {
 
 message QueryCdnKeysResponse {
   repeated CdnSeries series = 1;
+  // Per distinct requested run_id: the same freshness stamp as ChartResponse.run_versions.
+  map<string, uint64> run_versions = 2;
 }
 
 message CdnSeries {
@@ -598,6 +602,8 @@ message QueryTextWindowResponse {
   uint64 total_lines = 2;
   // First step in the unfiltered stream, for relative-time tooltips.
   int64 first_step = 3;
+  // Per requested run_id: the same freshness stamp as ChartResponse.run_versions.
+  map<string, uint64> run_versions = 4;
 }
 
 message TextLine {

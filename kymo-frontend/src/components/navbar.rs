@@ -160,6 +160,8 @@ pub fn Navbar() -> Element {
                     if let Some(window) = web_sys::window() {
                         if window.confirm_with_message("Reset layout? This will discard all customizations and regenerate from discovered metrics.").unwrap_or(false) {
                             state.reset_layout();
+                            // A maximized chart may be one of the discarded customizations; its bindings would no longer be planned for name lookups, so it could never become ready.
+                            crate::route::focus_chart(None);
                         }
                     }
                 }),

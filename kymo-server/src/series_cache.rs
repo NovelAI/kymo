@@ -219,20 +219,21 @@ struct EvictedLineage {
 /// duplicates.
 pub const WATERMARK_OVERLAP_MS: i64 = 1_000;
 
-/// Watermarks never advance past `now - this`. A row is STAMPED
+/// Watermarks never advance past the read's START minus this ([`watermark_cap`]). A row is STAMPED
 /// (`inserted_at DEFAULT now64(3)`) when ClickHouse starts processing its
 /// INSERT but only becomes VISIBLE when the insert commits — so a slow
 /// flush can surface rows stamped seconds in the past. If a faster
 /// concurrent flush to the same series had meanwhile pushed the watermark
 /// beyond those stamps, no later incremental read would ever see them
 /// (they sit below the high-water mark of an already-seen tag, so even
-/// rewrite detection can't notice). Capping the watermark at now − margin
+/// rewrite detection can't notice). Capping the watermark at start − margin
 /// means a row is only ever missed if its insert takes longer than
 /// margin + overlap to commit — flushes run well under a second (see the
 /// mkdb2_ch_insert_duration_seconds histogram). The cost is re-reading
-/// the last ~16s of an active series each refresh; the merge drops the
+/// an active series from ~16s before the previous read's start each refresh; the merge drops the
 /// duplicates. Compares this process' clock against ClickHouse's: both
 /// run in one NTP-synced cluster, skew ≪ margin.
+/// Writes that can exceed margin + overlap: an insert that commits after its client timed out (the client's retry restamps its rows), and bulk imports, whose caches FinalizeImportRun purges (docs/bulk-import.md).
 pub const VISIBILITY_MARGIN_MS: i64 = 15_000;
 
 fn unix_ms_now() -> i64 {
@@ -240,6 +241,11 @@ fn unix_ms_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// The highest watermark a read that started at `fetch_started` may record ([`VISIBILITY_MARGIN_MS`]), on the wall clock ClickHouse stamps rows with. The start, not the completion: a read's snapshot is no earlier than its start, so every row it lacks committed after it, while a cap at completion would let a read slower than the margin record a watermark past rows still committing at its snapshot.
+pub(crate) fn watermark_cap(fetch_started: Instant) -> i64 {
+    unix_ms_now() - fetch_started.elapsed().as_millis() as i64 - VISIBILITY_MARGIN_MS
 }
 
 /// How long an entry serves without even the incremental query, counted from its fetch START. Long because each expiry costs a ClickHouse round trip per series, held under the chart request's admission units.
@@ -538,19 +544,19 @@ impl SeriesRefreshLocks {
     /// Refresh each of `elected` in its own detached task running `refresh(its position in elected, its key)`, as [`Self::get_or_refresh`] would.
     /// Every task is spawned, and its slot's `running` set, before this returns: cancelling the caller cannot strand an elected slot or leave the shared read running on released units.
     /// Every task keeps a clone of `ctx`, so it is released only when the last task ends.
-    /// `started` must predate the read: it is each key's fetch start and published stamp.
+    /// Its published stamp is taken here, before any task can start the read, as a leader's is.
     /// The returned future awaits each task under its slot lock and publishes, as a leader does, up to the first failure; the tasks it leaves stay attachable, as a cancelled leader's do.
     pub(crate) fn spawn_batch<D, Fut>(
         &self,
         elected: Vec<ElectedMiss>,
         ctx: D,
-        started: Instant,
         mut refresh: impl FnMut(usize, &SeriesKey) -> Fut,
     ) -> impl std::future::Future<Output = Result<Vec<(SeriesKey, Arc<SeriesSnapshot>)>, RefreshError>>
     where
         D: Clone + Send + 'static,
         Fut: std::future::Future<Output = RefreshOutcome> + Send + 'static,
     {
+        let started = Instant::now();
         let running: Vec<ElectedMiss> = elected
             .into_iter()
             .enumerate()
@@ -613,14 +619,10 @@ pub enum Lookup {
 
 impl SeriesCache {
     pub fn new() -> Self {
-        Self {
-            inner: std::sync::Mutex::new(Inner::default()),
-            budget_bytes: default_budget_bytes(),
-        }
+        Self::with_budget(default_budget_bytes())
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_test_budget(budget_bytes: usize) -> Self {
+    pub(crate) fn with_budget(budget_bytes: usize) -> Self {
         Self {
             inner: std::sync::Mutex::new(Inner::default()),
             budget_bytes,
@@ -708,7 +710,7 @@ impl SeriesCache {
         self.insert_full_with_origin(key, rows, fetch_started, LineageOrigin::Miss)
     }
 
-    /// Store a full fetch. `fetch_started` feeds the bump gate and starts the fresh window. An LRU victim can recover its lineage only from a matching, single-use eviction record.
+    /// Store a full fetch. `fetch_started` anchors the watermark cap, feeds the bump gate and starts the fresh window. An LRU victim can recover its lineage only from a matching, single-use eviction record.
     pub(crate) fn insert_full_with_origin(
         &self,
         key: SeriesKey,
@@ -720,10 +722,7 @@ impl SeriesCache {
         // Consume before hashing outside the mutex: exactly one full fetch can own this lineage while no cache entry holds it. Never restore a claimed record, even if the fetched contents do not match.
         let evicted = self.inner.lock().unwrap().evicted.remove(&key);
         let rows = Arc::new(SeriesSnapshot::reload(rows, origin, evicted.as_ref()));
-        let max_inserted_ms = rows
-            .maximum
-            .unwrap_or(0)
-            .min(unix_ms_now() - VISIBILITY_MARGIN_MS);
+        let max_inserted_ms = rows.maximum.unwrap_or(0).min(watermark_cap(fetch_started));
         let mut inner = self.inner.lock().unwrap();
         // A concurrent fetch may have published and evicted a different lineage while this one was hashing. That record must not survive this replacement.
         inner.evicted.remove(&key);
@@ -800,7 +799,7 @@ impl SeriesCache {
             .map(|r| r.inserted_ms)
             .max()
             .unwrap_or(e.max_inserted_ms)
-            .min(unix_ms_now() - VISIBILITY_MARGIN_MS)
+            .min(watermark_cap(fetch_started))
             .max(e.max_inserted_ms);
         inner.total_bytes = inner.total_bytes + new_bytes - inner.map[key].bytes;
         let e = inner.map.get_mut(key).unwrap();
@@ -1139,10 +1138,7 @@ mod tests {
     #[test]
     fn replacement_purge_and_unrecorded_reloads_start_new_lineages() {
         let source = vec![row("", 0, 1.0, 100)];
-        let cache = SeriesCache {
-            inner: std::sync::Mutex::new(Inner::default()),
-            budget_bytes: entry_bytes(&source),
-        };
+        let cache = SeriesCache::with_budget(entry_bytes(&source));
         let key = SeriesKey::new("p", "r", "m");
         let first = cache.insert_full(key.clone(), source.clone(), Instant::now());
         let stale_generation = gen_of(&cache, &key);
@@ -1184,7 +1180,7 @@ mod tests {
     }
 
     fn eviction_cache(row_count: usize) -> SeriesCache {
-        SeriesCache::with_test_budget(entry_bytes(&vec![row("", 0, 0.0, 0); row_count]))
+        SeriesCache::with_budget(entry_bytes(&vec![row("", 0, 0.0, 0); row_count]))
     }
 
     fn evict(cache: &SeriesCache, key: &SeriesKey, row_count: usize) {
@@ -1614,42 +1610,34 @@ mod tests {
     }
 
     #[test]
-    fn watermark_capped_at_visibility_margin() {
-        let cache = SeriesCache {
-            inner: std::sync::Mutex::new(Inner::default()),
-            budget_bytes: usize::MAX,
-        };
+    fn slow_reads_cap_the_watermark_at_their_start() {
+        let cache = SeriesCache::with_budget(usize::MAX);
         let k = SeriesKey::new("p", "r", "m");
         // A row stamped "now" must not advance the watermark past
-        // now − margin, or rows from a still-committing concurrent flush
-        // (stamped earlier, visible later) would be skipped forever.
+        // its read's START − margin, or rows from a still-committing concurrent flush
+        // (stamped earlier, visible later) would be skipped forever. This read ran 20 s.
+        let slow = Duration::from_secs(20);
+        let started = Instant::now() - slow;
         let now = unix_ms_now();
-        cache.insert_full(k.clone(), vec![row("", 1, 1.0, now)], Instant::now());
+        let expected = now - slow.as_millis() as i64 - VISIBILITY_MARGIN_MS;
+        cache.insert_full(k.clone(), vec![row("", 1, 1.0, now)], started);
         let wm = cache.inner.lock().unwrap().map[&k].max_inserted_ms;
-        // Upper bound from a fresh clock read: insert_full caps against its own unix_ms_now(), which can be a ms past the `now` captured above.
-        assert!(wm <= unix_ms_now() - VISIBILITY_MARGIN_MS);
+        assert!(wm.abs_diff(expected) < 1_000, "{wm} vs {expected}");
         // Ancient stamps are below the cap already: watermark = the stamp
         // (idle series keep their cheap empty increments).
-        cache.insert_full(k.clone(), vec![row("", 1, 1.0, 100)], Instant::now());
+        cache.insert_full(k.clone(), vec![row("", 1, 1.0, 100)], started);
         let wm = cache.inner.lock().unwrap().map[&k].max_inserted_ms;
         assert_eq!(wm, 100);
-        let _ = cache.apply_increment(
-            &k,
-            vec![row("", 2, 2.0, now)],
-            Instant::now(),
-            gen_of(&cache, &k),
-        );
+        cache
+            .apply_increment(&k, vec![row("", 2, 2.0, now)], started, gen_of(&cache, &k))
+            .unwrap();
         let wm = cache.inner.lock().unwrap().map[&k].max_inserted_ms;
-        // Upper bound from a fresh clock read: apply_increment caps against its own unix_ms_now(), which can be a ms past the `now` captured above.
-        assert!((100..=unix_ms_now() - VISIBILITY_MARGIN_MS).contains(&wm));
+        assert!(wm.abs_diff(expected) < 1_000, "{wm} vs {expected}");
     }
 
     #[test]
     fn bump_gate_forces_stale_inside_the_fresh_window() {
-        let cache = SeriesCache {
-            inner: std::sync::Mutex::new(Inner::default()),
-            budget_bytes: entry_bytes(&vec![row("", 0, 0.0, 0); 8]),
-        };
+        let cache = SeriesCache::with_budget(entry_bytes(&vec![row("", 0, 0.0, 0); 8]));
         let k = SeriesKey::new("p", "r", "m");
         cache.insert_full(k.clone(), vec![row("", 1, 1.0, 100)], Instant::now());
         assert!(matches!(cache.lookup(&k), Lookup::Fresh(_)));
@@ -1671,10 +1659,7 @@ mod tests {
 
     #[test]
     fn increment_against_a_replaced_base_forces_full_rebuild() {
-        let cache = SeriesCache {
-            inner: std::sync::Mutex::new(Inner::default()),
-            budget_bytes: entry_bytes(&vec![row("", 0, 0.0, 0); 8]),
-        };
+        let cache = SeriesCache::with_budget(entry_bytes(&vec![row("", 0, 0.0, 0); 8]));
         let k = SeriesKey::new("p", "r", "m");
         cache.insert_full(k.clone(), vec![row("", 1, 1.0, 100)], Instant::now());
         let stale_gen = gen_of(&cache, &k);
@@ -1701,10 +1686,7 @@ mod tests {
 
     #[test]
     fn bump_notes_survive_pruning_while_a_fetch_is_in_flight() {
-        let cache = SeriesCache {
-            inner: std::sync::Mutex::new(Inner::default()),
-            budget_bytes: entry_bytes(&vec![row("", 0, 0.0, 0); 8]),
-        };
+        let cache = SeriesCache::with_budget(entry_bytes(&vec![row("", 0, 0.0, 0); 8]));
         let k = SeriesKey::new("p", "r", "m");
         // A bump noted seconds ago while a slow
         // fetch is still in flight. Backdate it directly; note_bumps always
@@ -1738,10 +1720,7 @@ mod tests {
 
     #[test]
     fn fresh_window_counts_from_fetch_start() {
-        let cache = SeriesCache {
-            inner: std::sync::Mutex::new(Inner::default()),
-            budget_bytes: entry_bytes(&vec![row("", 0, 0.0, 0); 8]),
-        };
+        let cache = SeriesCache::with_budget(entry_bytes(&vec![row("", 0, 0.0, 0); 8]));
         // A fetch that started a whole window ago is stale on arrival, however recently it stored.
         if let Some(started) = Instant::now().checked_sub(FRESH_WINDOW + Duration::from_secs(1)) {
             let k = SeriesKey::new("p", "r", "m");
@@ -1752,10 +1731,7 @@ mod tests {
 
     #[test]
     fn cache_insert_lookup_increment_evict() {
-        let cache = SeriesCache {
-            inner: std::sync::Mutex::new(Inner::default()),
-            budget_bytes: entry_bytes(&vec![row("", 0, 0.0, 0); 3]) * 2,
-        };
+        let cache = SeriesCache::with_budget(entry_bytes(&vec![row("", 0, 0.0, 0); 3]) * 2);
         let k1 = SeriesKey::new("p", "r1", "m");
         let k2 = SeriesKey::new("p", "r2", "m");
 
@@ -1794,10 +1770,7 @@ mod tests {
     #[test]
     fn oversized_entries_are_never_retained() {
         // Budget fits exactly two rows. Eviction can't touch a sole entry, so a series over the whole budget must be served without being stored — the budget is a hard bound on retained memory.
-        let cache = SeriesCache {
-            inner: std::sync::Mutex::new(Inner::default()),
-            budget_bytes: entry_bytes(&vec![row("", 0, 0.0, 0); 2]),
-        };
+        let cache = SeriesCache::with_budget(entry_bytes(&vec![row("", 0, 0.0, 0); 2]));
         let k = SeriesKey::new("p", "r", "m");
 
         // Full insert over budget: rows come back, nothing is retained.
@@ -1828,10 +1801,7 @@ mod tests {
 
     #[test]
     fn purge_runs_is_exact_and_removes_every_metric() {
-        let cache = SeriesCache {
-            inner: std::sync::Mutex::new(Inner::default()),
-            budget_bytes: usize::MAX,
-        };
+        let cache = SeriesCache::with_budget(usize::MAX);
         let target_a = SeriesKey::new("project-a", "same-run", "loss");
         let target_b = SeriesKey::new("project-a", "same-run", "lr");
         let other_project = SeriesKey::new("project-b", "same-run", "loss");
@@ -1895,10 +1865,7 @@ mod tests {
     }
 
     fn plain_cache() -> Arc<SeriesCache> {
-        Arc::new(SeriesCache {
-            inner: std::sync::Mutex::new(Inner::default()),
-            budget_bytes: 1024 * 1024,
-        })
+        Arc::new(SeriesCache::with_budget(1024 * 1024))
     }
 
     #[tokio::test]
@@ -2170,12 +2137,9 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_oversized_misses_share_one_loader_result() {
-        let cache = Arc::new(SeriesCache {
-            inner: std::sync::Mutex::new(Inner::default()),
-            // Every non-empty result is pass-through rather than retained in
-            // the LRU. Singleflight must still share it with current waiters.
-            budget_bytes: 0,
-        });
+        // Every non-empty result is pass-through rather than retained in
+        // the LRU. Singleflight must still share it with current waiters.
+        let cache = Arc::new(SeriesCache::with_budget(0));
         let locks = Arc::new(SeriesRefreshLocks::default());
         let key = SeriesKey::new("p", "r", "m");
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2223,10 +2187,7 @@ mod tests {
 
     #[tokio::test]
     async fn bump_during_the_leader_read_elects_a_waiter_to_refresh_again() {
-        let cache = Arc::new(SeriesCache {
-            inner: std::sync::Mutex::new(Inner::default()),
-            budget_bytes: usize::MAX,
-        });
+        let cache = Arc::new(SeriesCache::with_budget(usize::MAX));
         let locks = Arc::new(SeriesRefreshLocks::default());
         let key = SeriesKey::new("p", "r", "m");
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2309,10 +2270,7 @@ mod tests {
 
     #[tokio::test]
     async fn bump_invalidates_an_oversized_published_result_for_all_waiters() {
-        let cache = Arc::new(SeriesCache {
-            inner: std::sync::Mutex::new(Inner::default()),
-            budget_bytes: 0,
-        });
+        let cache = Arc::new(SeriesCache::with_budget(0));
         let locks = Arc::new(SeriesRefreshLocks::default());
         let key = SeriesKey::new("p", "r", "m");
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2416,10 +2374,7 @@ mod tests {
         drop(leader_lease);
         assert_eq!(locks.registry_len(), 0);
 
-        let cache = SeriesCache {
-            inner: std::sync::Mutex::new(Inner::default()),
-            budget_bytes: usize::MAX,
-        };
+        let cache = SeriesCache::with_budget(usize::MAX);
         let error = locks
             .get_or_refresh(&cache, &key, no_detach, |_| async {
                 Err::<Arc<SeriesSnapshot>, _>(anyhow::anyhow!("load failed").into())
@@ -2497,7 +2452,7 @@ mod tests {
         let units = Arc::new(sem.clone().try_acquire_many_owned(2).unwrap());
 
         let elected = locks.elect_misses(&cache, &keys, usize::MAX);
-        let batch = locks.spawn_batch(elected, units, Instant::now(), |index, key| {
+        let batch = locks.spawn_batch(elected, units, |index, key| {
             let (read, cache, key) = (read.clone(), cache.clone(), key.clone());
             async move {
                 // The first task ends before the read completes, as one timing out would.
@@ -2551,7 +2506,7 @@ mod tests {
         .boxed()
         .shared();
         let elected = locks.elect_misses(&cache, std::slice::from_ref(&key), 1);
-        drop(locks.spawn_batch(elected, (), Instant::now(), |_, key| {
+        drop(locks.spawn_batch(elected, (), |_, key| {
             let (read, cache, key) = (read.clone(), cache.clone(), key.clone());
             async move {
                 read.await;
@@ -2587,16 +2542,16 @@ mod tests {
         let cache = plain_cache();
         let locks = SeriesRefreshLocks::default();
         let key = series_key("a");
-        let started = Instant::now();
-        cache.note_bumps(std::iter::once(key.run_id.as_str()));
         let elected = locks.elect_misses(&cache, std::slice::from_ref(&key), 1);
         // A pass-through result, as under cache ablation, reaches others only through the slot, stamped by the task.
-        drop(locks.spawn_batch(elected, (), started, |_, _| async {
+        drop(locks.spawn_batch(elected, (), |_, _| async {
             Ok(Arc::new(SeriesSnapshot::full_with_origin(
                 vec![row("", 1, 1.0, 1)],
                 LineageOrigin::Miss,
             )))
         }));
+        // The single-threaded test runtime hasn't run the task yet: this bump lands after the batch's stamp.
+        cache.note_bumps(std::iter::once(key.run_id.as_str()));
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = reads.clone();
         locks

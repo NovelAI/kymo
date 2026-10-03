@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use serde::Deserialize;
 
-use crate::series_cache::{is_fresh, VISIBILITY_MARGIN_MS, WATERMARK_OVERLAP_MS};
+use crate::series_cache::{is_fresh, watermark_cap, WATERMARK_OVERLAP_MS};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct TextIndexKey {
@@ -129,19 +129,10 @@ pub struct TextStreamIndex {
 
 impl TextStreamIndex {
     /// None when [`latest_rows`] finds versions it cannot order.
-    fn from_rows(rows: Vec<TextIndexRow>, observed_max_inserted_ms: i64) -> Option<Self> {
-        let rows = latest_rows(rows)?;
-        let max_inserted_ms = rows
-            .iter()
-            .map(|row| row.inserted_ms)
-            .max()
-            .unwrap_or(0)
-            .max(observed_max_inserted_ms)
-            .min(unix_ms_now() - VISIBILITY_MARGIN_MS);
-        let rows = rows
-            .into_iter()
-            .filter(|row| row.is_text != 0)
-            .collect::<Vec<_>>();
+    fn from_rows(rows: Vec<TextIndexRow>) -> Option<Self> {
+        let mut rows = latest_rows(rows)?;
+        let max_inserted_ms = rows.iter().map(|row| row.inserted_ms).max().unwrap_or(0);
+        rows.retain(|row| row.is_text != 0);
         let first_step = rows.first().map_or(0, |row| row.step);
         let mut completed_lines = 0u64;
         let mut last_non_empty_ends_with_newline = None;
@@ -187,13 +178,6 @@ impl TextStreamIndex {
         }
         &self.chunks[start..end]
     }
-}
-
-fn unix_ms_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 fn row_key_cmp(left: &TextIndexRow, right: &TextIndexRow) -> Ordering {
@@ -301,9 +285,13 @@ pub struct TextIndexCache {
 
 impl TextIndexCache {
     pub fn new() -> Self {
+        Self::with_budget(default_budget_bytes())
+    }
+
+    pub(crate) fn with_budget(budget_bytes: usize) -> Self {
         Self {
             inner: std::sync::Mutex::new(Inner::default()),
-            budget_bytes: default_budget_bytes(),
+            budget_bytes,
         }
     }
 
@@ -345,11 +333,16 @@ impl TextIndexCache {
         observed_max_inserted_ms: i64,
         fetch_started: Instant,
     ) -> Arc<TextStreamIndex> {
-        self.store(
+        let mut index =
+            TextStreamIndex::from_rows(rows).expect("a FINAL read holds one version of each key");
+        // The later max query reads every version of the rows the index read saw, so its maximum covers theirs, and its newer snapshot may hold rows the index read never saw (store_locked caps it).
+        index.max_inserted_ms = observed_max_inserted_ms;
+        store_locked(
+            &mut self.inner.lock().unwrap(),
             key,
-            TextStreamIndex::from_rows(rows, observed_max_inserted_ms)
-                .expect("a FINAL read holds one version of each key"),
+            index,
             fetch_started,
+            self.budget_bytes,
         )
     }
 
@@ -382,7 +375,7 @@ impl TextIndexCache {
             .map(IndexedTextChunk::into_row)
             .chain(increment)
             .collect();
-        let index = TextStreamIndex::from_rows(rows, 0).ok_or(())?;
+        let index = TextStreamIndex::from_rows(rows).ok_or(())?;
         let mut inner = self.inner.lock().unwrap();
         if inner
             .entries
@@ -419,25 +412,17 @@ impl TextIndexCache {
         inner.total_bytes = inner.total_bytes.saturating_sub(removed_bytes);
         removed
     }
-
-    fn store(
-        &self,
-        key: TextIndexKey,
-        index: TextStreamIndex,
-        fetch_started: Instant,
-    ) -> Arc<TextStreamIndex> {
-        let mut inner = self.inner.lock().unwrap();
-        store_locked(&mut inner, key, index, fetch_started, self.budget_bytes)
-    }
 }
 
 fn store_locked(
     inner: &mut Inner,
     key: TextIndexKey,
-    index: TextStreamIndex,
+    mut index: TextStreamIndex,
     fetch_started: Instant,
     budget_bytes: usize,
 ) -> Arc<TextStreamIndex> {
+    // Both paths cap the frontier at the read's start.
+    index.max_inserted_ms = index.max_inserted_ms.min(watermark_cap(fetch_started));
     let bytes = entry_bytes(&key, &index);
     let index = Arc::new(index);
     if let Some(old) = inner.entries.remove(&key) {
@@ -483,9 +468,12 @@ fn settle(inner: &mut Inner, budget_bytes: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{TextIndexCache, TextIndexKey, TextIndexRow, TextRefreshLocks, TextStreamIndex};
+    use super::{
+        watermark_cap, TextIndexCache, TextIndexKey, TextIndexRow, TextRefreshLocks,
+        TextStreamIndex,
+    };
     use std::sync::Arc;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     fn row(step: i64, metric: &str, tag: &str, text: &str, inserted_ms: i64) -> TextIndexRow {
         TextIndexRow {
@@ -514,13 +502,10 @@ mod tests {
 
     #[test]
     fn tag_is_part_of_the_stable_line_order() {
-        let index = TextStreamIndex::from_rows(
-            vec![
-                row(7, "stdout", "b", "two\n", 1),
-                row(7, "stdout", "a", "one\n", 1),
-            ],
-            0,
-        )
+        let index = TextStreamIndex::from_rows(vec![
+            row(7, "stdout", "b", "two\n", 1),
+            row(7, "stdout", "a", "one\n", 1),
+        ])
         .unwrap();
         assert_eq!(index.total_lines, 2);
         assert_eq!(index.chunks[0].tag, "a");
@@ -532,10 +517,10 @@ mod tests {
 
     #[test]
     fn empty_trailing_chunk_keeps_the_unterminated_tail() {
-        let index = TextStreamIndex::from_rows(
-            vec![row(1, "stdout", "", "tail", 1), row(2, "stdout", "", "", 2)],
-            0,
-        )
+        let index = TextStreamIndex::from_rows(vec![
+            row(1, "stdout", "", "tail", 1),
+            row(2, "stdout", "", "", 2),
+        ])
         .unwrap();
         assert_eq!(index.total_lines, 1);
         assert_eq!(index.window_chunks(0, 1).len(), 2);
@@ -543,15 +528,12 @@ mod tests {
 
     #[test]
     fn exact_line_boundary_skips_only_completed_leading_chunks() {
-        let index = TextStreamIndex::from_rows(
-            vec![
-                row(1, "stdout", "", "previous\n", 1),
-                row(2, "stdout", "", "", 1),
-                row(3, "stdout", "", "part", 1),
-                row(4, "stdout", "", "ial\n", 1),
-            ],
-            0,
-        )
+        let index = TextStreamIndex::from_rows(vec![
+            row(1, "stdout", "", "previous\n", 1),
+            row(2, "stdout", "", "", 1),
+            row(3, "stdout", "", "part", 1),
+            row(4, "stdout", "", "ial\n", 1),
+        ])
         .unwrap();
 
         let selected = index.window_chunks(1, 1);
@@ -564,10 +546,7 @@ mod tests {
 
     #[test]
     fn incremental_replacement_recomputes_following_offsets() {
-        let cache = TextIndexCache {
-            inner: std::sync::Mutex::new(Default::default()),
-            budget_bytes: usize::MAX,
-        };
+        let cache = TextIndexCache::with_budget(usize::MAX);
         let key = key("p", "r", &["stdout"]);
         cache.insert_full(
             key.clone(),
@@ -593,10 +572,7 @@ mod tests {
 
     #[test]
     fn equal_timestamp_versions_that_disagree_need_a_final_read() {
-        let cache = TextIndexCache {
-            inner: std::sync::Mutex::new(Default::default()),
-            budget_bytes: usize::MAX,
-        };
+        let cache = TextIndexCache::with_budget(usize::MAX);
         let key = key("p", "r", &["stdout"]);
         cache.insert_full(
             key.clone(),
@@ -639,10 +615,7 @@ mod tests {
 
     #[test]
     fn non_text_replacement_removes_a_cached_chunk() {
-        let cache = TextIndexCache {
-            inner: std::sync::Mutex::new(Default::default()),
-            budget_bytes: usize::MAX,
-        };
+        let cache = TextIndexCache::with_budget(usize::MAX);
         let key = key("p", "r", &["stdout"]);
         cache.insert_full(
             key.clone(),
@@ -667,10 +640,7 @@ mod tests {
 
     #[test]
     fn stale_generation_cannot_replace_a_newer_index() {
-        let cache = TextIndexCache {
-            inner: std::sync::Mutex::new(Default::default()),
-            budget_bytes: usize::MAX,
-        };
+        let cache = TextIndexCache::with_budget(usize::MAX);
         let key = key("p", "r", &["stdout"]);
         cache.insert_full(
             key.clone(),
@@ -699,10 +669,7 @@ mod tests {
 
     #[test]
     fn oversized_key_is_not_retained_as_an_empty_index() {
-        let cache = TextIndexCache {
-            inner: std::sync::Mutex::new(Default::default()),
-            budget_bytes: 1_024,
-        };
+        let cache = TextIndexCache::with_budget(1_024);
         let key = TextIndexKey::new("p", "r", &["x".repeat(4_096)]);
 
         let index = cache.insert_full(key, Vec::new(), 0, Instant::now());
@@ -715,10 +682,7 @@ mod tests {
 
     #[test]
     fn purge_runs_is_exact_across_projects_and_streams() {
-        let cache = TextIndexCache {
-            inner: std::sync::Mutex::new(Default::default()),
-            budget_bytes: usize::MAX,
-        };
+        let cache = TextIndexCache::with_budget(usize::MAX);
         let target_a = key("project-a", "same-run", &["stdout"]);
         let target_b = key("project-a", "same-run", &["stderr"]);
         let other_project = key("project-b", "same-run", &["stdout"]);
@@ -750,10 +714,7 @@ mod tests {
 
     #[test]
     fn empty_full_index_keeps_the_non_text_refresh_frontier() {
-        let cache = TextIndexCache {
-            inner: std::sync::Mutex::new(Default::default()),
-            budget_bytes: usize::MAX,
-        };
+        let cache = TextIndexCache::with_budget(usize::MAX);
         let key = key("p", "r", &["numeric"]);
         let observed = 123_456;
         cache.insert_full(key.clone(), Vec::new(), observed, Instant::now());
@@ -766,12 +727,33 @@ mod tests {
         );
     }
 
+    /// A slow read caps its frontier at its start − margin, a full read even when its later max query saw newer rows.
+    #[test]
+    fn slow_reads_cap_the_frontier_at_their_start() {
+        let cache = TextIndexCache::with_budget(usize::MAX);
+        let key = key("p", "r", &["stdout"]);
+        let slow = Duration::from_secs(20);
+        let started = Instant::now() - slow;
+        // The max query saw rows up to a read starting now.
+        let observed = watermark_cap(Instant::now());
+        let expected = observed - slow.as_millis() as i64;
+        let rows = vec![row(1, "stdout", "", "old\n", 100)];
+        let wm = cache
+            .insert_full(key.clone(), rows, observed, started)
+            .max_inserted_ms;
+        assert!(wm.abs_diff(expected) < 1_000, "{wm} vs {expected}");
+        let generation = cache.inner.lock().unwrap().entries[&key].generation;
+        let rows = vec![row(2, "stdout", "", "new\n", observed)];
+        let wm = cache
+            .apply_increment(&key, rows, started, generation)
+            .unwrap()
+            .max_inserted_ms;
+        assert!(wm.abs_diff(expected) < 1_000, "{wm} vs {expected}");
+    }
+
     #[tokio::test]
     async fn same_key_refreshes_serialize_and_preserve_distinct_increments() {
-        let cache = Arc::new(TextIndexCache {
-            inner: std::sync::Mutex::new(Default::default()),
-            budget_bytes: usize::MAX,
-        });
+        let cache = Arc::new(TextIndexCache::with_budget(usize::MAX));
         let locks = Arc::new(TextRefreshLocks::default());
         let key = key("p", "r", &["stdout"]);
         cache.insert_full(

@@ -3711,16 +3711,24 @@ impl QueryService {
         });
     }
 
+    /// Read guards for `keys`, plus the data versions `ensure_runs_readable` read for them, by run_id: read before any of a reply's data, they are its echo (docs/first-mount-refresh.md).
     async fn readable_guards(
         &self,
         keys: &[RunKey],
-    ) -> Result<Vec<tokio::sync::OwnedRwLockReadGuard<()>>, Status> {
+    ) -> Result<
+        (
+            Vec<tokio::sync::OwnedRwLockReadGuard<()>>,
+            std::collections::HashMap<String, u64>,
+        ),
+        Status,
+    > {
         let guards = self.gates.read_many(keys.iter().cloned()).await;
-        self.pg
+        let versions = self
+            .pg
             .ensure_runs_readable(keys)
             .await
             .map_err(lifecycle_access_status)?;
-        Ok(guards)
+        Ok((guards, versions))
     }
 
     // --- Discovery ---
@@ -4389,7 +4397,7 @@ impl QueryService {
     ) -> Result<Response<proto::ListMetricsResponse>, Status> {
         let req = request.into_inner();
         let keys = vec![RunKey::new(req.project_id.clone(), req.run_id.clone())];
-        let _guards = self.readable_guards(&keys).await?;
+        let (_guards, _versions) = self.readable_guards(&keys).await?;
         // Served from the Postgres run_metrics registry (maintained at
         // ingest, seeded once from ClickHouse).
         let rows = self
@@ -4419,7 +4427,7 @@ impl QueryService {
             .iter()
             .map(|run_id| RunKey::new(req.project_id.clone(), run_id.clone()))
             .collect();
-        let _guards = self.readable_guards(&keys).await?;
+        let (_guards, _versions) = self.readable_guards(&keys).await?;
         let rows = self
             .pg
             .list_run_set_metrics(&req.project_id, &req.run_ids)
@@ -4469,7 +4477,9 @@ impl QueryService {
             .collect();
         // Keyed so each detached refresh co-owns exactly its runs' guards — a purge of run A waits for the scans reading A (a batched scan reads several runs), never for run B's own.
         let guards = self.gates.read_many_keyed(runs.iter().cloned()).await;
-        self.pg
+        // Read before any series data, so each version is a lower bound on what this answer holds: an insert commits, is noted in the series cache, and only then is counted by a version bump; cached rows serve only if fetched after the run's last note (series_cache.rs is_fresh). A version read after the data could count rows the answer lacks.
+        let run_versions = self
+            .pg
             .ensure_runs_readable(&runs)
             .await
             .map_err(lifecycle_access_status)?;
@@ -4587,7 +4597,9 @@ impl QueryService {
             .delta_audit
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             .is_multiple_of(67);
-        build_response(req, &all_rows, x_maps.as_ref(), audit)
+        let mut response = build_response(req, &all_rows, x_maps.as_ref(), audit)?;
+        response.run_versions = run_versions;
+        Ok(response)
     }
 
     // --- CDN queries ---
@@ -4603,9 +4615,7 @@ impl QueryService {
         let step_max = req.step_max.unwrap_or(i64::MAX);
 
         if req.refs.is_empty() {
-            return Ok(Response::new(proto::QueryCdnKeysResponse {
-                series: vec![],
-            }));
+            return Ok(Response::new(proto::QueryCdnKeysResponse::default()));
         }
 
         let keys: Vec<_> = req
@@ -4613,7 +4623,7 @@ impl QueryService {
             .iter()
             .map(|series| RunKey::new(series.project_id.clone(), series.run_id.clone()))
             .collect();
-        let _guards = self.readable_guards(&keys).await?;
+        let (_guards, run_versions) = self.readable_guards(&keys).await?;
 
         let key_refs: Vec<(String, String, String)> = req
             .refs
@@ -4638,7 +4648,10 @@ impl QueryService {
         // 1:1 correspondence with their request.
         let series = assemble_cdn_series(req.refs, rows);
 
-        Ok(Response::new(proto::QueryCdnKeysResponse { series }))
+        Ok(Response::new(proto::QueryCdnKeysResponse {
+            series,
+            run_versions,
+        }))
     }
 
     // --- Text stream queries ---
@@ -4652,7 +4665,7 @@ impl QueryService {
         let metric_names = normalize_text_metric_names(req.metric_names)?;
         let search = validate_text_search(&req.search)?;
         let keys = vec![RunKey::new(req.project_id.clone(), req.run_id.clone())];
-        let _guards = self.readable_guards(&keys).await?;
+        let (_guards, run_versions) = self.readable_guards(&keys).await?;
         let line_limit = req.line_limit.clamp(1, MAX_TEXT_WINDOW_LINES);
         let window = self
             .ch
@@ -4689,6 +4702,7 @@ impl QueryService {
             lines,
             total_lines: window.total_lines,
             first_step: window.first_step,
+            run_versions,
         }))
     }
 

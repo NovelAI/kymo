@@ -14,6 +14,8 @@ use std::time::Duration;
 
 use gloo_timers::future::sleep;
 
+use crate::state::trash::monotonic_now_ms;
+
 /// Where a panel sits relative to the viewport.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Zone {
@@ -54,18 +56,14 @@ fn hi_idle() -> bool {
     HI_IN_FLIGHT.with(|c| c.get() == 0)
 }
 
-/// Hold a Near-zone prefetch until every visible FIRST PAINT settles (or
-/// the panel is promoted mid-wait). The initial grace beat lets a
+/// Hold until every visible FIRST PAINT settles, `keep_waiting` turns false, or the monotonic `deadline_ms` passes. The initial grace beat lets a
 /// same-flush burst of visible fetches take their tokens before the first
-/// idle check. Capped: with slow queries and constant live-run churn the
-/// gate can stay busy for a long time, and a prefetch delayed past the cap
-/// helps nobody — by then it's what the user is about to scroll to.
-async fn wait_for_visible_idle(is_still_near: impl Fn() -> bool) {
-    let mut waited_ms = 0u32;
-    sleep(Duration::from_millis(150)).await;
-    while !hi_idle() && is_still_near() && waited_ms < 2_000 {
+/// idle check.
+pub(crate) async fn wait_for_visible_idle(deadline_ms: f64, keep_waiting: impl Fn() -> bool) {
+    let grace_ms = (deadline_ms - monotonic_now_ms()).clamp(0.0, 150.0);
+    sleep(Duration::from_millis(grace_ms as u64)).await;
+    while !hi_idle() && keep_waiting() && monotonic_now_ms() < deadline_ms {
         sleep(Duration::from_millis(50)).await;
-        waited_ms += 50;
     }
 }
 
@@ -82,7 +80,10 @@ async fn wait_for_visible_idle(is_still_near: impl Fn() -> bool) {
 pub async fn admit_fetch(zone: impl Fn() -> Zone, first_paint: bool) -> Option<HiFetchToken> {
     crate::grpc::wait_until_page_visible().await;
     if zone() == Zone::Near {
-        wait_for_visible_idle(|| zone() == Zone::Near).await;
+        // A Near-zone prefetch waits for the visible first paints (or its promotion), capped: with slow queries and constant live-run churn the
+        // gate can stay busy for a long time, and a prefetch delayed past the cap
+        // helps nobody — by then it's what the user is about to scroll to.
+        wait_for_visible_idle(monotonic_now_ms() + 2_000.0, || zone() == Zone::Near).await;
         crate::grpc::wait_until_page_visible().await;
     }
     (first_paint && zone() == Zone::Visible).then(HiFetchToken::new)

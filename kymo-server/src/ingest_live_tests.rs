@@ -713,6 +713,34 @@ async fn mixed_payload_reads(fixture: &mut Fixture, run: &str) -> Result<()> {
             .collect::<Vec<_>>(),
         [(2, "two.png"), (4, "four-a.png"), (4, "four-b.png")]
     );
+    // Gallery-key and text-window replies echo the run's data version, as chart replies do.
+    let polled = fixture.versions(run).await?.run_versions;
+    let cdn = fixture
+        .query
+        .query_cdn_keys(Request::new(proto::QueryCdnKeysRequest {
+            refs: vec![proto::SeriesRef {
+                project_id: project.clone(),
+                run_id: run.to_string(),
+                metric_name: metric.to_string(),
+                tags: vec![],
+            }],
+            ..Default::default()
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(cdn.run_versions, polled);
+    let text = fixture
+        .query
+        .query_text_window(Request::new(proto::QueryTextWindowRequest {
+            project_id: project.clone(),
+            run_id: run.to_string(),
+            metric_names: vec![metric.to_string()],
+            line_limit: 10,
+            ..Default::default()
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(text.run_versions, polled);
 
     // Incremental refreshes: a non-numeric row at a new step is no point, and one replacing a cached step deletes it.
     fixture
@@ -788,6 +816,12 @@ async fn cold_chart_batches_its_reads(fixture: &mut Fixture, run: &str) -> Resul
             refs.iter()
                 .map(|(run, _, points)| (run.as_str(), *points))
                 .collect::<Vec<_>>()
+        );
+        // The version echo holds one entry per distinct requested run, equal to what PollVersions reports (nothing bumps in between: this fixture applies bumps only when drained).
+        let runs: Vec<String> = refs.iter().map(|(run, _, _)| (*run).clone()).collect();
+        assert_eq!(
+            response.run_versions,
+            fixture.versions_for(&runs).await?.run_versions
         );
         Ok(selects().await? - before - 1)
     };

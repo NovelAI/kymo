@@ -1201,8 +1201,8 @@ mod tests {
         let classes = pg.classify_runs(&keys).await?;
         for key in &keys {
             assert_eq!(
-                classes.get(key),
-                Some(&crate::pg::RunLifecycleClass::Purged)
+                classes.get(key).map(|&(class, _)| class),
+                Some(crate::pg::RunLifecycleClass::Purged)
             );
             assert!(matches!(
                 pg.init_run(&key.project_id, &key.run_id, "must stay purged", None)

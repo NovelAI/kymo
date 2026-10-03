@@ -146,6 +146,46 @@ pub fn DashboardLayout(project_id: String) -> Element {
     use_context_provider(ZoneRegistry::default);
     let maximize_bridge = crate::util::js_bridge::use_bridge("maximize_resize");
 
+    // Discovery scope: the layout is built from the VISIBLE runs' metrics —
+    // the run page's run, or the project page's selection — so a chart
+    // exists only when a run the user can see logged its metric. The route
+    // is the authority for the run page.
+    let route = use_route::<Route>();
+    crate::route::note_route(&route);
+    let scope_run = match &route {
+        Route::RunPage { run_id, .. } => Some(run_id.clone()),
+        _ => None,
+    };
+    // Panels resolve `RunRef::Selected` through `current_run`, so it follows the route from the first render.
+    let mut current_run = state.current_run;
+    if *current_run.peek() != scope_run {
+        current_run.set(scope_run);
+    }
+
+    // A run page's layout gates on its run's readability alone, so a GetRun refresh that leaves the run readable does not re-list its metrics.
+    let scope_readable = use_memo({
+        let project_id = project_id.clone();
+        move || {
+            let Some(run_id) = &*state.current_run.read() else {
+                return true;
+            };
+            match &*state.direct_run.read() {
+                DirectRunLoad::Loaded(view) if view.matches(&project_id, run_id) => matches!(
+                    crate::state::trash::effective_lifecycle(
+                        &view.record,
+                        view.authoritative_now_ms()
+                    ),
+                    RunLifecycleState::Active | RunLifecycleState::Trashed
+                ),
+                _ => false,
+            }
+        }
+    });
+
+    // A run page holds its first ListRuns back until its layout has loaded (or its run settled unreadable) and the visible charts' first fetches have settled, 3 s at most from when it starts waiting: every RPC shares one WebSocket that can't interleave replies, and a big project's list reply (1.2 MB on an 11,830-run project) would queue the chart replies behind it. A project page needs the list for its own layout, so it never waits.
+    // The deadline is set once, so a restart mid-wait (a pushed refresh, a reconnect) waits out what's left instead of sending at once, and a layout that never loads can't hold the list forever.
+    let mut list_hold_until = use_hook(|| CopyValue::new(None::<f64>));
+
     // Connection resync bootstraps the list; other invalidations use runs_refresh.
     let _runs_fetch = use_resource({
         let grpc = state.grpc;
@@ -160,6 +200,24 @@ pub fn DashboardLayout(project_id: String) -> Element {
             async move {
                 if resync_gen == 0 {
                     return;
+                }
+                if !*runs_loaded.peek() && state.current_run.peek().is_some() {
+                    let now = crate::state::trash::monotonic_now_ms;
+                    let deadline = *list_hold_until.write().get_or_insert(now() + 3_000.0);
+                    // Peeked, so leaving the run page ends the wait instead of restarting it.
+                    let on_run_page = || state.current_run.peek().is_some();
+                    // The charts are known once the layout has loaded, or once the URL run settled unreadable (its layout never loads).
+                    let charts_known = || {
+                        state.layout_config.peek().is_some()
+                            || (!matches!(
+                                &*state.direct_run.peek(),
+                                DirectRunLoad::Idle | DirectRunLoad::Loading
+                            ) && !*scope_readable.peek())
+                    };
+                    while !charts_known() && on_run_page() && now() < deadline {
+                        sleep(Duration::from_millis(50)).await;
+                    }
+                    crate::state::visibility::wait_for_visible_idle(deadline, on_run_page).await;
                 }
                 let grpc = grpc.read().clone();
                 let snapshot =
@@ -206,23 +264,6 @@ pub fn DashboardLayout(project_id: String) -> Element {
         }
     });
 
-    // Discovery scope: the layout is built from the VISIBLE runs' metrics —
-    // the run page's run, or the project page's selection — so a chart
-    // exists only when a run the user can see logged its metric. The route
-    // is the authority for the run page: `current_run` is set by the child
-    // page only after the layout's first render, so keying on it would
-    // race the loader's first pass.
-    let route = use_route::<Route>();
-    crate::route::note_route(&route);
-    let scope_run = match &route {
-        Route::RunPage { run_id, .. } => Some(run_id.clone()),
-        _ => None,
-    };
-    let mut scope_signal = use_signal(|| scope_run.clone());
-    if *scope_signal.peek() != scope_run {
-        scope_signal.set(scope_run);
-    }
-
     // A direct run page has a point lookup independent of the active run
     // list. That is what keeps a deleted run viewable without reintroducing
     // it into the sidebar, project selection, or All-run bindings.
@@ -230,7 +271,7 @@ pub fn DashboardLayout(project_id: String) -> Element {
         let project_id = project_id.clone();
         move || {
             let project_id = project_id.clone();
-            let run_id = scope_signal.read().clone();
+            let run_id = state.current_run.read().clone();
             let _manual_refresh = *state.direct_run_refresh.read();
             let resync_gen = *state.resync_gen.read();
             async move {
@@ -287,7 +328,7 @@ pub fn DashboardLayout(project_id: String) -> Element {
     });
 
     let selected_runs = state.selected_runs;
-    let visible_run_ids = use_memo(move || match scope_signal.read().clone() {
+    let visible_run_ids = use_memo(move || match state.current_run.read().clone() {
         Some(rid) => vec![rid],
         None => {
             // Sorted so equal selections compare equal (HashSet iteration
@@ -299,7 +340,7 @@ pub fn DashboardLayout(project_id: String) -> Element {
     });
 
     // URL → overlay: `?chart=<rect id>` is the maximize overlay's source of truth — chart links open focused, and every dismissal goes through `focus_chart`, which rewrites the param and lands back here.
-    // Mirrored into a signal like `scope_signal` above, since effects only re-run on reactive reads.
+    // Mirrored into a signal like `current_run` above, since effects only re-run on reactive reads.
     let chart_param = route.chart_param();
     let mut chart_signal = use_signal(|| chart_param.clone());
     if *chart_signal.peek() != chart_param {
@@ -350,25 +391,6 @@ pub fn DashboardLayout(project_id: String) -> Element {
         )
     });
 
-    // A run page's layout gates on its run's readability alone, so a GetRun refresh that leaves the run readable does not re-list its metrics.
-    let scope_readable = use_memo({
-        let project_id = project_id.clone();
-        move || {
-            let Some(run_id) = &*scope_signal.read() else {
-                return true;
-            };
-            match &*state.direct_run.read() {
-                DirectRunLoad::Loaded(view) if view.matches(&project_id, run_id) => matches!(
-                    crate::state::trash::effective_lifecycle(
-                        &view.record,
-                        view.authoritative_now_ms()
-                    ),
-                    RunLifecycleState::Active | RunLifecycleState::Trashed
-                ),
-                _ => false,
-            }
-        }
-    });
     let _layout_fetch = use_resource({
         let grpc = state.grpc;
         let project_id = project_id.clone();
@@ -380,7 +402,8 @@ pub fn DashboardLayout(project_id: String) -> Element {
             let project_id = project_id.clone();
             let visible = visible_run_ids.read().clone();
             let _mk = *metrics_key.read();
-            let runs_loaded = *runs_loaded.read();
+            // The short-circuit keeps a run page unsubscribed, so the run list landing never re-runs this fetch there.
+            let scope_known = state.current_run.read().is_some() || *runs_loaded.read();
             let _gen = *layout_gen.read();
             let scope_readable = *scope_readable.read();
             async move {
@@ -393,17 +416,15 @@ pub fn DashboardLayout(project_id: String) -> Element {
                 if load_diff_or_route(&project_id, "load gate").is_none() {
                     return;
                 }
-                // An empty selection only means "nothing visible" once the
-                // first list_runs has landed (auto-select fills it); before
-                // that, rendering would flash an empty dashboard.
-                if !runs_loaded {
+                // A run page's scope comes from its URL. A project page waits for the first list_runs: an empty selection means "nothing visible" only once auto-select has filled it, and before that, rendering would flash an empty dashboard.
+                if !scope_known {
                     return;
                 }
                 let grpc = grpc.read().clone();
                 // One aggregated registry query for the visible run set;
                 // reloads are event-driven (visible set, registry pushes,
                 // resyncs restart the resource).
-                let all_metrics: Vec<MetricInfo> = if scope_signal.peek().is_some() {
+                let all_metrics: Vec<MetricInfo> = if state.current_run.peek().is_some() {
                     // A deleted direct run crosses a real terminal boundary.
                     // Do not feed NOT_FOUND/FAILED_PRECONDITION into the
                     // generic forever-retry helper; refresh GetRun so the

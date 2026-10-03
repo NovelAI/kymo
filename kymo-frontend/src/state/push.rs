@@ -93,6 +93,17 @@ fn fold_versions(mut into: Signal<HashMap<String, u64>>, from: &HashMap<String, 
     }
 }
 
+/// A data reply's version stamps, folded into `known` because a reply is also an observation. The stamps are the reply's echo, or the versions peeked at send when a server predates the echo, so either deploy order works; never merged with what the client knew, which would claim rows the reply may lack. Callers install the reply with no await after this, so the propagation the fold raises is served from it.
+pub fn answer_stamps(
+    known: Signal<HashMap<String, u64>>,
+    echo: HashMap<String, u64>,
+    sent: HashMap<String, u64>,
+) -> HashMap<String, u64> {
+    let stamps = if echo.is_empty() { sent } else { echo };
+    fold_versions(known, &stamps);
+    stamps
+}
+
 fn entry_rises(current: &HashMap<String, u64>, key: &str, value: u64) -> bool {
     current.get(key).is_none_or(|old| value > *old)
 }

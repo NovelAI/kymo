@@ -1,4 +1,6 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 
 use dioxus::prelude::*;
 
@@ -37,12 +39,12 @@ const CDN_KEYS_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
 thread_local! {
     /// Monotonic identity for chart models handed to UPlotChart (see data_key): every distinct model gets a fresh number. A counter, NOT the Rc address — the allocator reuses a dropped model's address for the next one, so pointer identity would silently equate different data.
     static NEXT_DATA_SEQ: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
-    /// Per-panel chart cache (chart_sync::ChartCacheEntry), surviving body unmounts (see MetricRect). Validity = ChartCacheEntry::fresh_for (send-time snapshots vs current values), never which version bump triggered a resource run. Entries always hold a FULL response (deltas splice before storing): they answer run-subset requests locally, splice the next delta, and re-render instantly on remount. Rc: hits are refcount bumps, not multi-MB copies. Both entry count and estimated retained heap bytes are hard-bounded.
+    /// Per-panel chart cache (chart_sync::ChartCacheEntry), surviving body unmounts (see MetricRect). Validity = ChartCacheEntry::fresh_for (the reply's version echo and send-time snapshots vs current values), never which version bump triggered a resource run. Entries always hold a FULL response (deltas splice before storing): they answer run-subset requests locally, splice the next delta, and re-render instantly on remount. Rc: hits are refcount bumps, not multi-MB copies. Both entry count and estimated retained heap bytes are hard-bounded.
     static CHART_CACHE: RefCell<Store<ChartCacheEntry>> =
         RefCell::new(Store::with_weight_limit(256, CHART_CACHE_MAX_BYTES));
-    /// Per-panel (trigger version, send-time version, refs) -> raw CDN key series of the last successful fetch. Same two-stamp validity as CHART_CACHE.
+    /// Per-panel (refs, version stamps) -> raw CDN key series of the last successful fetch. Validity = [`cdn_cache_hit`] (version stamps vs current values).
     #[allow(clippy::type_complexity)]
-    static CDN_KEYS_CACHE: RefCell<Store<(u64, u64, Vec<SeriesRef>, Vec<CdnSeries>)>> =
+    static CDN_KEYS_CACHE: RefCell<Store<(Vec<SeriesRef>, HashMap<String, u64>, Vec<CdnSeries>)>> =
         RefCell::new(Store::with_weight_limit(256, CDN_KEYS_CACHE_MAX_BYTES));
     /// Per-panel (metrics-gen key, bound metric names) -> detected (numeric, cdn, text). Tiny entries, generous cap.
     #[allow(clippy::type_complexity)]
@@ -58,12 +60,33 @@ fn next_data_seq() -> u64 {
     })
 }
 
-fn cdn_cache_heap_bytes(refs: &Vec<SeriesRef>, series: &Vec<CdnSeries>) -> usize {
-    let mut bytes = std::mem::size_of::<(u64, u64, Vec<SeriesRef>, Vec<CdnSeries>)>()
+/// The gallery cache hit rule (CDN_KEYS_CACHE): an entry serves a request whose refs match while every requested run's stamp covers what the client knows ([`crate::state::stamp_covers`]).
+fn cdn_cache_hit(
+    entry_refs: &[SeriesRef],
+    entry_stamps: &HashMap<String, u64>,
+    request_refs: &[SeriesRef],
+    known: &HashMap<String, u64>,
+) -> bool {
+    entry_refs == request_refs
+        && request_refs.iter().all(|series| {
+            crate::state::stamp_covers(
+                entry_stamps.get(&series.run_id).copied(),
+                known.get(&series.run_id).copied(),
+            )
+        })
+}
+
+fn cdn_cache_heap_bytes(
+    refs: &Vec<SeriesRef>,
+    stamps: &HashMap<String, u64>,
+    series: &Vec<CdnSeries>,
+) -> usize {
+    let mut bytes = std::mem::size_of::<(Vec<SeriesRef>, HashMap<String, u64>, Vec<CdnSeries>)>()
         .saturating_add(
             refs.capacity()
                 .saturating_mul(std::mem::size_of::<SeriesRef>()),
         )
+        .saturating_add(crate::state::chart_sync::string_map_heap_bytes(stamps))
         .saturating_add(
             series
                 .capacity()
@@ -131,9 +154,11 @@ pub struct CdnRunData {
 fn decorate_cdn_series(
     series: Vec<CdnSeries>,
     all_runs: &[crate::grpc::proto::RunInfo],
-    all_same_metric: bool,
     run_color: impl Fn(&str, u64) -> String,
 ) -> Vec<CdnRunData> {
+    let all_same_metric = series
+        .first()
+        .is_some_and(|first| series.iter().all(|s| s.metric_name == first.metric_name));
     series
         .into_iter()
         .map(|series| {
@@ -170,24 +195,12 @@ fn decorate_cdn_series(
         .collect()
 }
 
-/// Sorted, deduped run ids the bindings resolve to. Its own memo so the
-/// version-hash memos downstream recompute cheaply on every pushed event
-/// without re-resolving bindings.
-fn use_bound_run_ids(
-    bindings: Signal<Vec<MetricBinding>>,
-    max_runs: Signal<u32>,
-) -> Memo<Vec<String>> {
-    let state = use_context::<DashboardState>();
-    use_memo(move || {
-        let ctx = state.view_context();
-        let mut ids: Vec<String> =
-            resolve_capped_bindings(&bindings.read(), &ctx, *max_runs.read())
-                .into_iter()
-                .map(|r| r.run_id)
-                .collect();
-        ids.sort_unstable();
-        ids.dedup();
-        ids
+/// Whether every binding's runs are known without the project run list: `Specific` lists its own, `Selected` is the run page's URL run once one is set (else the selection, which the list defines), and `All` is the list.
+fn refs_known(bindings: &[MetricBinding], current_run: Option<&str>, runs_loaded: bool) -> bool {
+    bindings.iter().all(|binding| match &binding.runs {
+        RunRef::Specific(_) => true,
+        RunRef::Selected => current_run.is_some() || runs_loaded,
+        RunRef::All => runs_loaded,
     })
 }
 
@@ -654,15 +667,46 @@ fn AutoContent(
         max_runs_signal.set(options.max_runs);
     }
 
+    // ONE resolution pass per panel — AutoContent is the parent of every content viewer. The leaves query these refs, so a run list or names landing restarts nothing whose refs are unchanged.
+    let refs = use_memo(move || {
+        Rc::new(
+            resolve_capped_bindings(
+                &bindings_signal.read(),
+                &state.view_context(),
+                *max_runs_signal.read(),
+            )
+            .into_iter()
+            .map(|r| SeriesRef {
+                project_id: r.project_id,
+                run_id: r.run_id,
+                metric_name: r.metric_name,
+                tags: vec![],
+            })
+            .collect::<Vec<_>>(),
+        )
+    });
+    // The one readiness rule: hold the panel until its runs and their names are known.
+    let ready = use_memo(move || {
+        refs_known(
+            &bindings_signal.read(),
+            state.current_run.read().as_deref(),
+            *state.runs_loaded.read(),
+        ) && {
+            let known = state.known_runs();
+            refs.read()
+                .iter()
+                .all(|r| known.contains(&(r.project_id.clone(), r.run_id.clone())))
+        }
+    });
+
     // Registry-change key for the bound runs: a metric's TYPE can only
     // change when its registry entry does (upgrade), so this re-detects
     // exactly then — not on every data flush. Split memos so a pushed
     // event recomputes only the integer hash, not the binding resolution.
-    let bound_run_ids = use_bound_run_ids(bindings_signal, max_runs_signal);
     let my_metrics_gen = use_memo(move || {
         crate::state::versions_key(
             *state.resync_gen.read(),
-            bound_run_ids.read().iter().map(String::as_str),
+            refs.read().iter().map(|r| r.run_id.as_str()),
             &state.metrics_gen.read(),
         )
     });
@@ -674,6 +718,8 @@ fn AutoContent(
         UseHint,
         Detected((bool, bool, bool)),
         RunUnavailable,
+        /// The panel was not ready, so nothing probed. A distinct value because `use_resource` keeps it through the restart that readiness triggers: on that frame it must keep showing "Loading...", not mount the hint's leaf.
+        Unready,
     }
 
     // Only do the expensive type detection when the hint is insufficient.
@@ -681,10 +727,9 @@ fn AutoContent(
         let cache_key = cache_key.clone();
         move || {
             let grpc = state.grpc.read().clone();
-            let ctx = state.view_context();
             let mg = *my_metrics_gen.read();
-            let bindings = bindings_signal.read().clone();
-            let max_runs = *max_runs_signal.read();
+            let refs = refs.read().clone();
+            let ready = *ready.read();
             let allowed = *type_allowed.read();
             let cache_key = cache_key.clone();
             let resolved_display_type = resolved_display_type;
@@ -696,7 +741,10 @@ fn AutoContent(
                 // A new binding set must not expose controls from the stale
                 // type while its probe is in flight.
                 note_resolved_display_type(resolved_display_type, None);
-                let refs = resolve_capped_bindings(&bindings, &ctx, max_runs);
+                // Not ready: the readiness flip restarts this resource.
+                if !ready {
+                    return TypeFetch::Unready;
+                }
                 let mut metric_names: Vec<String> =
                     refs.iter().map(|r| r.metric_name.clone()).collect();
                 metric_names.sort_unstable();
@@ -725,7 +773,7 @@ fn AutoContent(
                 let mut has_numeric = false;
                 let mut has_cdn = false;
                 let mut has_text = false;
-                for r in &refs {
+                for r in refs.iter() {
                     if detected_names.contains(&r.metric_name) {
                         continue;
                     }
@@ -770,16 +818,27 @@ fn AutoContent(
     let render_for_type = |dt: &DisplayType| -> Element {
         match dt {
             DisplayType::Cdn => rsx! {
-                CdnContent { bindings: bindings.clone(), max_runs: options.max_runs, chart_height: chart_height, cdn_display_mode: cdn_display_mode.clone(), loading: loading, cdn_class: cdn_class, metadata_diff_only: options.metadata_diff_only, zone: zone, cache_key: cache_key.clone() }
+                CdnContent { refs: refs, chart_height: chart_height, cdn_display_mode: cdn_display_mode.clone(), loading: loading, cdn_class: cdn_class, metadata_diff_only: options.metadata_diff_only, zone: zone, cache_key: cache_key.clone() }
             },
             DisplayType::TextStream => rsx! {
-                TextStreamContent { bindings: bindings.clone(), max_runs: options.max_runs, chart_height: chart_height, zone: zone, cache_key: cache_key.clone() }
+                TextStreamViewer { stream_refs: refs.read().to_vec(), height: chart_height, x_axis_mode: crate::state::layout_config::XAxisMode::RelativeTime, zone: Some(zone), persist_key: cache_key.clone() }
             },
             DisplayType::Numeric => rsx! {
-                NumericContent { bindings: bindings.clone(), log_x: log_x, log_y: log_y, chart_height: chart_height, color_version: color_version, options: options.clone(), loading: loading, zone: zone, cache_key: cache_key.clone() }
+                NumericContent { refs: refs, log_x: log_x, log_y: log_y, chart_height: chart_height, color_version: color_version, options: options.clone(), loading: loading, zone: zone, cache_key: cache_key.clone() }
             },
         }
     };
+
+    // Not ready: the fixed-height box holds the layout stable until the missing knowledge lands (the run list, a point lookup, or the URL run's record). No leaf is mounted, so nothing queried under it.
+    if !*ready.read() {
+        crate::state::heal_loading(loading);
+        return rsx! { div { class: "rect-loading", style: "height: {chart_height}px;", "Loading..." } };
+    }
+    // A ready panel with no refs has no runs to show: knowledge, not a wait. No leaf mounts.
+    if refs.read().is_empty() {
+        crate::state::heal_loading(loading);
+        return rsx! { div { class: "rect-empty", style: "height: {chart_height}px;", "No runs shown" } };
+    }
 
     let read = detected_types.read();
     match &*read {
@@ -790,13 +849,7 @@ fn AutoContent(
                 .filter(|&&x| x)
                 .count();
             if type_count > 1 {
-                // No leaf mounts here, so heal the shared loading flag: a
-                // leaf unmounted mid-fetch left it true, and only leaf
-                // bodies heal it — the spinner would spin forever.
-                if *loading.peek() {
-                    let mut loading = loading;
-                    loading.set(false);
-                }
+                crate::state::heal_loading(loading);
                 rsx! { div { class: "rect-error", "Cannot mix different metric types" } }
             } else if *has_text {
                 render_for_type(&DisplayType::TextStream)
@@ -809,19 +862,14 @@ fn AutoContent(
         // No type check needed — use hint
         Some(TypeFetch::UseHint) => render_for_type(&display_type_hint),
         Some(TypeFetch::RunUnavailable) => {
-            if *loading.peek() {
-                let mut loading = loading;
-                loading.set(false);
-            }
+            crate::state::heal_loading(loading);
             rsx! { div { class: "rect-empty", style: "height: {chart_height}px;", "Run no longer available" } }
         }
-        // Still loading
-        None => {
-            if !needs_type_check {
-                render_for_type(&display_type_hint)
-            } else {
-                rsx! { div { class: "rect-loading", style: "height: {chart_height}px;", "Loading..." } }
-            }
+        // Still loading, and no type check is needed: use the hint.
+        None if !needs_type_check => render_for_type(&display_type_hint),
+        // Still loading, or the not-ready value held through the readiness restart.
+        None | Some(TypeFetch::Unready) => {
+            rsx! { div { class: "rect-loading", style: "height: {chart_height}px;", "Loading..." } }
         }
     }
 }
@@ -829,14 +877,14 @@ fn AutoContent(
 #[derive(PartialEq)]
 enum CdnFetch {
     Pending,
-    Answer(Vec<CdnRunData>),
+    /// RAW key series: decoration happens at render, so the fetch and its cache hold no presentation state.
+    Answer(Vec<CdnSeries>),
     Unavailable,
 }
 
 #[component]
 fn CdnContent(
-    bindings: Vec<MetricBinding>,
-    max_runs: u32,
+    refs: Memo<Rc<Vec<SeriesRef>>>,
     #[props(default = 280)] chart_height: u32,
     #[props(default)] cdn_display_mode: CdnDisplayMode,
     loading: Signal<bool>,
@@ -847,21 +895,11 @@ fn CdnContent(
 ) -> Element {
     let state = use_context::<DashboardState>();
 
-    let mut bindings_signal = use_signal(|| bindings.clone());
-    if *bindings_signal.read() != bindings {
-        bindings_signal.set(bindings.clone());
-    }
-    let mut max_runs_signal = use_signal(|| max_runs);
-    if *max_runs_signal.read() != max_runs {
-        max_runs_signal.set(max_runs);
-    }
-
-    // Same version key, bridge, and visibility gating as NumericContent. Like the whole body, the gallery unmounts at Far; its data rebuilds from CDN_KEYS_CACHE and explicit navigation survives in cdn_gallery's bounded session stores (GALLERY_STEP / GALLERY_INDEX).
-    let bound_run_ids = use_bound_run_ids(bindings_signal, max_runs_signal);
+    // Same bridge and visibility gating as NumericContent, keyed on the bound runs' versions alone. Like the whole body, the gallery unmounts at Far; its data rebuilds from CDN_KEYS_CACHE and explicit navigation survives in cdn_gallery's bounded session stores (GALLERY_STEP / GALLERY_INDEX).
     let my_version = use_memo(move || {
         crate::state::versions_key(
             0,
-            bound_run_ids.read().iter().map(String::as_str),
+            refs.read().iter().map(|r| r.run_id.as_str()),
             &state.run_versions.read(),
         )
     });
@@ -870,9 +908,9 @@ fn CdnContent(
     let data_seq = crate::state::use_version_bridge(my_version, loading, allowed);
     let mut loading = loading;
 
-    // The (data_seq, refs) -> key-series memoization lives in CDN_KEYS_CACHE (module-level, survives this body unmounting at Far), so re-entering the band with nothing changed is network-free. Labels and colors are rebuilt from the live run list on every pass.
+    // The (refs, stamps) -> key-series memoization lives in CDN_KEYS_CACHE (module-level, survives this body unmounting at Far), so re-entering the band with nothing changed is network-free.
     // Written only by settled fetches, so deferred passes retain the last
-    // gallery; transient failures retry and terminal failures settle once.
+    // series; transient failures retry and terminal failures settle once.
     let mut fetch = use_signal(|| CdnFetch::Pending);
 
     let _fetch = use_resource({
@@ -880,55 +918,24 @@ fn CdnContent(
         move || {
             let cache_key = cache_key.clone();
             let grpc = state.grpc.read().clone();
-            let ctx = state.view_context();
-            let ds = *data_seq.read();
-            let bindings = bindings_signal.read().clone();
-            let max_runs = *max_runs_signal.read();
-            let all_runs = state.display_runs();
-            // Run colors live in localStorage, outside Dioxus. The sidebar bumps this signal after an override changes; tracking it here rebuilds presentation without querying the key series again.
-            let _color_version = *state.color_version.read();
+            // The refresh heartbeat: version-bump propagations (floored and gated in use_version_bridge) restart this resource through it. Only the subscription matters — entry validity is decided by cdn_cache_hit, not the key.
+            let _refresh = *data_seq.read();
+            let refs = refs.read().clone();
             let allowed = *allowed.read();
-            let runs_loaded = *state.runs_loaded.read();
             let mut cdn_class = cdn_class;
             async move {
-                // Heal a cancelled predecessor's flag (see NumericContent).
-                if *loading.peek() {
-                    loading.set(false);
-                }
+                crate::state::heal_loading(loading);
                 if !allowed {
                     return;
                 }
-                let refs = resolve_capped_bindings(&bindings, &ctx, max_runs);
-                if refs.is_empty() {
-                    // Before the first list_runs lands, empty refs mean "runs
-                    // unknown", not "no data" — keep showing "Loading..."
-                    // (same guard as NumericContent's).
-                    if runs_loaded
-                        && !matches!(&*fetch.peek(), CdnFetch::Answer(runs) if runs.is_empty())
-                    {
-                        fetch.set(CdnFetch::Answer(Vec::new()));
-                    }
-                    return;
-                }
-                let all_same_metric = refs.iter().all(|r| r.metric_name == refs[0].metric_name);
-
-                let series_refs: Vec<SeriesRef> = refs
-                    .iter()
-                    .map(|r| SeriesRef {
-                        project_id: r.project_id.clone(),
-                        run_id: r.run_id.clone(),
-                        metric_name: r.metric_name.clone(),
-                        tags: vec![],
-                    })
-                    .collect();
+                let series_refs = refs.to_vec();
 
                 let cached = CDN_KEYS_CACHE.with(|c| c.borrow_mut().get(&cache_key));
                 // Any cached entry = the gallery already shows something: a
                 // refresh, not a first paint, for gate purposes.
                 let first_paint = cached.is_none();
-                // Trigger-or-sent hit rule, exactly as in NumericContent's cache check.
-                let series = match cached.and_then(|(cds_trigger, cds_sent, crefs, cseries)| {
-                    ((cds_trigger == ds || cds_sent == ds) && crefs == series_refs)
+                let series = match cached.and_then(|(crefs, cstamps, cseries)| {
+                    cdn_cache_hit(&crefs, &cstamps, &series_refs, &state.run_versions.peek())
                         .then_some(cseries)
                 }) {
                     Some(series) => series,
@@ -936,15 +943,17 @@ fn CdnContent(
                         loading.set(true);
                         let response = visibility::retry_visible_run("cdn keys", async || {
                             let _hi = visibility::admit_fetch(|| *zone.peek(), first_paint).await;
-                            // Sent stamp peeked at send — see NumericContent for the soundness argument.
-                            let sent = *my_version.peek();
+                            let sent = crate::state::versions_of(
+                                &state.run_versions.peek(),
+                                series_refs.iter().map(|s| s.run_id.as_str()),
+                            );
                             grpc.query_cdn_keys(series_refs.clone())
                                 .await
-                                .map(|r| (sent, r))
+                                .map(|response| (sent, response))
                         })
                         .await;
                         loading.set(false);
-                        let (sent, series) = match response {
+                        let (sent, response) = match response {
                             Ok(result) => result,
                             Err(_) => {
                                 evict_panel_caches(&cache_key);
@@ -957,11 +966,17 @@ fn CdnContent(
                                 return;
                             }
                         };
-                        let weight = cdn_cache_heap_bytes(&series_refs, &series);
+                        let stamps = crate::state::answer_stamps(
+                            state.run_versions,
+                            response.run_versions,
+                            sent,
+                        );
+                        let series = response.series;
+                        let weight = cdn_cache_heap_bytes(&series_refs, &stamps, &series);
                         CDN_KEYS_CACHE.with(|c| {
                             c.borrow_mut().put_weighted(
                                 cache_key,
-                                (ds, sent, series_refs, series.clone()),
+                                (series_refs, stamps, series.clone()),
                                 weight,
                             )
                         });
@@ -969,14 +984,8 @@ fn CdnContent(
                     }
                 };
 
-                let result = decorate_cdn_series(
-                    series,
-                    &all_runs,
-                    all_same_metric,
-                    crate::components::uplot_chart::run_color,
-                );
-                if !matches!(&*fetch.peek(), CdnFetch::Answer(current) if current == &result) {
-                    fetch.set(CdnFetch::Answer(result));
+                if !matches!(&*fetch.peek(), CdnFetch::Answer(current) if current == &series) {
+                    fetch.set(CdnFetch::Answer(series));
                 }
             }
         }
@@ -984,10 +993,18 @@ fn CdnContent(
 
     let shown = fetch.read();
     match &*shown {
-        CdnFetch::Answer(run_data) => {
+        CdnFetch::Answer(series) => {
+            // Decoration at render: names, ordinals and colors come from the live run list and the color overrides, so the resource above fetches and caches RAW key series only, and a metadata change re-decorates without restarting or cancelling the key query.
+            // Run colors live in localStorage, outside Dioxus. The sidebar bumps this signal after an override changes; tracking it here rebuilds presentation without querying the key series again.
+            let _color_version = *state.color_version.read();
+            let run_data = decorate_cdn_series(
+                series.clone(),
+                &state.display_runs(),
+                crate::components::uplot_chart::run_color,
+            );
             let mode = cdn_display_mode.clone();
             rsx! {
-                CdnGallery { runs: run_data.clone(), height: chart_height, display_mode: mode, cdn_class: cdn_class, metadata_diff_only: metadata_diff_only, persist_key: cache_key.clone() }
+                CdnGallery { runs: run_data, height: chart_height, display_mode: mode, cdn_class: cdn_class, metadata_diff_only: metadata_diff_only, persist_key: cache_key.clone() }
             }
         }
         CdnFetch::Unavailable => rsx! {
@@ -999,47 +1016,39 @@ fn CdnContent(
     }
 }
 
-#[component]
-fn TextStreamContent(
-    bindings: Vec<MetricBinding>,
-    max_runs: u32,
-    #[props(default = 280)] chart_height: u32,
-    zone: Signal<Zone>,
-    cache_key: String,
-) -> Element {
-    let state = use_context::<DashboardState>();
-    let ctx = state.view_context();
-    let refs = resolve_capped_bindings(&bindings, &ctx, max_runs);
-
-    if refs.is_empty() {
-        // Before the first list_runs lands, empty refs mean "runs unknown"
-        // (same guard as NumericContent's).
-        if !*state.runs_loaded.read() {
-            return rsx! { div { class: "rect-loading", style: "height: {chart_height}px;", "Loading..." } };
-        }
-        return rsx! { div { class: "rect-empty", style: "height: {chart_height}px;", "No runs shown" } };
-    }
-
-    let stream_refs: Vec<(String, String, String)> = refs
-        .iter()
-        .map(|r| {
-            (
-                r.project_id.clone(),
-                r.run_id.clone(),
-                r.metric_name.clone(),
-            )
-        })
-        .collect();
-
-    rsx! {
-        TextStreamViewer { stream_refs: stream_refs, height: chart_height, x_axis_mode: crate::state::layout_config::XAxisMode::RelativeTime, zone: Some(zone), persist_key: cache_key }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{cdn_cache_heap_bytes, decorate_cdn_series, normalize_rect_label};
+    use super::{
+        cdn_cache_heap_bytes, cdn_cache_hit, decorate_cdn_series, normalize_rect_label, refs_known,
+    };
     use crate::grpc::proto::{CdnEntry, CdnSeries, RunInfo, RunStatus, SeriesRef};
+    use crate::state::layout_config::{MetricBinding, ProjectRef, RunRef};
+    use std::collections::HashMap;
+
+    fn binding(runs: RunRef) -> MetricBinding {
+        MetricBinding {
+            project: ProjectRef::Current,
+            runs,
+            metric_name: "loss".to_string(),
+        }
+    }
+
+    #[test]
+    fn refs_known_needs_the_list_only_for_selected_without_a_run_and_all() {
+        let specific = || binding(RunRef::Specific(vec!["r".into()]));
+        let selected = || binding(RunRef::Selected);
+        let all = || binding(RunRef::All);
+
+        // Before the list lands, only Specific (and Selected on a run page) is known.
+        assert!(refs_known(&[specific()], None, false));
+        assert!(!refs_known(&[selected()], None, false));
+        assert!(!refs_known(&[all()], None, false));
+        assert!(refs_known(&[selected(), specific()], Some("run"), false));
+        assert!(!refs_known(&[all()], Some("run"), false));
+
+        // The list landing makes every form known, run page or not.
+        assert!(refs_known(&[selected(), all()], None, true));
+    }
 
     fn cdn_series(metric_name: &str) -> CdnSeries {
         CdnSeries {
@@ -1073,17 +1082,18 @@ mod tests {
     #[test]
     fn cdn_decoration_reapplies_run_colors_without_changing_data() {
         let series = vec![cdn_series("images")];
-        let first = decorate_cdn_series(series.clone(), &[run()], true, |_, _| "#111111".into());
-        let recolored =
-            decorate_cdn_series(series.clone(), &[run()], true, |_, _| "#222222".into());
+        let first = decorate_cdn_series(series.clone(), &[run()], |_, _| "#111111".into());
+        let recolored = decorate_cdn_series(series, &[run()], |_, _| "#222222".into());
 
         assert_eq!(first[0].label, "Named");
         assert_eq!(first[0].keys, recolored[0].keys);
         assert_eq!(first[0].color, "#111111");
         assert_eq!(recolored[0].color, "#222222");
 
-        let mixed_a = decorate_cdn_series(series.clone(), &[run()], false, |_, _| "#111111".into());
-        let mixed_b = decorate_cdn_series(series, &[run()], false, |_, _| "#222222".into());
+        // Mixed metrics label and color by run/metric instead.
+        let mixed = vec![cdn_series("images"), cdn_series("masks")];
+        let mixed_a = decorate_cdn_series(mixed.clone(), &[run()], |_, _| "#111111".into());
+        let mixed_b = decorate_cdn_series(mixed, &[run()], |_, _| "#222222".into());
         assert_eq!(mixed_a[0].label, "Named/images");
         assert_eq!(mixed_a[0].color, mixed_b[0].color);
     }
@@ -1091,10 +1101,7 @@ mod tests {
     #[test]
     fn cdn_decoration_marks_ended_runs() {
         let ended = |runs: &[RunInfo]| {
-            decorate_cdn_series(vec![cdn_series("images")], runs, true, |_, _| {
-                "#111111".into()
-            })[0]
-                .ended
+            decorate_cdn_series(vec![cdn_series("images")], runs, |_, _| "#111111".into())[0].ended
         };
         let with = |status: RunStatus| RunInfo {
             status: status as i32,
@@ -1118,16 +1125,55 @@ mod tests {
             metric_name: "images".into(),
             tags: vec!["tag".into()],
         }];
+        let stamps = HashMap::from([("run".to_string(), 7u64)]);
         let mut series = vec![cdn_series("images")];
-        let one_key = cdn_cache_heap_bytes(&refs, &series);
+        let one_key = cdn_cache_heap_bytes(&refs, &stamps, &series);
 
         series[0].entries.push(CdnEntry {
             step: 8,
             cdn_key: "x".repeat(256),
         });
-        let two_keys = cdn_cache_heap_bytes(&refs, &series);
+        let two_keys = cdn_cache_heap_bytes(&refs, &stamps, &series);
 
-        assert!(one_key > std::mem::size_of::<(u64, u64)>());
         assert!(two_keys >= one_key.saturating_add(256));
+    }
+
+    fn cdn_ref(run: &str) -> SeriesRef {
+        SeriesRef {
+            project_id: "project".into(),
+            run_id: run.into(),
+            metric_name: "images".into(),
+            tags: vec![],
+        }
+    }
+
+    #[test]
+    fn cdn_cache_hit_needs_matching_refs_and_covering_stamps() {
+        let request = vec![cdn_ref("a"), cdn_ref("b")];
+        let stamped: HashMap<String, u64> = [("a".into(), 5), ("b".into(), 5)].into();
+        let at = |a: u64, b: u64| HashMap::from([("a".to_string(), a), ("b".to_string(), b)]);
+
+        assert!(cdn_cache_hit(&request, &stamped, &request, &at(3, 0)));
+        // One run above its stamp suffices: the reply may predate that version's rows.
+        assert!(!cdn_cache_hit(&request, &stamped, &request, &at(5, 6)));
+        // Refs are the entry's identity: added, dropped, or reordered refs never hit.
+        assert!(!cdn_cache_hit(
+            &request,
+            &stamped,
+            &[cdn_ref("a")],
+            &at(5, 5)
+        ));
+        assert!(!cdn_cache_hit(
+            &request,
+            &stamped,
+            &[cdn_ref("b"), cdn_ref("a")],
+            &at(5, 5)
+        ));
+        assert!(!cdn_cache_hit(
+            &[cdn_ref("a")],
+            &[("a".into(), 5)].into(),
+            &request,
+            &at(5, 5)
+        ));
     }
 }
