@@ -179,7 +179,7 @@ mod tests {
         );
         for target in [SupportedTarget::MacosArm64, SupportedTarget::LinuxX86_64] {
             let artifacts = for_target(target).unwrap();
-            assert_eq!(artifacts.postgresql.version, "17.10.0");
+            assert_eq!(artifacts.postgresql.version, "17.11.0");
             assert_eq!(artifacts.clickhouse.version, "25.3.14.14");
             assert!(artifacts.postgresql.url.starts_with("https://github.com/"));
             assert!(artifacts.clickhouse.url.starts_with("https://github.com/"));

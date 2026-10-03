@@ -1,19 +1,19 @@
 {
   "schema_version": 1,
   "postgresql": {
-    "version": "17.10.0",
-    "base_url": "https://github.com/theseus-rs/postgresql-binaries/releases/download/17.10.0",
+    "version": "17.11.0",
+    "base_url": "https://github.com/NovelAI/kymo/releases/download/postgresql-17.11.0",
     "targets": {
       "macos-arm64": {
-        "filename": "postgresql-17.10.0-aarch64-apple-darwin.tar.gz",
-        "size": 12711817,
-        "sha256": "e15b5d3b86363d51fe06c9f26ee1d35d09b13951be82641b8f4b2d0e06e2c51e",
+        "filename": "postgresql-17.11.0-macos-arm64.tar.gz",
+        "size": 9256349,
+        "sha256": "33e8729acdc4fcb624dada99012fdf1085328205621d9c4023517052d38cf772",
         "format": "tar-gz-tree"
       },
       "linux-x86_64": {
-        "filename": "postgresql-17.10.0-x86_64-unknown-linux-gnu.tar.gz",
-        "size": 11752668,
-        "sha256": "333937dac26a33d367810b0db20892bbca6cf244f670e26f54f3e0b57dcb50b6",
+        "filename": "postgresql-17.11.0-linux-x86_64.tar.gz",
+        "size": 10480944,
+        "sha256": "43e9ae50cddf2d8f37810237bb6494dd750468995b37f241d8a41e449f42155e",
         "format": "tar-gz-tree"
       }
     }

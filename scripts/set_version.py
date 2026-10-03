@@ -5,7 +5,8 @@ import re
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+# The kymo tree: the public repository's root, or kymo/ in the monorepo.
+ROOT = next(path for path in Path(__file__).resolve().parents if (path / "local-runtime" / "Cargo.toml").is_file())
 PLACEHOLDERS = {
     "python_client/pyproject.toml": ['version = "0.0.0"', 'local = ["kymo-local-runtime==0.0.0"]'],
     "local-runtime/Cargo.toml": ['version = "0.0.0"'],

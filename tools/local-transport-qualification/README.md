@@ -1,15 +1,13 @@
 # Local transport qualification
 
-This standalone harness gates the transport assumptions in the AI-1433 local-deployment plan before they become launcher architecture. It is intentionally outside the main Cargo workspace: `postgresql_embedded` currently depends on SQLx 0.9, while `kymo-server` uses SQLx 0.8, and a release qualification tool should not add that duplicate dependency or database downloads to normal server builds.
+This standalone harness gates the transport assumptions in the AI-1433 local-deployment plan before they become launcher architecture. It is intentionally outside the main Cargo workspace, so its dependencies stay out of normal server builds. PostgreSQL is qualified through the launcher itself, by `runtime_qualification.py`.
 
-Artifact versions and hashes come from `../../shared/local-runtime-artifacts.json`, while database configuration comes from `../../local-runtime/core`. The qualification harness and launcher cannot silently drift to different release inputs or laptop profiles.
+The ClickHouse version and hashes come from `../../shared/local-runtime-artifacts.json`, and its configuration from `../../local-runtime/core`, so the harness and launcher cannot silently drift to different release inputs or laptop profiles.
 
 The browser fixtures share `fences_common.py` for the frozen WebSocket envelope and a two-animation-frame barrier. It has no protobuf or Playwright imports: each fixture owns its generated messages, response behavior, and RPC waiting rules. New fixtures should reuse this module rather than introducing another framing implementation. Run its golden wire vectors with `python -m unittest -v test_fences_common`.
 
 ## Frozen inputs
 
-- `postgresql_embedded` 0.21.0.
-- PostgreSQL archive 17.10.0 from `theseus-rs/postgresql-binaries`.
 - ClickHouse 25.3.14.14 LTS, matching the exact production server version when this harness was introduced.
 - ClickHouse crate 0.13.3, matching `kymo-server`.
 - grpcio and httpx from the supported `kymo` dependency range.
@@ -18,9 +16,8 @@ The browser fixtures share `fences_common.py` for the frozen WebSocket envelope 
 
 ## What it proves
 
-1. `postgresql_embedded` installs PostgreSQL 17, starts it with `listen_addresses=''`, connects through its generated Unix-socket URL, exposes no TCP listener, creates a mode-private socket, stops, restarts the same data directory, and reads a persisted marker.
-2. The exact ClickHouse binary starts with only one loopback HTTPS listener, a disabled default user, and a generated certificate trusted as the sole Rustls root by a custom Hyper client passed to `clickhouse::Client::with_http_client`. Missing credentials, a different certificate, and plaintext HTTP all fail. `SYSTEM SHUTDOWN` exits the directly supervised process group.
-3. tonic and grpcio exchange unary and bidi messages over a mode-0600 Unix socket. Axum and httpx exchange bounded and streaming bodies over a second socket. Oversized messages are rejected, cancellation reaches the tonic handler, and an overlong socket path fails.
+1. The exact ClickHouse binary starts with only one loopback HTTPS listener, a disabled default user, and a generated certificate trusted as the sole Rustls root by a custom Hyper client passed to `clickhouse::Client::with_http_client`. Missing credentials, a different certificate, and plaintext HTTP all fail. `SYSTEM SHUTDOWN` exits the directly supervised process group.
+2. tonic and grpcio exchange unary and bidi messages over a mode-0600 Unix socket. Axum and httpx exchange bounded and streaming bodies over a second socket. Oversized messages are rejected, cancellation reaches the tonic handler, and an overlong socket path fails.
 
 The test sets `CLICKHOUSE_WATCHDOG_ENABLE=0`. Without it, ClickHouse forks a watchdog arrangement and the spawned process handle does not prove ownership of the surviving server. Standalone ClickHouse configuration omits disabled listener elements entirely; merge-only `remove="1"` elements are invalid in a standalone file.
 
@@ -37,11 +34,9 @@ cargo run --locked -- \
   --python "$(command -v python3)"
 ```
 
-Pass `--state-dir PATH` to retain the downloaded PostgreSQL installation between runs. Use a short path because filesystem Unix sockets have a platform-specific path-length limit.
-
 ## Runtime qualification
 
-`runtime_qualification.py` qualifies an installed `kymo-local-runtime` wheel end to end: installation, the open hold, port conflicts and crash recovery, the live client integration, and the offline dashboard with frontend-aware idle shutdown. Its docstring lists the phases; the wheel must be built with the CI-only `test-idle-timeout` feature.
+`runtime_qualification.py` qualifies an installed `kymo-local-runtime` wheel end to end; its docstring lists the phases, and the wheel must be built with the CI-only `test-idle-timeout` feature.
 
 ## Browser fences
 

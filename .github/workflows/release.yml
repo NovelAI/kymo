@@ -205,6 +205,8 @@ jobs:
           name: frontend
           path: ${{ env.KYMO_FRONTEND_BUNDLE_DIR }}
       - run: python -m pip install 'maturin==1.14.1'
+      # The upgrade phase needs a launcher newer than the release it upgrades from, as any release is.
+      - run: scripts/set_version.py 2099.1.1
       # Built like the shipped macOS wheel, plus the CI-only feature.
       - working-directory: local-runtime
         env:
@@ -218,6 +220,7 @@ jobs:
       - run: python tools/local-transport-qualification/runtime_qualification.py integration
       - run: python tools/local-transport-qualification/runtime_qualification.py seed
       - run: python tools/local-transport-qualification/runtime_qualification.py browser
+      - run: python tools/local-transport-qualification/runtime_qualification.py upgrade
 
   # The internal CI qualifies the transports on Linux x86-64.
   transport-qualification:
@@ -239,9 +242,7 @@ jobs:
           tool: protoc@3.36
       - run: python -m pip install 'grpcio>=1.81.0,<2' 'httpx>=0.27.0'
       - run: python download_clickhouse.py --output "$RUNNER_TEMP/clickhouse"
-      - env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: cargo run --locked -- --clickhouse-binary "$RUNNER_TEMP/clickhouse" --python "$(command -v python)" --state-dir "$RUNNER_TEMP/m2q"
+      - run: cargo run --locked -- --clickhouse-binary "$RUNNER_TEMP/clickhouse" --python "$(command -v python)"
 
   # One job per project and index: a pending publisher is unique per workflow and environment, so each new project needs its own environment.
   testpypi:

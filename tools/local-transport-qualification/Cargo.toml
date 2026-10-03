@@ -17,11 +17,9 @@ futures = "0.3"
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 kymo-local-runtime-core = { path = "../../local-runtime/core" }
-postgresql_embedded = { version = "=0.21.0", default-features = false, features = ["theseus", "tls-rustls-ring", "tokio"] }
 prost = "0.14"
 rcgen = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring"] }
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }

@@ -8,8 +8,9 @@ Run the phases in order against a fresh KYMO_LOCAL_ROOT, with the wheel and the 
     python runtime_qualification.py integration
     python runtime_qualification.py seed
     python runtime_qualification.py browser
+    python runtime_qualification.py upgrade
 
-The internal Linux CI and the public repository's macOS release job both run these phases.
+The internal Linux CI and the public repository's macOS release job both run these phases. `upgrade` installs the `UPGRADE_FROM` release from PyPI, so it needs the network, and a wheel stamped with a newer version (`scripts/set_version.py`).
 """
 
 import fcntl
@@ -21,8 +22,10 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
+from textwrap import dedent
 from urllib.request import urlopen
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -33,6 +36,8 @@ MANIFEST = ROOT / "state/runtime.json"
 SUPERVISOR_LOG = ROOT / "state/supervisor.log"
 # Logged when an idle stop begins, well before runtime.json shows the stop.
 IDLE_STOP_MARKER = "local stack reached idle shutdown after "
+# The newest release whose PostgreSQL build this catalog replaces; installations it made must upgrade in place.
+UPGRADE_FROM = "2026.9.30"
 
 
 def manifest():
@@ -375,6 +380,100 @@ def offline_browser():
         raise fence_errors[0]
 
 
+def upgrade():
+    # A release's installation, with data, moves to this build's databases at its next start; until then this build attaches to its running stack, and stopping it fences nothing out.
+    work = pathlib.Path(tempfile.mkdtemp(prefix="kymo-upgrade-", dir=ROOT.parent))
+    root = work / "root"
+    env = {
+        **os.environ,
+        "KYMO_LOCAL_ROOT": str(root),
+        "KYMO_SPOOL_DIR": str(work / "spool"),
+    }
+    # The release's ClickHouse is this build's, and the earlier phases cached it: do not download it again.
+    root.mkdir(mode=0o700)
+    shutil.copytree(ROOT / "cache", root / "cache")
+    release = work / "release"
+    subprocess.check_call([sys.executable, "-m", "venv", release])
+    subprocess.check_call(
+        [
+            release / "bin/python",
+            "-m",
+            "pip",
+            "install",
+            "--quiet",
+            f"kymo[local]=={UPGRADE_FROM}",
+        ]
+    )
+    log_run = work / "log_run.py"
+    log_run.write_text(
+        dedent("""\
+            import sys
+
+            import kymo
+
+            if __name__ == "__main__":
+                kymo.init(mode="local", project_id="upgrade", run_name=sys.argv[1])
+                for step in range(100):
+                    kymo.log({"loss": 1.0 / (step + 1)}, step=step)
+                kymo.finish()
+            """)
+    )
+    subprocess.check_call([release / "bin/python", log_run, "before"], env=env)
+    installed = json.loads((root / "state/runtime.json").read_text())
+    assert installed["running"], installed
+    catalog = json.loads((KYMO / "shared/local-runtime-artifacts.json").read_text())[
+        "postgresql"
+    ]
+    # Otherwise nothing below would be replaced, and the phase would prove nothing.
+    assert installed["postgresql"]["version"] != catalog["version"], installed
+
+    endpoints = json.loads(
+        subprocess.check_output(["kymo", "ensure", "--json"], env=env)
+    )
+    attached = json.loads((root / "state/runtime.json").read_text())
+    assert (
+        endpoints["endpoint_generation"] == installed["running"]["generation_uuid"]
+    ), endpoints
+    assert attached["postgresql"] == installed["postgresql"], attached
+    subprocess.check_call(["kymo", "stop"], env=env)
+    stopped = json.loads((root / "state/runtime.json").read_text())
+    assert stopped["launcher_version"] == UPGRADE_FROM, stopped
+
+    subprocess.check_call([sys.executable, log_run, "after"], env=env)
+    upgraded = json.loads((root / "state/runtime.json").read_text())
+    assert upgraded["postgresql"]["version"] == catalog["version"], upgraded
+    for key in ("installation_uuid", "dashboard_port", "cdn_port", "clickhouse"):
+        assert upgraded[key] == installed[key], key
+    read = dedent("""\
+        import kymo
+
+        if __name__ == "__main__":
+            api = kymo.Api(mode="local")
+            print(sorted(run.name for run in api.runs("upgrade")))
+            api.close()
+        """)
+    assert (
+        subprocess.check_output(
+            [sys.executable, "-c", read], env=env, text=True
+        ).strip()
+        == "['after', 'before']"
+    )
+    refused = subprocess.run(
+        [release / "bin/kymo", "ensure", "--json"],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert (
+        refused.returncode != 0 and "refusing launcher downgrade" in refused.stderr
+    ), refused
+    subprocess.check_call(["kymo", "stop"], env=env)
+    shutil.rmtree(work)
+    print(
+        f"an installation by {UPGRADE_FROM} upgraded in place to PostgreSQL {catalog['version']}"
+    )
+
+
 PHASES = {
     "install": install,
     "open-hold": open_hold,
@@ -382,6 +481,7 @@ PHASES = {
     "integration": integration,
     "seed": seed,
     "browser": offline_browser,
+    "upgrade": upgrade,
 }
 
 if __name__ == "__main__":

@@ -66,7 +66,7 @@ The dashboard and CDN ports are stable across idle stops and restarts. Startup b
 
 Keep the Python client `kymo` as a universal pure-Python distribution and ship the native launcher and server as the platform wheel `kymo-local-runtime`, which the client's `local` extra pins to exactly the client's version. Release builds must never enable the CI-only `test-idle-timeout` feature.
 
-ClickHouse is downloaded rather than placed in the wheel because its installed binary is roughly 560 MB and PyPI's ordinary wheel limit is 100 MB. The artifact catalog freezes target, URL, version, archive size, and archive digest, plus ClickHouse's installed digest (its macOS asset expands itself on first run). PostgreSQL installs are validated by reported version and, on macOS, code signatures. Archives are streamed through bounded verified downloads and confined extraction. The supported runtime wheel must remain below 100 MB.
+ClickHouse is downloaded rather than placed in the wheel because its installed binary is roughly 560 MB and PyPI's ordinary wheel limit is 100 MB. The artifact catalog freezes target, URL, version, archive size, and archive digest, plus ClickHouse's installed digest (its macOS asset expands itself on first run). PostgreSQL is built from upstream source by `local-runtime/postgresql/build.sh` without optional libraries, so it needs only the C library at the wheel's floor (glibc 2.28, macOS 11.0) and the host's timezone database; the `postgresql` workflow checks that, smoke-tests it on bare AlmaLinux 8 and Ubuntu 26.04, and publishes it as an immutable release for the catalog to pin. PostgreSQL installs are validated by reported version and, on macOS, code signatures. Archives are streamed through bounded verified downloads and confined extraction. The supported runtime wheel must remain below 100 MB.
 
 Build the local frontend with the same `dx bundle --release --cargo-args=--locked` path used by the hosted image, with the `local-runtime` feature selecting runtime endpoints. The wheel job consumes that release output and passes it to the server's `local-bundle` build feature. The bundle must contain `index.html`; local startup fails closed if it is absent.
 
@@ -219,7 +219,7 @@ Also settled: a native launcher instead of Docker Compose (no Docker Desktop pre
 ## References
 
 - PostgreSQL 17 shutdown: <https://www.postgresql.org/docs/17/server-shutdown.html>
-- Portable PostgreSQL binaries: <https://github.com/theseus-rs/postgresql-binaries/releases>
+- PostgreSQL source releases: <https://www.postgresql.org/ftp/source/>
 - ClickHouse supported platforms: <https://clickhouse.com/support/platforms>
 - ClickHouse HTTP authentication: <https://clickhouse.com/docs/interfaces/http>
 - PyPI storage limits: <https://docs.pypi.org/project-management/storage-limits/>

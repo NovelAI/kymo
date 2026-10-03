@@ -14,8 +14,7 @@ jobs:
     strategy:
       matrix:
         include:
-          # Its host runs the catalog's current build for the upgrade smoke test. The theseus build needs Ubuntu 24.04's libraries; once the catalog pins our build, any runner works.
-          - {target: linux-x86_64, runner: ubuntu-24.04}
+          - {target: linux-x86_64, runner: ubuntu-latest}
           - {target: macos-arm64, runner: macos-15}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30

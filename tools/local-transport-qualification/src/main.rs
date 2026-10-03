@@ -2,7 +2,6 @@
 compile_error!("local transport qualification requires a Unix target");
 
 mod clickhouse;
-mod postgres;
 mod uds;
 
 use std::path::{Path, PathBuf};
@@ -12,13 +11,11 @@ use anyhow::{Context, Result, bail};
 struct Arguments {
     clickhouse_binary: PathBuf,
     python: PathBuf,
-    state_dir: Option<PathBuf>,
 }
 
 fn arguments() -> Result<Arguments> {
     let mut clickhouse_binary = None;
     let mut python = PathBuf::from("python3");
-    let mut state_dir = None;
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
         match arg.to_str() {
@@ -30,14 +27,9 @@ fn arguments() -> Result<Arguments> {
             Some("--python") => {
                 python = PathBuf::from(args.next().context("--python requires a path")?);
             }
-            Some("--state-dir") => {
-                state_dir = Some(PathBuf::from(
-                    args.next().context("--state-dir requires a path")?,
-                ));
-            }
             Some("--help" | "-h") => {
                 println!(
-                    "usage: kymo-local-transport-qualification --clickhouse-binary PATH [--python PATH] [--state-dir PATH]"
+                    "usage: kymo-local-transport-qualification --clickhouse-binary PATH [--python PATH]"
                 );
                 std::process::exit(0);
             }
@@ -47,7 +39,6 @@ fn arguments() -> Result<Arguments> {
     Ok(Arguments {
         clickhouse_binary: clickhouse_binary.context("--clickhouse-binary is required")?,
         python,
-        state_dir,
     })
 }
 
@@ -64,24 +55,12 @@ async fn main() -> Result<()> {
         "ClickHouse binary does not exist: {}",
         clickhouse_binary.display()
     );
-    let temporary;
-    let root = if let Some(root) = args.state_dir {
-        std::fs::create_dir_all(&root)
-            .with_context(|| format!("create qualification state root {}", root.display()))?;
-        canonicalize_existing(&root, "qualification state root")?
-    } else {
-        temporary = tempfile::Builder::new()
-            .prefix("m2q")
-            .tempdir_in("/tmp")
-            .context("create short qualification state root under /tmp")?;
-        canonicalize_existing(temporary.path(), "qualification state root")?
-    };
+    let temporary = tempfile::Builder::new()
+        .prefix("m2q")
+        .tempdir_in("/tmp")
+        .context("create short qualification state root under /tmp")?;
+    let root = canonicalize_existing(temporary.path(), "qualification state root")?;
     uds::make_private_dir(&root)?;
-
-    let postgres_version = postgres::qualify(&root.join("postgres")).await?;
-    println!(
-        "PASS PostgreSQL {postgres_version} socket-only startup, persistence, and permissions"
-    );
 
     clickhouse::qualify(&root.join("clickhouse"), &clickhouse_binary).await?;
     println!("PASS ClickHouse pinned HTTPS, authentication, listener isolation, and shutdown");
@@ -110,15 +89,11 @@ mod tests {
             .unwrap();
         let binary = temporary.path().join("clickhouse");
         std::fs::write(&binary, b"clickhouse").unwrap();
-        let relative_root = temporary.path().strip_prefix(&current).unwrap();
         let relative_binary = binary.strip_prefix(&current).unwrap();
 
-        let root = canonicalize_existing(relative_root, "qualification state root").unwrap();
         let binary = canonicalize_existing(relative_binary, "ClickHouse binary").unwrap();
 
-        assert!(root.is_absolute());
         assert!(binary.is_absolute());
-        assert_eq!(root, std::fs::canonicalize(temporary.path()).unwrap());
         assert_eq!(
             binary,
             std::fs::canonicalize(temporary.path().join("clickhouse")).unwrap()
