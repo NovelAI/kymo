@@ -1467,6 +1467,8 @@ input[type="checkbox"]:checked::before {
     display: flex;
     flex-direction: column;
     gap: var(--spacing-xs);
+    /* Query container for .cdn-file-group video. It doesn't contain layout, so the lightbox inside stays fixed to the viewport. */
+    container-type: size;
 }
 
 .cdn-gallery-content > .cdn-image-grid {
@@ -1622,6 +1624,18 @@ input[type="checkbox"]:checked::before {
 .cdn-file-link:hover {
     text-decoration: underline;
 }
+
+/* 16:9 so the box doesn't jump when playback loads the real size. Its height reserves the source label and file link lines, the group's two 4px gaps above the player, and the file list's and group's padding, so a player that is its group's first item shows its controls without scrolling, unless a pending-upload line sits above it. The 90px floor is the height where Chromium still shows play and the seek bar (at 160×90); a shorter panel scrolls instead. */
+.cdn-file-group video {
+    align-self: flex-start;
+    height: clamp(90px, 100cqh - 2lh - 8px - 4 * var(--spacing-xs), (100cqw - 2 * var(--spacing-xs)) * 9 / 16);
+    aspect-ratio: 16 / 9;
+    max-width: 100%;
+    background: #000;
+    border-radius: 3px;
+}
+
+.cdn-file-group audio { width: 100%; }
 
 .cdn-index-nav {
     display: flex;

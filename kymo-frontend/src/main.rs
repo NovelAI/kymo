@@ -38,6 +38,8 @@ const MATERIAL_ICONS_LICENSE: Asset = asset!("/assets/vendor/LICENSE-material-ic
 
 // Keyboard/assistive-tech activation arrives as a click with detail 0 (pointer clicks always have detail >= 1); replay it as the primary mousedown that controls activate on (util::primary, AI-1418). ARIA checkboxes also receive a matching mouseup so virtual activation cannot leave drag-paint armed. Physical pointer gestures never enter this listener. Guarded so a re-mount can't stack a second listener.
 const KB_ACTIVATE_JS: &str = r#"if(!window.__kymo_kbActivate){window.__kymo_kbActivate=1;document.addEventListener('click',(e)=>{if(e.detail!==0)return;const c=e.target.closest?.('[role="checkbox"]');if(c){c.dispatchEvent(new MouseEvent('mousedown',{bubbles:true,button:0}));c.dispatchEvent(new MouseEvent('mouseup',{bubbles:true,button:0}));return}const b=e.target.closest?.('button');if(b)b.dispatchEvent(new MouseEvent('mousedown',{bubbles:true,button:0}));});}"#;
+// One gallery player at a time: starting one pauses the others. In Chromium a player holds one of the CDN origin's six HTTP/1.1 connections while it plays and for 10-20 s after it pauses, and six held connections stall image loads from that origin. `play` doesn't bubble, hence capture. Guarded like KB_ACTIVATE_JS.
+const MEDIA_SOLO_JS: &str = r#"if(!window.__kymo_mediaSolo){window.__kymo_mediaSolo=1;document.addEventListener('play',(e)=>{for(const m of document.querySelectorAll('video,audio'))if(m!==e.target)m.pause();},true);}"#;
 const CHART_COPY_JS: &str = include_str!("components/uplot_chart/copy.js");
 const CHART_HIGHLIGHT_JS: &str = include_str!("components/uplot_chart/highlight.js");
 const CHART_HOVER_JS: &str = include_str!("components/uplot_chart/hover_points.js");
@@ -110,6 +112,7 @@ fn App() -> Element {
     rsx! {
         document::Script { src: UPLOT_JS }
         document::Script { {KB_ACTIVATE_JS} }
+        document::Script { {MEDIA_SOLO_JS} }
         document::Style { {font_faces()} }
         // The notice bar sits above the router so it survives navigation and covers every page
         // (sizing: kymo.css App Shell).

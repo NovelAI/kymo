@@ -707,8 +707,12 @@ fn MaximizeOverlay() -> Element {
         div {
             class: "maximize-overlay",
             // Focus on mount so keyboard navigation starts inside the overlay, not on the grid control (e.g. the Maximize button) left focused beneath it.
+            // Pause every player: the covered grid's panels stay mounted beneath the overlay (Near), and the overlay's own copies have only just mounted.
             tabindex: "-1",
-            onmounted: focus_on_mount,
+            onmounted: move |e| {
+                document::eval("for(const m of document.querySelectorAll('video,audio'))m.pause();");
+                focus_on_mount(e)
+            },
             // Dismiss on click (mouseup) can be annoying if you drag the x-axis and release in the border.
             onmousedown: primary(move |_| focus_chart(None)),
             div {

@@ -184,12 +184,28 @@ impl Manifest {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MediaKind {
+    Video,
+    Audio,
+}
+
 impl ManifestItem {
     fn display_name(&self) -> &str {
         self.filename
             .as_deref()
             .filter(|filename| !filename.is_empty())
             .unwrap_or(&self.resource)
+    }
+
+    /// Which inline player this resource gets, by the CDN key's extension: the CDN serves that extension's MIME type (kymo-server/src/cdn.rs) whatever the filename says, and the client uploads an unlisted extension as `.bin`. `.ogg` is audio because the CDN serves it as audio/ogg.
+    fn media_kind(&self) -> Option<MediaKind> {
+        let (_, extension) = self.resource.rsplit_once('.')?;
+        match extension.to_ascii_lowercase().as_str() {
+            "mp4" | "webm" => Some(MediaKind::Video),
+            "mp3" | "wav" | "ogg" => Some(MediaKind::Audio),
+            _ => None,
+        }
     }
 }
 
@@ -655,6 +671,27 @@ fn GalleryRenderer(
                                         aria_label: "{accessible_label}",
                                         "{label}"
                                     }
+                                    // preload="none": nothing loads until the user presses play.
+                                    match item.media_kind() {
+                                        Some(MediaKind::Video) => rsx! {
+                                            video {
+                                                preload: "none",
+                                                controls: true,
+                                                playsinline: true,
+                                                src: "{url}",
+                                                aria_label: "{accessible_label}",
+                                            }
+                                        },
+                                        Some(MediaKind::Audio) => rsx! {
+                                            audio {
+                                                preload: "none",
+                                                controls: true,
+                                                src: "{url}",
+                                                aria_label: "{accessible_label}",
+                                            }
+                                        },
+                                        None => rsx! {},
+                                    }
                                 }
                             }
                         }
@@ -878,6 +915,32 @@ mod tests {
             gallery_file_link_label(unnamed.display_name(), "first run", 0, 0),
             "sha256-resource — file 1 from source 1 (first run)"
         );
+    }
+
+    #[test]
+    fn media_players_follow_the_cdn_key_extension() {
+        use super::MediaKind::{Audio, Video};
+        for (resource, kind) in [
+            ("ab.mp4", Some(Video)),
+            ("ab.webm", Some(Video)),
+            ("ab.MP4", Some(Video)),
+            ("ab.mp3", Some(Audio)),
+            ("ab.wav", Some(Audio)),
+            ("ab.ogg", Some(Audio)),
+            ("ab.png", None),
+            ("ab", None),
+            ("ab.", None),
+            ("ab.mp4.bin", None),
+            ("ab.bin", None),
+        ] {
+            // The filename never decides: the CDN serves the key's type.
+            let item = ManifestItem {
+                resource: resource.to_string(),
+                filename: Some("clip.mp4".to_string()),
+                caption: None,
+            };
+            assert_eq!(item.media_kind(), kind, "{resource}");
+        }
     }
 
     #[test]
