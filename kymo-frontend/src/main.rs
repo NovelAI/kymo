@@ -21,7 +21,11 @@ const THEME_BOOT: Asset = asset!(
 // Vendored uPlot draws _focus series last; uplot_chart/highlight.js sets that flag.
 // See assets/vendor/README.md for the patch's provenance.
 const UPLOT_JS: Asset = asset!("/assets/vendor/uPlot.iife.min.js");
-const UPLOT_CSS: Asset = asset!("/assets/vendor/uPlot.min.css");
+// Static head, not a runtime link: while a sheet is still loading, WebKit reports new elements to ResizeObserver at 0×0, and a callback that reads layout then raises a "ResizeObserver loop" notice.
+const UPLOT_CSS: Asset = asset!(
+    "/assets/vendor/uPlot.min.css",
+    AssetOptions::css().with_static_head(true)
+);
 const SOURCE_SANS_400: Asset = asset!("/assets/vendor/source-sans-pro-400.ttf");
 const SOURCE_SANS_600: Asset = asset!("/assets/vendor/source-sans-pro-600.ttf");
 const SOURCE_CODE_400: Asset = asset!("/assets/vendor/source-code-pro-400.ttf");
@@ -65,7 +69,7 @@ fn App() -> Element {
         MATERIAL_ICONS_LICENSE,
     );
     // Likewise for the static-head assets, which dx links from index.html.
-    let _static_head = (STYLE, THEME_BOOT);
+    let _static_head = (STYLE, THEME_BOOT, UPLOT_CSS);
     // Above the router so every page resolves the same preferences; construction applies the font size and theme (stored, else the OS's) before descendants mount.
     let user_config = use_context_provider(state::UserConfigState::new);
     state::use_os_theme(user_config);
@@ -106,7 +110,6 @@ fn App() -> Element {
     rsx! {
         document::Script { src: UPLOT_JS }
         document::Script { {KB_ACTIVATE_JS} }
-        document::Link { rel: "stylesheet", href: UPLOT_CSS }
         document::Style { {font_faces()} }
         // The notice bar sits above the router so it survives navigation and covers every page
         // (sizing: kymo.css App Shell).

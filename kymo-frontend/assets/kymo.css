@@ -192,7 +192,7 @@ input[type="checkbox"]:checked::before {
 }
 
 /* === Overflow Fade === */
-/* Overflowing text fades over its last 16px. util/overflow_fade.js sets data-overflow only while the content reaches past the box's right edge, so text that fits is never faded. Keep the text in an inline-block child, so an edit or font change resizes an observed element even when the box keeps its size; WebKit can also leave a box holding bare text at a stale width (seen in the Trash table's baseline-aligned grid when the web font swaps in). The mask also fades the box's own paint (background, focus ring) and clips descendants shown outside it, fixed ones included: use an unpainted box and turn the mask off for hover reveals. */
+/* Overflowing text fades over its last 16px. util/overflow_fade.js sets data-overflow only while the content reaches past the box's right edge, so text that fits is never faded. Keep the text in an inline-block child, so an edit or font change resizes an observed element even when the box keeps its size; WebKit can also leave a box holding bare text at a stale width (seen in the Trash table's baseline-aligned grid when the web font swaps in). The chart tooltip's name cells (.kymo-tip-name) are the exception: their rows are rebuilt wholesale, so a name never changes in place, and a child per row would add 1-3 ms per rebuild at 200 runs. The mask also fades the box's own paint (background, focus ring) and clips descendants shown outside it, fixed ones included: use an unpainted box and turn the mask off for hover reveals. */
 .fade-overflow {
     display: block;
     overflow: hidden;

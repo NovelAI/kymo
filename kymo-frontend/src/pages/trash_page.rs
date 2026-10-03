@@ -32,22 +32,16 @@ fn record_is(record: &RunRecord, project_id: &str, run_id: &str) -> bool {
         .is_some_and(|run| run.project_id == project_id && run.run_id == run_id)
 }
 
-fn expiry_time(ms: Option<i64>) -> (String, String) {
-    let Some(ms) = ms else {
-        return ("Scheduled".to_string(), String::new());
-    };
-    let datetime = js_sys::Date::new(&JsValue::from_f64(ms as f64))
+fn iso_time(ms: i64) -> String {
+    js_sys::Date::new(&JsValue::from_f64(ms as f64))
         .to_iso_string()
-        .as_string()
-        .unwrap_or_default();
-    (local_time(ms), datetime)
+        .into()
 }
 
 fn restore_failure(outcome: RestoreRunOutcome, detail: &str) -> String {
     match outcome {
         RestoreRunOutcome::Expired => "Recovery has expired; this run is being deleted.".into(),
         RestoreRunOutcome::NotFound => "This run no longer exists.".into(),
-        RestoreRunOutcome::Error if !detail.is_empty() => detail.to_string(),
         RestoreRunOutcome::Unknown => "The server returned an unknown restore result.".into(),
         _ if !detail.is_empty() => detail.to_string(),
         _ => "The run could not be restored.".into(),
@@ -489,7 +483,6 @@ fn trash_row(
             format!("Restore {run_name} #{ordinal} to project {project_id}"),
         )
     };
-    let (expires_at, expires_datetime) = expiry_time(record.purge_at_ms);
     let expires_in = match record.purge_at_ms {
         _ if is_expired => "Expired — deleting…".to_string(),
         Some(purge_at) => format!(
@@ -537,7 +530,11 @@ fn trash_row(
             }
             td { role: "cell",
                 div { class: "trash-run-expiry",
-                    time { datetime: "{expires_datetime}", "{expires_at}" }
+                    if let Some(ms) = record.purge_at_ms {
+                        time { datetime: "{iso_time(ms)}", "{local_time(ms)}" }
+                    } else {
+                        span { "Scheduled" }
+                    }
                     span { class: "trash-expiry-relative", "{expires_in}" }
                 }
             }
