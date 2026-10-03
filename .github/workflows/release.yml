@@ -205,8 +205,6 @@ jobs:
           name: frontend
           path: ${{ env.KYMO_FRONTEND_BUNDLE_DIR }}
       - run: python -m pip install 'maturin==1.14.1'
-      # The upgrade phase needs a launcher newer than the release it upgrades from, as any release is.
-      - run: scripts/set_version.py 2099.1.1
       # Built like the shipped macOS wheel, plus the CI-only feature.
       - working-directory: local-runtime
         env:
@@ -220,7 +218,6 @@ jobs:
       - run: python tools/local-transport-qualification/runtime_qualification.py integration
       - run: python tools/local-transport-qualification/runtime_qualification.py seed
       - run: python tools/local-transport-qualification/runtime_qualification.py browser
-      - run: python tools/local-transport-qualification/runtime_qualification.py upgrade
 
   # The internal CI qualifies the transports on Linux x86-64.
   transport-qualification:

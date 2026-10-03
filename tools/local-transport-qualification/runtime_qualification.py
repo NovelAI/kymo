@@ -10,7 +10,7 @@ Run the phases in order against a fresh KYMO_LOCAL_ROOT, with the wheel and the 
     python runtime_qualification.py browser
     python runtime_qualification.py upgrade
 
-The internal Linux CI and the public repository's macOS release job both run these phases. `upgrade` installs the `UPGRADE_FROM` release from PyPI, so it needs the network, and a wheel stamped with a newer version (`scripts/set_version.py`).
+The internal Linux CI runs every phase; the public repository's macOS release job runs all but `upgrade`. `upgrade` installs the `UPGRADE_FROM` release from PyPI, so it needs the network, and a wheel stamped with a newer version (`scripts/set_version.py`).
 """
 
 import fcntl
