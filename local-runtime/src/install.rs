@@ -21,7 +21,14 @@ use kymo_local_runtime_core::paths::{
 use sha2::{Digest, Sha256};
 use tar::Archive;
 
-const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+// A replacement holds up the start (and `kymo stop` waits for it), so past this budget the start keeps the recorded build; an explicit `kymo install` has no budget.
+const REPLACEMENT_BUDGET: Duration = Duration::from_secs(120);
+// Bounds each read, the response headers included, so a stalled server fails the install instead of hanging it.
+const DOWNLOAD_IDLE_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(60)
+};
 
 pub async fn install(paths: &RuntimePaths) -> Result<RuntimeManifest> {
     let artifacts = for_target(SupportedTarget::current()?)?;
@@ -33,11 +40,11 @@ pub async fn install(paths: &RuntimePaths) -> Result<RuntimeManifest> {
     install_locked(paths, &artifacts).await
 }
 
-pub async fn ensure_installed(
+pub(crate) async fn ensure_installed(
     paths: &RuntimePaths,
+    artifacts: &TargetArtifacts,
     allow_install: bool,
 ) -> Result<RuntimeManifest> {
-    let artifacts = for_target(SupportedTarget::current()?)?;
     if !allow_install
         && matches!(
             std::fs::symlink_metadata(paths.manifest()),
@@ -50,9 +57,10 @@ pub async fn ensure_installed(
     ensure_private_dir(&paths.downloads())?;
     ensure_private_dir(&paths.artifacts())?;
     let _install_lock = acquire_install_lock(paths)?;
+    // Recorded builds that are in place run as they are; a start replaces an earlier PostgreSQL build.
     if let Some(manifest) =
-        RuntimeManifest::read_optional_validated(paths, &artifacts, env!("CARGO_PKG_VERSION"))?
-        && installed_files_present(paths, &artifacts)?
+        RuntimeManifest::read_optional_validated(paths, artifacts, env!("CARGO_PKG_VERSION"))?
+        && installed_files_present(paths, &manifest)?
     {
         return Ok(manifest);
     }
@@ -61,7 +69,34 @@ pub async fn ensure_installed(
         "local database artifacts are not installed; run `kymo install`"
     );
     let _runtime_lock = crate::supervisor::acquire_runtime_lock(paths)?;
-    install_locked(paths, &artifacts).await
+    install_locked(paths, artifacts).await
+}
+
+/// Replace a recorded earlier build; the caller holds the runtime lock. On failure or timeout keep the recorded build, so an offline or slow start is not an outage; the start checks that it still runs, and later starts retry.
+pub(crate) async fn replace_predecessor(
+    paths: &RuntimePaths,
+    artifacts: &TargetArtifacts,
+    recorded: RuntimeManifest,
+) -> RuntimeManifest {
+    let error =
+        match tokio::time::timeout(REPLACEMENT_BUDGET, install_locked(paths, artifacts)).await {
+            Ok(Ok(manifest)) => return manifest,
+            Ok(Err(error)) => error,
+            Err(_) => anyhow::anyhow!("it took longer than {REPLACEMENT_BUDGET:?}"),
+        };
+    eprintln!("warning: keeping the installed databases; replacing them failed: {error:#}");
+    recorded
+}
+
+pub(crate) fn local_install_allowed() -> Result<bool> {
+    let value = std::env::var_os("KYMO_LOCAL_NO_INSTALL").unwrap_or_default();
+    match value.to_string_lossy().trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(false),
+        "0" | "false" | "no" | "off" | "" => Ok(true),
+        value => bail!(
+            "KYMO_LOCAL_NO_INSTALL must be one of 1/true/yes/on or 0/false/no/off, got {value:?}"
+        ),
+    }
 }
 
 pub(crate) fn acquire_install_lock(paths: &RuntimePaths) -> Result<File> {
@@ -71,10 +106,10 @@ pub(crate) fn acquire_install_lock(paths: &RuntimePaths) -> Result<File> {
     Ok(lock)
 }
 
-fn installed_files_present(paths: &RuntimePaths, artifacts: &TargetArtifacts) -> Result<bool> {
+fn installed_files_present(paths: &RuntimePaths, manifest: &RuntimeManifest) -> Result<bool> {
     let binaries = [
-        paths.postgresql_binary(&artifacts.postgresql.version),
-        paths.clickhouse_binary(&artifacts.clickhouse.version),
+        paths.postgresql_binary(&manifest.postgresql.version),
+        paths.clickhouse_binary(&manifest.clickhouse.version),
     ];
     if binaries.iter().any(|path| !path.is_file()) {
         return Ok(false);
@@ -103,6 +138,9 @@ async fn install_locked(
         .map(|manifest| (manifest.dashboard_port, manifest.cdn_port))
         .map_or_else(|| allocate_browser_ports(installation_uuid), Ok)?;
     install_postgresql(paths, &artifacts.postgresql).await?;
+    if paths.postgresql_data().join("PG_VERSION").exists() {
+        check_postgresql_data(paths, &artifacts.postgresql.version)?;
+    }
     install_clickhouse(paths, &artifacts.clickhouse).await?;
     let mut manifest = RuntimeManifest::installed(
         artifacts,
@@ -164,7 +202,7 @@ async fn install_clickhouse(paths: &RuntimePaths, artifact: &Artifact) -> Result
     recover_staging_directory(&staging)?;
     if destination.is_file() {
         validate_confined_regular_file(&paths.state, &destination)?;
-        validate_clickhouse(&destination, artifact)?;
+        validate_clickhouse(&destination, artifact.installed_sha256.as_deref())?;
         sync_dir(parent)?;
         return Ok(());
     }
@@ -185,7 +223,7 @@ async fn install_clickhouse(paths: &RuntimePaths, artifact: &Artifact) -> Result
         eprintln!("preparing ClickHouse executable");
         expand_and_validate_clickhouse(&candidate, &artifact.version)?;
     }
-    validate_clickhouse(&candidate, artifact)?;
+    validate_clickhouse(&candidate, artifact.installed_sha256.as_deref())?;
     File::open(&candidate)?.sync_all()?;
     let staged = staging.join("tree");
     std::fs::create_dir(&staged)?;
@@ -220,6 +258,8 @@ async fn download_verified(paths: &RuntimePaths, artifact: &Artifact) -> Result<
     eprintln!("downloading {} {}", artifact.product, artifact.version);
     let response = reqwest::Client::builder()
         .user_agent("kymo-local-runtime")
+        .connect_timeout(Duration::from_secs(10))
+        .read_timeout(DOWNLOAD_IDLE_TIMEOUT)
         .build()?
         .get(&artifact.url)
         .send()
@@ -243,10 +283,7 @@ async fn download_verified(paths: &RuntimePaths, artifact: &Artifact) -> Result<
     let mut digest = Sha256::new();
     let mut received = 0_u64;
     let mut stream = response.bytes_stream();
-    while let Some(chunk) = tokio::time::timeout(DOWNLOAD_IDLE_TIMEOUT, stream.next())
-        .await
-        .context("artifact download stalled")?
-    {
+    while let Some(chunk) = stream.next().await {
         let chunk = chunk.context("read artifact response")?;
         received = received
             .checked_add(chunk.len() as u64)
@@ -493,25 +530,50 @@ fn validate_digest(filename: &str, expected: &str, actual: &str) -> Result<()> {
     Ok(())
 }
 
+/// `postgres -C` reads the cluster's control file and configuration as a start does, without starting a server: a build that cannot open the cluster is never recorded. It reads the control file only for a runtime-computed parameter such as `data_checksums`; recheck that when moving PostgreSQL releases.
+fn check_postgresql_data(paths: &RuntimePaths, version: &str) -> Result<()> {
+    run_postgresql(
+        std::process::Command::new(paths.postgresql_binary(version))
+            .args(["-C", "data_checksums", "-D"])
+            .arg(paths.postgresql_data()),
+    )
+    .with_context(|| format!("PostgreSQL {version} cannot open the existing data directory"))?;
+    Ok(())
+}
+
 pub(crate) fn validate_postgresql(binary: &Path, expected_version: &str) -> Result<()> {
-    let output = std::process::Command::new(binary)
-        .arg("--version")
-        .output()
-        .with_context(|| format!("execute {}", binary.display()))?;
-    ensure!(output.status.success(), "PostgreSQL version check failed");
-    let version = String::from_utf8_lossy(&output.stdout);
-    let displayed_version = expected_version
-        .strip_suffix(".0")
-        .unwrap_or(expected_version);
+    let version = run_postgresql(std::process::Command::new(binary).arg("--version"))
+        .context("PostgreSQL version check failed")?;
+    // `postgres (PostgreSQL) 17.10` prints major.minor; catalog versions append a build number.
+    let release = expected_version
+        .rsplit_once('.')
+        .map_or(expected_version, |(release, _build)| release);
     ensure!(
-        version.contains(displayed_version),
+        version.split_whitespace().nth(2) == Some(release),
         "unexpected PostgreSQL version: {}",
         version.trim()
     );
     Ok(())
 }
 
-pub(crate) fn validate_clickhouse(binary: &Path, artifact: &Artifact) -> Result<()> {
+/// Run a PostgreSQL program with the stack's environment, so a library path set only in the caller cannot make a build look runnable; returns its standard output.
+fn run_postgresql(command: &mut std::process::Command) -> Result<String> {
+    let program = Path::new(command.get_program()).display().to_string();
+    let output = command
+        .env_clear()
+        .envs(crate::supervisor::stack_environment())
+        .output()
+        .with_context(|| format!("execute {program}"))?;
+    ensure!(
+        output.status.success(),
+        "{program} failed ({}): {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+pub(crate) fn validate_clickhouse(binary: &Path, installed_sha256: Option<&str>) -> Result<()> {
     let mode = std::fs::metadata(binary)
         .with_context(|| format!("stat {}", binary.display()))?
         .permissions()
@@ -520,10 +582,7 @@ pub(crate) fn validate_clickhouse(binary: &Path, artifact: &Artifact) -> Result<
         mode & 0o100 != 0,
         "installed ClickHouse binary is not owner-executable"
     );
-    let expected = artifact
-        .installed_sha256
-        .as_deref()
-        .context("ClickHouse installed digest is not frozen")?;
+    let expected = installed_sha256.context("ClickHouse installed digest is not frozen")?;
     let actual = sha256(binary)?;
     ensure!(
         actual == expected,
@@ -605,7 +664,10 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("kymo");
         let paths = RuntimePaths::under(root.clone()).unwrap();
-        let error = ensure_installed(&paths, false).await.unwrap_err();
+        let artifacts = for_target(SupportedTarget::current().unwrap()).unwrap();
+        let error = ensure_installed(&paths, &artifacts, false)
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("kymo install"));
         assert!(!root.exists());
     }
@@ -662,23 +724,14 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let binary = temporary.path().join("clickhouse");
         std::fs::write(&binary, b"clickhouse").unwrap();
-        let artifact = Artifact {
-            product: "clickhouse",
-            version: "1".to_owned(),
-            filename: "clickhouse".to_owned(),
-            url: "https://example.invalid/clickhouse".to_owned(),
-            archive_size: 10,
-            sha256: sha256(&binary).unwrap(),
-            installed_sha256: Some(sha256(&binary).unwrap()),
-            format: ArchiveFormat::Executable,
-        };
+        let digest = sha256(&binary).unwrap();
 
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let error = validate_clickhouse(&binary, &artifact).unwrap_err();
+        let error = validate_clickhouse(&binary, Some(&digest)).unwrap_err();
         assert!(error.to_string().contains("not owner-executable"));
 
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
-        validate_clickhouse(&binary, &artifact).unwrap();
+        validate_clickhouse(&binary, Some(&digest)).unwrap();
     }
 
     #[tokio::test]
@@ -714,6 +767,30 @@ mod tests {
         let downloaded = download_verified(&paths, &artifact).await.unwrap();
         server.join().unwrap();
         assert_eq!(std::fs::read(downloaded).unwrap(), b"exact");
+    }
+
+    #[tokio::test]
+    async fn a_server_that_never_answers_fails_the_download() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Accept and read the request, then hold the connection open without answering.
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            std::thread::sleep(DOWNLOAD_IDLE_TIMEOUT * 3);
+        });
+
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::under(temporary.path().join("kymo")).unwrap();
+        paths.prepare().unwrap();
+        ensure_private_dir(&paths.downloads()).unwrap();
+        let mut artifact = installed_artifacts().postgresql;
+        artifact.url = format!("http://127.0.0.1:{port}/archive");
+
+        let error = download_verified(&paths, &artifact).await.unwrap_err();
+        assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+        server.join().unwrap();
     }
 
     #[test]
@@ -813,6 +890,220 @@ mod tests {
             std::fs::read_link(output.join("lib/libpq.dylib")).unwrap(),
             Path::new("libpq.5.dylib")
         );
+    }
+
+    const FAKE_CLICKHOUSE: &[u8] = b"#!/bin/sh\n";
+
+    fn write_executable(path: &Path, contents: &[u8]) {
+        ensure_private_dir(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn fake_postgres(release: &str) -> Vec<u8> {
+        format!("#!/bin/sh\necho 'postgres (PostgreSQL) {release}'\n").into_bytes()
+    }
+
+    /// The catalog an installation was made from, with stand-in executables.
+    fn installed_artifacts() -> TargetArtifacts {
+        let artifact = |product, version: &str, filename: &str, format| Artifact {
+            product,
+            version: version.to_owned(),
+            filename: filename.to_owned(),
+            url: "https://example.invalid/archive".to_owned(),
+            archive_size: 1,
+            sha256: "0".repeat(64),
+            installed_sha256: None,
+            format,
+        };
+        let mut clickhouse = artifact(
+            "clickhouse",
+            "25.3.14.14",
+            "clickhouse-test",
+            ArchiveFormat::Executable,
+        );
+        clickhouse.installed_sha256 = Some(format!("{:x}", Sha256::digest(FAKE_CLICKHOUSE)));
+        TargetArtifacts {
+            postgresql: artifact(
+                "postgresql",
+                "17.10.0",
+                "postgresql-17.10.0-test.tar.gz",
+                ArchiveFormat::TarGzTree,
+            ),
+            clickhouse,
+        }
+    }
+
+    /// A later catalog that replaces the installed PostgreSQL build with `archive`.
+    fn replacing_artifacts(installed: &TargetArtifacts, archive: &[u8]) -> TargetArtifacts {
+        let mut next = installed.clone();
+        next.postgresql.version = "17.11.0".to_owned();
+        next.postgresql.filename = "postgresql-17.11.0-test.tar.gz".to_owned();
+        next.postgresql.archive_size = archive.len() as u64;
+        next.postgresql.sha256 = format!("{:x}", Sha256::digest(archive));
+        next
+    }
+
+    fn postgresql_archive(postgres: &[u8]) -> Vec<u8> {
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut bundle = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(postgres.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        bundle
+            .append_data(&mut header, "postgresql/bin/postgres", postgres)
+            .unwrap();
+        bundle.into_inner().unwrap().finish().unwrap()
+    }
+
+    fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Runtime::new().unwrap().block_on(future)
+    }
+
+    /// An installation made from `artifacts` by an older launcher, stopped.
+    fn install_stand_in(paths: &RuntimePaths, artifacts: &TargetArtifacts) -> RuntimeManifest {
+        paths.prepare().unwrap();
+        write_executable(
+            &paths.postgresql_binary(&artifacts.postgresql.version),
+            &fake_postgres("17.10"),
+        );
+        write_executable(
+            &paths.clickhouse_binary(&artifacts.clickhouse.version),
+            FAKE_CLICKHOUSE,
+        );
+        let installation_uuid = initialize_installation_uuid(paths).unwrap();
+        ensure_private_dir(&paths.postgresql_data()).unwrap();
+        std::fs::write(paths.postgresql_data().join("PG_VERSION"), b"17\n").unwrap();
+        let manifest =
+            RuntimeManifest::installed(artifacts, installation_uuid, "0.0.0-older", 40_001, 40_002);
+        manifest.write_atomic(&paths.manifest()).unwrap();
+        manifest
+    }
+
+    #[test]
+    fn a_recorded_predecessor_build_is_left_for_the_start_to_replace() {
+        let _serial = crate::serialize_process_test();
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::under(temporary.path().join("kymo")).unwrap();
+        let installed = installed_artifacts();
+        let recorded = install_stand_in(&paths, &installed);
+        let next = replacing_artifacts(&installed, &postgresql_archive(&fake_postgres("17.11")));
+
+        for allow_install in [true, false] {
+            let manifest = block_on(ensure_installed(&paths, &next, allow_install)).unwrap();
+            assert_eq!(manifest, recorded);
+        }
+        assert_eq!(RuntimeManifest::read(&paths.manifest()).unwrap(), recorded);
+        assert!(!paths.postgresql_dir("17.11.0").exists());
+    }
+
+    /// A later catalog whose PostgreSQL build is already downloaded.
+    fn cached_replacement(
+        paths: &RuntimePaths,
+        installed: &TargetArtifacts,
+        postgres: &[u8],
+    ) -> TargetArtifacts {
+        let archive = postgresql_archive(postgres);
+        let next = replacing_artifacts(installed, &archive);
+        ensure_private_dir(&paths.downloads()).unwrap();
+        let cached = paths.downloads().join(&next.postgresql.filename);
+        std::fs::write(&cached, &archive).unwrap();
+        std::fs::set_permissions(&cached, std::fs::Permissions::from_mode(0o600)).unwrap();
+        next
+    }
+
+    #[test]
+    fn a_recorded_build_whose_files_are_gone_needs_an_install() {
+        let _serial = crate::serialize_process_test();
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::under(temporary.path().join("kymo")).unwrap();
+        let installed = installed_artifacts();
+        install_stand_in(&paths, &installed);
+        let next = replacing_artifacts(&installed, &postgresql_archive(&fake_postgres("17.11")));
+        std::fs::remove_dir_all(paths.postgresql_dir("17.10.0")).unwrap();
+
+        let error = block_on(ensure_installed(&paths, &next, false)).unwrap_err();
+        assert!(error.to_string().contains("kymo install"), "{error:#}");
+    }
+
+    #[test]
+    fn a_predecessor_build_is_replaced_by_the_catalog_build() {
+        let _serial = crate::serialize_process_test();
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::under(temporary.path().join("kymo")).unwrap();
+        let installed = installed_artifacts();
+        let recorded = install_stand_in(&paths, &installed);
+        let next = cached_replacement(&paths, &installed, &fake_postgres("17.11"));
+
+        let manifest = block_on(replace_predecessor(&paths, &next, recorded.clone()));
+        assert_eq!(manifest.postgresql, next.postgresql.identity());
+        assert_eq!(manifest.installation_uuid, recorded.installation_uuid);
+        assert_eq!(
+            (manifest.dashboard_port, manifest.cdn_port),
+            (recorded.dashboard_port, recorded.cdn_port)
+        );
+        assert_eq!(manifest.launcher_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(RuntimeManifest::read(&paths.manifest()).unwrap(), manifest);
+        validate_postgresql(&paths.postgresql_binary("17.11.0"), "17.11.0").unwrap();
+        // The replaced build stays on disk.
+        assert!(paths.postgresql_binary("17.10.0").is_file());
+    }
+
+    #[test]
+    fn a_replacement_that_cannot_open_the_data_keeps_the_recorded_build() {
+        let _serial = crate::serialize_process_test();
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::under(temporary.path().join("kymo")).unwrap();
+        let installed = installed_artifacts();
+        let recorded = install_stand_in(&paths, &installed);
+        let next = cached_replacement(
+            &paths,
+            &installed,
+            b"#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'postgres (PostgreSQL) 17.11'; exit; fi\necho 'FATAL:  database files are incompatible with server' >&2\nexit 1\n",
+        );
+
+        let manifest = block_on(replace_predecessor(&paths, &next, recorded.clone()));
+        assert_eq!(manifest, recorded);
+        assert_eq!(RuntimeManifest::read(&paths.manifest()).unwrap(), recorded);
+    }
+
+    #[test]
+    fn a_failed_replacement_falls_back_to_the_recorded_build() {
+        let _serial = crate::serialize_process_test();
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::under(temporary.path().join("kymo")).unwrap();
+        let installed = installed_artifacts();
+        let recorded = install_stand_in(&paths, &installed);
+        let next = replacing_artifacts(&installed, &postgresql_archive(&fake_postgres("17.11")));
+
+        let manifest = block_on(replace_predecessor(&paths, &next, recorded.clone()));
+        assert_eq!(manifest, recorded);
+        // The fallback writes no manifest.
+        assert_eq!(RuntimeManifest::read(&paths.manifest()).unwrap(), recorded);
+    }
+
+    #[test]
+    fn postgresql_version_check_matches_the_release_exactly_and_reports_loader_errors() {
+        let _serial = crate::serialize_process_test();
+        let temporary = tempfile::tempdir().unwrap();
+        let binary = temporary
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("bin/postgres");
+        write_executable(&binary, &fake_postgres("17.10"));
+        validate_postgresql(&binary, "17.10.0").unwrap();
+        validate_postgresql(&binary, "17.10.3").unwrap();
+        for other in ["17.1.0", "17.100.0", "17.11.0", "18.10.0"] {
+            assert!(validate_postgresql(&binary, other).is_err(), "{other}");
+        }
+        write_executable(
+            &binary,
+            b"#!/bin/sh\necho 'libxml2.so.2: cannot open shared object file' >&2\nexit 127\n",
+        );
+        let error = validate_postgresql(&binary, "17.10.0").unwrap_err();
+        assert!(format!("{error:#}").contains("libxml2.so.2"), "{error:#}");
     }
 
     #[test]

@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
 use hyper_util::rt::TokioIo;
-use kymo_local_runtime_core::artifacts::{SupportedTarget, for_target};
+use kymo_local_runtime_core::artifacts::{SupportedTarget, TargetArtifacts, for_target};
 use kymo_local_runtime_core::manifest::{
     LaunchIntent, ProcessIdentity, RunningStack, RuntimeManifest, validate_browser_ports,
 };
@@ -172,6 +172,7 @@ struct SupervisorSecret {
 struct Children {
     postgresql: Child,
     postgresql_group: u32,
+    pg_ctl: PathBuf,
     clickhouse: Child,
     clickhouse_group: u32,
     server: Child,
@@ -245,7 +246,9 @@ pub(crate) async fn ensure_running(
     init_hold_id: Option<Uuid>,
     open_hold_id: Option<Uuid>,
 ) -> Result<EnsureOutput> {
+    let allow_install = crate::install::local_install_allowed()?;
     let artifacts = for_target(SupportedTarget::current()?)?;
+    crate::install::ensure_installed(paths, &artifacts, allow_install).await?;
     let deadline = tokio::time::Instant::now() + LAUNCH_TIMEOUT;
     let mut started = false;
     loop {
@@ -292,7 +295,7 @@ pub(crate) async fn ensure_running(
                     !started,
                     "the local stack stopped right after it started; see `kymo status`"
                 );
-                start_with_lock(paths, lock).await?;
+                start_with_lock(paths, lock, &artifacts, allow_install).await?;
                 started = true;
                 continue;
             }
@@ -307,11 +310,24 @@ pub(crate) async fn ensure_running(
     }
 }
 
-async fn start_with_lock(paths: &RuntimePaths, lock: File) -> Result<()> {
-    let artifacts = for_target(SupportedTarget::current()?)?;
+async fn start_with_lock(
+    paths: &RuntimePaths,
+    lock: File,
+    artifacts: &TargetArtifacts,
+    allow_install: bool,
+) -> Result<()> {
     let mut manifest =
-        RuntimeManifest::read_validated(paths, &artifacts, env!("CARGO_PKG_VERSION"))?;
+        RuntimeManifest::read_validated(paths, artifacts, env!("CARGO_PKG_VERSION"))?;
     clear_stopped_remnants(paths, &mut manifest)?;
+    // With the runtime lock held nothing runs the recorded builds: the one time they can be replaced.
+    if allow_install && manifest.postgresql.version != artifacts.postgresql.version {
+        manifest = crate::install::replace_predecessor(paths, artifacts, manifest).await;
+    }
+    // Starting fences older launchers out (validate_compatibility refuses a downgrade); stopping does not.
+    if manifest.launcher_version != env!("CARGO_PKG_VERSION") {
+        manifest.launcher_version = env!("CARGO_PKG_VERSION").to_owned();
+        manifest.write_atomic(&paths.manifest())?;
+    }
 
     let (ready_parent, ready_child) = StdUnixStream::pair().context("create readiness channel")?;
     ready_parent.set_read_timeout(Some(LAUNCH_TIMEOUT))?;
@@ -327,11 +343,7 @@ async fn start_with_lock(paths: &RuntimePaths, lock: File) -> Result<()> {
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log));
     // Children inherit this environment, so the whole stack behaves the same whichever process woke it.
-    command.env_clear().envs(
-        SUPERVISOR_ENVIRONMENT
-            .iter()
-            .filter_map(|name| std::env::var_os(name).map(|value| (*name, value))),
-    );
+    command.env_clear().envs(stack_environment());
     unsafe {
         command.as_std_mut().pre_exec(move || {
             dup_to(lock_source, SUPERVISOR_LOCK_FD)?;
@@ -360,7 +372,7 @@ pub(crate) fn clear_stopped_remnants(
     paths: &RuntimePaths,
     manifest: &mut RuntimeManifest,
 ) -> Result<()> {
-    let mut changed = manifest.record_launcher_version(env!("CARGO_PKG_VERSION"));
+    let mut changed = false;
     if let Some(launching) = &manifest.launching {
         let live = live_launch_groups(launching);
         ensure!(
@@ -1113,6 +1125,9 @@ async fn start_children(
     cdn_listener: TcpListener,
 ) -> Result<Children> {
     let paths = launch.paths;
+    let pg_ctl = paths
+        .postgresql_binary(&launch.manifest.postgresql.version)
+        .with_file_name("pg_ctl");
     // Clone before any child exists, so this cannot fail with components left running.
     let server_listeners = (dashboard_listener.try_clone()?, cdn_listener.try_clone()?);
     let (mut postgresql, postgresql_group, database_url) =
@@ -1123,6 +1138,7 @@ async fn start_children(
             Err(error) => {
                 if let Err(cleanup) = stop_postgresql(
                     paths,
+                    &pg_ctl,
                     &mut postgresql,
                     postgresql_group,
                     &endpoints.postgresql_socket_dir,
@@ -1158,6 +1174,7 @@ async fn start_children(
             .await;
             let postgresql_cleanup = stop_postgresql(
                 paths,
+                &pg_ctl,
                 &mut postgresql,
                 postgresql_group,
                 &endpoints.postgresql_socket_dir,
@@ -1177,6 +1194,7 @@ async fn start_children(
     Ok(Children {
         postgresql,
         postgresql_group,
+        pg_ctl,
         clickhouse,
         clickhouse_group,
         server,
@@ -1209,6 +1227,8 @@ async fn start_postgresql(
     let paths = launch.paths;
     let postgres = paths.postgresql_binary(&launch.manifest.postgresql.version);
     validate_confined_regular_file(&paths.state, &postgres)?;
+    // A build the host cannot load (a missing shared library) fails here with the loader's message rather than as an exit status after launch.
+    crate::install::validate_postgresql(&postgres, &launch.manifest.postgresql.version)?;
     let bin = postgres
         .parent()
         .context("PostgreSQL binary has no parent")?;
@@ -1466,6 +1486,7 @@ async fn stop_children(
     .await;
     let postgresql = stop_postgresql(
         paths,
+        &children.pg_ctl,
         &mut children.postgresql,
         children.postgresql_group,
         &children.postgresql_socket_dir,
@@ -1560,16 +1581,12 @@ async fn stop_clickhouse(
 
 async fn stop_postgresql(
     paths: &RuntimePaths,
+    pg_ctl: &Path,
     child: &mut Child,
     process_group: u32,
     socket_dir: &Path,
 ) -> Result<()> {
     if !child_has_exited(child, process_group, "PostgreSQL")? {
-        let pg_ctl = paths
-            .postgresql_binary(&for_target(SupportedTarget::current()?)?.postgresql.version)
-            .parent()
-            .context("PostgreSQL binary has no parent")?
-            .join("pg_ctl");
         run_checked(
             Command::new(pg_ctl)
                 .arg("-D")
@@ -1825,6 +1842,13 @@ fn bind_control(path: &Path) -> Result<UnixListener> {
 fn unused_loopback_addr() -> Result<SocketAddr> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     Ok(listener.local_addr()?)
+}
+
+/// The allowlisted part of this process's environment that the supervisor, and so every stack process, runs with.
+pub(crate) fn stack_environment() -> impl Iterator<Item = (&'static str, std::ffi::OsString)> {
+    SUPERVISOR_ENVIRONMENT
+        .iter()
+        .filter_map(|name| std::env::var_os(name).map(|value| (*name, value)))
 }
 
 pub(crate) fn acquire_runtime_lock(paths: &RuntimePaths) -> Result<File> {
@@ -2532,15 +2556,17 @@ mod tests {
     }
 
     #[test]
-    fn clearing_remnants_records_a_newer_launcher() {
+    fn clearing_remnants_leaves_older_launchers_working() {
         let (_temporary, paths, mut manifest) = installed_paths();
         manifest.launcher_version = "0.0.0-0".to_owned();
+        manifest.write_atomic(&paths.manifest()).unwrap();
         clear_stopped_remnants(&paths, &mut manifest).unwrap();
+        assert_eq!(manifest.launcher_version, "0.0.0-0");
         assert_eq!(
             RuntimeManifest::read(&paths.manifest())
                 .unwrap()
                 .launcher_version,
-            env!("CARGO_PKG_VERSION")
+            "0.0.0-0"
         );
     }
 

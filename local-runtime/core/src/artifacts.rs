@@ -4,6 +4,8 @@ use std::path::{Component, Path};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 
+use crate::manifest::InstalledArtifact;
+
 const CATALOG_JSON: &str = include_str!("../../../shared/local-runtime-artifacts.json");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,6 +75,17 @@ pub struct Artifact {
     pub format: ArchiveFormat,
 }
 
+impl Artifact {
+    /// The manifest's record of this artifact.
+    pub fn identity(&self) -> InstalledArtifact {
+        InstalledArtifact {
+            version: self.version.clone(),
+            archive_sha256: self.sha256.clone(),
+            installed_sha256: self.installed_sha256.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TargetArtifacts {
     pub postgresql: Artifact,
@@ -129,7 +142,7 @@ fn artifact(
     })
 }
 
-fn validate_path_component(name: &str, value: &str) -> Result<()> {
+pub(crate) fn validate_path_component(name: &str, value: &str) -> Result<()> {
     let mut components = Path::new(value).components();
     ensure!(
         matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none(),

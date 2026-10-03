@@ -109,16 +109,8 @@ impl RuntimeManifest {
             protocol_max: PROTOCOL_MAX,
             data_schema_generation: DATA_SCHEMA_GENERATION,
             installation_uuid,
-            postgresql: InstalledArtifact {
-                version: artifacts.postgresql.version.clone(),
-                archive_sha256: artifacts.postgresql.sha256.clone(),
-                installed_sha256: artifacts.postgresql.installed_sha256.clone(),
-            },
-            clickhouse: InstalledArtifact {
-                version: artifacts.clickhouse.version.clone(),
-                archive_sha256: artifacts.clickhouse.sha256.clone(),
-                installed_sha256: artifacts.clickhouse.installed_sha256.clone(),
-            },
+            postgresql: artifacts.postgresql.identity(),
+            clickhouse: artifacts.clickhouse.identity(),
             dashboard_port,
             cdn_port,
             launching: None,
@@ -222,16 +214,12 @@ impl RuntimeManifest {
             self.data_schema_generation,
             DATA_SCHEMA_GENERATION
         );
-        validate_artifact("PostgreSQL", &self.postgresql, &artifacts.postgresql)?;
-        validate_artifact("ClickHouse", &self.clickhouse, &artifacts.clickhouse)?;
+        validate_postgresql_artifact(&self.postgresql, &artifacts.postgresql)?;
+        ensure!(
+            self.clickhouse == artifacts.clickhouse.identity(),
+            "active ClickHouse runtime does not match the frozen artifact catalog"
+        );
         validate_browser_ports(self.dashboard_port, self.cdn_port)
-    }
-
-    /// Record the running launcher so an older environment can never drive this installation again; `validate_compatibility` has already refused a downgrade.
-    pub fn record_launcher_version(&mut self, launcher_version: &str) -> bool {
-        let changed = self.launcher_version != launcher_version;
-        self.launcher_version = launcher_version.to_owned();
-        changed
     }
 }
 
@@ -260,18 +248,20 @@ pub fn allocate_browser_ports(installation_uuid: Uuid) -> Result<(u16, u16)> {
     }
 }
 
-fn validate_artifact(
-    name: &str,
+/// An installation may also record another build of the catalog's PostgreSQL major release, which shares its data directory format: a start replaces it the way upstream applies minor releases. Artifact directories are keyed by version, so a different build of the same version is refused.
+fn validate_postgresql_artifact(
     installed: &InstalledArtifact,
     expected: &crate::artifacts::Artifact,
 ) -> Result<()> {
+    if *installed == expected.identity() {
+        return Ok(());
+    }
     ensure!(
-        installed.version == expected.version
-            && installed.archive_sha256 == expected.sha256
-            && installed.installed_sha256 == expected.installed_sha256,
-        "active {name} runtime does not match the frozen artifact catalog"
+        installed.version != expected.version
+            && installed.version.split('.').next() == expected.version.split('.').next(),
+        "active PostgreSQL runtime does not match the frozen artifact catalog"
     );
-    Ok(())
+    crate::artifacts::validate_path_component("PostgreSQL version", &installed.version)
 }
 
 pub fn initialize_installation_uuid(paths: &RuntimePaths) -> Result<Uuid> {
@@ -389,15 +379,52 @@ mod tests {
     }
 
     #[test]
-    fn the_running_launcher_version_is_recorded() {
+    fn an_earlier_postgresql_build_of_the_same_major_is_accepted_until_replaced() {
         let temporary = tempfile::tempdir().unwrap();
         let paths = RuntimePaths::under(temporary.path().join("kymo")).unwrap();
         paths.prepare().unwrap();
-        let mut manifest = installed_manifest(&paths);
-        manifest.launcher_version = "0.0.9".to_owned();
-        assert!(manifest.record_launcher_version("0.1.0"));
-        assert_eq!(manifest.launcher_version, "0.1.0");
-        assert!(!manifest.record_launcher_version("0.1.0"));
+        // A fixed pair of builds, independent of the catalog's current one.
+        let mut installed =
+            crate::artifacts::for_target(crate::artifacts::SupportedTarget::MacosArm64).unwrap();
+        installed.postgresql.version = "17.10.0".to_owned();
+        installed.postgresql.sha256 = "0".repeat(64);
+        let manifest = RuntimeManifest::installed(
+            &installed,
+            initialize_installation_uuid(&paths).unwrap(),
+            env!("CARGO_PKG_VERSION"),
+            40_001,
+            40_002,
+        );
+        let mut next = installed.clone();
+        next.postgresql.version = "17.11.0".to_owned();
+        next.postgresql.sha256 = "1".repeat(64);
+        manifest
+            .validate_compatibility(&next, env!("CARGO_PKG_VERSION"))
+            .unwrap();
+
+        let refused = |postgresql_version: &str, archive_sha256: &str, clickhouse_sha256: &str| {
+            let mut recorded = manifest.clone();
+            recorded.postgresql.version = postgresql_version.to_owned();
+            recorded.postgresql.archive_sha256 = archive_sha256.to_owned();
+            let mut catalog = next.clone();
+            catalog.clickhouse.sha256 = clickhouse_sha256.to_owned();
+            recorded
+                .validate_compatibility(&catalog, env!("CARGO_PKG_VERSION"))
+                .is_err()
+        };
+        let clickhouse = &installed.clickhouse.sha256;
+        // Another build of the catalog's version would share its artifact directory.
+        assert!(refused("17.11.0", &"2".repeat(64), clickhouse));
+        // Another major release has another data directory format.
+        assert!(refused("16.4.0", &"2".repeat(64), clickhouse));
+        // The version names the build's artifact directory.
+        assert!(refused("17.0/../x", &"2".repeat(64), clickhouse));
+        // ClickHouse must still match exactly.
+        assert!(refused(
+            &manifest.postgresql.version,
+            &manifest.postgresql.archive_sha256,
+            &"3".repeat(64)
+        ));
     }
 
     #[test]

@@ -15,6 +15,7 @@ prometheus-server
 github.com
 www.apache.org
 www.postgresql.org
+ftp.postgresql.org
 clickhouse.com
 creativecommons.org
 pypi.org

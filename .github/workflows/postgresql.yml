@@ -1,0 +1,92 @@
+name: postgresql
+
+# Builds the PostgreSQL archives local mode installs (local-runtime/postgresql/build.sh), checks they need only the C library, smoke-tests them, and publishes them as release postgresql-<version>. Dispatch after recipe changes, then pin the printed sizes and digests in shared/local-runtime-artifacts.json. Releases are immutable: bump the build number for changed output.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      matrix:
+        include:
+          # Its host runs the catalog's current build for the upgrade smoke test. The theseus build needs Ubuntu 24.04's libraries; once the catalog pins our build, any runner works.
+          - {target: linux-x86_64, runner: ubuntu-24.04}
+          - {target: macos-arm64, runner: macos-15}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir dist
+          if [ "$TARGET" = linux-x86_64 ]; then
+            docker run --rm --volume "$PWD:/work" --workdir /work quay.io/pypa/manylinux_2_28_x86_64 \
+              sh -c 'dnf --assumeyes --quiet install flex && exec local-runtime/postgresql/build.sh "$@"' sh "$TARGET" dist
+          else
+            local-runtime/postgresql/build.sh "$TARGET" dist
+          fi
+          tar -xzf dist/*.tar.gz -C "$RUNNER_TEMP"
+      - name: Check
+        env:
+          TARGET: ${{ matrix.target }}
+        run: python3 local-runtime/postgresql/check.py dist/*.tar.gz "$TARGET"
+      - name: Open a cluster made by the catalog's current build
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          read -r url sha256 <<<"$(python3 -c 'import json, sys; p = json.load(open("shared/local-runtime-artifacts.json"))["postgresql"]; t = p["targets"][sys.argv[1]]; print(p["base_url"] + "/" + t["filename"], t["sha256"])' "$TARGET")"
+          curl --fail --silent --show-error --location --output "$RUNNER_TEMP/current.tar.gz" "$url"
+          echo "$sha256  $RUNNER_TEMP/current.tar.gz" | shasum -a 256 --check
+          mkdir "$RUNNER_TEMP/current"
+          tar -xzf "$RUNNER_TEMP/current.tar.gz" -C "$RUNNER_TEMP/current"
+          local-runtime/postgresql/smoke.sh "$RUNNER_TEMP"/postgresql-*-"$TARGET" "$RUNNER_TEMP"/current/*
+      - name: Smoke-test on the oldest and newest supported Linux
+        if: matrix.target == 'linux-x86_64'
+        run: |
+          # glibc 2.28 is the wheel's floor; Ubuntu 26.04 ships only libxml2.so.16. Neither image adds packages: the tree must run on a bare base.
+          for image in almalinux:8 ubuntu:26.04; do
+            docker run --rm --volume "$PWD:/work:ro" --volume "$RUNNER_TEMP:/build:ro" "$image" \
+              sh -c 'useradd --create-home smoke && su smoke -c "/work/local-runtime/postgresql/smoke.sh /build/postgresql-*-linux-x86_64"'
+          done
+      - uses: actions/upload-artifact@v7
+        with:
+          name: postgresql-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    # The release tag must point at a commit whose workflow files match main's.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          version=$(ls postgresql-*-linux-x86_64.tar.gz | sed 's/^postgresql-\(.*\)-linux-x86_64\.tar\.gz$/\1/')
+          # A published build must never change under a catalog that pins it. If a publish dies midway, nothing pins it yet: `gh release delete postgresql-<version> --cleanup-tag`, then dispatch again.
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/postgresql-$version" >/dev/null 2>&1; then
+            echo "::error::postgresql-$version already exists; bump the build number in local-runtime/postgresql/build.sh"
+            exit 1
+          fi
+          gh release create "postgresql-$version" ./*.tar.gz --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "PostgreSQL $version for local mode" \
+            --notes "PostgreSQL built by local-runtime/postgresql/build.sh at $GITHUB_SHA for kymo local mode. Pin these in shared/local-runtime-artifacts.json."
+          for archive in ./*.tar.gz; do
+            echo "$archive size $(stat --format=%s "$archive") sha256 $(sha256sum "$archive" | cut -d' ' -f1)"
+          done

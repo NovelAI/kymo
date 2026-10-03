@@ -17,7 +17,7 @@ kymo stop [--hold]
 kymo ports [--dashboard <port> --cdn <port>]
 ```
 
-`ensure` installs missing artifacts unless `KYMO_LOCAL_NO_INSTALL=1`, starts one stack when stopped, and returns the current installation UUID, endpoint generation, private client sockets, loopback browser origins, protocol range, and ephemeral server bearer. `MKDB2_LOCAL_NO_INSTALL` is rejected. Its JSON output is machine-oriented secret material and must not be logged. `start` is `ensure` without the JSON. Concurrent or repeated calls reuse the running supervisor.
+`ensure` installs missing artifacts unless `KYMO_LOCAL_NO_INSTALL=1`, starts one stack when stopped (first replacing an earlier PostgreSQL build the installation records, as [local deployment](https://github.com/NovelAI/kymo/blob/main/docs/local-deployment.md#replacing-database-builds-at-the-next-start) describes), and returns the current installation UUID, endpoint generation, private client sockets, loopback browser origins, protocol range, and ephemeral server bearer. `MKDB2_LOCAL_NO_INSTALL` is rejected. Its JSON output is machine-oriented secret material and must not be logged. `start` is `ensure` without the JSON. Concurrent or repeated calls reuse the running supervisor.
 
 The supervisor starts PostgreSQL 17 on a private Unix socket, ClickHouse on pinned HTTPS, and `kymo-server` with separate native, upload, dashboard, and CDN transports. Lifecycle, recovery, `stop`/`--hold`, ports, idle shutdown, and the trust boundary are specified in [local deployment](https://github.com/NovelAI/kymo/blob/main/docs/local-deployment.md#runtime-identity-ports-and-lifecycle).
 

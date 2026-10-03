@@ -123,12 +123,6 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> Result<()> {
     supervisor::close_inherited_descriptors_on_exec()?;
     validate_environment_namespace()?;
-    let allow_install = matches!(
-        &cli.command,
-        Command::Start | Command::Ensure { .. } | Command::Open { .. }
-    )
-    .then(local_install_allowed)
-    .transpose()?;
     let paths = RuntimePaths::discover()?;
     match cli.command {
         Command::Install => {
@@ -139,12 +133,10 @@ async fn run(cli: Cli) -> Result<()> {
             );
         }
         Command::Start => {
-            install::ensure_installed(&paths, allow_install.expect("validated for start")).await?;
             let output = supervisor::ensure_running(&paths, None, None).await?;
             println!("local stack is ready at {}", output.dashboard_origin);
         }
         Command::Ensure { json, init_hold_id } => {
-            install::ensure_installed(&paths, allow_install.expect("validated for ensure")).await?;
             let output = supervisor::ensure_running(&paths, init_hold_id, None).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&output)?);
@@ -173,7 +165,6 @@ async fn run(cli: Cli) -> Result<()> {
                     "local kymo installation identity changed; refusing to open the dashboard"
                 );
             }
-            install::ensure_installed(&paths, allow_install.expect("validated for open")).await?;
             let output =
                 supervisor::ensure_running(&paths, None, Some(uuid::Uuid::new_v4())).await?;
             if let Some(expected) = expected_installation_uuid {
@@ -269,23 +260,6 @@ fn launch_browser(url: &str) -> Result<()> {
     Ok(())
 }
 
-fn local_install_allowed() -> Result<bool> {
-    fn parse(name: &str, value: &std::ffi::OsStr) -> Result<bool> {
-        match value.to_string_lossy().trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Ok(false),
-            "0" | "false" | "no" | "off" | "" => Ok(true),
-            value => anyhow::bail!(
-                "{name} must be one of 1/true/yes/on or 0/false/no/off, got {value:?}"
-            ),
-        }
-    }
-    let canonical_value = std::env::var_os("KYMO_LOCAL_NO_INSTALL")
-        .as_deref()
-        .map(|value| parse("KYMO_LOCAL_NO_INSTALL", value))
-        .transpose()?;
-    Ok(canonical_value.unwrap_or(true))
-}
-
 fn status(paths: &RuntimePaths) -> StatusOutput {
     let artifacts = match SupportedTarget::current().and_then(for_target) {
         Ok(artifacts) => artifacts,
@@ -321,8 +295,8 @@ fn status(paths: &RuntimePaths) -> StatusOutput {
         },
         Ok(Some(manifest)) => {
             let binaries = [
-                paths.postgresql_binary(&artifacts.postgresql.version),
-                paths.clickhouse_binary(&artifacts.clickhouse.version),
+                paths.postgresql_binary(&manifest.postgresql.version),
+                paths.clickhouse_binary(&manifest.clickhouse.version),
             ];
             if let Some(path) = binaries.iter().find(|path| !is_regular_file(path)) {
                 StatusOutput {
@@ -463,41 +437,32 @@ fn doctor(paths: &RuntimePaths) -> DoctorOutput {
         checks.push(check);
     }
     checks.push(doctor_root("cache-root", &paths.cache, true));
-    checks.push(if !artifact_roots_healthy {
-        DoctorCheck {
-            name: "manifest-identity",
-            healthy: false,
-            detail: "skipped because a managed root is unsafe".to_owned(),
-        }
-    } else {
-        match &artifacts {
-            Ok(artifacts) => {
-                match RuntimeManifest::read_validated(paths, artifacts, env!("CARGO_PKG_VERSION")) {
-                    Ok(_) => DoctorCheck {
-                        name: "manifest-identity",
-                        healthy: true,
-                        detail: paths.manifest().display().to_string(),
-                    },
-                    Err(error) => DoctorCheck {
-                        name: "manifest-identity",
-                        healthy: false,
-                        detail: format!("{error:#}"),
-                    },
-                }
-            }
-            Err(error) => DoctorCheck {
-                name: "manifest-identity",
-                healthy: false,
-                detail: error.to_string(),
-            },
-        }
+    let manifest = match &artifacts {
+        Ok(artifacts) if artifact_roots_healthy => Some(RuntimeManifest::read_validated(
+            paths,
+            artifacts,
+            env!("CARGO_PKG_VERSION"),
+        )),
+        _ => None,
+    };
+    checks.push(DoctorCheck {
+        name: "manifest-identity",
+        healthy: matches!(manifest, Some(Ok(_))),
+        detail: match (&manifest, &artifacts) {
+            (Some(Ok(_)), _) => paths.manifest().display().to_string(),
+            (Some(Err(error)), _) => format!("{error:#}"),
+            (None, Err(error)) => error.to_string(),
+            (None, Ok(_)) => "skipped because a managed root is unsafe".to_owned(),
+        },
     });
-    if artifact_roots_healthy && let Ok(artifacts) = &artifacts {
-        let postgresql = paths.postgresql_binary(&artifacts.postgresql.version);
+    if let (Some(Ok(manifest)), Ok(artifacts)) = (&manifest, &artifacts) {
+        // Check the builds the installation records; PostgreSQL may be an earlier one until a start replaces it.
+        let postgresql_version = &manifest.postgresql.version;
+        let postgresql = paths.postgresql_binary(postgresql_version);
         checks.push(
-            match validate_confined_regular_file(&paths.state, &postgresql).and_then(|()| {
-                install::validate_postgresql(&postgresql, &artifacts.postgresql.version)
-            }) {
+            match validate_confined_regular_file(&paths.state, &postgresql)
+                .and_then(|()| install::validate_postgresql(&postgresql, postgresql_version))
+            {
                 Ok(()) => DoctorCheck {
                     name: "postgresql-binary",
                     healthy: true,
@@ -510,11 +475,14 @@ fn doctor(paths: &RuntimePaths) -> DoctorOutput {
                 },
             },
         );
-        let clickhouse = paths.clickhouse_binary(&artifacts.clickhouse.version);
+        let clickhouse = paths.clickhouse_binary(&manifest.clickhouse.version);
         checks.push(
-            match validate_confined_regular_file(&paths.state, &clickhouse)
-                .and_then(|()| install::validate_clickhouse(&clickhouse, &artifacts.clickhouse))
-            {
+            match validate_confined_regular_file(&paths.state, &clickhouse).and_then(|()| {
+                install::validate_clickhouse(
+                    &clickhouse,
+                    manifest.clickhouse.installed_sha256.as_deref(),
+                )
+            }) {
                 Ok(()) => DoctorCheck {
                     name: "clickhouse-binary",
                     healthy: true,
@@ -527,6 +495,16 @@ fn doctor(paths: &RuntimePaths) -> DoctorOutput {
                 },
             },
         );
+        if manifest.postgresql.version != artifacts.postgresql.version {
+            checks.push(DoctorCheck {
+                name: "database-builds",
+                healthy: true,
+                detail: format!(
+                    "the next start that can install replaces PostgreSQL {} with {}",
+                    manifest.postgresql.version, artifacts.postgresql.version
+                ),
+            });
+        }
     }
     let runtime = status(paths);
     checks.push(DoctorCheck {

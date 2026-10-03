@@ -97,7 +97,7 @@ kymo open [--no-browser] [<project-id> [<run-id>]]
 kymo ports [--dashboard <port> --cdn <port>]
 ```
 
-`install` may run implicitly during `ensure`, `start`, or `open`. `KYMO_LOCAL_NO_INSTALL=1` makes those commands fail quickly with the explicit install instruction. A launch may take up to 8 minutes (first `initdb` plus each component's readiness budget); the Python client's first-use ensure timeout (10 minutes) is independent of the 30-second `InitRun` RPC.
+`install` may run implicitly during `ensure`, `start`, or `open`. `KYMO_LOCAL_NO_INSTALL=1` makes those commands fail quickly with the explicit install instruction. A launch may take up to 8 minutes (first `initdb` plus each component's readiness budget), plus up to 2 minutes when it replaces an earlier PostgreSQL build; the Python client's first-use ensure timeout (10 minutes) is independent of the 30-second `InitRun` RPC.
 
 Python usage:
 
@@ -125,7 +125,7 @@ The data directory owns a durable installation UUID, which is the installation's
 - Current generation UUID, sockets, process identities, artifact paths, and secret references while running.
 - The process groups of a launch in progress, and the last failure for diagnosis.
 
-The first manifest picks two distinct free ports below every supported kernel's ephemeral range. Compatible reinstalls preserve them. All mutable identity and manifest publication uses file sync, atomic publication, and parent-directory sync. Existing acknowledged data without its identity fails closed rather than receiving a replacement UUID. Every start records the running launcher version, so an older environment can never drive the installation again.
+The first manifest picks two distinct free ports below every supported kernel's ephemeral range. Compatible reinstalls preserve them. All mutable identity and manifest publication uses file sync, atomic publication, and parent-directory sync. Existing acknowledged data without its identity fails closed rather than receiving a replacement UUID. Every start and every completed install records the running launcher version, which older environments then refuse; stopping records nothing.
 
 The supervisor holds the runtime lock for its whole life, so acquiring that lock proves no supervisor is alive. Every child runs in its own process group and is published in the manifest immediately after it spawns (`initdb` included); a failed startup keeps that record unless every child is proven gone. Before any start, the lock holder proves each recorded group from a crashed stack or interrupted launch is gone, then clears the record; crash-stale database PID files are ordinary residue at that point. Only a record whose processes are still alive fails closed. A failed start or an unexpected component exit stops the remaining components and records the reason, but never blocks the next start. The supervisor itself never restarts anything; each `ensure` starts at most once, and the Python worker's backoff paces retries. A client that disconnects mid-request or a launcher that gives up before readiness only loses its own reply.
 
@@ -175,7 +175,7 @@ Uninstall deletes the data, state, and cache roots after `kymo stop`. The hold c
 Backup and restore run while `kymo stop --hold` holds the stack stopped:
 
 - A cold backup copies the data root plus `state/runtime.json`, preserving ClickHouse's confined `Atomic` links and file modes. The manifest travels with the data because it records which database versions wrote it.
-- A restore puts both back. The launcher refuses a restore whose manifest does not match its frozen database catalog.
+- A restore puts both back. The launcher refuses a restore whose manifest records neither its catalog's database builds nor another build of the catalog's PostgreSQL major release.
 
 No live-copy or portable-bundle guarantee is made in v1.
 
@@ -195,7 +195,7 @@ Required automated or release-qualification coverage:
 8. Local release bundle contains all fonts/scripts/styles/WASM, makes zero external requests with network disabled, and contains no hosted service endpoint. Hosted `/grpc-ws` framing and unauthenticated hosted upload remain unchanged.
 9. Numeric, tagged, text, image, resource, metadata, Trash restore, purge, dashboard, spool replay, mutation ordering, and DATA_LOSS quarantine work locally.
 10. Legacy hosted clients that omit the additive writer/mutation fields retain legacy behavior. Checked-in Python protobuf stubs match the source.
-11. A newer compatible launcher/server/frontend cannot be downgraded by an older environment once it has started the stack (the version is recorded at start, so a running older generation keeps serving until its next start). Any PostgreSQL, ClickHouse, or data-schema-generation change is refused before database startup.
+11. A newer compatible launcher/server/frontend cannot be downgraded by an older environment once it has started the stack (the version is recorded at start, so a running older generation keeps serving until its next start). Another build of the catalog's PostgreSQL major release is replaced at the next start that can install, with data, UUID, and ports intact; any other PostgreSQL, ClickHouse, or data-schema-generation change is refused before database startup.
 12. The supported Apple Silicon path preserves valid executable signatures and requires no undocumented security override.
 
 ## Tradeoffs
@@ -208,9 +208,11 @@ The child adds memory, startup latency, binary distribution, and eventual major-
 
 Ephemeral ports avoid conflicts automatically but make printed run URLs stale after every idle restart and force an endpoint-resolution layer into the browser API. Two persisted high ports make `run_url()` durable and SSH forwarding understandable. The cost is a rare explicit `kymo ports` remediation instead of silent rebinding.
 
-### Refusing database upgrades in v1
+### Replacing database builds at the next start
 
-Compatible launcher/server/frontend replacement can be atomic, but starting a new database binary may mutate storage before validation. V1 freezes PostgreSQL, ClickHouse, and the data-schema generation and refuses differences. A future migration feature needs its own quiescent snapshot/journal and bidirectional-compatibility design.
+An installation may record another build of the catalog's PostgreSQL major release, which shares its data directory format; it is replaced the way upstream applies minor releases: stop, swap binaries, start. A start that finds nothing running (or `kymo install`) installs the catalog build beside the old one, checks that it opens the existing cluster (`postgres -C` reads the control file and configuration without starting a server), and only then atomically republishes the manifest, keeping the installation UUID and ports; the launch that follows runs it. The manifest publish is the only commit point, so no journal is needed. Until then a running stack keeps serving and newer launchers attach to it. A start that cannot replace the build within two minutes (offline, a slow or failed download, a build that cannot open the cluster) runs the recorded build, and the next start retries; `KYMO_LOCAL_NO_INSTALL=1` skips the attempt. Artifact directories are keyed by version, so a rebuild of an unchanged release takes a new build number. The replaced build and its cached archive stay on disk (about 50 MB). There is no automatic rollback; the cold backup is the way back.
+
+ClickHouse pin moves (its new binary migrates data on first start) and PostgreSQL major releases (`pg_upgrade` into a new data directory) are still refused; each needs its own qualification first.
 
 Also settled: a native launcher instead of Docker Compose (no Docker Desktop prerequisite on personal machines); unauthenticated browser access instead of per-tab sessions (sessions would defend a shared-workstation boundary the product does not claim); an embedded frontend (no server/frontend skew offline); activity-derived idle instead of client leases (existing signals suffice until measurements say otherwise; `system_metrics=False` may cost a cold restart after a long silent phase).
 
@@ -228,3 +230,4 @@ Also settled: a native launcher instead of Docker Compose (no Docker Desktop pre
 - 2026-09-28: The launcher stopped handing its caller's inheritable descriptors to the stack. A woken stack used to hold its waker's pipes open: a parent's `join` timed out, and a shell pipeline stayed open until the stack stopped.
 - 2026-09-28: The supervised server enables the bulk-import lane, and the W&B importer's `--local` imports into local mode.
 - 2026-09-30: A viewer restarts the idle hour: closing a dashboard WebSocket or serving the dashboard shell resets the idle clock, replacing a 10-second reconnect grace and a 60-second page-load grace. A dashboard closed long after the last logging used to let the stack stop about 10 seconds later, so a viewer whose SSH tunnel dropped came back to a stopped stack.
+- 2026-10-02: Another build of the catalog's PostgreSQL major release is replaced at the next start instead of refusing every command, which would have stranded every installation at the first catalog change. Stopping no longer fences older launchers out.
