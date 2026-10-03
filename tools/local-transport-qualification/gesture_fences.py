@@ -289,9 +289,12 @@ def run_fences(page) -> None:
 
     # An unchanged draft makes this safe even if a regression accidentally blurs the editor.
     armed_row.locator(".run-overflow-trigger").click()
-    armed_row.locator(".run-overflow-menu:popover-open").get_by_role(
+    rename = armed_row.locator(".run-overflow-menu:popover-open").get_by_role(
         "button", name="Rename", exact=True
-    ).click()
+    )
+    # A row's :hover and :focus-within don't extend to its open top-layer menu, so moving onto the menu turns the row content-visibility: auto, and WebKit then gives the menu no box until the next frame; click() alone presses in that frame, so hover first and let click()'s stability check wait it out.
+    rename.hover()
+    rename.click()
     editor = armed_row.locator(".run-name-inline-input")
     expect(editor).to_be_focused()
     try:

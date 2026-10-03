@@ -10,7 +10,6 @@ import json
 import struct
 import sys
 import traceback
-from collections import Counter
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -18,16 +17,13 @@ from playwright.sync_api import Browser, Error, Page, expect, sync_playwright
 
 ROOT = Path(__file__).resolve().parents[2]
 PROJECT = "copy-probe"
-ORIGIN = "http://copy-probe.test:8097"
+ORIGIN = "http://copy-probe.test"
+LOOPBACK = ("127.0.0.1", "localhost", "::1")
 TEXT = "  alpha bravo charlie\r\ndelta\tEND  "
 CAPTION = "  caption bravo charlie\r\ndelta\tEND  "
 PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 )
-RESIZE_OBSERVER_NOTIFICATIONS = {
-    "ResizeObserver loop completed with undelivered notifications.",
-    "ResizeObserver loop limit exceeded",
-}
 
 
 def protobuf():
@@ -178,12 +174,8 @@ class Fixture:
                     ],
                 }
             route.fulfill(json=manifest, headers=headers)
-        elif parsed.hostname in ("copy-probe.test", "127.0.0.1", "localhost", "::1"):
-            asset_path = (
-                path if path.startswith(("/assets/", "/wasm/")) else "/index.html"
-            )
-            # Stream debug WASM to avoid DevTools' base64 frame-size limit.
-            route.continue_(url=self.args.url.rstrip("/") + asset_path)
+        elif parsed.hostname in ("copy-probe.test", *LOOPBACK):
+            route.continue_()
         else:
             self.blocked.append(route.request.url)
             route.abort()
@@ -195,7 +187,7 @@ class Fixture:
             self.page.locator(".metadata-copy-value").first.wait_for(timeout=20_000)
         except Error as error:
             raise AssertionError(
-                f"fixture failed: {self.page.locator('body').inner_text()[:2000]}; errors={self.errors}; blocked={self.blocked}"
+                f"fixture failed: {self.page.locator('#main').inner_text()[:2000]}; errors={self.errors}; blocked={self.blocked}"
             ) from error
         assert self.page.evaluate("isSecureContext") is secure
         if not secure:
@@ -203,11 +195,7 @@ class Fixture:
 
     def assert_clean(self):
         assert not self.blocked, self.blocked
-        unexpected = [
-            error for error in self.errors if error not in RESIZE_OBSERVER_NOTIFICATIONS
-        ]
-        assert not unexpected, unexpected
-        return dict(Counter(self.errors))
+        assert not self.errors, self.errors
 
 
 def clear_selection(page):
@@ -477,9 +465,13 @@ def async_checks(page, target):
 def sidebar_copy(page, index):
     name = f"Copy fixture run-{index}"
     page.get_by_role("button", name=f"More actions for {name}", exact=True).click()
-    page.get_by_role("dialog", name=f"Actions for {name}", exact=True).get_by_role(
-        "button", name="Copy run name", exact=True
-    ).click()
+    item = page.get_by_role(
+        "dialog", name=f"Actions for {name}", exact=True
+    ).get_by_role("button", name="Copy run name", exact=True)
+    # A row's :hover and :focus-within don't extend to its open top-layer menu, so moving onto the menu turns the row content-visibility: auto, and WebKit then gives the menu no box until the next frame.
+    # click() alone presses in that frame and its hit-target check finds the gallery behind; hovering first lets click()'s stability check wait it out, as a person's later press does.
+    item.hover()
+    item.click()
 
 
 def sidebar_checks(page):
@@ -560,11 +552,10 @@ def run_checks(browser: Browser, args):
                     page.locator('.cdn-caption[aria-label="Copy empty text"]').first,
                     "",
                 )
+            fixture.assert_clean()
             results[mode] = {
-                "checks": "passed",
                 "metadata_native_drag": metadata_drag,
                 "caption_native_drag": caption_drag,
-                "diagnostics": fixture.assert_clean(),
             }
         finally:
             page.close()
@@ -574,8 +565,7 @@ def run_checks(browser: Browser, args):
         fixture.open(secure=True)
         results["late_rejection"] = async_checks(page, metadata(page, "original"))
         sidebar_checks(page)
-        results["sidebar_copy"] = "passed"
-        results["secure_diagnostics"] = fixture.assert_clean()
+        fixture.assert_clean()
     finally:
         page.close()
     return results
@@ -592,14 +582,15 @@ def main():
     )
     parser.add_argument("--headed", action="store_true")
     args = parser.parse_args()
-    if urlsplit(args.url).hostname not in ("127.0.0.1", "localhost", "::1"):
+    if urlsplit(args.url).hostname not in LOOPBACK:
         parser.error("--url must point to a local dx server")
     failures = []
     with sync_playwright() as playwright:
         for engine in args.engines:
             try:
+                # Proxying through the dx server lets the unresolvable copy-probe.test origin load the bundle with its URL intact.
                 browser = getattr(playwright, engine).launch(
-                    headless=not args.headed, timeout=30_000
+                    headless=not args.headed, timeout=30_000, proxy={"server": args.url}
                 )
                 try:
                     result = run_checks(browser, args)
