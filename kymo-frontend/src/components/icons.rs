@@ -128,6 +128,12 @@ pub fn CaretRightIcon() -> Element {
     bootstrap_icon("m12.14 8.753-5.482 4.796c-.646.566-1.658.106-1.658-.753V3.204a1 1 0 0 1 1.659-.753l5.48 4.796a1 1 0 0 1 0 1.506z", false)
 }
 
+/// Bootstrap Icons "caret-up-fill".
+#[component]
+pub fn CaretUpIcon() -> Element {
+    bootstrap_icon("m7.247 4.86-4.796 5.481c-.566.647-.106 1.659.753 1.659h9.592a1 1 0 0 0 .753-1.659l-4.796-5.48a1 1 0 0 0-1.506 0z", false)
+}
+
 /// Bootstrap Icons "caret-down-fill".
 #[component]
 pub fn CaretDownIcon() -> Element {

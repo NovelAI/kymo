@@ -202,6 +202,12 @@ input[type="checkbox"]:checked::before {
 .fade-overflow[data-overflow] {
     mask-image: linear-gradient(to right, #000 calc(100% - 16px), transparent);
 }
+/* .fade-lines wraps instead: its owner caps the height in lines (max-height: N lh, with a numeric line-height), and text cut at the bottom fades its last visible line downward, as a single line fades toward its right edge (fading the end of the last line would often land in the gap a wrapped line leaves). A modifier of .fade-overflow, so overflow_fade.js's mutation-observer selector stays one class. */
+.fade-overflow.fade-lines { white-space: normal; }
+.fade-overflow.fade-lines > * { display: block; }
+.fade-overflow.fade-lines[data-overflow] {
+    mask-image: linear-gradient(to bottom, #000 calc(100% - 1lh), transparent);
+}
 
 /* === App Shell === */
 /* app-root is a flex column holding the notice bar and the route root. List pages let the
@@ -299,12 +305,12 @@ input[type="checkbox"]:checked::before {
     min-height: 0;
     overflow-y: auto;
     position: relative;
-    /* Own stacking context: in-grid z-indexes (actions 55, title pop 60, tips 70) resolve locally, so nothing in the grid can hit-test or paint above the sibling maximize overlay (50). In-grid fixed CDN lightboxes still cover sidebar/navbar: those are z-auto/static and paint earlier. Editor dialogs use the browser top layer. */
+    /* Own stacking context: in-grid z-indexes (actions 55, title pop 60, tips 70) resolve locally, so nothing in the grid can hit-test or paint above the sibling maximize overlay (50). Editor dialogs and the image preview use the browser top layer. */
     isolation: isolate;
 }
 /* While the maximize overlay is up, freeze the underlying scrollbar so the
    illusion of a flat full-area panel isn't broken by a vestigial gutter. */
-.main-content-locked { overflow: hidden; }
+.main-content[inert] { overflow: hidden; }
 
 /* === Maximize Overlay === */
 /* Anchored to .main-wrap (the main column's non-scrolling box), NOT the
@@ -1467,7 +1473,7 @@ input[type="checkbox"]:checked::before {
     display: flex;
     flex-direction: column;
     gap: var(--spacing-xs);
-    /* Query container for .cdn-file-group video. It doesn't contain layout, so the lightbox inside stays fixed to the viewport. */
+    /* Query container for .cdn-file-group video. */
     container-type: size;
 }
 
@@ -1519,7 +1525,8 @@ input[type="checkbox"]:checked::before {
     line-height: 1.3; /* numeric for .icon-button's 1lh */
 }
 
-.cdn-nav-btn:disabled {
+.cdn-nav-btn:disabled,
+.cdn-lightbox-nav:disabled {
     opacity: 0.3;
     cursor: default;
 }
@@ -1551,7 +1558,8 @@ input[type="checkbox"]:checked::before {
     gap: 2px;
 }
 
-.cdn-image-item a { display: contents; }
+/* A box of its own, so Tab reaches it (display: contents leaves a link unfocusable); a column flex like the item, so the image lays out as before. The ring is on the image. */
+.cdn-image-item a { display: flex; flex-direction: column; outline: none; }
 .cdn-image-item img {
     width: 100%;
     height: auto;
@@ -1567,10 +1575,11 @@ input[type="checkbox"]:checked::before {
     border-color: var(--text-headings);
 }
 
+/* Inset: the gallery's scrollers clip anything outside an edge thumbnail. */
 .cdn-image-item a:focus-visible img {
     border-color: var(--text-headings);
     outline: 2px solid var(--text-headings);
-    outline-offset: 2px;
+    outline-offset: -2px;
 }
 
 .metadata-viewer, .cdn-image-item { position: relative; }
@@ -1671,26 +1680,88 @@ input[type="checkbox"]:checked::before {
     margin-bottom: 2px;
 }
 
+/* A modal dialog filling the viewport; its own background is the backdrop. */
 .cdn-lightbox {
-    position: fixed;
-    inset: 0;
-    z-index: 10000;
+    width: auto;
+    height: auto;
+    max-width: none;
+    max-height: none;
+    margin: 0;
+    border: 0;
+    overflow: hidden;
     background: rgba(0, 0, 0, 0.85);
     backdrop-filter: blur(4px);
-    display: flex;
-    align-items: center;
-    justify-content: center;
+    display: grid;
+    grid-template: minmax(0, 1fr) auto / auto minmax(0, 1fr) auto;
+    place-items: center;
+    gap: var(--spacing-sm);
+    padding: var(--spacing-md);
+    /* The backdrop is dark in both themes, so its text takes the dark theme's colours. */
+    color: #FFFFFFA0;
     cursor: pointer;
-    /* Focused on mount so its Esc handler gets the key; a focus ring would outline the whole viewport. */
+    /* Focused once shown, so its key handler gets the keys; a focus ring would outline the whole viewport. */
     outline: none;
 }
 
+.cdn-lightbox::backdrop { background: none; }
+
+/* The image cell, filling the grid's middle area. The image is centred absolutely: as a grid item, WebKit resolves its max-height: 100% against the whole lightbox, not its row, and draws it under the info line. */
+.cdn-lightbox-stage {
+    place-self: stretch;
+    position: relative;
+    display: grid;
+    place-items: center;
+}
+
 .cdn-lightbox-img {
-    max-width: 90vw;
-    max-height: 90vh;
-    object-fit: contain;
+    position: absolute;
+    inset: 0;
+    margin: auto;
+    max-width: 100%;
+    max-height: 100%;
     border-radius: 4px;
 }
+
+.cdn-lightbox-note { font-size: var(--font-size-14); }
+
+.cdn-lightbox-nav {
+    background: rgba(255, 255, 255, 0.12);
+    border: none;
+    border-radius: 4px;
+    color: #FFFFFF;
+    padding: var(--spacing-md) var(--spacing-xs);
+    font-size: var(--font-size-16);
+    line-height: 1.3; /* numeric for .icon-button's 1lh */
+    cursor: pointer;
+}
+
+.cdn-lightbox-info {
+    grid-column: 1 / -1;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: center;
+    gap: var(--spacing-xs) var(--spacing-md);
+    font-size: var(--font-size-13);
+    /* Also keeps a long unbroken run name inside the window. */
+    overflow-wrap: anywhere;
+    cursor: auto;
+}
+
+.cdn-lightbox-run { font-weight: 600; max-height: 2lh; }
+
+/* A prompt-length caption would squeeze the image out: four lines, the rest in its tooltip. */
+.cdn-lightbox-caption { max-height: 4lh; }
+
+.cdn-lightbox-step {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--spacing-xs);
+}
+
+.cdn-lightbox-step .cdn-lightbox-nav { padding: 2px var(--spacing-xs); font-size: inherit; }
+
+.cdn-lightbox-step, .cdn-lightbox-position { font-variant-numeric: tabular-nums; white-space: nowrap; }
 
 /* === Not Found === */
 .not-found {

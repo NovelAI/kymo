@@ -11,8 +11,8 @@ function updateHover(u){
     return
   }
   let l=u.cursor.left,t=u.cursor.top;
-  // Hide covered charts' fixed tips immediately, before zone virtualization unmounts them. The maximized chart lives outside the locked main element.
-  if(!isSrc&&el.closest('.main-content-locked')){tip.style.display='none';return}
+  // Hide covered charts' fixed tips immediately, before zone virtualization unmounts them. The maximized chart lives outside the inert main element.
+  if(!isSrc&&el.closest('[inert]')){tip.style.display='none';return}
   let bx=el.getBoundingClientRect();
   // Offscreen charts must not leave fixed, viewport-clamped readouts at the screen edge.
   if(!isSrc&&(bx.bottom<=0||bx.top>=window.innerHeight||bx.right<=0||bx.left>=window.innerWidth)){tip.style.display='none';return}

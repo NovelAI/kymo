@@ -18,7 +18,7 @@ use crate::grpc::GrpcClient;
 use crate::route::Route;
 use crate::state::trash::lookup_trashed_runs;
 use crate::state::DashboardState;
-use crate::util::{is_app_escape, local_storage, primary};
+use crate::util::{is_app_escape, js_bridge::js_string, local_storage, primary};
 
 /// A transport cut, not a product limit. Arbitrarily large selections are
 /// sent sequentially so one WebSocket frame and one response stay modest.
@@ -340,11 +340,7 @@ fn submit_trash_runs(project_id: String, requested: Vec<String>, ui: TrashMutati
                 }
             }
         }
-        let ordered = requested
-            .iter()
-            .filter_map(|run_id| results.remove(run_id))
-            .collect();
-        apply_trash_results(ordered, &requested, ui);
+        apply_trash_results(results.into_values().collect(), &requested, ui);
         busy.set(false);
     });
 }
@@ -353,7 +349,11 @@ fn apply_trash_results(results: Vec<TrashRunResult>, requested: &[String], ui: T
     let mut picker = ui.picker;
     let mut feedback = ui.feedback;
     let summary = summarize_trash_results(requested, &results);
-    let was_bulk = picker.peek().is_some();
+    // Read before the row unmounts: once it has, focus is on the page either way.
+    let heir = match requested {
+        [run_id] if summary.succeeded.contains(run_id) => row_focus_heir(run_id),
+        _ => None,
+    };
     remove_active_runs(ui.dashboard, &summary.succeeded);
 
     if picker.peek().is_some() {
@@ -364,8 +364,8 @@ fn apply_trash_results(results: Vec<TrashRunResult>, requested: &[String], ui: T
             picker.set(Some(summary.failed.clone()));
         }
     }
-    if !was_bulk && !summary.succeeded.is_empty() {
-        focus_sidebar_trash_trigger();
+    if let Some(heir) = heir {
+        focus_when_mounted(&heir, Some(".sidebar-filter:not(:disabled)"), false);
     }
 
     let moved = summary.succeeded.len();
@@ -514,13 +514,40 @@ fn end_paint_if_active(mut paint: Signal<Option<SelectionPaint>>) {
     }
 }
 
+/// Closing the picker parks focus on the Trash trigger when the picker would take it along: focus in the sidebar (a picker control, or a selection row, which WebKit leaves focused after it stops being focusable) or already on the page (a pending reply's disabled controls drop it there). Focus the user moved elsewhere stays: a maximized panel or the grid, where Escape also cancels the picker, or anything focused while a reply was pending. Read before the picker unmounts.
 fn close_trash_picker(
     mut picker: Signal<Option<HashSet<String>>>,
     paint: Signal<Option<SelectionPaint>>,
 ) {
+    let park = web_sys::window()
+        .and_then(|window| window.document()?.active_element())
+        .is_none_or(|active| active.matches("body, .sidebar *").unwrap_or(true));
     end_paint_if_active(paint);
     picker.set(None);
-    focus_sidebar_trash_trigger();
+    if park {
+        focus_when_mounted("sidebar-trash-trigger", None, false);
+    }
+}
+
+/// The id of the ⋯ trigger that inherits focus from `run_id`'s row as it is trashed: the next row's, else the previous row's, else empty (the run filter takes it). The rows are the run list's only elements, so a row's element siblings are its neighbours.
+///
+/// `None` unless focus is on that row's ⋯ (bulk mode draws none), where the closing menu hands it back. A Safari click leaves it on the page instead; a reply landing within a frame of the press can still find it on the menu's first item (inside the row), and one landing later may find it wherever the user moved on to.
+fn row_focus_heir(run_id: &str) -> Option<String> {
+    let trigger = web_sys::window()?.document()?.active_element()?;
+    if !trigger.matches(".run-overflow-trigger").ok()? {
+        return None;
+    }
+    let row = trigger.closest(".sidebar-run").ok()??;
+    if row.get_attribute("data-run-id").as_deref() != Some(run_id) {
+        return None;
+    }
+    Some(
+        row.next_element_sibling()
+            .or_else(|| row.previous_element_sibling())
+            .and_then(|heir| heir.query_selector(".run-overflow-trigger").ok().flatten())
+            .map(|trigger| trigger.id())
+            .unwrap_or_default(),
+    )
 }
 
 fn focus_when_mounted(
@@ -528,10 +555,8 @@ fn focus_when_mounted(
     fallback_selector: Option<&str>,
     preserve_existing_focus: bool,
 ) {
-    let primary_id = serde_json::to_string(primary_id).unwrap_or_else(|_| "\"\"".to_string());
-    let fallback_selector = fallback_selector
-        .map(|selector| serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string()))
-        .unwrap_or_else(|| "null".to_string());
+    let primary_id = js_string(primary_id);
+    let fallback_selector = fallback_selector.map_or_else(|| "null".to_string(), js_string);
     spawn(async move {
         let _ = document::eval(&format!(
             "(()=>{{\
@@ -550,12 +575,8 @@ fn focus_when_mounted(
     });
 }
 
-fn focus_sidebar_trash_trigger() {
-    focus_when_mounted("sidebar-trash-trigger", None, false);
-}
-
 async fn hide_run_popover(menu_id: &str) {
-    let menu_id = serde_json::to_string(menu_id).unwrap_or_else(|_| "\"\"".to_string());
+    let menu_id = js_string(menu_id);
     let _ = document::eval(&format!(
         "try{{document.getElementById({menu_id})?.hidePopover()}}catch(_){{}}"
     ))

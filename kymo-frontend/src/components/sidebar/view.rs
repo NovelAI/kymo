@@ -1,5 +1,5 @@
 use super::*;
-use crate::util::{focus_on_mount, is_app_escape, js_bridge::js_string, TOP_LAYER_SELECTOR};
+use crate::util::{focus_on_mount, is_app_escape, TOP_LAYER_SELECTOR};
 use dioxus::core::{current_scope_id, Runtime};
 
 /// A run's liveness glyph: shape tells the kind of state, CSS color its severity.

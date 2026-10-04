@@ -1,4 +1,4 @@
-//! Page-wide viewport-zone tracking: TWO IntersectionObservers total (plus MutationObservers for `.metric-slot` auto-registration and the maximize overlay's lock class), one rAF-batched eval channel, and ZoneBridge fanning changes out to per-slot signals. Replaces per-rect observer pairs and eval channels — at thousands of panels those dominated idle cost. A slot that never changes zone costs nothing after its initial classification.
+//! Page-wide viewport-zone tracking: TWO IntersectionObservers total (plus MutationObservers for `.metric-slot` auto-registration and the grid's `inert` under the maximize overlay), one rAF-batched eval channel, and ZoneBridge fanning changes out to per-slot signals. Replaces per-rect observer pairs and eval channels — at thousands of panels those dominated idle cost. A slot that never changes zone costs nothing after its initial classification.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -26,10 +26,10 @@ function cb(k){return function(es){for(const e of es){const s=st.get(e.target);i
 const sc=document.querySelector('main.main-content');
 const vo=new IntersectionObserver(cb('v'),{root:sc});
 const no=new IntersectionObserver(cb('n'),{root:sc,rootMargin:'100% 0px 100% 0px'});
-// Occlusion: IntersectionObserver is geometry-only — z-order is not an input, so the maximize overlay covering the grid fires no events. The scroll container carries main-content-locked exactly while the overlay is up (dashboard_layout.rs); while set, intersecting slots cap at Near: canvases unmount (leaving the cursor-sync and highlight-redraw loops to the overlay chart) but data stays warm for an instant close. Only intersecting slots' codes depend on the lock, so a flip re-queues exactly those — every queued entry is a real change.
-let locked=!!sc&&sc.classList.contains('main-content-locked');
-const lo=new MutationObserver(function(){const l=sc.classList.contains('main-content-locked');if(l!==locked){locked=l;for(const s of st.values())if(s.v)queue(s);}});
-if(sc)lo.observe(sc,{attributes:true,attributeFilter:['class']});
+// Occlusion: IntersectionObserver is geometry-only — z-order is not an input, so the maximize overlay covering the grid fires no events. The scroll container is inert exactly while the overlay is up (dashboard_layout.rs), and intersecting slots then cap at Near: canvases unmount (leaving the cursor-sync and highlight-redraw loops to the overlay chart) but data stays warm for an instant close. Only intersecting slots' codes depend on the lock, so a flip re-queues exactly those — every queued entry is a real change.
+let locked=!!sc&&sc.hasAttribute('inert');
+const lo=new MutationObserver(function(){const l=sc.hasAttribute('inert');if(l!==locked){locked=l;for(const s of st.values())if(s.v)queue(s);}});
+if(sc)lo.observe(sc,{attributes:true,attributeFilter:['inert']});
 function add(el){if(st.has(el))return;st.set(el,{id:el.dataset.slotId,v:null,n:null});vo.observe(el);no.observe(el);}
 function rm(el){if(st.delete(el)){vo.unobserve(el);no.unobserve(el);}}
 function scan(n,f){if(!(n instanceof Element))return;if(n.matches('.metric-slot'))f(n);for(const el of n.querySelectorAll('.metric-slot'))f(el);}

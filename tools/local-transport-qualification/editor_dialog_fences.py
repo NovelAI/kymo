@@ -625,7 +625,8 @@ def run_fences(page: Page) -> None:
     expect(page.locator(".sidebar-trash-mode")).to_be_visible()
     page.keyboard.press("Escape")
     expect(page.locator(".sidebar-trash-mode")).to_have_count(0)
-    expect(bulk).to_be_focused()
+    # Focus outside the sidebar (back on the dialog's trigger) is not the picker's to move.
+    expect(defaults).to_be_focused()
 
     color_picker_dismissal(page)
 

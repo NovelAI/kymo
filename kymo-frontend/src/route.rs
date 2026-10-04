@@ -13,16 +13,6 @@ use crate::pages::trash_page::TrashPage;
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChartQuery(Option<String>);
 
-impl ChartQuery {
-    fn value(&self) -> Option<String> {
-        self.0.clone()
-    }
-
-    fn is_some(&self) -> bool {
-        self.0.is_some()
-    }
-}
-
 impl From<Option<String>> for ChartQuery {
     fn from(value: Option<String>) -> Self {
         Self(value)
@@ -87,7 +77,7 @@ impl Route {
     /// The focused-chart `?chart=` param of the current page, if any.
     pub fn chart_param(&self) -> Option<String> {
         match self {
-            Route::ProjectPage { chart, .. } | Route::RunPage { chart, .. } => chart.value(),
+            Route::ProjectPage { chart, .. } | Route::RunPage { chart, .. } => chart.0.clone(),
             _ => None,
         }
     }
@@ -111,7 +101,7 @@ impl Route {
     }
 }
 
-// The route the last focus push created. It proves "the current history entry is the one we pushed" only while the URL has continuously remained exactly this route — `note_route` clears it the moment anything else becomes current, because a *different* entry with the same route can only be reached by passing through some other route first (identical consecutive pushes are deduped by the router). While the proof holds, the entry below ours is necessarily the pre-open page (entries below an existing entry are immutable), so popping is safe.
+// The route of the entry the last focus push created, carried along by `focus_chart`'s chart-to-chart rewrites of that entry. It proves "the current history entry is the one we pushed" only while the URL has continuously remained exactly this route — `note_route` clears it the moment anything else becomes current, because a *different* entry with the same route can only be reached by passing through some other route first (identical consecutive pushes are deduped by the router). While the proof holds, the entry below ours is necessarily the pre-open page (entries below an existing entry are immutable), so popping is safe.
 thread_local! {
     static FOCUS_PUSH: std::cell::RefCell<Option<Route>> = const { std::cell::RefCell::new(None) };
 }
@@ -126,22 +116,22 @@ pub fn note_route(route: &Route) {
 }
 
 /// Focus or unfocus a chart by rewriting the current URL's `?chart=` param — the maximize overlay's source of truth (synced by DashboardLayout) and a shareable link to the focused chart.
-/// Focusing pushes, so Back dismisses the overlay. Dismissing pops the entry that push created when it's provably still the current one (see `FOCUS_PUSH`), so open→Esc leaves no duplicate entry for Back to eat; otherwise — direct chart link, or the URL moved under the overlay — it rewrites in place.
+/// Focusing pushes, so Back dismisses the overlay; moving from one focused chart to another (←/→) rewrites that entry in place, so Back still dismisses rather than stepping back through charts. Dismissing pops the entry that push created when it's provably still the current one (see `FOCUS_PUSH`), so open→Esc leaves no duplicate entry for Back to eat; otherwise — direct chart link, or the URL moved under the overlay — it rewrites in place.
 pub fn focus_chart(chart: Option<String>) {
     let current: Route = router().current();
     let target = current.with_chart(chart);
     if target == current {
         return;
     }
-    if matches!(
-        &target,
-        Route::ProjectPage { chart, .. } | Route::RunPage { chart, .. } if chart.is_some()
-    ) {
+    let ours = FOCUS_PUSH.take().is_some_and(|route| route == current);
+    if current.chart_param().is_none() {
         navigator().push(target.clone());
         FOCUS_PUSH.set(Some(target));
-    } else if FOCUS_PUSH.take().is_some_and(|route| route == current) {
+    } else if ours && target.chart_param().is_none() {
         navigator().go_back();
     } else {
+        // A chart-to-chart rewrite keeps our entry, so the proof moves with it.
+        FOCUS_PUSH.set(ours.then(|| target.clone()));
         navigator().replace(target);
     }
 }

@@ -470,7 +470,7 @@ pub struct RectConfig {
 }
 
 /// How a CDN gallery displays multiple runs.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Default)]
 pub enum CdnDisplayMode {
     /// Slider picks an index; shows that index from each run.
     #[default]
@@ -751,6 +751,21 @@ impl LayoutConfig {
             .map(|s| s.max_columns.max(1))
             .unwrap_or(1);
         Some((rect, max_columns))
+    }
+
+    /// The panel the maximized panel `id` moves to on → (`forward`) or ←: its section neighbour among the panels the `needle` filter lists, on any page. A panel the filter hides steps to the listed panels around its place.
+    pub fn adjacent_rect(&self, id: &str, needle: &str, forward: bool) -> Option<&str> {
+        let (rects, at) = self.sections.iter().find_map(|s| {
+            let at = s.rects.iter().position(|r| r.id == id)?;
+            Some((&s.rects, at))
+        })?;
+        let listed = |r: &&RectConfig| r.matches_filter(needle);
+        if forward {
+            rects[at + 1..].iter().find(listed)
+        } else {
+            rects[..at].iter().rev().find(listed)
+        }
+        .map(|r| r.id.as_str())
     }
 }
 
@@ -1228,6 +1243,50 @@ mod filter_tests {
         let empty = SectionConfig::auto("empty".to_string(), Vec::new());
         assert!(empty.matches_filter(""));
         assert!(!empty.matches_filter("empty"));
+    }
+
+    #[test]
+    fn maximized_panels_step_through_their_sections_listed_panels() {
+        let panel = |id: &str| RectConfig {
+            id: id.to_string(),
+            ..rect("", &[id])
+        };
+
+        let layout = LayoutConfig {
+            sections: vec![
+                SectionConfig::auto(
+                    "train".to_string(),
+                    ["train/a", "train/loss", "train/b", "train/loss2"]
+                        .map(panel)
+                        .to_vec(),
+                ),
+                SectionConfig::auto("val".to_string(), vec![panel("val/loss")]),
+            ],
+        };
+        let adjacent_rects = |id: &'static str, needle: &'static str| {
+            (
+                layout.adjacent_rect(id, needle, false),
+                layout.adjacent_rect(id, needle, true),
+            )
+        };
+        assert_eq!(adjacent_rects("train/a", ""), (None, Some("train/loss")));
+        assert_eq!(
+            adjacent_rects("train/b", ""),
+            (Some("train/loss"), Some("train/loss2"))
+        );
+        // Section ends stop: no crossing into the next section.
+        assert_eq!(adjacent_rects("train/loss2", ""), (Some("train/b"), None));
+        assert_eq!(adjacent_rects("val/loss", ""), (None, None));
+        // The filter's hidden panels are skipped, and a hidden panel steps to the listed ones around it.
+        assert_eq!(
+            adjacent_rects("train/loss", "loss"),
+            (None, Some("train/loss2"))
+        );
+        assert_eq!(
+            adjacent_rects("train/b", "loss"),
+            (Some("train/loss"), Some("train/loss2"))
+        );
+        assert_eq!(adjacent_rects("missing", ""), (None, None));
     }
 }
 

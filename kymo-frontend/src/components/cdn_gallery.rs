@@ -1,16 +1,18 @@
 use std::cell::RefCell;
 use std::collections::BTreeSet;
-use std::rc::Rc;
 
 use dioxus::prelude::*;
+use dioxus::web::WebEventExt;
+use wasm_bindgen::JsCast;
 
 use crate::components::copy_text::CopyText;
-use crate::components::icons::{CaretLeftIcon, CaretRightIcon};
+use crate::components::icons::{CaretDownIcon, CaretLeftIcon, CaretRightIcon, CaretUpIcon};
 use crate::components::metric_rect::CdnRunData;
+use crate::route::Route;
 use crate::state::layout_config::CdnDisplayMode;
 use crate::state::panel_cache::Store;
 use crate::state::visibility::retry_visible;
-use crate::util::{focus_on_mount, is_app_escape, primary};
+use crate::util::primary;
 
 thread_local! {
     /// persist_key -> the step the user navigated to, so a gallery scrolled out of the band (its panel body unmounts, see metric_rect.rs) comes back on the same step. Only explicit navigation writes it — an untouched gallery keeps the default jump-to-latest on remount.
@@ -31,22 +33,75 @@ fn remember_gallery_index(persist_key: Option<&str>, index: usize) {
     }
 }
 
-fn selected_step_index(steps: &[i64], selected_step: Option<i64>) -> Option<usize> {
-    if steps.is_empty() {
-        return None;
-    }
-    Some(match selected_step {
-        Some(step) => match steps.binary_search(&step) {
-            Ok(index) => index,
-            Err(insertion) => insertion.min(steps.len() - 1),
-        },
+/// `steps` is non-empty.
+fn selected_step_index(steps: &[i64], selected_step: Option<i64>) -> usize {
+    match selected_step {
+        Some(step) => steps
+            .binary_search(&step)
+            .unwrap_or_else(|insertion| insertion.min(steps.len() - 1)),
         // The signal can still be None when the gallery first mounted with no data. Preserve the normal untouched-gallery default when steps later arrive: start at latest (the caller then stores that concrete step).
         None => steps.len() - 1,
-    })
+    }
 }
 
-fn opens_gallery_lightbox(modifiers: dioxus::html::Modifiers) -> bool {
+/// No Alt, Ctrl, Meta or Shift: only a plain click opens the lightbox (modified clicks keep the link's native behaviour), and only plain arrow keys move it (Alt+← and Cmd+← are browser Back).
+fn unmodified(modifiers: dioxus::html::Modifiers) -> bool {
     !modifiers.alt() && !modifiers.ctrl() && !modifiers.meta() && !modifiers.shift()
+}
+
+/// The image the lightbox shows: its (project, run, metric) source and its index in that source's manifest, which together identify an entry in a panel. The image itself is looked up on every render, which keeps the lightbox open across step changes and refetches. Its `Debug` spelling is the thumbnail's `data-image`, which Esc matches.
+#[derive(Clone, Debug, PartialEq)]
+struct LightboxImage {
+    project_id: String,
+    run_id: String,
+    metric_name: String,
+    item: usize,
+}
+
+/// Where ←/→ go from the open image, as (source, item) pairs.
+#[derive(Debug, PartialEq)]
+struct LightboxNeighbours {
+    previous: Option<(usize, usize)>,
+    next: Option<(usize, usize)>,
+    /// The open image's 1-based place and the image count, when it exists at the shown step.
+    position: Option<(usize, usize)>,
+}
+
+/// The lightbox's ←/→ neighbours of the open image `(source, item)`, in the order `mode` draws thumbnails: source-major for GroupByRun, index-major for Interleaved, and only the open image's index for SelectIndex. `counts[source]` is that source's item count at the shown step. The open image need not exist there (a placeholder, a shorter manifest), so ←/→ still reach the images around its place.
+fn lightbox_neighbours(
+    mode: CdnDisplayMode,
+    counts: &[usize],
+    open: (usize, usize),
+) -> LightboxNeighbours {
+    let order = |&(source, item): &(usize, usize)| match mode {
+        CdnDisplayMode::Interleaved => (item, source),
+        CdnDisplayMode::GroupByRun | CdnDisplayMode::SelectIndex => (source, item),
+    };
+    let mut images: Vec<(usize, usize)> = counts
+        .iter()
+        .enumerate()
+        .flat_map(|(source, &count)| (0..count).map(move |item| (source, item)))
+        .filter(|&(_, item)| mode != CdnDisplayMode::SelectIndex || item == open.1)
+        .collect();
+    images.sort_unstable_by_key(order);
+    // The images before `at` sort before the open image, which sits at `at` when it exists.
+    let at = images.partition_point(|image| order(image) < order(&open));
+    let present = images.get(at) == Some(&open);
+    LightboxNeighbours {
+        previous: at.checked_sub(1).map(|i| images[i]),
+        next: images.get(at + usize::from(present)).copied(),
+        position: present.then(|| (at + 1, images.len())),
+    }
+}
+
+/// The step ↑ (`later`) or ↓ takes the lightbox to: the open source's own next or previous logged step, so it skips steps only other sources logged. Placeholder steps count; the lightbox shows their upload status.
+fn adjacent_source_step(keys: &[(i64, String)], step: i64, later: bool) -> Option<i64> {
+    let steps = keys.iter().map(|(s, _)| *s);
+    if later {
+        steps.filter(|&s| s > step).min()
+    } else {
+        steps.filter(|&s| s < step).max()
+    }
 }
 
 fn gallery_thumbnail_label(
@@ -83,28 +138,35 @@ fn gallery_file_link_label(
 
 fn gallery_image(
     item: &ManifestItem,
-    run_label: &str,
+    run: &RunManifest,
     source_index: usize,
     image_index: usize,
-    on_lightbox: EventHandler<String>,
+    on_lightbox: EventHandler<LightboxImage>,
 ) -> Element {
     let url = crate::runtime::cdn_url(&item.resource);
     let accessible_label = gallery_thumbnail_label(
-        run_label,
+        &run.label,
         source_index,
         item.caption.as_deref(),
         image_index,
     );
-    let click_url = url.clone();
+    let open = LightboxImage {
+        project_id: run.project_id.clone(),
+        run_id: run.run_id.clone(),
+        metric_name: run.metric_name.clone(),
+        item: image_index,
+    };
     rsx! {
         a {
             href: "{url}",
             target: "_blank",
             aria_label: "{accessible_label}",
+            // Esc in the preview hands focus back by it (`gallery_thumbnail`): a URL can name several entries, as identical images share a content-addressed key.
+            "data-image": "{open:?}",
             onclick: move |event: Event<MouseData>| {
-                if opens_gallery_lightbox(event.modifiers()) {
+                if unmodified(event.modifiers()) {
                     event.prevent_default();
-                    on_lightbox.call(click_url.clone());
+                    on_lightbox.call(open.clone());
                 }
             },
             img { src: "{url}", loading: "lazy", alt: "" }
@@ -115,11 +177,27 @@ fn gallery_image(
     }
 }
 
+/// The link `gallery_image` drew for `image` in the gallery holding `inside`.
+fn gallery_thumbnail(
+    inside: &web_sys::Element,
+    image: &LightboxImage,
+) -> Option<web_sys::HtmlElement> {
+    let identity = format!("{image:?}");
+    let links = inside
+        .closest(".cdn-gallery")
+        .ok()??
+        .query_selector_all("[data-image]")
+        .ok()?;
+    (0..links.length())
+        .filter_map(|i| links.item(i)?.dyn_into::<web_sys::HtmlElement>().ok())
+        .find(|link| link.get_attribute("data-image").as_deref() == Some(identity.as_str()))
+}
+
 fn gallery_run_image(
     run: &RunManifest,
     source_index: usize,
     idx: usize,
-    on_lightbox: EventHandler<String>,
+    on_lightbox: EventHandler<LightboxImage>,
 ) -> Element {
     let Some(item) = run.manifest.as_ref().and_then(|m| m.items.get(idx)) else {
         return rsx! {};
@@ -130,7 +208,7 @@ fn gallery_run_image(
         div {
             class: "cdn-image-item",
             style: "background: {color}22;",
-            {gallery_image(item, run_label, source_index, idx, on_lightbox)}
+            {gallery_image(item, run, source_index, idx, on_lightbox)}
             div {
                 class: "cdn-run-label fade-overflow",
                 style: "color: {color};",
@@ -361,14 +439,14 @@ pub fn CdnGallery(
     persist_key: Option<String>,
 ) -> Element {
     // Collect all unique steps across runs
-    let all_steps: Rc<[i64]> = {
+    let all_steps: Vec<i64> = {
         let mut steps = BTreeSet::new();
         for run in &runs {
             for (step, _) in &run.keys {
                 steps.insert(*step);
             }
         }
-        steps.into_iter().collect::<Vec<_>>().into()
+        steps.into_iter().collect()
     };
 
     let total_steps = all_steps.len();
@@ -382,20 +460,25 @@ pub fn CdnGallery(
                 .or(latest_step)
         }
     });
-    // Explicit navigation below writes through; resolving a disappeared step
-    // to its successor doesn't (that isn't the user picking another step).
-    let remember = {
+    // Explicit navigation (the step controls, the lightbox's ↑/↓) goes through here and writes through; resolving a disappeared step to its successor doesn't (that isn't the user picking another step).
+    let pick_step = use_callback({
         let persist_key = persist_key.clone();
         move |step: i64| {
+            selected_step.set(Some(step));
             if let Some(k) = &persist_key {
                 GALLERY_STEP.with(|c| c.borrow_mut().put(k.clone(), step));
             }
         }
-    };
+    });
+    // Held here rather than in GalleryRenderer, which unmounts whenever the step or its manifests are refetched.
+    let mut lightbox = use_signal(|| None::<LightboxImage>);
 
     if all_steps.is_empty() {
         if cdn_class.peek().is_some() {
             cdn_class.set(None);
+        }
+        if lightbox.peek().is_some() {
+            lightbox.set(None);
         }
         return rsx! {
             div { class: "cdn-gallery", style: "height: {height}px;",
@@ -405,8 +488,10 @@ pub fn CdnGallery(
     }
 
     let selected = *selected_step.read();
-    let idx = selected_step_index(&all_steps, selected).unwrap();
+    let idx = selected_step_index(&all_steps, selected);
     let step = all_steps[idx];
+    let previous_step = idx.checked_sub(1).map(|i| all_steps[i]);
+    let next_step = all_steps.get(idx + 1).copied();
     let current_step = idx + 1;
     let step_value_text = format!("Step {step}, {current_step} of {total_steps}");
     if selected.is_none() {
@@ -443,29 +528,20 @@ pub fn CdnGallery(
     let status = pending_status(&pending_live, &pending_ended);
     let single_run = runs.len() <= 1;
 
-    // Track keys in signal for use_resource
-    let mut keys_signal = use_signal(|| run_keys.clone());
-    if *keys_signal.read() != run_keys {
-        keys_signal.set(run_keys.clone());
-    }
-
     // Fetch this step's manifests concurrently, retrying each until it settles; the step publishes once every source has settled.
-    let manifests = use_resource(move || {
-        let keys = keys_signal.read().clone();
-        async move {
-            let source_keys = keys.clone();
-            let futs = keys.into_iter().map(|(mut run_manifest, key)| async move {
-                let manifest = if key.starts_with("pending:") {
-                    None
-                } else {
-                    retry_visible("manifest", async || fetch_manifest(&key).await).await
-                };
-                run_manifest.manifest = manifest;
-                run_manifest
-            });
-            (source_keys, futures::future::join_all(futs).await)
-        }
-    });
+    let manifests = use_resource(use_reactive((&run_keys,), move |(keys,)| async move {
+        let source_keys = keys.clone();
+        let futs = keys.into_iter().map(|(mut run_manifest, key)| async move {
+            let manifest = if key.starts_with("pending:") {
+                None
+            } else {
+                retry_visible("manifest", async || fetch_manifest(&key).await).await
+            };
+            run_manifest.manifest = manifest;
+            run_manifest
+        });
+        (source_keys, futures::future::join_all(futs).await)
+    }));
 
     // Publish the settled step's CDN sub-type upward so the BindingEditor only shows applicable panels.
     let mut cdn_class_sig = cdn_class;
@@ -480,7 +556,7 @@ pub fn CdnGallery(
         }
     });
 
-    let (presentation, run_manifests) = {
+    let (presentation, run_manifests, lightbox_view) = {
         let read = manifests.read();
         let current = current_manifest_results(&run_keys, read.as_ref());
         let parsed_manifest_count = current.map(|run_manifests| {
@@ -489,9 +565,14 @@ pub fn CdnGallery(
                 .filter(|run_manifest| run_manifest.manifest.is_some())
                 .count()
         });
+        // An open lightbox shows the last settled manifests, current or not, so its image stays up while the next step loads.
+        let lightbox_view = lightbox()
+            .zip(read.as_ref())
+            .map(|(open, (_, settled))| (open, settled.clone(), current.is_none()));
         (
             gallery_presentation(status.is_some(), parsed_manifest_count),
             current.map(<[RunManifest]>::to_vec).unwrap_or_default(),
+            lightbox_view,
         )
     };
     // If single run, always use GroupByRun behavior.
@@ -505,68 +586,42 @@ pub fn CdnGallery(
         div { class: "cdn-gallery", style: "height: {height}px;",
             // Step slider — pointless with a single step (e.g. info/run_info metadata, always step 0)
             if total_steps > 1 {
+                // MAXIMIZE_KEYS_JS (dashboard_layout.rs) presses the step buttons by aria-label for ↑/↓ in a maximized panel.
                 div { class: "cdn-step-nav",
                     button {
                         class: "cdn-nav-btn icon-button",
                         title: "Previous step",
                         aria_label: "Previous step",
-                        disabled: idx == 0,
-                        onmousedown: primary({
-                            let remember = remember.clone();
-                            let all_steps = all_steps.clone();
-                            move |_| {
-                                let Some(i) = selected_step_index(&all_steps, *selected_step.read()) else {
-                                    return;
-                                };
-                                if let Some(&step) = i.checked_sub(1).and_then(|i| all_steps.get(i)) {
-                                    selected_step.set(Some(step));
-                                    remember(step);
-                                }
+                        disabled: previous_step.is_none(),
+                        onmousedown: primary(move |_| {
+                            if let Some(step) = previous_step {
+                                pick_step.call(step);
                             }
                         }),
                         CaretLeftIcon {}
                     }
-                    {
-                        let max_val = total_steps.saturating_sub(1);
-                        let remember_slider = remember.clone();
-                        let all_steps = all_steps.clone();
-                        rsx! {
-                            input {
-                                r#type: "range",
-                                class: "cdn-step-slider",
-                                aria_label: "Gallery step",
-                                aria_valuetext: "{step_value_text}",
-                                min: "0",
-                                max: "{max_val}",
-                                value: "{idx}",
-                                oninput: move |e: Event<FormData>| {
-                                    if let Ok(v) = e.value().parse::<usize>() {
-                                        let v = v.min(total_steps.saturating_sub(1));
-                                        let step = all_steps[v];
-                                        selected_step.set(Some(step));
-                                        remember_slider(step);
-                                    }
-                                },
+                    input {
+                        r#type: "range",
+                        class: "cdn-step-slider",
+                        aria_label: "Gallery step",
+                        aria_valuetext: "{step_value_text}",
+                        min: "0",
+                        max: "{total_steps - 1}",
+                        value: "{idx}",
+                        oninput: move |e: Event<FormData>| {
+                            if let Ok(v) = e.value().parse::<usize>() {
+                                pick_step.call(all_steps[v.min(total_steps - 1)]);
                             }
-                        }
+                        },
                     }
                     button {
                         class: "cdn-nav-btn icon-button",
                         title: "Next step",
                         aria_label: "Next step",
-                        disabled: idx >= total_steps - 1,
-                        onmousedown: primary({
-                            let remember = remember.clone();
-                            let all_steps = all_steps.clone();
-                            move |_| {
-                                let Some(i) = selected_step_index(&all_steps, *selected_step.read()) else {
-                                    return;
-                                };
-                                if i + 1 < total_steps {
-                                    let step = all_steps[i + 1];
-                                    selected_step.set(Some(step));
-                                    remember(step);
-                                }
+                        disabled: next_step.is_none(),
+                        onmousedown: primary(move |_| {
+                            if let Some(step) = next_step {
+                                pick_step.call(step);
                             }
                         }),
                         CaretRightIcon {}
@@ -593,7 +648,8 @@ pub fn CdnGallery(
                             run_manifests,
                             mode: effective_mode,
                             metadata_diff_only,
-                            persist_key: persist_key.clone(),
+                            persist_key,
+                            on_lightbox: move |open| lightbox.set(Some(open)),
                         }
                     },
                     GalleryPresentation::Empty => rsx! {
@@ -602,6 +658,231 @@ pub fn CdnGallery(
                     GalleryPresentation::Loading => rsx! {
                         div { class: "cdn-gallery-loading", "Loading..." }
                     },
+                }
+            }
+
+            if let Some((open, shown, loading)) = lightbox_view {
+                GalleryLightbox {
+                    open,
+                    runs,
+                    shown,
+                    loading,
+                    mode: effective_mode,
+                    step,
+                    lightbox,
+                    on_step: pick_step,
+                }
+            }
+        }
+    }
+}
+
+/// What a lightbox arrow key or button does.
+#[derive(Clone)]
+enum LightboxMove {
+    Image(LightboxImage),
+    Step(i64),
+}
+
+/// The full-size view of one gallery image. ←/→ walk the images in the order the panel draws them, ↑/↓ walk the open image's source through its steps (moving the panel's step), and the buttons do the same for pointers.
+#[component]
+fn GalleryLightbox(
+    open: LightboxImage,
+    runs: Vec<CdnRunData>,
+    /// The last settled manifests; another step's while `loading`.
+    shown: Vec<RunManifest>,
+    loading: bool,
+    mode: CdnDisplayMode,
+    /// The panel's step, which ↑/↓ move.
+    step: i64,
+    mut lightbox: Signal<Option<LightboxImage>>,
+    on_step: EventHandler<i64>,
+) -> Element {
+    // Navigating (Back, Forward) closes it: a preview opened on one page would otherwise stay modal over the next (Forward into a maximized chart), holding its keys.
+    let opened_on = use_hook(|| router().current::<Route>());
+    use_effect(move || {
+        if router().current::<Route>() != opened_on {
+            lightbox.set(None);
+        }
+    });
+    // Each run's settled image manifest at the shown step, aligned with `runs`. A metric can log resources at other steps (the panel lists those as files).
+    let manifests: Vec<Option<&Manifest>> = runs
+        .iter()
+        .map(|run| {
+            shown
+                .iter()
+                .find(|settled| {
+                    (&settled.project_id, &settled.run_id, &settled.metric_name)
+                        == (&run.project_id, &run.run_id, &run.metric_name)
+                })
+                .and_then(|settled| settled.manifest.as_ref())
+                .filter(|manifest| manifest.is_image_gallery())
+        })
+        .collect();
+    let source = runs.iter().position(|run| {
+        (&run.project_id, &run.run_id, &run.metric_name)
+            == (&open.project_id, &open.run_id, &open.metric_name)
+    });
+    let run = source.map(|source| &runs[source]);
+    let item = source
+        .and_then(|source| manifests[source])
+        .and_then(|manifest| manifest.items.get(open.item));
+
+    let counts: Vec<usize> = manifests
+        .iter()
+        .map(|manifest| manifest.map_or(0, |manifest| manifest.items.len()))
+        .collect();
+    let neighbours = source.map(|source| lightbox_neighbours(mode, &counts, (source, open.item)));
+    let image = |image: Option<(usize, usize)>| {
+        image.map(|(source, item)| {
+            let run = &runs[source];
+            LightboxMove::Image(LightboxImage {
+                project_id: run.project_id.clone(),
+                run_id: run.run_id.clone(),
+                metric_name: run.metric_name.clone(),
+                item,
+            })
+        })
+    };
+    let left = image(neighbours.as_ref().and_then(|n| n.previous));
+    let right = image(neighbours.as_ref().and_then(|n| n.next));
+    let source_step = |later: bool| {
+        run.and_then(|run| adjacent_source_step(&run.keys, step, later))
+            .map(LightboxMove::Step)
+    };
+    let (up, down) = (source_step(true), source_step(false));
+    let position = neighbours.and_then(|n| n.position).filter(|_| !loading);
+
+    let mut go = move |to: Option<LightboxMove>| match to {
+        Some(LightboxMove::Image(open)) => lightbox.set(Some(open)),
+        Some(LightboxMove::Step(step)) => on_step.call(step),
+        None => {}
+    };
+    // A press on a control, with any button, neither closes the lightbox nor takes focus from it (a focused control that became disabled would drop focus to <body>, out of reach of the keys); a disabled control still swallows the press.
+    let control = |to: &Option<LightboxMove>, label: &str, key: &str, icon: Element| {
+        let mut act = primary({
+            let to = to.clone();
+            move |_| go(to.clone())
+        });
+        rsx! {
+            button {
+                class: "cdn-lightbox-nav icon-button",
+                title: "{label} ({key})",
+                aria_label: "{label}",
+                disabled: to.is_none(),
+                onmousedown: move |e: Event<MouseData>| {
+                    e.stop_propagation();
+                    e.prevent_default();
+                    act(e);
+                },
+                {icon}
+            }
+        }
+    };
+    let previous_image = control(&left, "Previous image", "←", rsx! { CaretLeftIcon {} });
+    let next_image = control(&right, "Next image", "→", rsx! { CaretRightIcon {} });
+    let previous_step = control(&down, "Previous step", "↓", rsx! { CaretDownIcon {} });
+    let next_step = control(&up, "Next step", "↑", rsx! { CaretUpIcon {} });
+
+    let body = match (item, run) {
+        (Some(item), _) => {
+            let url = crate::runtime::cdn_url(&item.resource);
+            // Keyed by URL: a reused <img> would keep painting the previous picture, under this one's info line, until the new one loads. No alt: the info line names the image.
+            rsx! {
+                img { key: "{url}", class: "cdn-lightbox-img", src: "{url}", alt: "" }
+            }
+        }
+        // Nothing of this image to keep up until the step loads.
+        (None, _) if loading => rsx! {},
+        (None, None) => rsx! { div { class: "cdn-lightbox-note", "No longer in this panel" } },
+        (None, Some(run)) => {
+            let pending = run
+                .keys
+                .iter()
+                .any(|(s, key)| *s == step && key.starts_with("pending:"));
+            let note = match (pending, run.ended) {
+                (true, false) => "Not uploaded yet".to_string(),
+                (true, true) => "Upload did not finish".to_string(),
+                (false, _) => format!("No image {} at step {step}", open.item + 1),
+            };
+            rsx! { div { class: "cdn-lightbox-note", "{note}" } }
+        }
+    };
+
+    rsx! {
+        // A modal dialog in the browser's top layer, which no ancestor can clip or cover: Safari clipped a fixed overlay to the content row, under the navbar.
+        dialog {
+            class: "cdn-lightbox",
+            aria_label: "Full-size image",
+            tabindex: "-1",
+            onmounted: move |event| {
+                let dialog = event.as_web_event().unchecked_into::<web_sys::HtmlDialogElement>();
+                // Shown in the flush that inserts it, so no key meets it as a plain dialog. Unlike EditorDialog (opened on mousedown, whose focus move must pass first), it opens on a click, after its press's focus move.
+                let _ = dialog.show_modal();
+                // The dialog itself, not a control (Chromium picks the first button, ignoring autofocus on the dialog): a focused control that turns disabled drops focus out from under the keys.
+                let _ = dialog.focus();
+            },
+            // Esc: closed here first (the default action then finds it closed), as nothing behind a modal dialog can take focus; then the last shown image's thumbnail takes it, so Tab and Enter carry on from there. With none drawn (a step loading), close restores the opener if it survives. A pointer close leaves focus alone: Safari would ring the thumbnail.
+            oncancel: move |e| {
+                let dialog = e.as_web_event().target().unwrap().unchecked_into::<web_sys::HtmlDialogElement>();
+                dialog.close();
+                if let Some(thumbnail) = gallery_thumbnail(&dialog, &open) {
+                    let _ = thumbnail.focus();
+                }
+                lightbox.set(None);
+            },
+            // mousedown, not click, so a drag-release in the backdrop doesn't dismiss; primary button only, so right-click (e.g. "save image as") keeps it open.
+            onmousedown: primary(move |_| lightbox.set(None)),
+            // WebKit chained a wheel over the preview to the grid's scroller, and a panel scrolled out of the band unmounts, preview and all. Ctrl+wheel is a pinch-zoom, left alone.
+            onwheel: move |e: Event<WheelData>| {
+                if !e.modifiers().ctrl() {
+                    e.prevent_default();
+                }
+            },
+            onkeydown: move |e: Event<KeyboardData>| {
+                let to = match e.key() {
+                    // Nothing in here takes focus, so Tab (and Shift+Tab) would only move it out from under the keys.
+                    Key::Tab => &None,
+                    _ if !unmodified(e.modifiers()) => return,
+                    Key::ArrowLeft => &left,
+                    Key::ArrowRight => &right,
+                    Key::ArrowUp => &up,
+                    Key::ArrowDown => &down,
+                    _ => return,
+                };
+                // Consumed at the ends too, so nothing beneath acts on it.
+                e.prevent_default();
+                go(to.clone());
+            },
+            {previous_image}
+            div { class: "cdn-lightbox-stage", {body} }
+            {next_image}
+            div {
+                class: "cdn-lightbox-info",
+                // Selecting the caption must not dismiss.
+                onmousedown: move |e| e.stop_propagation(),
+                if let Some(run) = run {
+                    span { class: "cdn-lightbox-run fade-overflow fade-lines", style: "color: {run.color};", title: "{run.label}",
+                        span { "{run.label}" }
+                    }
+                }
+                // Plain text, not CopyText: a focused caption that unmounts (the next image has none) would leave focus on <body>, out of reach of the keys.
+                if let Some(caption) = item.and_then(|item| item.caption.as_ref()) {
+                    span { class: "cdn-lightbox-caption fade-overflow fade-lines", title: "{caption}",
+                        span { "{caption}" }
+                    }
+                }
+                span { class: "cdn-lightbox-step",
+                    {previous_step}
+                    if loading {
+                        "loading step {step}…"
+                    } else {
+                        "step {step}"
+                    }
+                    {next_step}
+                }
+                if let Some((place, total)) = position {
+                    span { class: "cdn-lightbox-position", "{place} / {total}" }
                 }
             }
         }
@@ -615,11 +896,11 @@ fn GalleryRenderer(
     mode: CdnDisplayMode,
     #[props(default = false)] metadata_diff_only: bool,
     #[props(default)] persist_key: Option<String>,
+    on_lightbox: EventHandler<LightboxImage>,
 ) -> Element {
-    let mut lightbox_src = use_signal(|| Option::<String>::None);
     let state = use_context::<crate::state::DashboardState>();
 
-    let content = match classify_manifests(&run_manifests) {
+    match classify_manifests(&run_manifests) {
         Some(CdnManifestClass::Mixed) => rsx! {
             div { class: "rect-error",
                 "Metadata cannot share a panel with image or file sources. Split them into separate panels."
@@ -701,44 +982,16 @@ fn GalleryRenderer(
         },
         Some(CdnManifestClass::ImageGallery) => match mode {
             CdnDisplayMode::SelectIndex => rsx! {
-                SelectIndexView { run_manifests: run_manifests.clone(), on_lightbox: move |src: String| lightbox_src.set(Some(src)), persist_key }
+                SelectIndexView { run_manifests, on_lightbox, persist_key }
             },
             CdnDisplayMode::GroupByRun => rsx! {
-                GroupByRunView { run_manifests: run_manifests.clone(), on_lightbox: move |src: String| lightbox_src.set(Some(src)) }
+                GroupByRunView { run_manifests, on_lightbox }
             },
             CdnDisplayMode::Interleaved => rsx! {
-                InterleavedView { run_manifests: run_manifests.clone(), on_lightbox: move |src: String| lightbox_src.set(Some(src)) }
+                InterleavedView { run_manifests, on_lightbox }
             },
         },
         None => rsx! { div { class: "cdn-gallery-empty", "No manifests loaded" } },
-    };
-
-    rsx! {
-        {content}
-
-        if let Some(src) = lightbox_src.read().as_ref() {
-            {
-                let src = src.clone();
-                rsx! {
-                    div {
-                        class: "cdn-lightbox",
-                        // mousedown not click so a drag-release in the backdrop doesn't dismiss;
-                        // primary button only so right-click (e.g. "save image as") keeps it open.
-                        onmousedown: primary(move |_| lightbox_src.set(None)),
-                        // Esc dismisses too. Focus on mount so the key lands here (the opening click may leave focus on the thumbnail link or <body>, whose keydowns never reach this div); consume it so an enclosing Esc layer (e.g. the maximize overlay) doesn't also dismiss.
-                        tabindex: "-1",
-                        onmounted: focus_on_mount,
-                        onkeydown: move |e: Event<KeyboardData>| {
-                            if is_app_escape(&e) {
-                                e.prevent_default();
-                                lightbox_src.set(None);
-                            }
-                        },
-                        img { class: "cdn-lightbox-img", src: "{src}" }
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -746,7 +999,7 @@ fn GalleryRenderer(
 #[component]
 fn SelectIndexView(
     run_manifests: Vec<RunManifest>,
-    on_lightbox: EventHandler<String>,
+    on_lightbox: EventHandler<LightboxImage>,
     #[props(default)] persist_key: Option<String>,
 ) -> Element {
     // Find max item count across all manifests
@@ -808,27 +1061,22 @@ fn SelectIndexView(
 
 /// Mode 2: Group by Run — one grid per run showing all images.
 #[component]
-fn GroupByRunView(run_manifests: Vec<RunManifest>, on_lightbox: EventHandler<String>) -> Element {
+fn GroupByRunView(
+    run_manifests: Vec<RunManifest>,
+    on_lightbox: EventHandler<LightboxImage>,
+) -> Element {
     rsx! {
         for (source_index, rm) in run_manifests.iter().enumerate() {
-            {
-                let color = rm.color.clone();
-                let run_label = rm.label.clone();
-                if let Some(m) = &rm.manifest {
-                    rsx! {
-                        div { class: "cdn-run-group", style: "background: {color}11;",
-                            div { class: "cdn-run-group-label", style: "color: {color};", "{run_label}" }
-                            div { class: "cdn-image-grid",
-                                for (idx, item) in m.items.iter().enumerate() {
-                                    div { class: "cdn-image-item",
-                                        {gallery_image(item, &run_label, source_index, idx, on_lightbox)}
-                                    }
-                                }
+            if let Some(m) = &rm.manifest {
+                div { class: "cdn-run-group", style: "background: {rm.color}11;",
+                    div { class: "cdn-run-group-label", style: "color: {rm.color};", "{rm.label}" }
+                    div { class: "cdn-image-grid",
+                        for (idx, item) in m.items.iter().enumerate() {
+                            div { class: "cdn-image-item",
+                                {gallery_image(item, rm, source_index, idx, on_lightbox)}
                             }
                         }
                     }
-                } else {
-                    rsx! {}
                 }
             }
         }
@@ -837,7 +1085,10 @@ fn GroupByRunView(run_manifests: Vec<RunManifest>, on_lightbox: EventHandler<Str
 
 /// Mode 3: Interleaved — one grid per index, each showing all runs at that index.
 #[component]
-fn InterleavedView(run_manifests: Vec<RunManifest>, on_lightbox: EventHandler<String>) -> Element {
+fn InterleavedView(
+    run_manifests: Vec<RunManifest>,
+    on_lightbox: EventHandler<LightboxImage>,
+) -> Element {
     let max_items = run_manifests
         .iter()
         .filter_map(|rm| rm.manifest.as_ref().map(|m| m.items.len()))
@@ -870,14 +1121,13 @@ mod tests {
 
     #[test]
     fn selected_gallery_step_survives_step_insertions() {
-        assert_eq!(selected_step_index(&[0, 10], Some(10)), Some(1));
-        assert_eq!(selected_step_index(&[0, 5, 10], Some(10)), Some(2));
-        assert_eq!(selected_step_index(&[0, 10], Some(5)), Some(1));
-        assert_eq!(selected_step_index(&[0, 10], Some(20)), Some(1));
+        assert_eq!(selected_step_index(&[0, 10], Some(10)), 1);
+        assert_eq!(selected_step_index(&[0, 5, 10], Some(10)), 2);
+        assert_eq!(selected_step_index(&[0, 10], Some(5)), 1);
+        assert_eq!(selected_step_index(&[0, 10], Some(20)), 1);
         // A gallery that mounted empty starts at the latest step when data first arrives, then keeps that concrete selection as newer steps appear instead of following latest forever.
-        assert_eq!(selected_step_index(&[-10, -5], None), Some(1));
-        assert_eq!(selected_step_index(&[-10, -5, 0], Some(-5)), Some(1));
-        assert_eq!(selected_step_index(&[], None), None);
+        assert_eq!(selected_step_index(&[-10, -5], None), 1);
+        assert_eq!(selected_step_index(&[-10, -5, 0], Some(-5)), 1);
     }
 
     #[test]
@@ -955,16 +1205,99 @@ mod tests {
 
     #[test]
     fn gallery_lightbox_preserves_native_modified_clicks() {
-        assert!(super::opens_gallery_lightbox(Modifiers::empty()));
-        assert!(super::opens_gallery_lightbox(Modifiers::CAPS_LOCK));
+        assert!(super::unmodified(Modifiers::empty()));
+        assert!(super::unmodified(Modifiers::CAPS_LOCK));
         for modifier in [
             Modifiers::ALT,
             Modifiers::CONTROL,
             Modifiers::META,
             Modifiers::SHIFT,
         ] {
-            assert!(!super::opens_gallery_lightbox(modifier));
+            assert!(!super::unmodified(modifier));
         }
+    }
+
+    #[test]
+    fn lightbox_arrows_follow_each_modes_drawing_order() {
+        use super::{lightbox_neighbours, CdnDisplayMode, LightboxNeighbours};
+        let counts = [2, 3, 1];
+        let at = |mode, open| lightbox_neighbours(mode, &counts, open);
+        let neighbours = |previous, next, position| LightboxNeighbours {
+            previous,
+            next,
+            position,
+        };
+        // GroupByRun: each source's batch in turn.
+        assert_eq!(
+            at(CdnDisplayMode::GroupByRun, (0, 1)),
+            neighbours(Some((0, 0)), Some((1, 0)), Some((2, 6)))
+        );
+        assert_eq!(
+            at(CdnDisplayMode::GroupByRun, (0, 0)),
+            neighbours(None, Some((0, 1)), Some((1, 6)))
+        );
+        assert_eq!(
+            at(CdnDisplayMode::GroupByRun, (2, 0)),
+            neighbours(Some((1, 2)), None, Some((6, 6)))
+        );
+        // Interleaved: every source's image #0, then #1.
+        assert_eq!(
+            at(CdnDisplayMode::Interleaved, (2, 0)),
+            neighbours(Some((1, 0)), Some((0, 1)), Some((3, 6)))
+        );
+        assert_eq!(
+            at(CdnDisplayMode::Interleaved, (1, 1)),
+            neighbours(Some((0, 1)), Some((1, 2)), Some((5, 6)))
+        );
+        // SelectIndex draws one index, so the arrows stay on it.
+        assert_eq!(
+            at(CdnDisplayMode::SelectIndex, (0, 1)),
+            neighbours(None, Some((1, 1)), Some((1, 2)))
+        );
+        assert_eq!(
+            at(CdnDisplayMode::SelectIndex, (1, 1)),
+            neighbours(Some((0, 1)), None, Some((2, 2)))
+        );
+    }
+
+    #[test]
+    fn lightbox_arrows_leave_a_missing_image_for_its_neighbours() {
+        use super::{lightbox_neighbours, CdnDisplayMode, LightboxNeighbours};
+        let missing = |previous, next| LightboxNeighbours {
+            previous,
+            next,
+            position: None,
+        };
+        // Past the source's item count.
+        assert_eq!(
+            lightbox_neighbours(CdnDisplayMode::GroupByRun, &[2, 3, 1], (0, 5)),
+            missing(Some((0, 1)), Some((1, 0)))
+        );
+        // A source with nothing at the step (a placeholder).
+        assert_eq!(
+            lightbox_neighbours(CdnDisplayMode::GroupByRun, &[2, 0, 1], (1, 0)),
+            missing(Some((0, 1)), Some((2, 0)))
+        );
+        assert_eq!(
+            lightbox_neighbours(CdnDisplayMode::SelectIndex, &[2, 3, 1], (2, 1)),
+            missing(Some((1, 1)), None)
+        );
+    }
+
+    #[test]
+    fn lightbox_steps_walk_the_sources_own_steps() {
+        use super::adjacent_source_step;
+        let keys: Vec<(i64, String)> = [30, 0, 10]
+            .into_iter()
+            .map(|step| (step, format!("key-{step}")))
+            .collect();
+        assert_eq!(adjacent_source_step(&keys, 10, true), Some(30));
+        assert_eq!(adjacent_source_step(&keys, 10, false), Some(0));
+        assert_eq!(adjacent_source_step(&keys, 30, true), None);
+        assert_eq!(adjacent_source_step(&keys, 0, false), None);
+        // From a step this source never logged (another source's), to the ones around it.
+        assert_eq!(adjacent_source_step(&keys, 20, true), Some(30));
+        assert_eq!(adjacent_source_step(&keys, 20, false), Some(10));
     }
 
     #[test]

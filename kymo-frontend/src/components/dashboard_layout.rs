@@ -49,9 +49,25 @@ window.__kymo_bridges.mount(__BRIDGE_NAME__,__BRIDGE_OWNER__,()=>{clearTimeout(t
 ro.observe(el);
 })()"#;
 
-/// Esc closes the maximized chart wherever focus is, including `<body>` and the notice bar outside the app shell. On `window` it runs after the in-app handlers and bulk mode's `document` listener, and skips Esc they consumed (`defaultPrevented`), IME composition Esc, and Esc an open native dialog or popover will close.
-const MAXIMIZE_ESCAPE_JS: &str = r#"(()=>{
-function key(e){if(e.key==='Escape'&&!e.isComposing&&!e.defaultPrevented&&!document.querySelector(__TOP_LAYER_SELECTOR__)){try{dioxus.send(true);}catch(_){td();}}}
+/// Esc closes the maximized chart (sends 0); plain ←/→ move to the previous/next panel (-1/1). Installed on `window` after the in-app handlers and bulk mode's `document` listener, so it serves any focus (`<body>`, the notice bar) while leaving alone keys they consumed (`defaultPrevented`), IME composition, and keys an open dialog or popover will take (the image preview is one). Arrows also skip controls that take arrows and anything focused in or on a sideways scroller (a metadata value; the log viewer, which Chromium lets Tab focus); ←/→ also skip key repeat, since each switch mounts a panel that queries its data. Plain ↑/↓ press a maximized gallery's own Next/Previous step buttons (as `KB_ACTIVATE_JS` replays presses), so the panel's step rules apply and a held key scrubs; panels without a step bar, and focus outside the overlay, keep the keys' native behaviour. Other keys return before any document query.
+const MAXIMIZE_KEYS_JS: &str = r#"(()=>{
+// Wider than the scroller's outer box, its own scrollbar included: WebKit can leave a scroller's content at the width it had before a vertical scrollbar arrived.
+function scrollsSideways(el){for(;el instanceof Element;el=el.parentElement)if(el.scrollWidth>el.offsetWidth&&/auto|scroll/.test(getComputedStyle(el).overflowX))return true;return false;}
+function covered(){return document.querySelector(__TOP_LAYER_SELECTOR__);}
+function send(value){try{dioxus.send(value);}catch(_){td();}}
+function key(e){
+  if(e.isComposing||e.defaultPrevented)return;
+  if(e.key==='Escape'){if(!covered())send(0);return;}
+  const dir={ArrowLeft:-1,ArrowRight:1}[e.key],step={ArrowUp:'Next step',ArrowDown:'Previous step'}[e.key];
+  if(!dir&&!step||dir&&e.repeat||e.altKey||e.ctrlKey||e.metaKey||e.shiftKey||!document.querySelector('.maximize-overlay')||e.target.closest?.('input:not([type=checkbox],[type=button],[type=submit],[type=reset],[type=file],[type=image]),textarea,select,audio,video')||scrollsSideways(e.target)||covered())return;
+  if(dir){e.preventDefault();send(dir);return;}
+  // ↑/↓ scroll natively everywhere else (the sidebar's run list), unlike ←/→.
+  if(e.target!==document.body&&!e.target.closest?.('.maximize-overlay'))return;
+  const button=document.querySelector(`.maximize-content .cdn-step-nav button[aria-label="${step}"]`);
+  if(!button)return;
+  e.preventDefault();
+  if(!button.disabled)button.dispatchEvent(new MouseEvent('mousedown',{bubbles:true,button:0}));
+}
 const td=window.__kymo_bridges.mount(__BRIDGE_NAME__,__BRIDGE_OWNER__,()=>window.removeEventListener('keydown',key));
 window.addEventListener('keydown',key);
 })()"#;
@@ -340,14 +356,7 @@ pub fn DashboardLayout(project_id: String) -> Element {
     });
 
     // URL → overlay: `?chart=<rect id>` is the maximize overlay's source of truth — chart links open focused, and every dismissal goes through `focus_chart`, which rewrites the param and lands back here.
-    // Mirrored into a signal like `current_run` above, since effects only re-run on reactive reads.
-    let chart_param = route.chart_param();
-    let mut chart_signal = use_signal(|| chart_param.clone());
-    if *chart_signal.peek() != chart_param {
-        chart_signal.set(chart_param);
-    }
-    use_effect(move || {
-        let param = chart_signal.read().clone();
+    use_effect(use_reactive((&route.chart_param(),), move |(param,)| {
         let layout = state.layout_config.read().clone();
         let mut maximized = state.maximized;
         match param {
@@ -374,7 +383,7 @@ pub fn DashboardLayout(project_id: String) -> Element {
                 }
             }
         }
-    });
+    }));
 
     // Registry-change key for the VISIBLE run set: the loader restarts when
     // a pushed metric-registry event touches a run it can see, or a resync
@@ -589,13 +598,6 @@ pub fn DashboardLayout(project_id: String) -> Element {
         }
     });
 
-    // Double duty: freezes the grid's scroll (CSS overflow) and tells the zone watcher (state/zones.rs) to cap covered slots at Near while the overlay is up.
-    let main_class = if state.maximized.read().is_some() {
-        "main-content main-content-locked"
-    } else {
-        "main-content"
-    };
-
     // Deleted run metadata comes from the point lookup and is never inserted
     // into the active list just to name its direct page.
     let title = match &route {
@@ -647,7 +649,8 @@ pub fn DashboardLayout(project_id: String) -> Element {
                 // would sit at the top of the scrollable content,
                 // off-screen for anyone who maximized from below the fold.
                 div { class: "main-wrap",
-                    main { class: "{main_class}",
+                    // Inert under the overlay: nothing covered takes focus or Tab. The attribute also freezes the grid's scroll (CSS), caps covered slots at Near (state/zones.rs) and hides covered charts' synced tooltips (uplot_chart/hover.js).
+                    main { class: "main-content", inert: state.maximized.read().is_some().then_some(true),
                         Outlet::<Route> {}
                     }
                     MaximizeOverlay {}
@@ -671,16 +674,33 @@ fn MaximizeOverlay() -> Element {
     let state = use_context::<DashboardState>();
     let mut maximized_signal = state.maximized;
 
-    let escape_bridge = crate::util::js_bridge::use_bridge("maximize_escape");
+    let keys_bridge = crate::util::js_bridge::use_bridge("maximize_keys");
     use_future(move || {
-        let js = escape_bridge
-            .script(MAXIMIZE_ESCAPE_JS)
+        let js = keys_bridge
+            .script(MAXIMIZE_KEYS_JS)
             .replace("__TOP_LAYER_SELECTOR__", &js_string(TOP_LAYER_SELECTOR));
         async move {
             let mut eval = document::eval(&js);
-            while eval.recv::<bool>().await.is_ok() {
-                if maximized_signal.peek().is_some() {
+            while let Ok(dir) = eval.recv::<i32>().await {
+                let Some(id) = maximized_signal
+                    .peek()
+                    .as_ref()
+                    .map(|m| m.config.id.clone())
+                else {
+                    continue;
+                };
+                if dir == 0 {
                     focus_chart(None);
+                    continue;
+                }
+                let needle = state.panel_needle();
+                let next = state.layout_config.peek().as_ref().and_then(|layout| {
+                    layout
+                        .adjacent_rect(&id, &needle, dir > 0)
+                        .map(str::to_string)
+                });
+                if let Some(next) = next {
+                    focus_chart(Some(next));
                 }
             }
         }
@@ -718,35 +738,34 @@ fn MaximizeOverlay() -> Element {
             div {
                 class: "maximize-content",
                 onmousedown: move |e| e.stop_propagation(),
-                MetricRect {
-                    // Keyed: ?chart= can jump straight from one maximized rect to another (chart page links), and a reused instance would keep the previous rect's use_hook state (cache key).
-                    key: "{rect_id}",
-                    config: rect_config,
-                    chart_height: chart_height,
-                    max_columns: max_columns,
-                    is_maximized: true,
-                    on_update: move |new_rect: RectConfig| {
-                        if state.update_rect(new_rect.clone()) {
-                            maximized_signal.set(Some(MaximizedRect {
-                                config: new_rect,
-                                max_columns,
-                            }));
-                        } else {
-                            // The rect dropped out of a regenerated layout
-                            // (its run/metric vanished mid-session). Closing
-                            // beats keeping an overlay that pretends the
-                            // edit applied.
+                for id in [rect_id] {
+                    MetricRect {
+                        // A one-item keyed list: Dioxus 0.7.9 ignores `key:` on a component nested in elements, and a reused instance would carry the previous chart's hooks (cache key, fetched data, gallery step) into the next one (←/→, chart links).
+                        key: "{id}",
+                        config: rect_config.clone(),
+                        chart_height: chart_height,
+                        max_columns: max_columns,
+                        is_maximized: true,
+                        on_update: move |new_rect: RectConfig| {
+                            if state.update_rect(new_rect.clone()) {
+                                maximized_signal.set(Some(MaximizedRect {
+                                    config: new_rect,
+                                    max_columns,
+                                }));
+                            } else {
+                                // The rect dropped out of a regenerated layout
+                                // (its run/metric vanished mid-session). Closing
+                                // beats keeping an overlay that pretends the
+                                // edit applied.
+                                focus_chart(None);
+                            }
+                        },
+                        on_delete: move |_| {
+                            state.delete_rect(&id);
                             focus_chart(None);
-                        }
-                    },
-                    on_delete: {
-                        let rect_id = rect_id.clone();
-                        move |_| {
-                            state.delete_rect(&rect_id);
-                            focus_chart(None);
-                        }
-                    },
-                    on_resize: move |_| {},
+                        },
+                        on_resize: move |_| {},
+                    }
                 }
             }
         }
@@ -773,8 +792,8 @@ mod tests {
     }
 
     #[test]
-    fn maximize_escape_uses_the_shared_lifecycle() {
-        crate::util::js_bridge::validate_template(super::MAXIMIZE_ESCAPE_JS);
+    fn maximize_keys_use_the_shared_lifecycle() {
+        crate::util::js_bridge::validate_template(super::MAXIMIZE_KEYS_JS);
     }
 
     fn explicit_layout() -> LayoutConfig {

@@ -360,9 +360,6 @@ fn MetricRectBody(
 
     let state = use_context::<DashboardState>();
     let color_ver = *state.color_version.read();
-    let log_x = config.options.log_x;
-    let log_y = config.options.log_y;
-    let cdn_mode = config.options.cdn_display_mode.clone();
     let options = config.options.clone();
     // Key into the module-level caches. The overlay copy gets its own entries — its width (and so its chart request) differs from the grid rect's, and the two must not evict each other per open/close.
     let cache_key = use_hook(|| {
@@ -378,11 +375,8 @@ fn MetricRectBody(
             rect_id: config.id.clone(),
             bindings: config.bindings.clone(),
             display_type_hint: config.display_type,
-            log_x: log_x,
-            log_y: log_y,
             chart_height: chart_height,
             color_version: color_ver,
-            cdn_display_mode: cdn_mode,
             options: options,
             loading: loading,
             cdn_class: cdn_class,
@@ -632,11 +626,8 @@ fn AutoContent(
     rect_id: String,
     bindings: Vec<MetricBinding>,
     display_type_hint: DisplayType,
-    #[props(default = false)] log_x: bool,
-    #[props(default = false)] log_y: bool,
     #[props(default = 280)] chart_height: u32,
     #[props(default = 0)] color_version: u64,
-    #[props(default)] cdn_display_mode: CdnDisplayMode,
     #[props(default)] options: RectOptions,
     /// Flipped true while a leaf content's data query is in flight, so the
     /// parent MetricRect can show a spinner and the leaves can gate their
@@ -818,13 +809,13 @@ fn AutoContent(
     let render_for_type = |dt: &DisplayType| -> Element {
         match dt {
             DisplayType::Cdn => rsx! {
-                CdnContent { refs: refs, chart_height: chart_height, cdn_display_mode: cdn_display_mode.clone(), loading: loading, cdn_class: cdn_class, metadata_diff_only: options.metadata_diff_only, zone: zone, cache_key: cache_key.clone() }
+                CdnContent { refs: refs, chart_height: chart_height, cdn_display_mode: options.cdn_display_mode, loading: loading, cdn_class: cdn_class, metadata_diff_only: options.metadata_diff_only, zone: zone, cache_key: cache_key.clone() }
             },
             DisplayType::TextStream => rsx! {
                 TextStreamViewer { stream_refs: refs.read().to_vec(), height: chart_height, x_axis_mode: crate::state::layout_config::XAxisMode::RelativeTime, zone: Some(zone), persist_key: cache_key.clone() }
             },
             DisplayType::Numeric => rsx! {
-                NumericContent { refs: refs, log_x: log_x, log_y: log_y, chart_height: chart_height, color_version: color_version, options: options.clone(), loading: loading, zone: zone, cache_key: cache_key.clone() }
+                NumericContent { refs: refs, log_x: options.log_x, log_y: options.log_y, chart_height: chart_height, color_version: color_version, options: options.clone(), loading: loading, zone: zone, cache_key: cache_key.clone() }
             },
         }
     };
@@ -1002,9 +993,8 @@ fn CdnContent(
                 &state.display_runs(),
                 crate::components::uplot_chart::run_color,
             );
-            let mode = cdn_display_mode.clone();
             rsx! {
-                CdnGallery { runs: run_data, height: chart_height, display_mode: mode, cdn_class: cdn_class, metadata_diff_only: metadata_diff_only, persist_key: cache_key.clone() }
+                CdnGallery { runs: run_data, height: chart_height, display_mode: cdn_display_mode, cdn_class: cdn_class, metadata_diff_only: metadata_diff_only, persist_key: cache_key.clone() }
             }
         }
         CdnFetch::Unavailable => rsx! {
