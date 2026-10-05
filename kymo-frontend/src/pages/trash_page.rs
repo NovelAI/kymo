@@ -587,6 +587,9 @@ fn trash_row(
                                         data.write().mark_expired(&project_id, &run_id);
                                         action_message.set(restore_failure(response.outcome(), &response.error));
                                     }
+                                    Err(status) if crate::grpc::not_sent(&status) => {
+                                        action_message.set(format!("Couldn’t restore the run: {}.", status.message()));
+                                    }
                                     result => {
                                         let diagnostic = match &result {
                                             Ok(response) => restore_failure(response.outcome(), &response.error),
@@ -630,8 +633,11 @@ fn trash_row(
                                         }
                                     }
                                 }
-                                let next = refresh.peek().wrapping_add(1);
-                                refresh.set(next);
+                                // While disconnected, the reconnect's resync reloads the page, and a refresh queued now would go out beside it.
+                                if crate::grpc::connection().1 {
+                                    let next = refresh.peek().wrapping_add(1);
+                                    refresh.set(next);
+                                }
                                 restoring.write().remove(&key);
                             });
                         }

@@ -12,11 +12,12 @@
 //! On disconnect every parked oneshot is dropped. Read-only unary calls
 //! re-enqueue and ride the reconnect — one socket blip must not blank every
 //! in-flight chart, because nothing refetches a finished run's chart until
-//! the user touches it. Mutations use `unary_no_replay`: a lost
+//! the user touches it. Mutations use `unary_route_no_replay`: a lost
 //! response has an unknown outcome and must be reconciled, because replaying
 //! after an intervening inverse mutation would no longer be idempotent. Their
 //! response wait is finite so a live-but-silent socket cannot park the UI
-//! forever; a deadline is also outcome-unknown and is followed by reconciliation.
+//! forever; a deadline is also outcome-unknown and is followed by reconciliation,
+//! unless the request was still queued, which is reported as not sent.
 //! Requests issued while
 //! disconnected wait in the queue and flush once the socket is OPEN —
 //! minus those whose caller stopped waiting (deadline, unmount), which
@@ -37,7 +38,7 @@
 
 use std::collections::{hash_map::Entry, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, LazyLock, Weak};
 use std::time::Duration;
 
 use futures::channel::{mpsc, oneshot};
@@ -46,7 +47,6 @@ use gloo_net::websocket::{futures::WebSocket, Message, State};
 use prost::Message as _;
 use tonic::Status;
 
-const RECONNECT_DELAY_MS: u32 = 1_000;
 /// A response that never arrives (server-side task panic, dropped frame)
 /// would otherwise park the caller until the next disconnect. Generous —
 /// the slowest real queries are a few seconds.
@@ -58,37 +58,27 @@ const MUTATION_RESPONSE_TIMEOUT_MS: u64 = 150_000;
 
 /// A versioned value with parked wakers — the handoff between the socket
 /// task (which runs outside the dioxus runtime and can't write signals)
-/// and async consumers. Backs the page-hidden and connection-state flags;
+/// and async consumers. Backs the page-hidden, connection-state and reconnect-intent flags;
 /// push events use the subscriber hub below.
-struct WatchState<T> {
+#[derive(Default)]
+struct WatchState {
     generation: u64,
-    value: T,
+    value: bool,
     next_waiter_id: u64,
     waiters: HashMap<u64, std::task::Waker>,
 }
 
-impl<T: Default> Default for WatchState<T> {
-    fn default() -> Self {
-        Self {
-            generation: 0,
-            value: T::default(),
-            next_waiter_id: 0,
-            waiters: HashMap::new(),
-        }
-    }
-}
-
 #[derive(Default)]
-struct Watch<T>(std::sync::Mutex<WatchState<T>>);
+pub(super) struct Watch(std::sync::Mutex<WatchState>);
 
-struct WatchChanged<'a, T> {
-    watch: &'a Watch<T>,
+pub(super) struct WatchChanged<'a> {
+    watch: &'a Watch,
     seen: u64,
     waiter_id: Option<u64>,
 }
 
-impl<T: Clone> std::future::Future for WatchChanged<'_, T> {
-    type Output = (u64, T);
+impl std::future::Future for WatchChanged<'_> {
+    type Output = (u64, bool);
 
     fn poll(
         self: std::pin::Pin<&mut Self>,
@@ -100,7 +90,7 @@ impl<T: Clone> std::future::Future for WatchChanged<'_, T> {
             if let Some(waiter_id) = this.waiter_id.take() {
                 state.waiters.remove(&waiter_id);
             }
-            return std::task::Poll::Ready((state.generation, state.value.clone()));
+            return std::task::Poll::Ready((state.generation, state.value));
         }
 
         let waiter_id = *this.waiter_id.get_or_insert_with(|| loop {
@@ -123,7 +113,7 @@ impl<T: Clone> std::future::Future for WatchChanged<'_, T> {
     }
 }
 
-impl<T> Drop for WatchChanged<'_, T> {
+impl Drop for WatchChanged<'_> {
     fn drop(&mut self) {
         if let Some(waiter_id) = self.waiter_id {
             self.watch.0.lock().unwrap().waiters.remove(&waiter_id);
@@ -131,9 +121,9 @@ impl<T> Drop for WatchChanged<'_, T> {
     }
 }
 
-impl<T: Clone> Watch<T> {
+impl Watch {
     /// Apply `f`; if it returns true, bump the generation and wake waiters.
-    fn update(&self, f: impl FnOnce(&mut T) -> bool) {
+    pub(super) fn update(&self, f: impl FnOnce(&mut bool) -> bool) {
         let wakers = {
             let mut state = self.0.lock().unwrap();
             if !f(&mut state.value) {
@@ -151,18 +141,14 @@ impl<T: Clone> Watch<T> {
         }
     }
 
-    fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
-        f(&self.0.lock().unwrap().value)
-    }
-
     /// Current (gen, value) without waiting.
-    fn get(&self) -> (u64, T) {
+    pub(super) fn get(&self) -> (u64, bool) {
         let state = self.0.lock().unwrap();
-        (state.generation, state.value.clone())
+        (state.generation, state.value)
     }
 
     /// Await the generation advancing past `seen`, returning (gen, value).
-    fn changed(&self, seen: u64) -> WatchChanged<'_, T> {
+    pub(super) fn changed(&self, seen: u64) -> WatchChanged<'_> {
         WatchChanged {
             watch: self,
             seen,
@@ -172,13 +158,10 @@ impl<T: Clone> Watch<T> {
 
     /// Await `pred(value)` holding (immediately if it already does).
     /// Waiters woken by an update re-check and re-park if it doesn't.
-    async fn wait_for(&self, pred: impl Fn(&T) -> bool) {
+    async fn wait_for(&self, pred: impl Fn(bool) -> bool) {
         loop {
-            let (generation, ready) = {
-                let state = self.0.lock().unwrap();
-                (state.generation, pred(&state.value))
-            };
-            if ready {
+            let (generation, value) = self.get();
+            if pred(value) {
                 return;
             }
             self.changed(generation).await;
@@ -363,6 +346,10 @@ impl PushHub {
         }
     }
 
+    /// Merge one server push event into the cumulative seed and publish only the
+    /// entries that rose. Postgres versions only grow: an older value — reordered
+    /// across a reconnect, or racing the resync poll — must never regress an entry
+    /// or re-trigger downstream fetches.
     fn apply_event(&self, ev: super::proto::RunVersionsEvent) {
         self.publish(|snapshot| {
             let mut delta = PushUpdate::default();
@@ -389,6 +376,8 @@ impl PushHub {
         });
     }
 
+    /// The socket (re)connected: anything cached from before the gap is
+    /// suspect, and this also seeds the very first resync on page load.
     fn note_connected(&self) {
         self.publish(|snapshot| {
             snapshot.resync_gen += 1;
@@ -425,31 +414,19 @@ impl PushSubscription {
     }
 }
 
-static PUSH: OnceLock<PushHub> = OnceLock::new();
-static HIDDEN: OnceLock<Watch<bool>> = OnceLock::new();
-static CONNECTED: OnceLock<Watch<bool>> = OnceLock::new();
+static PUSH: LazyLock<PushHub> = LazyLock::new(Default::default);
+static HIDDEN: LazyLock<Watch> = LazyLock::new(Default::default);
+static CONNECTED: LazyLock<Watch> = LazyLock::new(Default::default);
 /// Set when the server refuses this bundle's wire revision; the connection task has then stopped for good.
 static STALE: AtomicBool = AtomicBool::new(false);
 
-fn push_hub() -> &'static PushHub {
-    PUSH.get_or_init(Default::default)
-}
-
 pub fn subscribe_push() -> PushSubscription {
-    push_hub().subscribe()
-}
-
-fn hidden_watch() -> &'static Watch<bool> {
-    HIDDEN.get_or_init(Default::default)
-}
-
-fn conn_watch() -> &'static Watch<bool> {
-    CONNECTED.get_or_init(Default::default)
+    PUSH.subscribe()
 }
 
 /// `(generation, connected)`: the generation bumps on every connect and disconnect, so 0 means the socket has never connected.
 pub fn connection() -> (u64, bool) {
-    conn_watch().get()
+    CONNECTED.get()
 }
 
 /// Whether the server refused this bundle's wire revision, so the tab no longer connects.
@@ -459,7 +436,7 @@ pub fn is_stale() -> bool {
 
 /// Resolves on the first connect or disconnect after generation `seen`.
 pub async fn connection_changed(seen: u64) {
-    conn_watch().changed(seen).await;
+    CONNECTED.changed(seen).await;
 }
 
 /// Sleep `ms` of CONNECTED time: parked while the socket is down, restarted
@@ -468,24 +445,16 @@ pub async fn connection_changed(seen: u64) {
 /// that stays silent for the full window still fails the caller.
 async fn live_deadline(ms: u64) {
     loop {
-        let (gen, connected) = conn_watch().get();
+        let (gen, connected) = CONNECTED.get();
         if !connected {
-            let _ = conn_watch().changed(gen).await;
+            let _ = CONNECTED.changed(gen).await;
             continue;
         }
         futures::select! {
             _ = gloo_timers::future::sleep(std::time::Duration::from_millis(ms)).fuse() => return,
-            _ = conn_watch().changed(gen).fuse() => {} // disconnected: park and restart
+            _ = CONNECTED.changed(gen).fuse() => {} // disconnected: park and restart
         }
     }
-}
-
-/// Merge one server push event into the cumulative seed and publish only the
-/// entries that rose. Postgres versions only grow: an older value — reordered
-/// across a reconnect, or racing the resync poll — must never regress an entry
-/// or re-trigger downstream fetches.
-fn apply_push_event(ev: super::proto::RunVersionsEvent) {
-    push_hub().apply_event(ev);
 }
 
 fn merge_version_delta(
@@ -526,19 +495,13 @@ pub fn merge_versions(
     }
 }
 
-/// The socket (re)connected: anything cached from before the gap is
-/// suspect, and this also seeds the very first resync on page load.
-fn note_connected() {
-    push_hub().note_connected();
-}
-
-pub fn page_hidden() -> bool {
-    hidden_watch().with(|h| *h)
+pub(super) fn page_hidden() -> bool {
+    HIDDEN.get().1
 }
 
 /// Resolves once the page is visible (immediately if it already is).
 pub async fn wait_until_page_visible() {
-    hidden_watch().wait_for(|h| !h).await
+    HIDDEN.wait_for(|h| !h).await
 }
 
 /// Record a visibility flip (from the root component's visibilitychange
@@ -548,7 +511,7 @@ pub async fn wait_until_page_visible() {
 /// could re-enqueue opposite flips in drop order, leaving the server quiet
 /// on a visible tab.
 pub fn set_page_visibility(hidden: bool) {
-    hidden_watch().update(|h| {
+    HIDDEN.update(|h| {
         let changed = *h != hidden;
         *h = hidden;
         changed
@@ -559,6 +522,18 @@ struct Pending {
     path: &'static str,
     body: Vec<u8>,
     resp: oneshot::Sender<Result<Vec<u8>, Status>>,
+    /// Set just before the frame is written: a no-replay call whose deadline passes while this is unset was never sent.
+    sent: Arc<AtomicBool>,
+}
+
+/// A mutation that expired before it was sent. Nothing changed on the server, so there is nothing to reconcile.
+const NOT_SENT: &str = "no connection to the server; nothing was sent";
+
+/// Whether the server never ran the request: it expired unsent, or the server refused this bundle, which dispatches nothing.
+/// Matched by message, so neither text may ever describe a request the server ran.
+pub fn not_sent(status: &Status) -> bool {
+    status.code() == tonic::Code::Unavailable
+        && [NOT_SENT, super::ws_rpc::RELOAD_REQUIRED].contains(&status.message())
 }
 
 #[derive(Clone)]
@@ -566,26 +541,16 @@ pub struct WsClient {
     tx: mpsc::UnboundedSender<Pending>,
 }
 
-static SINGLETON: OnceLock<WsClient> = OnceLock::new();
+static SINGLETON: LazyLock<WsClient> = LazyLock::new(|| {
+    let (tx, rx) = mpsc::unbounded();
+    wasm_bindgen_futures::spawn_local(connection_task(rx));
+    WsClient { tx }
+});
 
 impl WsClient {
     /// The process-wide client. First call spawns the connection task.
     pub fn singleton() -> WsClient {
-        SINGLETON
-            .get_or_init(|| {
-                let (tx, rx) = mpsc::unbounded();
-                wasm_bindgen_futures::spawn_local(connection_task(rx));
-                WsClient { tx }
-            })
-            .clone()
-    }
-
-    async fn unary<Req, Resp>(&self, path: &'static str, req: Req) -> Result<Resp, Status>
-    where
-        Req: prost::Message,
-        Resp: prost::Message + Default,
-    {
-        self.unary_inner(path, req, true).await
+        SINGLETON.clone()
     }
 
     pub async fn unary_route<Req, Resp>(
@@ -597,20 +562,12 @@ impl WsClient {
         Req: prost::Message,
         Resp: prost::Message + Default,
     {
-        self.unary(route.path, req).await
+        self.unary_inner(route.path, req, true).await
     }
 
     /// Send a mutation at most once. Queueing and response share one absolute
     /// deadline; once sent, a connection loss is surfaced as outcome-unknown
     /// instead of transparently replaying the request.
-    async fn unary_no_replay<Req, Resp>(&self, path: &'static str, req: Req) -> Result<Resp, Status>
-    where
-        Req: prost::Message,
-        Resp: prost::Message + Default,
-    {
-        self.unary_inner(path, req, false).await
-    }
-
     pub async fn unary_route_no_replay<Req, Resp>(
         &self,
         route: super::routes::Rpc<Req, Resp>,
@@ -620,7 +577,9 @@ impl WsClient {
         Req: prost::Message,
         Resp: prost::Message + Default,
     {
-        self.unary_no_replay(route.path, req).await
+        // A mutation, or the read that verifies one, is something the user just did: try the socket now rather than at the next scheduled retry (intent shown while connected is discarded when the socket drops).
+        super::reconnect::wake(true);
+        self.unary_inner(route.path, req, false).await
     }
 
     async fn unary_inner<Req, Resp>(
@@ -637,29 +596,29 @@ impl WsClient {
         // Read-only calls retain their connected-time behavior so an outage
         // does not blank finished charts. A mutation's longer deadline is
         // absolute from enqueue through response: if it expires while queued,
-        // dropping this receiver makes the manager discard it without sending;
+        // dropping this receiver makes the connection task discard it without sending;
         // if already sent, reconciliation observes the outcome without replay.
-        let mut timeout = Box::pin(
-            if replay_on_disconnect {
-                futures::future::Either::Left(live_deadline(REQUEST_TIMEOUT_MS))
-            } else {
-                futures::future::Either::Right(gloo_timers::future::sleep(Duration::from_millis(
-                    MUTATION_RESPONSE_TIMEOUT_MS,
-                )))
-            }
-            .fuse(),
-        );
+        let mut timeout = std::pin::pin!(if replay_on_disconnect {
+            futures::future::Either::Left(live_deadline(REQUEST_TIMEOUT_MS))
+        } else {
+            futures::future::Either::Right(gloo_timers::future::sleep(Duration::from_millis(
+                MUTATION_RESPONSE_TIMEOUT_MS,
+            )))
+        }
+        .fuse());
         // A dropped oneshot is the only transport-loss signal — the socket
         // died with this request in flight (server errors arrive as values).
         // Read-only calls re-enqueue and ride the reconnect. Mutations return
         // outcome-unknown so their caller can reconcile authoritative state.
         loop {
             let (resp_tx, resp_rx) = oneshot::channel();
+            let sent = Arc::new(AtomicBool::new(false));
             self.tx
                 .unbounded_send(Pending {
                     path,
                     body: body.clone(),
                     resp: resp_tx,
+                    sent: sent.clone(),
                 })
                 // The connection task ends only when the server refused this bundle.
                 .map_err(|_| Status::unavailable(super::ws_rpc::RELOAD_REQUIRED))?;
@@ -682,16 +641,18 @@ impl WsClient {
                         ));
                     }
                 },
-                // The manager may retain this sender until a late response or
+                // The connection task may retain this sender until a late response or
                 // disconnect. Its receiver is dropped, so it cannot replay or
                 // otherwise continue the caller's mutation workflow.
                 _ = timeout => {
-                    let message = if replay_on_disconnect {
-                        "ws request timed out"
+                    // Exact on single-threaded wasm: the connection task can't dequeue the request between the `sent` check and the return that drops the receiver.
+                    return Err(if replay_on_disconnect {
+                        Status::deadline_exceeded("ws request timed out")
+                    } else if sent.load(Ordering::Relaxed) {
+                        Status::deadline_exceeded("mutation response timed out; outcome is unknown")
                     } else {
-                        "mutation response timed out; outcome is unknown"
-                    };
-                    return Err(Status::deadline_exceeded(message));
+                        Status::unavailable(NOT_SENT)
+                    });
                 },
             }
         }
@@ -731,35 +692,30 @@ async fn connection_task(mut requests: mpsc::UnboundedReceiver<Pending>) {
         crate::runtime::config().websocket_url,
         super::ws_rpc::FRONTEND_WIRE_REVISION
     );
+    let mut reconnect = super::reconnect::Reconnect::new();
     loop {
-        let ws = match WebSocket::open(&url) {
-            Ok(ws) => ws,
-            Err(_) => {
-                gloo_timers::future::sleep(std::time::Duration::from_millis(
-                    RECONNECT_DELAY_MS as u64,
-                ))
-                .await;
-                continue;
-            }
+        reconnect.turn().await;
+        let Ok(mut ws) = WebSocket::open(&url) else {
+            reconnect.failed();
+            continue;
         };
-        // The browser hands back a CONNECTING socket synchronously; a send
-        // before it reaches OPEN fails, and each failure burned one queued
-        // request per reconnect cycle — a 1-request-per-second error drain
-        // while the server was down. Park until the handshake settles; the
-        // queue keeps the requests.
-        while matches!(ws.state(), State::Connecting) {
-            gloo_timers::future::sleep(std::time::Duration::from_millis(50)).await;
+        // Settle the handshake before dequeuing anything: the schedule needs this attempt's outcome, and a send on a socket that never opened is silently dropped, so a mutation would be reported outcome-unknown though never sent.
+        // The socket's open or error event wakes this rather than a timer, which a hidden tab can have throttled to one a minute while other tabs wait on this attempt.
+        // The timeout catches a socket that errs without leaving CONNECTING (WebKit, on a port it blocks), which no event would wake again; it outlasts Firefox's longest delay plus its 20 s handshake timeout, and stays within an attempt's claim.
+        select! {
+            _ = futures::future::poll_fn(|cx| ws.poll_ready_unpin(cx)).fuse() => {}
+            _ = gloo_timers::future::sleep(Duration::from_secs(90)).fuse() => {}
         }
         if !matches!(ws.state(), State::Open) {
-            gloo_timers::future::sleep(std::time::Duration::from_millis(RECONNECT_DELAY_MS as u64))
-                .await;
+            reconnect.failed();
             continue;
         }
+        reconnect.opened();
         // Fresh connection: push events during the gap are lost, so tell
         // consumers to resync. Also fires on the FIRST connect, seeding the
         // page's initial version fetch.
-        note_connected();
-        conn_watch().update(|c| {
+        PUSH.note_connected();
+        CONNECTED.update(|c| {
             let changed = !*c;
             *c = true;
             changed
@@ -792,29 +748,22 @@ async fn connection_task(mut requests: mpsc::UnboundedReceiver<Pending>) {
                     if p.resp.is_canceled() {
                         continue;
                     }
-                    next_id = next_id.wrapping_add(1);
-                    if next_id == 0 {
-                        // id 0 is the server-push channel; a request wearing
-                        // it would have its response dropped as an event.
-                        next_id = 1;
-                    }
+                    // id 0 is the server-push channel; a request wearing it would have its response dropped as an event.
+                    next_id = next_id.wrapping_add(1).max(1);
                     let frame = encode_request(next_id, p.path, &p.body);
+                    p.sent.store(true, Ordering::Relaxed);
                     if sink.send(Message::Bytes(frame)).await.is_err() {
-                        // Socket died mid-send; this request's oneshot drops
-                        // with the inflight map below.
+                        // Socket died mid-send; this request's oneshot drops here, never having reached the inflight map below.
                         break;
                     }
                     inflight.insert(next_id, p.resp);
                 }
-                vis = hidden_watch().changed(seen_vis_gen).fuse() => {
+                vis = HIDDEN.changed(seen_vis_gen).fuse() => {
                     let (gen, hidden) = vis;
                     seen_vis_gen = gen;
                     if hidden != sent_hidden {
                         sent_hidden = hidden;
-                        next_id = next_id.wrapping_add(1);
-                        if next_id == 0 {
-                            next_id = 1;
-                        }
+                        next_id = next_id.wrapping_add(1).max(1);
                         let body =
                             super::proto::PushControlRequest { quiet: hidden }.encode_to_vec();
                         let frame = encode_request(next_id, super::ws_rpc::PUSH_CONTROL, &body);
@@ -840,7 +789,7 @@ async fn connection_task(mut requests: mpsc::UnboundedReceiver<Pending>) {
                                         match super::proto::RunVersionsEvent::decode(
                                             payload.as_slice(),
                                         ) {
-                                            Ok(ev) => apply_push_event(ev),
+                                            Ok(ev) => PUSH.apply_event(ev),
                                             Err(e) => crate::util::warn(&format!(
                                                 "bad push frame: {e}"
                                             )),
@@ -858,7 +807,7 @@ async fn connection_task(mut requests: mpsc::UnboundedReceiver<Pending>) {
             }
         }
         drop(inflight);
-        conn_watch().update(|c| {
+        CONNECTED.update(|c| {
             let changed = *c;
             *c = false;
             changed
@@ -867,8 +816,7 @@ async fn connection_task(mut requests: mpsc::UnboundedReceiver<Pending>) {
             // Stop for good, never reload by ourselves: dropping `requests` fails every waiting and later call at once, and the notice bar asks the user to reload.
             return;
         }
-        gloo_timers::future::sleep(std::time::Duration::from_millis(RECONNECT_DELAY_MS as u64))
-            .await;
+        reconnect.dropped();
     }
 }
 
@@ -917,7 +865,7 @@ mod push_tests {
 
     #[test]
     fn canceled_watch_waiters_unregister_without_a_state_change() {
-        let watch = Watch::<bool>::default();
+        let watch = Watch::default();
         let (generation, _) = watch.get();
         let canceled_counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
         let canceled_waker = waker_ref(&canceled_counter);
@@ -954,11 +902,11 @@ mod push_tests {
 
     #[test]
     fn canceled_watch_predicate_waits_unregister_too() {
-        let watch = Watch::<bool>::default();
+        let watch = Watch::default();
         let counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
         let waker = waker_ref(&counter);
         let mut context = Context::from_waker(&waker);
-        let mut wait = Box::pin(watch.wait_for(|value| *value));
+        let mut wait = Box::pin(watch.wait_for(|value| value));
         assert!(matches!(wait.as_mut().poll(&mut context), Poll::Pending));
         assert_eq!(watch.waiter_count(), 1);
         drop(wait);
@@ -1114,5 +1062,18 @@ mod push_tests {
         hub.apply_event(event(&[("run", 4)], &[], 0, &[], false));
         assert_eq!(hub.0.lock().unwrap().subscribers.len(), 1);
         assert_eq!(late.inbox.take().unwrap().runs, versions(&[("run", 4)]));
+    }
+}
+
+#[cfg(test)]
+mod not_sent_tests {
+    use super::*;
+
+    #[test]
+    fn only_an_unsent_expiry_or_a_stale_bundle_refusal_counts_as_not_sent() {
+        assert!(not_sent(&Status::unavailable(NOT_SENT)));
+        assert!(not_sent(&Status::unavailable(crate::grpc::RELOAD_REQUIRED)));
+        assert!(!not_sent(&Status::unavailable("connection lost")));
+        assert!(!not_sent(&Status::deadline_exceeded(NOT_SENT)));
     }
 }

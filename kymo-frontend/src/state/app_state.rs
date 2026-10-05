@@ -344,7 +344,11 @@ impl DashboardState {
         }
     }
 
+    /// Does nothing while disconnected: the reconnect's resync reloads the list, and a refresh queued now would go out beside it.
     pub fn request_runs_refresh(&self) {
+        if !crate::grpc::connection().1 {
+            return;
+        }
         let mut refresh = self.runs_refresh;
         let next = refresh.peek().wrapping_add(1);
         refresh.set(next);

@@ -4,6 +4,7 @@ pub mod client;
 #[allow(dead_code)]
 pub mod chart_delta;
 mod gen;
+mod reconnect;
 mod routes;
 mod ws;
 #[path = "../../../proto/ws_rpc.rs"]
@@ -13,7 +14,7 @@ mod ws_rpc;
 pub use client::GrpcClient;
 pub use gen::proto;
 pub use ws::{
-    connection, connection_changed, is_stale, merge_versions, raise, set_page_visibility,
+    connection, connection_changed, is_stale, merge_versions, not_sent, raise, set_page_visibility,
     subscribe_push, wait_until_page_visible,
 };
 pub use ws_rpc::RELOAD_REQUIRED;

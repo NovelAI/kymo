@@ -33,7 +33,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{RawQuery, State};
 use axum::http::{header::ORIGIN, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -42,6 +42,7 @@ use prost::Message as _;
 use tonic::Status;
 use tower_http::cors::AllowOrigin;
 
+use crate::local_auth::private_error;
 use crate::proto;
 use crate::proto::kymo_server::Kymo;
 use crate::KymoService;
@@ -287,13 +288,13 @@ pub async fn ws_handler(
     };
     if !origin_allowed {
         tracing::warn!(origin = ?headers.get(ORIGIN), "rejected WebSocket origin");
-        if local {
-            return crate::local_auth::private_error(
-                StatusCode::FORBIDDEN,
-                "WebSocket origin is not allowed",
-            );
-        }
-        return (StatusCode::FORBIDDEN, "WebSocket origin is not allowed").into_response();
+        return private_error(StatusCode::FORBIDDEN, "WebSocket origin is not allowed");
+    }
+    // Subscribed before the upgrade, so shutdown waits for a socket it has already accepted. The flag only ever turns true, so the socket's `changed()` is the shutdown.
+    let closing = state.service.ingest.subscribe_draining();
+    // A socket opened now would only get the shutdown Close, and its tab would take the open for the server being back.
+    if *closing.borrow() {
+        return private_error(StatusCode::SERVICE_UNAVAILABLE, "server shutting down");
     }
     let activity = match &state.mode {
         WsMode::Local { activity } => Some(activity.clone()),
@@ -313,7 +314,7 @@ pub async fn ws_handler(
             let _frontend = activity
                 .as_ref()
                 .map(|activity| activity.frontend_connected());
-            handle_socket(socket, state.service, local, refused).await;
+            handle_socket(socket, state.service, local, refused, closing).await;
         })
         .into_response()
 }
@@ -334,8 +335,16 @@ const KEEPALIVE_PING_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// Only local sockets are dropped after this much silence: they hold the stack up, so a peer that vanished without a close (a dropped SSH tunnel, a sleeping laptop) must be noticed. Dropping a silent hosted socket would only make every tab reconnect and resync after a sleep.
 const KEEPALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-async fn handle_socket(socket: WebSocket, svc: Arc<KymoService>, drop_silent: bool, refused: bool) {
+async fn handle_socket(
+    socket: WebSocket,
+    svc: Arc<KymoService>,
+    drop_silent: bool,
+    refused: bool,
+    mut closing: tokio::sync::watch::Receiver<bool>,
+) {
     let (mut sink, mut stream) = socket.split();
+    // On shutdown the writer sends a Close and the reader waits for the browser's reply: a browser that sees the socket vanish first counts a failure and delays reconnecting to the restarted server. Shutdown waits (briefly) until both halves drop their subscriptions.
+    let mut writer_closing = closing.clone();
     // Requests run concurrently (a slow QueryChart must not stall the
     // others), so responses funnel through one writer task.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
@@ -343,8 +352,16 @@ async fn handle_socket(socket: WebSocket, svc: Arc<KymoService>, drop_silent: bo
         let mut ping = tokio::time::interval(KEEPALIVE_PING_INTERVAL);
         loop {
             let message = tokio::select! {
-                // A due ping goes ahead of queued responses, so a long queue can't delay the pong that keeps a local socket alive.
+                // Shutdown's Close goes first; a due ping goes ahead of queued responses, so a long queue can't delay the pong that keeps a local socket alive.
                 biased;
+                _ = writer_closing.changed() => {
+                    let close = CloseFrame {
+                        code: close_code::AWAY,
+                        reason: "server shutting down".into(),
+                    };
+                    let _ = sink.send(Message::Close(Some(close))).await;
+                    break;
+                }
                 _ = ping.tick() => Message::Ping(Default::default()),
                 frame = rx.recv() => match frame {
                     Some(frame) => Message::Binary(frame.into()),
@@ -376,7 +393,7 @@ async fn handle_socket(socket: WebSocket, svc: Arc<KymoService>, drop_silent: bo
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(EVENT_COALESCE_MS));
     // Delay, not Skip: Delay reschedules a full period after a late tick fires (first event after quiet still flushes immediately), so one connection's frames are genuinely ≥ the period apart; Skip re-anchors to phase boundaries and can emit two frames milliseconds apart. Cache correctness does NOT ride on this spacing (series_cache's bump gate owns that — spacing arguments proved unsound across sockets); this is honest per-connection rate limiting only.
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
+    'serve: loop {
         let dirty_any = !dirty_runs.is_empty()
             || !dirty_projects.is_empty()
             || dirty_global != 0
@@ -429,7 +446,10 @@ async fn handle_socket(socket: WebSocket, svc: Arc<KymoService>, drop_silent: bo
                 let path = path.to_owned();
                 let body_start = buf.len() - body.len();
                 while tasks.len() >= MAX_IN_FLIGHT {
-                    tasks.join_next().await;
+                    tokio::select! {
+                        _ = tasks.join_next() => {}
+                        _ = closing.changed() => break 'serve,
+                    }
                     // This loop stopped reading, so the peer's queued pongs are not its silence.
                     last_heard = tokio::time::Instant::now();
                 }
@@ -490,7 +510,12 @@ async fn handle_socket(socket: WebSocket, svc: Arc<KymoService>, drop_silent: bo
                 tracing::info!("ws: closing a local socket silent for {:?}", KEEPALIVE_TIMEOUT);
                 break;
             }
+            _ = closing.changed() => break,
         }
+    }
+    // Once shutdown began, whatever ended the serve loop (its own shutdown arm, or the writer stopping after its Close and closing the channel), wait here for the browser's reply: the stream ends right after it.
+    if *closing.borrow() {
+        while let Some(Ok(_)) = stream.next().await {}
     }
     // Abort in-flight work before releasing the writer — the tasks hold tx
     // clones, and the writer drains until every sender is gone.

@@ -486,9 +486,8 @@ struct DirtyHeartbeat {
 /// Bumping inline per stream flush made every ingest ACK wait on its own committed Postgres UPDATE — concurrent streams queued on the runs row locks, exhausted the pool (1–2.3s per single-row statement), and backpressured kymo's send queue. Flushes now max-merge into the dirty state and one task writes the union per BUMP_INTERVAL: one statement, at most one row-touch per active run, regardless of stream count. Registration rode the flush path (with its own retry buffer) until it moved in here too — the ingest ACK now waits on nothing but ClickHouse, and there is one retry mechanism instead of two. Writes stay best-effort — a missed write (error, crash) is healed by the run's next flush.
 pub struct BumpCoalescer {
     state: std::sync::Mutex<CoalescerState>,
-    /// Set by SIGTERM or the local self-fence RPC: flushes refuse new work so the shutdown drain can quiesce instead of racing arriving marks (see spawn).
-    draining: std::sync::atomic::AtomicBool,
-    shutdown: tokio::sync::Notify,
+    /// Set by SIGTERM or the local self-fence RPC: flushes refuse new work so the shutdown drain can quiesce instead of racing arriving marks, and dashboard sockets subscribe and close cleanly; exit waits up to a second for their subscriptions to drop (see spawn).
+    draining: tokio::sync::watch::Sender<bool>,
     activity: Arc<crate::activity::ActivityTracker>,
 }
 
@@ -582,8 +581,7 @@ impl BumpCoalescer {
     fn new(activity: Arc<crate::activity::ActivityTracker>) -> Self {
         Self {
             state: std::sync::Mutex::new(CoalescerState::default()),
-            draining: std::sync::atomic::AtomicBool::new(false),
-            shutdown: tokio::sync::Notify::new(),
+            draining: tokio::sync::watch::channel(false).0,
             activity,
         }
     }
@@ -619,16 +617,15 @@ impl BumpCoalescer {
     /// The caller may lose its response when the process exits; supervisors
     /// prove completion from endpoint closure rather than trusting the RPC ACK.
     pub(crate) fn request_shutdown(&self) {
-        if !self
-            .draining
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
-            self.shutdown.notify_one();
-        }
+        self.draining.send_replace(true);
+    }
+
+    pub(crate) fn subscribe_draining(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.draining.subscribe()
     }
 
     pub(crate) fn is_draining(&self) -> bool {
-        self.draining.load(std::sync::atomic::Ordering::Acquire)
+        *self.draining.borrow()
     }
 
     /// Start the write-behind task; ingest flushes mark the returned handle dirty.
@@ -659,11 +656,18 @@ impl BumpCoalescer {
                     _ = term.recv() => {
                         coalescer.request_shutdown();
                     }
-                    _ = coalescer.shutdown.notified() => {}
+                    // Subscribed per iteration, not hoisted: a receiver held across the drain keeps draining.closed() below from resolving.
+                    _ = async {
+                        let _ = coalescer.subscribe_draining().wait_for(|draining| *draining).await;
+                    } => {}
                 }
                 if coalescer.is_draining() {
                     // Quiesce, then drain until empty: new flushes are refused (the client spools and re-sends after the restart, exactly as under the old hard kill), and marks land before their stream can ACK — so anything ACKed before a drain pass is in the maps that pass reads. Not airtight: a flush past the draining check but still awaiting ClickHouse has no marks yet, and if the maps read empty right then, exit() kills it unACKed (the client re-sends, storage dedups). Only marks+ACK racing into the microseconds before exit() can be ACKed yet lost — accepted, like the hard-kill window but ~10^5× smaller.
                     let deadline = Instant::now() + Duration::from_secs(5);
+                    // Give dashboard sockets' close handshakes (ws_proxy.rs handle_socket) up to a second first; flushes admitted before the drain land meanwhile.
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(1), coalescer.draining.closed())
+                            .await;
                     loop {
                         let _ = tokio::time::timeout(
                             Duration::from_secs(3),
@@ -852,6 +856,10 @@ impl BumpCoalescer {
 }
 
 impl IngestService {
+    pub(crate) fn subscribe_draining(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.bumps.subscribe_draining()
+    }
+
     pub fn new(
         ch: Arc<ChClient>,
         bumps: Arc<BumpCoalescer>,
@@ -1044,11 +1052,7 @@ impl IngestService {
                 "mutation_version must contain nonzero writer_epoch and mutation_seq fields",
             ));
         }
-        if self
-            .bumps
-            .draining
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if self.bumps.is_draining() {
             return Err(Status::unavailable("server shutting down"));
         }
         // Share the same global ClickHouse admission budget as streamed and
@@ -1840,7 +1844,7 @@ async fn flush_rows_inner(
 ) -> Result<(), Status> {
     debug_assert!(!rows.is_empty());
     // SIGTERM drain: refuse work; the client spools and re-sends after restart (as unary `flush`).
-    if bumps.draining.load(std::sync::atomic::Ordering::Relaxed) {
+    if bumps.is_draining() {
         return Err(Status::unavailable("server shutting down"));
     }
 
@@ -2003,6 +2007,19 @@ mod registry_tests {
 
     fn metric_key(m: &str) -> (String, String, String) {
         ("p".to_string(), "r".to_string(), m.to_string())
+    }
+
+    #[tokio::test]
+    async fn shutdown_signals_sockets_and_exit_waits_for_their_subscriptions() {
+        let c = BumpCoalescer::empty_for_test();
+        let mut socket = c.subscribe_draining();
+        assert!(!*socket.borrow());
+        c.request_shutdown();
+        assert!(socket.wait_for(|draining| *draining).await.is_ok());
+        let mut closed = std::pin::pin!(c.draining.closed());
+        assert!(futures::poll!(closed.as_mut()).is_pending());
+        drop(socket);
+        assert!(futures::poll!(closed.as_mut()).is_ready());
     }
 
     #[test]

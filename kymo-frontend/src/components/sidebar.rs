@@ -2,7 +2,7 @@ mod view;
 
 pub use view::Sidebar;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use dioxus::core::Task;
@@ -181,30 +181,22 @@ fn result_failure(result: &TrashRunResult) -> String {
 
 fn summarize_trash_results(
     requested: &[String],
-    results: &[TrashRunResult],
+    results: &HashMap<String, Result<(), String>>,
 ) -> TrashMutationSummary {
-    let by_id: std::collections::HashMap<&str, &TrashRunResult> = results
-        .iter()
-        .map(|result| (result.run_id.as_str(), result))
-        .collect();
     let mut succeeded = HashSet::new();
     let mut failed = HashSet::new();
     let mut first_failure = None;
     for run_id in requested {
-        let Some(result) = by_id.get(run_id.as_str()) else {
-            failed.insert(run_id.clone());
-            first_failure.get_or_insert_with(|| "server omitted a run result".to_string());
-            continue;
+        let failure = match results.get(run_id) {
+            Some(Ok(())) => {
+                succeeded.insert(run_id.clone());
+                continue;
+            }
+            Some(Err(message)) => message.as_str(),
+            None => "server omitted a run result",
         };
-        if matches!(
-            result.outcome(),
-            TrashRunOutcome::Trashed | TrashRunOutcome::AlreadyTrashed
-        ) {
-            succeeded.insert(run_id.clone());
-        } else {
-            failed.insert(run_id.clone());
-            first_failure.get_or_insert_with(|| result_failure(result));
-        }
+        failed.insert(run_id.clone());
+        first_failure.get_or_insert_with(|| failure.to_string());
     }
     TrashMutationSummary {
         succeeded,
@@ -238,10 +230,6 @@ fn remove_active_runs(state: DashboardState, run_ids: &HashSet<String>) {
         let mut selected = state.selected_runs;
         selected.set(next_selected);
     }
-
-    // Also reconcile outcome-unknown transport failures: the server may have
-    // committed a chunk whose response was lost.
-    state.request_runs_refresh();
 }
 
 fn submit_trash_runs(project_id: String, requested: Vec<String>, ui: TrashMutationUi) {
@@ -254,69 +242,55 @@ fn submit_trash_runs(project_id: String, requested: Vec<String>, ui: TrashMutati
     feedback.set(String::new());
     spawn(async move {
         let grpc = GrpcClient::new();
-        let mut results = std::collections::HashMap::<String, TrashRunResult>::new();
+        let mut results = HashMap::<String, Result<(), String>>::new();
         let mut ambiguous = Vec::new();
         for (chunk_index, chunk) in requested.chunks(TRASH_RPC_CHUNK).enumerate() {
             match grpc.trash_runs(&project_id, chunk).await {
                 Ok(response) => {
-                    let returned = response
+                    let mut returned = response
                         .results
                         .into_iter()
                         .map(|result| (result.run_id.clone(), result))
-                        .collect::<std::collections::HashMap<_, _>>();
+                        .collect::<HashMap<_, _>>();
                     for run_id in chunk {
-                        let result =
-                            returned
-                                .get(run_id)
-                                .cloned()
-                                .unwrap_or_else(|| TrashRunResult {
-                                    run_id: run_id.clone(),
-                                    outcome: TrashRunOutcome::Error as i32,
-                                    error: "server omitted this run result".to_string(),
-                                });
+                        let Some(result) = returned.remove(run_id) else {
+                            ambiguous.push(run_id.clone());
+                            continue;
+                        };
                         if matches!(
                             result.outcome(),
                             TrashRunOutcome::Error | TrashRunOutcome::Unknown
                         ) {
                             ambiguous.push(run_id.clone());
                         }
-                        results.insert(run_id.clone(), result);
+                        let outcome = match result.outcome() {
+                            TrashRunOutcome::Trashed | TrashRunOutcome::AlreadyTrashed => Ok(()),
+                            _ => Err(result_failure(&result)),
+                        };
+                        results.insert(run_id.clone(), outcome);
                     }
                 }
                 Err(status) => {
                     let first = chunk_index * TRASH_RPC_CHUNK;
-                    let failed_end = (first + chunk.len()).min(requested.len());
-                    for run_id in &requested[first..failed_end] {
-                        ambiguous.push(run_id.clone());
-                        results.insert(
-                            run_id.clone(),
-                            TrashRunResult {
-                                run_id: run_id.clone(),
-                                outcome: TrashRunOutcome::Error as i32,
-                                error: format!(
-                                    "the request did not return a result: {}",
-                                    status.message()
-                                ),
-                            },
-                        );
-                    }
-                    for run_id in &requested[failed_end..] {
-                        results.insert(
-                            run_id.clone(),
-                            TrashRunResult {
-                                run_id: run_id.clone(),
-                                outcome: TrashRunOutcome::Error as i32,
-                                error: "not sent after the connection failed".to_string(),
-                            },
-                        );
+                    // Only this chunk may have run, and not even it if it was never sent; the chunks after it never were.
+                    let may_have_run = !crate::grpc::not_sent(&status);
+                    for (offset, run_id) in requested[first..].iter().enumerate() {
+                        let error = if offset >= chunk.len() {
+                            "not sent after the connection failed".to_string()
+                        } else if may_have_run {
+                            ambiguous.push(run_id.clone());
+                            format!("the request did not return a result: {}", status.message())
+                        } else {
+                            status.message().to_string()
+                        };
+                        results.insert(run_id.clone(), Err(error));
                     }
                     break;
                 }
             }
         }
 
-        // Typed replies are final. Only outcome-unknown identities pay a
-        // chunked verification pass; a failed lookup leaves them selected.
+        // Verify only missing or uncertain results; a failed lookup leaves those runs selected.
         if !ambiguous.is_empty() {
             feedback.set("Verifying uncertain results…".to_string());
             if let Ok(records) = lookup_trashed_runs(&project_id, &ambiguous).await {
@@ -328,27 +302,26 @@ fn submit_trash_runs(project_id: String, requested: Vec<String>, ui: TrashMutati
                     .collect::<HashSet<_>>();
                 for run_id in &ambiguous {
                     if confirmed.contains(run_id.as_str()) {
-                        results.insert(
-                            run_id.clone(),
-                            TrashRunResult {
-                                run_id: run_id.clone(),
-                                outcome: TrashRunOutcome::AlreadyTrashed as i32,
-                                ..Default::default()
-                            },
-                        );
+                        results.insert(run_id.clone(), Ok(()));
                     }
                 }
             }
         }
-        apply_trash_results(results.into_values().collect(), &requested, ui);
+        apply_trash_results(&results, &requested, ui);
+        // Reconcile the list, which also covers outcome-unknown transport failures: the server may have committed a chunk whose response was lost.
+        ui.dashboard.request_runs_refresh();
         busy.set(false);
     });
 }
 
-fn apply_trash_results(results: Vec<TrashRunResult>, requested: &[String], ui: TrashMutationUi) {
+fn apply_trash_results(
+    results: &HashMap<String, Result<(), String>>,
+    requested: &[String],
+    ui: TrashMutationUi,
+) {
     let mut picker = ui.picker;
     let mut feedback = ui.feedback;
-    let summary = summarize_trash_results(requested, &results);
+    let summary = summarize_trash_results(requested, results);
     // Read before the row unmounts: once it has, focus is on the page either way.
     let heir = match requested {
         [run_id] if summary.succeeded.contains(run_id) => row_focus_heir(run_id),
@@ -720,8 +693,7 @@ fn InlineRunRename(
                         on_close.call(restore_focus);
                     }
                     Err(status) => {
-                        // A transport cut can hide a committed rename. Reconcile
-                        // while leaving the inline draft available for retry.
+                        // A transport cut can hide a committed rename: reconcile, keeping the inline draft for retry.
                         state.request_runs_refresh();
                         busy.set(false);
                         let message = match status.message() {
@@ -861,9 +833,9 @@ const SIDEBAR_RESIZE_JS: &str = r#"(function(){
 
 #[cfg(test)]
 mod selection_pick_tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
-    use crate::grpc::proto::{RunInfo, RunStatus, TrashRunOutcome, TrashRunResult};
+    use crate::grpc::proto::{RunInfo, RunStatus};
 
     use super::{
         all_or_none_selection, apply_rename_if_current, continue_selection_paint,
@@ -1087,18 +1059,10 @@ mod selection_pick_tests {
     #[test]
     fn partial_server_results_remove_only_confirmed_runs() {
         let requested = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let results = vec![
-            TrashRunResult {
-                run_id: "a".to_string(),
-                outcome: TrashRunOutcome::Trashed as i32,
-                ..Default::default()
-            },
-            TrashRunResult {
-                run_id: "b".to_string(),
-                outcome: TrashRunOutcome::Error as i32,
-                error: "busy".to_string(),
-            },
-        ];
+        let results = HashMap::from([
+            ("a".to_string(), Ok(())),
+            ("b".to_string(), Err("busy".to_string())),
+        ]);
 
         let summary = summarize_trash_results(&requested, &results);
         assert_eq!(summary.succeeded, HashSet::from(["a".to_string()]));

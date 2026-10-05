@@ -1,5 +1,5 @@
 #[cfg(not(target_arch = "wasm32"))]
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 use crate::grpc::proto::{ListTrashRequest, RunLifecycleState, RunRecord};
 use crate::grpc::GrpcClient;
@@ -18,12 +18,8 @@ pub fn monotonic_now_ms() -> f64 {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn monotonic_now_ms() -> f64 {
-    static START: OnceLock<std::time::Instant> = OnceLock::new();
-    START
-        .get_or_init(std::time::Instant::now)
-        .elapsed()
-        .as_secs_f64()
-        * 1_000.0
+    static START: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
+    START.elapsed().as_secs_f64() * 1_000.0
 }
 
 #[cfg(target_arch = "wasm32")]
