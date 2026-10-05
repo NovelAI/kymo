@@ -2,7 +2,7 @@ use dioxus::prelude::*;
 
 use crate::components::icons::TrashIcon;
 use crate::components::theme_toggle::ThemeToggle;
-use crate::components::user_settings::UserSettingsButton;
+use crate::components::user_settings::{UserSettingsButton, UserSettingsPanel};
 use crate::grpc::GrpcClient;
 use crate::route::Route;
 use crate::util::{is_app_escape, local_storage, local_time, primary};
@@ -71,6 +71,7 @@ pub fn ProjectsPage() -> Element {
     });
 
     let mut filter = use_signal(String::new);
+    let settings_open = use_signal(|| false);
     let mut sort = use_signal(|| match local_storage::get(SORT_KEY).as_deref() {
         Some("name") => Sort::Name,
         _ => Sort::LastLogged,
@@ -108,7 +109,7 @@ pub fn ProjectsPage() -> Element {
                             TrashIcon {}
                             span { "Trash" }
                         }
-                        UserSettingsButton {}
+                        UserSettingsButton { open: settings_open }
                         ThemeToggle { class: "page-action" }
                     }
                 }
@@ -174,6 +175,9 @@ pub fn ProjectsPage() -> Element {
                         p { class: "text-disabled", "Loading..." }
                     },
                 }
+            }
+            if *settings_open.read() {
+                UserSettingsPanel { open: settings_open }
             }
         }
     }

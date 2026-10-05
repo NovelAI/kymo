@@ -40,13 +40,13 @@ cargo run --locked -- \
 
 ## Browser fences
 
-The editor dialog checks run locally with Playwright and a project containing a numeric chart, at least two sections, and an active sidebar run for the colour-picker case:
+The options panel checks run locally with Playwright against the `browser-e2e` fixture project from `seed_browser_fixture.py` (see Frontend checks below): it has the numeric, `info/run_info` metadata and `sample` gallery charts and the two active runs the checks use.
 
 ```sh
-python editor_dialog_fences.py <dashboard-project-url>
+python options_panel_fences.py <dashboard-project-url>
 ```
 
-Run them after editor, focus, or dialog changes. They cover native modality, dismissal, focus return, label activation, option inheritance and persistence, and smoothing hints at wide and narrow widths. They are excluded from CI to keep its runtime down. Run `user_settings_fences.py <dashboard-origin>` as well when changing the shared dialog or focus helpers.
+Run them after editor, focus, or panel changes. They cover docking and target switching, dismissal and focus return, edits kept by Esc and Close, Revert, a collapse made beside an open section panel, label activation, option inheritance and persistence, and smoothing hints at wide and narrow widths. They are excluded from CI to keep its runtime down. Run `user_settings_fences.py <dashboard-origin> --dashboard-path /<project>` as well when changing the shared panel or focus helpers; without `--dashboard-path` it skips the dashboard docking check. In Playwright WebKit on macOS the field checks stop at the first label click, which doesn't focus the checkbox there.
 
 ## Target status
 
@@ -77,11 +77,11 @@ Use the printed local origin for these commands; the gesture URL is a project pa
 ```sh
 python tools/local-transport-qualification/gesture_fences.py http://127.0.0.1:PORT/browser-e2e
 python tools/local-transport-qualification/gesture_fences.py http://127.0.0.1:PORT/browser-e2e --browser webkit
-python tools/local-transport-qualification/user_settings_fences.py http://127.0.0.1:PORT/
+python tools/local-transport-qualification/user_settings_fences.py http://127.0.0.1:PORT/ --dashboard-path /browser-e2e
 python tools/local-transport-qualification/legacy_storage_fences.py http://127.0.0.1:PORT/
 python tools/local-transport-qualification/zoom_fences.py http://127.0.0.1:PORT/zoom-e2e/zoom-fixture
 ```
 
-The gesture, user settings, legacy storage, zoom, editor dialog, first-mount, and text scroll fences accept `--browser chromium|firefox|webkit` (default: `chromium`).
+The gesture, user settings, legacy storage, zoom, options panel, first-mount, and text scroll fences accept `--browser chromium|firefox|webkit` (default: `chromium`).
 
 WebKit exercises native checkbox activation on auxiliary clicks that Chromium does not produce. The gesture fence suppresses native context menus to keep test input flowing; Kevin must check the actual macOS Ctrl-click menu by hand.

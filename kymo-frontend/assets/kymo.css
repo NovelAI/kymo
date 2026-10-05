@@ -4,8 +4,9 @@
        text controls use rem to follow this root size. */
     --kymo-user-font-size: 16px;
     font-size: var(--kymo-user-font-size);
-    /* The sidebar drag (sidebar.rs) overrides this on <html> with the saved percentage. */
+    /* The width drags (util/width_drag.js) override these on <html> with the saved widths. */
     --kymo-sidebar-w: 20vw;
+    --kymo-options-w: 30rem;
     --bg0: #0E0F21;
     --bg1: #13152C;
     --bg2: #191B31;
@@ -129,7 +130,7 @@ input[type="range"]:focus::-moz-range-thumb {
 
 /* === Shared Controls === */
 /* Bare action buttons that brighten on hover; size, padding, and opacity gating are per-site. */
-.navbar-action, .section-action, .rect-action, .navbar-search-clear,
+.navbar-action, .section-action, .rect-action, .navbar-search-clear, .options-panel-close,
 .sidebar-trash-trigger, .sidebar-trash-cancel, .run-overflow-trigger, .project-sort {
     background: none;
     border: none;
@@ -138,7 +139,13 @@ input[type="range"]:focus::-moz-range-thumb {
     line-height: 1.3; /* numeric for .icon-button's 1lh */
     transition: color var(--transition);
 }
-.navbar-action:hover, .section-action:hover, .rect-action:hover, .navbar-search-clear:hover { color: var(--text-headings); }
+.navbar-action:hover, .section-action:hover, .rect-action:hover, .navbar-search-clear:hover, .options-panel-close:hover { color: var(--text-headings); }
+/* A panel trigger whose panel is open shows pressed, and closes it. */
+.navbar-action[aria-expanded="true"], .section-action[aria-expanded="true"] {
+    color: var(--text-headings);
+    background: var(--bg3);
+    opacity: 1;
+}
 
 /* Inline text buttons; color per-site. */
 .btn-link, .binding-remove {
@@ -293,7 +300,8 @@ input[type="checkbox"]:checked::before {
    column's visible area — independent of scroll position, sidebar width,
    or sidebar collapse. */
 .main-wrap {
-    flex: 1;
+    /* Counted as 20rem when a row too narrow for everything shares out the shortfall; see .options-panel. */
+    flex: 1 1 20rem;
     min-width: 0;
     position: relative;
     display: flex;
@@ -305,7 +313,7 @@ input[type="checkbox"]:checked::before {
     min-height: 0;
     overflow-y: auto;
     position: relative;
-    /* Own stacking context: in-grid z-indexes (actions 55, title pop 60, tips 70) resolve locally, so nothing in the grid can hit-test or paint above the sibling maximize overlay (50). Editor dialogs and the image preview use the browser top layer. */
+    /* Own stacking context: in-grid z-indexes (actions 55, title pop 60, tips 70) resolve locally, so nothing in the grid can hit-test or paint above the sibling maximize overlay (50). The options panel (60) paints above both; the image preview uses the browser top layer. */
     isolation: isolate;
 }
 /* While the maximize overlay is up, freeze the underlying scrollbar so the
@@ -347,26 +355,27 @@ input[type="checkbox"]:checked::before {
 
 /* === Sidebar === */
 .sidebar {
-    width: var(--kymo-sidebar-w);
+    flex: 0 1 var(--kymo-sidebar-w);
     background: var(--bg1);
     border-right: 1px solid var(--bg3);
     display: flex;
     flex-direction: column;
-    flex-shrink: 0;
     overflow: hidden;
     position: relative;
 }
 
-.sidebar-resize {
+/* Width drag handles (util/width_drag.js): the run list's right edge, the options panel's left. */
+.sidebar-resize, .options-panel-resize {
     position: absolute;
     top: 0;
-    right: 0;
     width: 5px;
     height: 100%;
     cursor: col-resize;
     z-index: 5;
 }
-.sidebar-resize:hover { background: var(--bg3); }
+.sidebar-resize { right: 0; }
+.options-panel-resize { left: 0; }
+.sidebar-resize:hover, .options-panel-resize:hover { background: var(--bg3); }
 
 .sidebar-meta { font-size: var(--font-size-11); color: var(--text-disabled); }
 
@@ -913,6 +922,8 @@ input[type="checkbox"]:checked::before {
 .section::after { bottom: -2px; }
 .section[data-insert-before="true"]::before, .section[data-insert-after="true"]::after { background: var(--text-headings); }
 .section[data-dragging="true"] > .section-header { opacity: 0.5; }
+/* The section the options panel edits. */
+.section[data-options-target="true"] > .section-header { box-shadow: inset 3px 0 0 var(--text-headings); }
 .section-drag-handle { color: var(--text-disabled); font-size: var(--font-size-15); cursor: grab; user-select: none; }
 .section-drag-handle:hover { color: var(--text-headings); }
 
@@ -1159,47 +1170,62 @@ input[type="checkbox"]:checked::before {
     border-bottom: 2px solid var(--text-disabled);
 }
 
-/* === Editor Dialogs === */
-.editor-dialog {
-    margin: auto;
-    padding: 0;
-    border: 0;
-    max-width: none;
-    max-height: none;
-    background: transparent;
-    color: inherit;
-    /* The inner panel owns scrolling; the transparent shell must not add
-       a second scroll area from the browser's dialog defaults. */
-    overflow: visible;
-}
-
-.editor-dialog::backdrop {
-    background: rgba(0, 0, 0, 0.6);
-}
-
-/* The autofocus panel is not an interactive control. */
-.editor-dialog > .modal:focus { outline: none; }
-
-.modal {
+/* === Options panel === */
+/* Docks as the last flex item of its host (the dashboard's .content-row, the projects page's main), so the content beside it narrows while it is open, at any window width. Its default 30rem grows with the user font like the forms inside it; a dragged width is a share of the window, like the run list's. */
+.options-panel {
+    /* Above the main column and the maximize overlay (50): a chart's fixed hover tip near its right edge passes under the panel, and the smoothing hint beside it stays over a maximized chart. */
+    position: relative;
+    z-index: 60;
+    /* In a row too narrow for everything at its width, the panel gives way first (its shrink weight dwarfs the others'), down to 14rem, where its forms stop fitting at a 12px font; then what's beside it (the run list, and the charts or project list, counted as 20rem) shrink together in proportion. It never lies over them. */
+    flex: 0 1000 var(--kymo-options-w);
+    min-width: 14rem;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
     background: var(--bg1);
-    border: 1px solid var(--bg3);
-    padding: var(--spacing-lg);
-    width: min(480px, calc(100vw - 32px));
-    max-height: 80vh;
-    overflow-y: auto;
+    border-left: 1px solid var(--bg3);
 }
-
-.modal h3 {
-    font-size: var(--font-size-17);
-    margin-bottom: var(--spacing-md);
+.options-panel:focus { outline: none; }
+.options-panel-header {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-sm);
+    padding: var(--spacing-sm) var(--spacing-md) var(--spacing-sm) var(--spacing-lg);
+    border-bottom: 1px solid var(--bg3);
 }
-
-.user-settings-modal { width: min(420px, calc(100vw - 32px)); }
-.user-settings-scope {
+.options-panel-heading { flex: 1; min-width: 0; }
+.options-panel-heading h3 { font-size: var(--font-size-17); }
+.options-panel-target {
     color: var(--text-disabled);
-    font-size: var(--font-size-12);
-    margin: calc(-1 * var(--spacing-sm)) 0 var(--spacing-lg);
+    font-size: var(--font-size-13);
 }
+.options-panel-close { font-size: var(--font-size-16); padding: 2px 4px; }
+.options-panel-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: var(--spacing-lg);
+}
+
+/* The panel's host is a query container, so the smoothing hint can place itself by the host's width in rem (media queries ignore the user font). Fixed-position descendants (chart tips, the smoothing hint at a narrow window's foot) still position against the viewport inside it, as checked in Chromium and WebKit; `contain: layout` would capture them, so don't add it here. */
+.content-row, .projects-page { container: options-host / inline-size; }
+/* The projects page scrolls the document, so its panel sticks to the viewport beside the list, as tall as its content: a full viewport would push the document past a notice bar. */
+.projects-page {
+    display: flex;
+    align-items: flex-start;
+    /* A fixed width, without the dashboard's drag handle: Settings' font slider would otherwise widen the panel under the pointer as it drags. */
+    --kymo-options-w: 420px;
+}
+.projects-page .options-panel-resize { display: none; }
+.projects-page > .projects-page-inner { flex: 1 1 20rem; min-width: 0; }
+.projects-page > .options-panel {
+    position: sticky;
+    top: 0;
+    max-height: 100vh;
+    border-bottom: 1px solid var(--bg3);
+}
+
 .user-settings-field {
     display: flex;
     align-items: center;
@@ -1226,23 +1252,15 @@ input[type="checkbox"]:checked::before {
     color: var(--warning);
     font-size: var(--font-size-12);
 }
-.modal-actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: var(--spacing-sm);
-    padding-top: var(--spacing-sm);
-    border-top: 1px solid var(--bg3);
-    margin-top: var(--spacing-md);
-}
 
-/* Fixed smoothing help never reflows the editor's controls or action row. */
+/* Smoothing help beside the panel (its containing block: nothing between is positioned, and the scrolling body doesn't clip it), so it never reflows the panel's controls. */
 .smoothing-hover-hint {
-    position: fixed;
-    left: calc(50% + 260px);
+    position: absolute;
+    right: calc(100% + var(--spacing-lg));
     top: 50%;
     z-index: 61;
     box-sizing: border-box;
-    width: min(380px, calc(50vw - 280px));
+    width: min(380px, calc(100vw - 100% - 2 * var(--spacing-lg)));
     margin: 0;
     padding: var(--spacing-md);
     background: var(--bg1);
@@ -1257,15 +1275,17 @@ input[type="checkbox"]:checked::before {
     visibility: hidden;
 }
 
-.modal:has(.smoothing-select:hover) .smoothing-hover-hint {
+.options-panel:has(.smoothing-select:hover) .smoothing-hover-hint {
     visibility: visible;
 }
 
-@media (max-width: 1000px) {
+/* With no room beside the panel the help spans the window's foot; the panel body scrolls, so it can cover a select hovered down there. */
+@container options-host (width < 54rem) {
     .smoothing-hover-hint {
+        position: fixed;
+        top: auto;
         right: var(--spacing-lg);
-        top: var(--spacing-lg);
-        bottom: auto;
+        bottom: var(--spacing-lg);
         left: var(--spacing-lg);
         width: auto;
         transform: none;
@@ -2057,7 +2077,7 @@ input[type="checkbox"]:checked::before {
     letter-spacing: 0.05em;
     margin-bottom: var(--spacing-sm);
 }
-.modal > .editor-section-label ~ .editor-section-label { margin-top: var(--spacing-md); }
+.options-panel-body > .editor-section-label ~ .editor-section-label { margin-top: var(--spacing-md); }
 .editor-section-toggle {
     cursor: pointer;
     user-select: none;
@@ -2118,6 +2138,8 @@ button.editor-section-toggle:focus-visible {
     cursor: pointer;
     white-space: nowrap;
 }
+/* An options panel can be as narrow as 14rem, so its option checkboxes' longer labels wrap. */
+.editor-options .checkbox-label { white-space: normal; }
 
 /* === Navbar Actions === */
 .navbar-action {
@@ -2143,7 +2165,7 @@ button.editor-section-toggle:focus-visible {
     padding: 6px 10px;
     transition: border-color var(--transition), background var(--transition), color var(--transition);
 }
-.page-action:hover {
+.page-action:hover, .page-action[aria-expanded="true"] {
     border-color: var(--text-headings);
     background: var(--bg2);
     color: var(--text-headings);

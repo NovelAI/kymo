@@ -11,8 +11,10 @@ import json
 
 from playwright.sync_api import Page, expect, sync_playwright
 
+from fences_common import drag_handle
 from user_settings_fences import (
     VIEWPORT,
+    close_settings,
     open_settings,
     set_font_size,
     wait_font,
@@ -153,11 +155,7 @@ def run_fences(page: Page, origin: str) -> None:
     handle = page.locator(".sidebar-resize")
     box = handle.bounding_box()
     assert box is not None
-    y = box["y"] + box["height"] / 2
-    page.mouse.move(box["x"] + box["width"] / 2, y)
-    page.mouse.down()
-    page.mouse.move(box["x"] + 40, y, steps=4)
-    page.mouse.up()
+    drag_handle(page, handle, box["x"] + 40)
     width = float(migrated("kymo_sidebar_w", "mkdb2_sidebar_w")["kymo_sidebar_w"])
     rendered = page.locator(".sidebar").bounding_box()
     assert rendered is not None
@@ -166,14 +164,13 @@ def run_fences(page: Page, origin: str) -> None:
         f"stored {width}% does not match the rendered {rendered['width']}px"
     )
 
-    # Settings live on the project list; the first save migrates the key.
+    # Settings live on the project list; the first change saved migrates the key.
     page.goto(origin, wait_until="domcontentloaded")
     page.locator(".project-row").first.wait_for(timeout=20_000)
     wait_font(page, 20)
     open_settings(page)
     set_font_size(page, 18)
-    page.get_by_role("button", name="Save", exact=True).click()
-    expect(page.get_by_role("dialog", name="Settings", exact=True)).to_be_hidden()
+    close_settings(page)
     config = json.loads(
         migrated("kymo_user_config_v1", "mkdb2_user_config_v1")["kymo_user_config_v1"]
     )

@@ -413,7 +413,7 @@ pub(super) fn NumericContent(
         )
     });
 
-    // Fetch gate: an out-of-band panel (only mounted here while an editor pins the body) doesn't query and doesn't react to version bumps until it re-enters the band. A memo so Near <-> Visible flips don't restart an identical in-flight fetch (priority is peeked in the body).
+    // Fetch gate: an out-of-band panel (only mounted here mid-rename, which keeps the body mounted) doesn't query and doesn't react to version bumps until it re-enters the band. A memo so Near <-> Visible flips don't restart an identical in-flight fetch (priority is peeked in the body).
     let allowed = use_memo(move || *zone.read() != Zone::Far);
     // The shared `loading` prop is both the corner spinner and the bridge's busy flag (same signal-sharing as text_stream): it spans the whole fetch — admission wait and retries included — so every fetch spins the chart it touches, and a pushed bump propagates when the flag clears instead of cancelling the fetch mid-flight. That propagation usually lands on the cache entry's echoed versions (folded into the client's map at receipt, see the fetch below) — a cache hit, not a second query.
     let data_seq = crate::state::use_version_bridge(my_version, loading, allowed);

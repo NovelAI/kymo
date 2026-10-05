@@ -27,7 +27,7 @@ from playwright.sync_api import (
 
 from fences_common import encode_response, request_frame
 from fences_common import render_turn as settle
-from user_settings_fences import open_settings, set_font_size
+from user_settings_fences import close_settings, open_settings, set_font_size
 
 
 PROJECT = "text-scroll-e2e"
@@ -422,8 +422,7 @@ def font_roundtrip(page: Page, expected: dict[str, dict]) -> None:
         page.locator(".navbar-brand").click()
         open_settings(page)
         set_font_size(page, pixels)
-        page.get_by_role("button", name="Save", exact=True).click()
-        expect(page.get_by_role("dialog", name="Settings")).to_have_count(0)
+        close_settings(page)
         page.locator(".project-row").filter(has_text=PROJECT).click()
         for run in active_last(page, expected):
             activate(page, run)

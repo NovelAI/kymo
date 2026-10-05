@@ -4,7 +4,6 @@ use std::rc::Rc;
 
 use dioxus::prelude::*;
 
-use crate::components::binding_editor::BindingEditor;
 use crate::components::cdn_gallery::CdnGallery;
 use crate::components::icons::{CloseIcon, GearIcon, MaximizeIcon, SpinnerIcon};
 use crate::components::text_stream::TextStreamViewer;
@@ -15,8 +14,33 @@ use crate::state::layout_config::{CdnDisplayMode, MetricBinding, RectOptions, Ru
 use crate::state::panel_cache::{panel_key, Store};
 use crate::state::visibility::{self, Zone};
 use crate::state::zones::ZoneRegistry;
-use crate::state::{resolve_capped_bindings, DashboardState, DisplayType, RectConfig};
+use crate::state::{resolve_capped_bindings, DashboardState, DisplayType, PanelTarget, RectConfig};
 use crate::util::{editor_trigger_id, focus_on_mount, is_app_escape, primary};
+
+/// A chart's title: its label, else its metrics' names without their section prefix.
+pub(crate) fn rect_title(config: &RectConfig) -> String {
+    if !config.label.is_empty() {
+        return config.label.clone();
+    }
+    let names = config
+        .bindings
+        .iter()
+        .map(|b| {
+            // Strip prefix before last '/' (same as section grouping)
+            match b.metric_name.rfind('/') {
+                Some(pos) => &b.metric_name[pos + 1..],
+                None => b.metric_name.as_str(),
+            }
+        })
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if names.is_empty() {
+        "(unconfigured)".to_string()
+    } else {
+        names
+    }
+}
 
 fn normalize_rect_label(label: String) -> String {
     if label.trim().is_empty() {
@@ -215,14 +239,12 @@ pub struct ResizeResult {
 pub fn MetricRect(
     config: RectConfig,
     chart_height: u32,
-    /// Section's max columns — needed to clamp the column_span input in the
-    /// binding editor and the preview label during drag-resize.
-    max_columns: u32,
     /// True when this rect is being rendered inside the maximize overlay —
     /// hides the maximize button and disables the resize handle.
     #[props(default = false)]
     is_maximized: bool,
-    on_update: EventHandler<RectConfig>,
+    /// Fired with the new label when a title rename commits.
+    on_rename: EventHandler<String>,
     on_delete: EventHandler<()>,
     on_resize: EventHandler<ResizeResult>,
 ) -> Element {
@@ -234,8 +256,8 @@ pub fn MetricRect(
             Zone::Far
         }
     });
-    // Held true by the body while a modal (binding editor / rename) is open: scrolling it out of the band must not unmount an editor mid-edit. Fetches still freeze at Far — `allowed` gates on the zone, not on mount.
-    let pin = use_signal(|| false);
+    // The body's title rename: scrolling it out of the band mid-rename must not unmount the input. Fetches still freeze at Far — `allowed` gates on the zone, not on mount.
+    let renaming = use_signal(|| false);
     let registry = use_context::<ZoneRegistry>();
     use_hook({
         let registry = registry.clone();
@@ -266,15 +288,14 @@ pub fn MetricRect(
             class: "{slot_class}",
             "data-slot-id": "{config.id}",
             style: "--kymo-chart-height: {chart_height}px;",
-            if is_maximized || *pin.read() || *zone.read() != Zone::Far {
+            if is_maximized || *renaming.read() || *zone.read() != Zone::Far {
                 MetricRectBody {
                     config: config.clone(),
                     chart_height: chart_height,
-                    max_columns: max_columns,
                     is_maximized: is_maximized,
                     zone: zone,
-                    pin: pin,
-                    on_update: on_update,
+                    renaming: renaming,
+                    on_rename: on_rename,
                     on_delete: on_delete,
                     on_resize: on_resize,
                 }
@@ -287,16 +308,13 @@ pub fn MetricRect(
 fn MetricRectBody(
     config: RectConfig,
     chart_height: u32,
-    max_columns: u32,
     is_maximized: bool,
     zone: Signal<Zone>,
-    pin: Signal<bool>,
-    on_update: EventHandler<RectConfig>,
+    mut renaming: Signal<bool>,
+    on_rename: EventHandler<String>,
     on_delete: EventHandler<()>,
     on_resize: EventHandler<ResizeResult>,
 ) -> Element {
-    let mut editing = use_signal(|| false);
-    let mut renaming = use_signal(|| false);
     let initial_label = config.label.clone();
     let editor_trigger_id = editor_trigger_id(
         if is_maximized {
@@ -306,15 +324,6 @@ fn MetricRectBody(
         },
         &config.id,
     );
-
-    // Keep the slot from unmounting this body while a modal is open.
-    let mut pin_out = pin;
-    use_effect(move || {
-        let hold = *editing.read() || *renaming.read();
-        if *pin_out.peek() != hold {
-            pin_out.set(hold);
-        }
-    });
 
     // True while this rect's content has a query in flight: drives the
     // corner spinner and gates the leaves' version bridges (see
@@ -333,32 +342,21 @@ fn MetricRectBody(
     // become a persisted user override.
     let resolved_display_type = use_signal(|| Option::<DisplayType>::None);
 
-    let display_title = if config.label.is_empty() {
-        config
-            .bindings
-            .iter()
-            .map(|b| {
-                // Strip prefix before last '/' (same as section grouping)
-                match b.metric_name.rfind('/') {
-                    Some(pos) => &b.metric_name[pos + 1..],
-                    None => b.metric_name.as_str(),
-                }
-            })
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join(", ")
-    } else {
-        config.label.clone()
-    };
-    let display_title = if display_title.is_empty() {
-        "(unconfigured)".to_string()
-    } else {
-        display_title
-    };
+    let display_title = rect_title(&config);
 
     let mut rename_value = use_signal(move || initial_label.clone());
 
     let state = use_context::<DashboardState>();
+    // The options panel edits the maximized chart from outside this body, so the maximized copy reports what it learns about its content; what the grid copy handed over (Configure, below) fills in what it hasn't learned yet.
+    use_effect(use_reactive((&config,), move |(config,)| {
+        if is_maximized {
+            state.report_chart_facts(
+                &config,
+                cdn_class.read().clone(),
+                *resolved_display_type.read(),
+            );
+        }
+    }));
     let color_ver = *state.color_version.read();
     let options = config.options.clone();
     // Key into the module-level caches. The overlay copy gets its own entries — its width (and so its chart request) differs from the grid rect's, and the two must not evict each other per open/close.
@@ -391,14 +389,9 @@ fn MetricRectBody(
             div { class: "rect-header",
                 if *renaming.read() {
                     {
-                        let mut commit_rename = {
-                            let config = config.clone();
-                            move || {
-                                renaming.set(false);
-                                let mut updated = config.clone();
-                                updated.label = normalize_rect_label(rename_value.read().clone());
-                                on_update.call(updated);
-                            }
+                        let mut commit_rename = move || {
+                            renaming.set(false);
+                            on_rename.call(normalize_rect_label(rename_value.read().clone()));
                         };
                         rsx! {
                             input {
@@ -410,16 +403,13 @@ fn MetricRectBody(
                                 oninput: move |e: Event<FormData>| {
                                     rename_value.set(e.value());
                                 },
-                                onkeydown: {
-                                    let mut commit_rename = commit_rename.clone();
-                                    move |e: Event<KeyboardData>| {
-                                        if e.key() == Key::Enter && !e.is_composing() {
-                                            commit_rename();
-                                        } else if is_app_escape(&e) {
-                                            // Consume the key so cancelling a rename inside a maximized chart doesn't also close the overlay.
-                                            e.prevent_default();
-                                            renaming.set(false);
-                                        }
+                                onkeydown: move |e: Event<KeyboardData>| {
+                                    if e.key() == Key::Enter && !e.is_composing() {
+                                        commit_rename();
+                                    } else if is_app_escape(&e) {
+                                        // Consume the key so cancelling a rename inside a maximized chart doesn't also close the overlay.
+                                        e.prevent_default();
+                                        renaming.set(false);
                                     }
                                 },
                                 onblur: move |_| commit_rename(),
@@ -460,12 +450,28 @@ fn MetricRectBody(
                             }
                         }
                     }
-                    button {
-                        id: "{editor_trigger_id}",
-                        class: "rect-action icon-button",
-                        title: "Configure",
-                        onmousedown: primary(move |_| editing.set(true)),
-                        GearIcon {}
+                    // A maximized chart with its settings open beside it has no use for the button; only the maximized copy reads the panel, so grid charts don't re-render as it opens and closes.
+                    if !(is_maximized && state.options_panel.read().as_ref().is_some_and(|p| p.target == PanelTarget::Chart)) {
+                        {
+                            let rect = config.clone();
+                            let trigger_id = editor_trigger_id.clone();
+                            rsx! {
+                                button {
+                                    id: "{editor_trigger_id}",
+                                    class: "rect-action icon-button",
+                                    title: "Configure",
+                                    onmousedown: primary(move |_| {
+                                        state.open_options_panel(PanelTarget::Chart, trigger_id.clone());
+                                        if !is_maximized {
+                                            // Configure edits beside the maximized chart: maximize a grid chart, handing the maximized copy what this one already knows so the editor opens on the right sections.
+                                            state.hand_over_chart_facts(&rect, cdn_class.peek().clone(), *resolved_display_type.peek());
+                                            focus_chart(Some(rect.id.clone()));
+                                        }
+                                    }),
+                                    GearIcon {}
+                                }
+                            }
+                        }
                     }
                     if is_maximized {
                         button {
@@ -542,39 +548,6 @@ fn MetricRectBody(
                 }
             }
 
-            if *editing.read() {
-                BindingEditor {
-                    return_focus_id: editor_trigger_id.clone(),
-                    bindings: config.bindings.clone(),
-                    options: config.options.clone(),
-                    anchor: state.inherited_options_for_rect(&config.id),
-                    display_type: resolved_display_type.read().unwrap_or(config.display_type),
-                    cdn_class: cdn_class.read().clone(),
-                    max_columns: max_columns,
-                    on_change: {
-                        let config = config.clone();
-                        move |(new_bindings, new_options): (Vec<MetricBinding>, RectOptions)| {
-                            on_update.call(RectConfig {
-                                bindings: new_bindings,
-                                options: new_options,
-                                ..config.clone()
-                            });
-                        }
-                    },
-                    on_save: {
-                        let config = config.clone();
-                        move |(new_bindings, new_options): (Vec<MetricBinding>, RectOptions)| {
-                            editing.set(false);
-                            on_update.call(RectConfig {
-                                bindings: new_bindings,
-                                options: new_options,
-                                ..config.clone()
-                            });
-                        }
-                    },
-                    on_cancel: move |_| editing.set(false),
-                }
-            }
         }
     }
 }
@@ -702,7 +675,7 @@ fn AutoContent(
         )
     });
 
-    // Zone gate + cache, like the data fetches: an out-of-band rect (only reachable here while an editor pins the body) must not turn a registry event into list_metrics traffic, and a Near/Visible re-detection defers to visible fetches. The cache keys on (metrics-gen hash, bound metric NAMES) — a binding edit that keeps the same runs but swaps metrics must not serve the old types. All-terminal passes never enter it. It lives in TYPE_CACHE so a body remounting after a scroll-away skips re-detection.
+    // Zone gate + cache, like the data fetches: an out-of-band rect (only reachable here mid-rename, which keeps the body mounted) must not turn a registry event into list_metrics traffic, and a Near/Visible re-detection defers to visible fetches. The cache keys on (metrics-gen hash, bound metric NAMES) — a binding edit that keeps the same runs but swaps metrics must not serve the old types. All-terminal passes never enter it. It lives in TYPE_CACHE so a body remounting after a scroll-away skips re-detection.
     let type_allowed = use_memo(move || *zone.read() != Zone::Far);
 
     enum TypeFetch {

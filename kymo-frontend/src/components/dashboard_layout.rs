@@ -7,21 +7,25 @@ use gloo_timers::future::sleep;
 
 use crate::components::metric_rect::MetricRect;
 use crate::components::navbar::Navbar;
+use crate::components::options_panel::DashboardOptionsPanel;
 use crate::components::sidebar::Sidebar;
 use crate::components::uplot_chart::ZoomBridge;
 use crate::grpc::proto::{MetricInfo, RunLifecycleState};
 use crate::route::{focus_chart, Route};
 use crate::state::app_state::{ExplicitRunKey, ExplicitRunMetadata};
-use crate::state::layout_config::{resolve_rect_locally, RectConfig, RunRef};
+use crate::state::layout_config::{resolve_rect_locally, RunRef};
 use crate::state::push::PushBridge;
 use crate::state::visibility::{
     is_terminal_run_status, retry_visible, retry_visible_run, visible_attempt,
 };
 use crate::state::zones::{ZoneBridge, ZoneRegistry};
 use crate::state::{
-    load_diff_or_route, DashboardState, DirectRunLoad, DirectRunView, LayoutConfig, MaximizedRect,
+    load_diff_or_route, DashboardState, DirectRunLoad, DirectRunView, LayoutConfig, OpenPanel,
+    PanelTarget,
 };
-use crate::util::{focus_on_mount, js_bridge::js_string, primary, TOP_LAYER_SELECTOR};
+use crate::util::{
+    focus_on_mount, js_bridge::js_string, primary, MAXIMIZE_OVERLAY_ID, TOP_LAYER_SELECTOR,
+};
 
 const EXPLICIT_METADATA_CONCURRENCY: usize = 16;
 /// Backoff between retry passes over keys whose lookup failed transiently.
@@ -364,22 +368,43 @@ pub fn DashboardLayout(project_id: String) -> Element {
                 if maximized.peek().is_some() {
                     maximized.set(None);
                 }
+                // However the chart was un-maximized (its Close, Esc, Back, a reset), or a Configure's maximize never landed (pressed again while the close's history pop was pending), the chart panel closes, and any other panel forgets the maximize it was to undo.
+                let mut panel = state.options_panel;
+                let open = panel.peek().clone();
+                match open {
+                    Some(p) if p.target == PanelTarget::Chart => panel.set(None),
+                    Some(p) if p.unmaximize_on_close => panel.set(Some(OpenPanel {
+                        unmaximize_on_close: false,
+                        ..p
+                    })),
+                    _ => {}
+                }
             }
             // The loaded layout is the authority, but a chart link must not wait for its metrics sweep (tens of seconds on big projects), so until it holds the rect this falls back to `resolve_rect_locally`.
             // Once open, the overlay is left alone: it re-resolves against the live layout each render, upgrading a fallback config when the sweep lands.
             Some(id) => {
-                if maximized.peek().as_ref().is_some_and(|m| m.config.id == id) {
+                if maximized.peek().as_ref().is_some_and(|m| m.id == id) {
                     return;
                 }
                 let resolved = layout
                     .as_ref()
-                    .and_then(|l| l.resolve_rect(&id))
+                    .and_then(|l| l.find_rect(&id).cloned())
                     .or_else(|| resolve_rect_locally(&state.peek_diff(), &id));
-                if let Some((config, max_columns)) = resolved {
-                    maximized.set(Some(MaximizedRect {
-                        config,
-                        max_columns,
-                    }));
+                if let Some(config) = resolved {
+                    // The maximize moved to another chart (←/→), and a chart panel follows it there.
+                    let mut panel = state.options_panel;
+                    let follower = panel.peek().clone().filter(|p| {
+                        p.target == PanelTarget::Chart
+                            && !p.follows_chart
+                            && maximized.peek().is_some()
+                    });
+                    if let Some(p) = follower {
+                        panel.set(Some(OpenPanel {
+                            follows_chart: true,
+                            ..p
+                        }));
+                    }
+                    maximized.set(Some(config));
                 }
             }
         }
@@ -655,6 +680,8 @@ pub fn DashboardLayout(project_id: String) -> Element {
                     }
                     MaximizeOverlay {}
                 }
+                // Docked after the main column, which narrows while it's open.
+                DashboardOptionsPanel {}
             }
             PushBridge {}
             ZoneBridge {}
@@ -667,12 +694,12 @@ pub fn DashboardLayout(project_id: String) -> Element {
 /// `DashboardState::maximized` holds a snapshot for fallback, but the rect
 /// is re-resolved against the live layout each render, so edits land
 /// against current values rather than the (possibly drifted) snapshot
-/// taken when the overlay opened; saves route through
-/// `DashboardState::update_rect` like any other edit.
+/// taken when the overlay opened; edits route through
+/// `DashboardState::edit_maximized_rect`.
 #[component]
 fn MaximizeOverlay() -> Element {
     let state = use_context::<DashboardState>();
-    let mut maximized_signal = state.maximized;
+    let maximized_signal = state.maximized;
 
     let keys_bridge = crate::util::js_bridge::use_bridge("maximize_keys");
     use_future(move || {
@@ -682,11 +709,7 @@ fn MaximizeOverlay() -> Element {
         async move {
             let mut eval = document::eval(&js);
             while let Ok(dir) = eval.recv::<i32>().await {
-                let Some(id) = maximized_signal
-                    .peek()
-                    .as_ref()
-                    .map(|m| m.config.id.clone())
-                else {
+                let Some(id) = maximized_signal.peek().as_ref().map(|m| m.id.clone()) else {
                     continue;
                 };
                 if dir == 0 {
@@ -706,32 +729,38 @@ fn MaximizeOverlay() -> Element {
         }
     });
 
-    let view = match maximized_signal.read().clone() {
-        Some(v) => v,
-        None => return rsx! {},
+    let Some(snapshot) = maximized_signal.read().clone() else {
+        return rsx! {};
     };
 
-    let rect_id = view.config.id.clone();
-    let max_columns = view.max_columns;
+    let rect_id = snapshot.id.clone();
     let rect_config = state
         .layout_config
         .read()
         .as_ref()
         .and_then(|l| l.find_rect(&rect_id).cloned())
-        .unwrap_or(view.config);
+        .unwrap_or(snapshot);
 
     // The content area already excludes the navbar and any notice bar.
     let chart_height = *MAXIMIZED_CHART_HEIGHT.read();
 
     rsx! {
         div {
+            id: MAXIMIZE_OVERLAY_ID,
             class: "maximize-overlay",
-            // Focus on mount so keyboard navigation starts inside the overlay, not on the grid control (e.g. the Maximize button) left focused beneath it.
+            // Focus on mount so keyboard navigation starts inside the overlay, not on the grid control (e.g. the Maximize button) left focused beneath it; a chart panel opening with the maximize (Configure on a grid chart) keeps focus instead.
             // Pause every player: the covered grid's panels stay mounted beneath the overlay (Near), and the overlay's own copies have only just mounted.
             tabindex: "-1",
             onmounted: move |e| {
                 document::eval("for(const m of document.querySelectorAll('video,audio'))m.pause();");
-                focus_on_mount(e)
+                if !state
+                    .options_panel
+                    .peek()
+                    .as_ref()
+                    .is_some_and(|p| p.target == PanelTarget::Chart)
+                {
+                    focus_on_mount(e)
+                }
             },
             // Dismiss on click (mouseup) can be annoying if you drag the x-axis and release in the border.
             onmousedown: primary(move |_| focus_chart(None)),
@@ -744,20 +773,13 @@ fn MaximizeOverlay() -> Element {
                         key: "{id}",
                         config: rect_config.clone(),
                         chart_height: chart_height,
-                        max_columns: max_columns,
                         is_maximized: true,
-                        on_update: move |new_rect: RectConfig| {
-                            if state.update_rect(new_rect.clone()) {
-                                maximized_signal.set(Some(MaximizedRect {
-                                    config: new_rect,
-                                    max_columns,
-                                }));
-                            } else {
-                                // The rect dropped out of a regenerated layout
-                                // (its run/metric vanished mid-session). Closing
-                                // beats keeping an overlay that pretends the
-                                // edit applied.
-                                focus_chart(None);
+                        on_rename: {
+                            let id = id.clone();
+                            move |label: String| {
+                                state.edit_maximized_rect(&id, |diff, base| {
+                                    diff.edit_rect(base, &id, |r| r.label = label)
+                                })
                             }
                         },
                         on_delete: move |_| {

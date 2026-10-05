@@ -1,8 +1,8 @@
 use dioxus::prelude::*;
 use serde_json::Value;
 
-use crate::components::editor_dialog::EditorDialog;
 use crate::components::icons::{CaretDownIcon, CaretRightIcon, CloseIcon};
+use crate::components::options_panel::OptionsPanel;
 use crate::state::layout_config::{
     ema_time_constant, finer_overrides, OptionOverride, OverrideTarget, RectOptions,
     SmoothingAlgorithm,
@@ -10,9 +10,8 @@ use crate::state::layout_config::{
 use crate::state::DashboardState;
 use crate::util::{primary, use_live_apply};
 
-fn clamp_max_runs(value: u32) -> u32 {
-    value.min(64)
-}
+/// Field-id prefix for every options editor; one panel is open at a time.
+pub const OPTIONS_ID_PREFIX: &str = "kymo-options";
 
 /// Reset an overridden field to its inherited value; hidden when `show` is false.
 #[component]
@@ -62,13 +61,25 @@ fn pretty_option_value(field: &str, v: &Value) -> String {
     }
 }
 
+/// The finer-level pins a defaults editor lists under its fields, and the record of those it has cleared, which its Revert puts back.
+#[derive(Clone, PartialEq)]
+pub struct OverrideChips {
+    pins: Vec<OptionOverride>,
+    cleared: Signal<Vec<OptionOverride>>,
+}
+
 /// Clears finer-level pins so they inherit this field again.
 fn override_chips(
     state: DashboardState,
     field: &'static str,
-    overrides: &[OptionOverride],
+    chips: Option<&OverrideChips>,
 ) -> Element {
-    let hits: Vec<OptionOverride> = overrides
+    let Some(chips) = chips else {
+        return rsx! {};
+    };
+    let mut cleared = chips.cleared;
+    let hits: Vec<OptionOverride> = chips
+        .pins
         .iter()
         .filter(|o| o.field == field)
         .cloned()
@@ -91,9 +102,9 @@ fn override_chips(
                         button {
                             class: "override-chip",
                             title: "{title}",
-                            onmousedown: primary(move |_| match &o.target {
-                                OverrideTarget::Section(name) => state.clear_section_chart_default(name, &o.field),
-                                OverrideTarget::Rect(id) => state.clear_rect_option(id, &o.field),
+                            onmousedown: primary(move |_| {
+                                state.clear_option_pin(&o);
+                                cleared.write().push(o.clone());
                             }),
                             "{text}"
                             span { class: "override-chip-x", CloseIcon {} }
@@ -105,38 +116,48 @@ fn override_chips(
     }
 }
 
-/// Edits project chart defaults live, storing their diff from library defaults. Cancel restores the open-time values; Save closes.
+/// Edits project chart defaults live, as a sparse patch over the library defaults, written field by field (`OptionsBaseline::write_fields`).
 #[component]
 pub fn ProjectDefaultsEditor(return_focus_id: String, on_close: EventHandler<()>) -> Element {
-    let id_prefix = format!("{return_focus_id}-dialog");
     let state = use_context::<DashboardState>();
-    let initial = use_hook(|| state.project_level_options());
-    let draft = use_signal(|| initial.clone());
-
-    let cancel_live = use_live_apply(
-        initial.clone(),
-        move || draft.read().clone(),
-        move |opts| state.set_project_chart_defaults(opts),
-        move || on_close.call(()),
-    );
+    let baseline = use_hook(|| state.chart_defaults_baseline(None));
+    let mut draft = use_signal(|| baseline.opened.clone());
+    let mut cleared = use_signal(Vec::new);
+    use_live_apply(move || draft.read().clone(), {
+        let baseline = baseline.clone();
+        move |previous: &RectOptions, opts: RectOptions| {
+            state.edit_project_chart_defaults(|stored| {
+                baseline.write_fields(stored, previous, &opts)
+            });
+        }
+    });
+    let unchanged = *draft.read() == baseline.opened && cleared.read().is_empty();
 
     rsx! {
-        EditorDialog {
+        OptionsPanel {
+            title: "Project settings",
             return_focus_id,
-            title: "Project chart defaults",
-            on_cancel: move |_| cancel_live(),
-            on_save: move |_| on_close.call(()),
+            revert_disabled: unchanged,
+            on_revert: {
+                let opened = baseline.opened.clone();
+                move |_| {
+                    draft.set(opened.clone());
+                    state.restore_overrides(&std::mem::take(&mut *cleared.write()));
+                }
+            },
+            on_close,
 
             div { class: "editor-options",
-                ChartOptionsForm { id_prefix, draft, anchor: RectOptions::default() }
+                ChartOptionsForm { draft, anchor: baseline.anchor.clone(), cleared }
             }
         }
     }
 }
 
-/// Collapsible editor content; the caller owns expansion state across visibility changes.
+/// Collapsible editor content, open until the user collapses it.
 #[component]
-pub fn EditorSection(title: String, open: Signal<bool>, children: Element) -> Element {
+pub fn EditorSection(title: String, children: Element) -> Element {
+    let mut open = use_signal(|| true);
     rsx! {
         button {
             r#type: "button",
@@ -166,13 +187,12 @@ fn field_class(overridden: bool) -> &'static str {
 /// Smoothing controls shared by chart and defaults editors; optional chips expose finer-level overrides.
 #[component]
 pub fn SmoothingFields(
-    id_prefix: String,
     draft: Signal<RectOptions>,
     anchor: RectOptions,
-    #[props(default)] overrides: Vec<OptionOverride>,
+    #[props(default)] chips: Option<OverrideChips>,
 ) -> Element {
     let state = use_context::<DashboardState>();
-    let chips = |field| override_chips(state, field, &overrides);
+    let chips = |field| override_chips(state, field, chips.as_ref());
     let o = draft.read().clone();
     let smoothing_value = match &o.smoothing {
         SmoothingAlgorithm::None => "none",
@@ -217,9 +237,9 @@ pub fn SmoothingFields(
     rsx! {
         div { class: field_class(o.smoothing != anchor.smoothing),
             ResetDot { show: o.smoothing != anchor.smoothing, onreset: move |_| draft.write().smoothing = inherited_smoothing.clone() }
-            label { r#for: "{id_prefix}-smoothing", "Smoothing" }
+            label { r#for: "{OPTIONS_ID_PREFIX}-smoothing", "Smoothing" }
             select {
-                id: "{id_prefix}-smoothing",
+                id: "{OPTIONS_ID_PREFIX}-smoothing",
                 class: "smoothing-select",
                 value: "{smoothing_value}",
                 onchange: move |e: Event<FormData>| {
@@ -246,9 +266,9 @@ pub fn SmoothingFields(
         if is_polyfit {
             div { class: field_class(o.smoothing_poly_order != anchor.smoothing_poly_order),
                 ResetDot { show: o.smoothing_poly_order != anchor.smoothing_poly_order, onreset: move |_| draft.write().smoothing_poly_order = inherited_order }
-                label { r#for: "{id_prefix}-fit-order", "Fit order" }
+                label { r#for: "{OPTIONS_ID_PREFIX}-fit-order", "Fit order" }
                 select {
-                    id: "{id_prefix}-fit-order",
+                    id: "{OPTIONS_ID_PREFIX}-fit-order",
                     value: "{poly_order}",
                     onchange: move |e: Event<FormData>| {
                         if let Ok(v) = e.value().parse::<u32>() {
@@ -265,10 +285,10 @@ pub fn SmoothingFields(
         if needs_window {
             div { class: field_class(o.smoothing_window != anchor.smoothing_window),
                 ResetDot { show: o.smoothing_window != anchor.smoothing_window, onreset: move |_| draft.write().smoothing_window = inherited_window }
-                label { id: "{id_prefix}-window-label", r#for: "{id_prefix}-window", "Window" }
+                label { id: "{OPTIONS_ID_PREFIX}-window-label", r#for: "{OPTIONS_ID_PREFIX}-window", "Window" }
                 div { class: "slider-input-row",
                     input {
-                        aria_labelledby: "{id_prefix}-window-label",
+                        aria_labelledby: "{OPTIONS_ID_PREFIX}-window-label",
                         r#type: "range",
                         min: "3",
                         max: "{BIWEIGHT_WINDOW_MAX}",
@@ -276,7 +296,7 @@ pub fn SmoothingFields(
                         oninput: set_window,
                     }
                     input {
-                        id: "{id_prefix}-window",
+                        id: "{OPTIONS_ID_PREFIX}-window",
                         r#type: "number",
                         class: "slider-input-number",
                         min: "3",
@@ -291,10 +311,10 @@ pub fn SmoothingFields(
         if is_ema {
             div { class: field_class(o.smoothing_alpha != anchor.smoothing_alpha),
                 ResetDot { show: o.smoothing_alpha != anchor.smoothing_alpha, onreset: move |_| draft.write().smoothing_alpha = inherited_alpha }
-                label { id: "{id_prefix}-time-constant-label", r#for: "{id_prefix}-time-constant", "Time constant (steps)" }
+                label { id: "{OPTIONS_ID_PREFIX}-time-constant-label", r#for: "{OPTIONS_ID_PREFIX}-time-constant", "Time constant (steps)" }
                 div { class: "slider-input-row",
                     input {
-                        aria_labelledby: "{id_prefix}-time-constant-label",
+                        aria_labelledby: "{OPTIONS_ID_PREFIX}-time-constant-label",
                         r#type: "range",
                         min: "1",
                         max: "500",
@@ -302,7 +322,7 @@ pub fn SmoothingFields(
                         oninput: set_time_constant,
                     }
                     input {
-                        id: "{id_prefix}-time-constant",
+                        id: "{OPTIONS_ID_PREFIX}-time-constant",
                         r#type: "number",
                         class: "slider-input-number",
                         min: "1",
@@ -323,17 +343,16 @@ pub fn SmoothingFields(
 /// Axis scales and run cap shared by chart and defaults editors.
 #[component]
 pub fn AxisFields(
-    id_prefix: String,
     draft: Signal<RectOptions>,
     anchor: RectOptions,
-    #[props(default)] overrides: Vec<OptionOverride>,
+    #[props(default)] chips: Option<OverrideChips>,
 ) -> Element {
     let state = use_context::<DashboardState>();
-    let chips = |field| override_chips(state, field, &overrides);
+    let chips = |field| override_chips(state, field, chips.as_ref());
     let o = draft.read().clone();
     let inherited_max_runs = anchor.max_runs;
     let log_field = |axis: &str, value: bool, inherited: bool, set: fn(&mut RectOptions, bool)| {
-        let input_id = format!("{id_prefix}-log-{}", axis.to_lowercase());
+        let input_id = format!("{OPTIONS_ID_PREFIX}-log-{}", axis.to_lowercase());
         rsx! {
             div { class: field_class(value != inherited),
                 ResetDot {
@@ -360,16 +379,16 @@ pub fn AxisFields(
         {chips("log_y")}
         div { class: field_class(o.max_runs != anchor.max_runs),
             ResetDot { show: o.max_runs != anchor.max_runs, onreset: move |_| draft.write().max_runs = inherited_max_runs }
-            label { r#for: "{id_prefix}-max-runs", "Max runs" }
+            label { r#for: "{OPTIONS_ID_PREFIX}-max-runs", "Max runs" }
             input {
-                id: "{id_prefix}-max-runs",
+                id: "{OPTIONS_ID_PREFIX}-max-runs",
                 r#type: "number",
                 min: "0",
                 max: "64",
                 value: "{o.max_runs}",
                 oninput: move |event: Event<FormData>| {
                     if let Ok(value) = event.value().parse::<u32>() {
-                        draft.write().max_runs = clamp_max_runs(value);
+                        draft.write().max_runs = value.min(64);
                     }
                 },
             }
@@ -378,14 +397,14 @@ pub fn AxisFields(
     }
 }
 
-/// Project/section chart defaults. `anchor` marks inherited values; live apply stores their diff.
-/// `section` scopes finer-level override chips, or is omitted for project defaults.
+/// Project/section chart defaults. `anchor` marks inherited values; live apply stores them as a sparse patch over it.
+/// `section` scopes finer-level override chips, or is omitted for project defaults; `cleared` records the chips clicked.
 #[component]
 pub fn ChartOptionsForm(
-    id_prefix: String,
     draft: Signal<RectOptions>,
     anchor: RectOptions,
     section: Option<String>,
+    cleared: Signal<Vec<OptionOverride>>,
 ) -> Element {
     let state = use_context::<DashboardState>();
     // Recomputed on every layout write, so a cleared chip disappears as the intent lands.
@@ -396,26 +415,16 @@ pub fn ChartOptionsForm(
         };
         finer_overrides(&state.peek_diff(), shown, section.as_deref())
     });
-    let overrides = overrides();
+    let chips = OverrideChips {
+        pins: overrides(),
+        cleared,
+    };
     rsx! {
         SmoothingFields {
-            id_prefix: id_prefix.clone(),
             draft,
             anchor: anchor.clone(),
-            overrides: overrides.clone(),
+            chips: chips.clone(),
         }
-        AxisFields { id_prefix, draft, anchor, overrides }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::clamp_max_runs;
-
-    #[test]
-    fn max_runs_editor_preserves_unlimited_and_caps_large_values() {
-        assert_eq!(clamp_max_runs(0), 0);
-        assert_eq!(clamp_max_runs(1), 1);
-        assert_eq!(clamp_max_runs(65), 64);
+        AxisFields { draft, anchor, chips }
     }
 }

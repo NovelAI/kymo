@@ -2,15 +2,17 @@ use std::collections::{HashMap, HashSet};
 
 use dioxus::prelude::*;
 
-use crate::components::editor_dialog::EditorDialog;
-use crate::components::options_editor::{AxisFields, EditorSection, SmoothingFields};
+use crate::components::options_editor::{
+    AxisFields, EditorSection, SmoothingFields, OPTIONS_ID_PREFIX,
+};
+use crate::components::options_panel::OptionsPanel;
 use crate::components::sidebar::{sidebar_needs_run_ordinals, sidebar_run_label};
 use crate::grpc::proto::{metric_info::MetricType, MetricInfo, RunInfo};
 use crate::state::layout_config::{
     run_ref_ids, CdnDisplayMode, DisplayType, MetricBinding, ProjectRef, RectOptions, RunRef,
     ViewContext,
 };
-use crate::util::{primary, use_live_apply};
+use crate::util::{is_app_escape, primary, use_live_apply};
 
 type XMetricSource = (String, String);
 type XMetricResult = (Option<XMetricSource>, Vec<String>);
@@ -220,17 +222,15 @@ fn metric_groups<'a>(
 
 /// Constrain a row only when its siblings' known types agree.
 fn required_kind(
-    bindings: &[MetricBinding],
-    row_ids: &[u64],
+    sources: &[(u64, MetricBinding)],
     catalogs: &RowCatalogs,
     index: usize,
 ) -> Option<DisplayType> {
-    let mut kinds = bindings
+    let mut kinds = sources
         .iter()
-        .zip(row_ids)
         .enumerate()
         .filter(|(i, _)| *i != index)
-        .filter_map(|(_, (binding, row_id))| {
+        .filter_map(|(_, (row_id, binding))| {
             catalog_kind(catalogs.get(row_id)?, &binding.metric_name)
         });
     let first = kinds.next()?;
@@ -286,57 +286,81 @@ fn matching_metric_catalog<'a>(
 #[component]
 pub fn BindingEditor(
     return_focus_id: String,
+    /// The grid copy's Configure, for focus when the maximized one went with the panel.
+    fallback_focus_id: String,
+    /// See `OptionsPanel`.
+    take_focus: bool,
+    /// The maximized chart the panel edits.
+    rect_id: String,
+    /// The chart's title, naming what the panel edits.
+    target: String,
     bindings: Vec<MetricBinding>,
-    options: RectOptions,
-    /// The cascade resolution at this rect's section; draft fields differing from it (chart-level overrides) are highlighted.
-    anchor: RectOptions,
     display_type: DisplayType,
     /// The gallery's resolved CDN sub-type ("image_gallery", "metadata", "file_list" or "mixed"); None until its manifest loads.
-    #[props(default)]
     cdn_class: Option<String>,
     /// Section's max columns — clamps the Width input.
     max_columns: u32,
-    /// Fired on every draft edit (slider ticks included) so the rect applies it live; Cancel re-fires it with the config captured at open.
-    on_change: EventHandler<(Vec<MetricBinding>, RectOptions)>,
-    /// Also commits mount-time normalization (such as the width clamp), which live apply never emits.
-    on_save: EventHandler<(Vec<MetricBinding>, RectOptions)>,
-    on_cancel: EventHandler<()>,
+    on_close: EventHandler<()>,
 ) -> Element {
-    let id_prefix = format!("{return_focus_id}-dialog");
+    let state = use_context::<crate::state::DashboardState>();
     let is_numeric = matches!(display_type, DisplayType::Numeric);
     let is_cdn = matches!(display_type, DisplayType::Cdn);
     let (class_has_gallery_panel, class_has_metadata_panel) =
         cdn_option_panels(cdn_class.as_deref());
     let show_gallery_panel = is_cdn && class_has_gallery_panel;
     let show_metadata_panel = is_cdn && class_has_metadata_panel;
-    let plots_open = use_signal(|| is_numeric);
-    let smoothing_open = use_signal(|| is_numeric);
-    let gallery_open = use_signal(|| show_gallery_panel);
-    let metadata_open = use_signal(|| show_metadata_panel);
-    let mut draft = use_signal(|| bindings.clone());
-    // One draft of the whole struct, so options without a control here pass through untouched.
-    let mut draft_opts = use_signal(|| RectOptions {
-        column_span: options.column_span.clamp(1, max_columns),
-        ..options.clone()
+    // The chart's options level as stored: its own patch over what it inherits from its section and the project, which draft fields differing from it (chart-level overrides) are highlighted against.
+    let baseline = use_hook(|| state.rect_options_baseline(&rect_id));
+    // One draft of the whole struct, so options without a control here pass through untouched, the saved width included: only the Width control clamps it to the section's columns, as rendering does.
+    let initial = use_hook(|| (bindings.clone(), baseline.opened.clone()));
+    // Each source with an id of its own, which keeps row-local state with its source across removals.
+    let mut sources = use_signal(|| {
+        (0..)
+            .zip(initial.0.clone())
+            .collect::<Vec<(u64, MetricBinding)>>()
+    });
+    let mut next_row_id = use_signal(|| bindings.len() as u64);
+    let mut draft_opts = use_signal(|| initial.1.clone());
+
+    let draft = move || {
+        sources
+            .read()
+            .iter()
+            .map(|(_, b)| b.clone())
+            .collect::<Vec<_>>()
+    };
+    let current_config = move || (draft(), draft_opts.read().clone());
+    let unchanged = current_config() == initial;
+    // Each change (slider ticks included) applies live as one edit of just what changed: the sources as one, option fields as the defaults editors write theirs (`OptionsBaseline::write_fields`).
+    use_live_apply(current_config, {
+        let baseline = baseline.clone();
+        move |previous: &(Vec<MetricBinding>, RectOptions), (bindings, options)| {
+            state.edit_maximized_rect(&rect_id, |diff, base| {
+                (bindings == previous.0
+                    || diff.edit_rect(base, &rect_id, |rect| rect.bindings = bindings))
+                    && (options == previous.1
+                        || diff.edit_rect_options(base, &rect_id, |stored| {
+                            baseline.write_fields(stored, &previous.1, &options)
+                        }))
+            });
+        }
     });
 
-    let original = use_hook(|| (bindings.clone(), options.clone()));
-
-    let current_config = move || (draft.read().clone(), draft_opts.read().clone());
-
-    let cancel_live = use_live_apply(
-        original.clone(),
-        current_config,
-        move |current| on_change.call(current),
-        move || on_cancel.call(()),
-    );
-
-    // Stable ids keep row-local state with its source across removals.
-    let mut row_ids = use_signal(|| (0..bindings.len() as u64).collect::<Vec<u64>>());
-    let mut next_row_id = use_signal(|| bindings.len() as u64);
     let mut row_catalogs = use_signal(RowCatalogs::new);
+    let revert = {
+        let initial = initial.clone();
+        move |_| {
+            if sources.peek().iter().map(|(_, b)| b).ne(&initial.0) {
+                // Fresh row ids remount every source row, so no row keeps state from a source it no longer shows.
+                let first = *next_row_id.peek();
+                sources.set((first..).zip(initial.0.clone()).collect());
+                next_row_id.set(first + initial.0.len() as u64);
+                row_catalogs.write().clear();
+            }
+            draft_opts.set(initial.1.clone());
+        }
+    };
 
-    let state = use_context::<crate::state::DashboardState>();
     // One project list for every source row.
     let projects = use_resource(move || {
         let grpc = state.grpc.read().clone();
@@ -349,7 +373,7 @@ pub fn BindingEditor(
     });
 
     let x_metric_source =
-        use_memo(move || x_metric_discovery_source(&draft.read(), &state.view_context()));
+        use_memo(move || x_metric_discovery_source(&draft(), &state.view_context()));
     let current_x_metric_source = x_metric_source.read().clone();
     let x_metric_version = crate::state::versions_key(
         *state.resync_gen.read(),
@@ -381,40 +405,36 @@ pub fn BindingEditor(
     ));
 
     rsx! {
-        EditorDialog {
-            return_focus_id,
+        OptionsPanel {
             title: "Configure Metric",
-            on_cancel: move |_| cancel_live(),
-            on_save: move |_| on_save.call(current_config()),
+            target,
+            return_focus_id,
+            fallback_focus_id,
+            take_focus,
+            revert_disabled: unchanged,
+            on_revert: revert,
+            on_close,
 
             // --- Bindings section ---
             div { class: "editor-section-label", "Data Sources" }
 
             div { style: "margin-bottom: 12px;",
-                for (i, (binding, row_id)) in draft.read().iter().zip(row_ids.read().iter().copied()).enumerate() {
+                for (i, (row_id, binding)) in sources.read().iter().cloned().enumerate() {
                     BindingRow {
                         key: "{row_id}",
-                        id_prefix: format!("{id_prefix}-source-{i}"),
                         index: i,
-                        binding: binding.clone(),
-                        required_kind: required_kind(&draft.read(), &row_ids.read(), &row_catalogs.read(), i),
+                        binding,
+                        required_kind: required_kind(&sources.read(), &row_catalogs.read(), i),
                         row_id,
                         row_catalogs,
                         projects,
                         on_change: move |new_binding: MetricBinding| {
-                            let Some(i) = row_ids.peek().iter().position(|id| *id == row_id) else {
-                                return;
-                            };
-                            if let Some(slot) = draft.write().get_mut(i) {
-                                *slot = new_binding;
+                            if let Some(slot) = sources.write().iter_mut().find(|(id, _)| *id == row_id) {
+                                slot.1 = new_binding;
                             }
                         },
                         on_remove: move |_: ()| {
-                            let Some(i) = row_ids.peek().iter().position(|id| *id == row_id) else {
-                                return;
-                            };
-                            row_ids.write().remove(i);
-                            draft.write().remove(i);
+                            sources.write().retain(|(id, _)| *id != row_id);
                             row_catalogs.write().remove(&row_id);
                         },
                     }
@@ -424,14 +444,13 @@ pub fn BindingEditor(
             button {
                 class: "btn-link",
                 onmousedown: primary(move |_| {
-                    draft.write().push(MetricBinding {
+                    let row_id = *next_row_id.peek();
+                    next_row_id.set(row_id + 1);
+                    sources.write().push((row_id, MetricBinding {
                         project: ProjectRef::Current,
                         runs: RunRef::Selected,
                         metric_name: String::new(),
-                    });
-                    let row_id = *next_row_id.peek();
-                    next_row_id.set(row_id + 1);
-                    row_ids.write().push(row_id);
+                    }));
                 }),
                 "+ Add Source"
             }
@@ -439,12 +458,11 @@ pub fn BindingEditor(
             if is_numeric {
                 EditorSection {
                     title: "Plots",
-                    open: plots_open,
 
                     div { class: "editor-options",
-                        AxisFields { id_prefix: id_prefix.clone(), draft: draft_opts, anchor: anchor.clone() }
+                        AxisFields { draft: draft_opts, anchor: baseline.anchor.clone() }
                         div { class: "binding-field",
-                            label { r#for: "{id_prefix}-x-axis", "X axis" }
+                            label { r#for: "{OPTIONS_ID_PREFIX}-x-axis", "X axis" }
                             {
                                 use crate::state::layout_config::XAxisMode;
                                 let mode_val = match &draft_opts.read().x_axis_mode {
@@ -454,7 +472,7 @@ pub fn BindingEditor(
                                 };
                                 rsx! {
                                     select {
-                                        id: "{id_prefix}-x-axis",
+                                        id: "{OPTIONS_ID_PREFIX}-x-axis",
                                         value: "{mode_val}",
                                         onchange: move |e: Event<FormData>| {
                                             let mode = match e.value().as_str() {
@@ -473,7 +491,7 @@ pub fn BindingEditor(
                         }
                         if matches!(draft_opts.read().x_axis_mode, crate::state::layout_config::XAxisMode::Step) {
                             div { class: "binding-field",
-                                label { r#for: "{id_prefix}-x-metric", "X metric" }
+                                label { r#for: "{OPTIONS_ID_PREFIX}-x-metric", "X metric" }
                                 {
                                     let x_val = draft_opts.read().x_axis_metric.clone();
                                     let mut opts = matching_x_metric_names(
@@ -485,7 +503,7 @@ pub fn BindingEditor(
                                     }
                                     rsx! {
                                         select {
-                                            id: "{id_prefix}-x-metric",
+                                            id: "{OPTIONS_ID_PREFIX}-x-metric",
                                             value: "{x_val}",
                                             onchange: move |e: Event<FormData>| {
                                                 draft_opts.write().x_axis_metric = e.value();
@@ -504,13 +522,11 @@ pub fn BindingEditor(
                 }
                 EditorSection {
                     title: "Smoothing",
-                    open: smoothing_open,
 
                     div { class: "editor-options",
                         SmoothingFields {
-                            id_prefix: id_prefix.clone(),
                             draft: draft_opts,
-                            anchor: anchor.clone(),
+                            anchor: baseline.anchor.clone(),
                         }
                     }
                 }
@@ -519,11 +535,10 @@ pub fn BindingEditor(
             if show_gallery_panel {
                 EditorSection {
                     title: "Image Gallery",
-                    open: gallery_open,
 
                     div { class: "editor-options",
                         div { class: "binding-field",
-                            label { r#for: "{id_prefix}-mode", "Mode" }
+                            label { r#for: "{OPTIONS_ID_PREFIX}-mode", "Mode" }
                             {
                                 let cdn_mode_value = match &draft_opts.read().cdn_display_mode {
                                     CdnDisplayMode::SelectIndex => "select_index",
@@ -532,7 +547,7 @@ pub fn BindingEditor(
                                 };
                                 rsx! {
                                     select {
-                                        id: "{id_prefix}-mode",
+                                        id: "{OPTIONS_ID_PREFIX}-mode",
                                         value: "{cdn_mode_value}",
                                         onchange: move |e: Event<FormData>| {
                                             let m = match e.value().as_str() {
@@ -556,7 +571,6 @@ pub fn BindingEditor(
             if show_metadata_panel {
                 EditorSection {
                     title: "Metadata",
-                    open: metadata_open,
 
                     div { class: "editor-options",
                         div { class: "binding-field",
@@ -580,13 +594,13 @@ pub fn BindingEditor(
 
             div { class: "editor-options",
                 div { class: "binding-field",
-                    label { r#for: "{id_prefix}-width", "Width" }
+                    label { r#for: "{OPTIONS_ID_PREFIX}-width", "Width" }
                     input {
-                        id: "{id_prefix}-width",
+                        id: "{OPTIONS_ID_PREFIX}-width",
                         r#type: "number",
                         min: "1",
                         max: "{max_columns}",
-                        value: draft_opts.read().column_span.to_string(),
+                        value: draft_opts.read().column_span.clamp(1, max_columns).to_string(),
                         oninput: move |e: Event<FormData>| {
                             if let Ok(v) = e.value().parse::<u32>() {
                                 draft_opts.write().column_span = v.clamp(1, max_columns);
@@ -852,10 +866,11 @@ mod tests {
             metric_name: metric_name.into(),
         };
         let required = |sources: &[(u64, &str)], index| {
-            let bindings: Vec<MetricBinding> =
-                sources.iter().map(|(_, metric)| source(metric)).collect();
-            let row_ids: Vec<u64> = sources.iter().map(|(row_id, _)| *row_id).collect();
-            required_kind(&bindings, &row_ids, &catalogs, index)
+            let sources: Vec<(u64, MetricBinding)> = sources
+                .iter()
+                .map(|(row_id, metric)| (*row_id, source(metric)))
+                .collect();
+            required_kind(&sources, &catalogs, index)
         };
 
         // A lone source, or one whose siblings are empty, undiscovered, or not in their own catalog, may pick any type.
@@ -1055,7 +1070,6 @@ mod tests {
 
 #[component]
 fn BindingRow(
-    id_prefix: String,
     index: usize,
     binding: MetricBinding,
     /// Set when the other sources agree on a type: metrics of any other type are disabled, since a chart cannot mix types.
@@ -1069,6 +1083,7 @@ fn BindingRow(
     on_remove: EventHandler<()>,
 ) -> Element {
     let state = use_context::<crate::state::DashboardState>();
+    let id_prefix = format!("{OPTIONS_ID_PREFIX}-source-{index}");
     let effective_project = binding.project.id(&state.project_id.read()).to_string();
     let mut metric_filter = use_signal(String::new);
 
@@ -1329,6 +1344,13 @@ fn BindingRow(
                                 spellcheck: "false",
                                 value: "{filter}",
                                 oninput: move |e: Event<FormData>| metric_filter.set(e.value()),
+                                onkeydown: move |e: Event<KeyboardData>| {
+                                    // Esc clears a non-empty filter first, like the app's other filters; the panel takes the next one.
+                                    if is_app_escape(&e) && !metric_filter.peek().is_empty() {
+                                        e.prevent_default();
+                                        metric_filter.set(String::new());
+                                    }
+                                },
                             }
                             if !filter.trim().is_empty() {
                                 span { class: "binding-filter-count", "{matched} of {total}" }

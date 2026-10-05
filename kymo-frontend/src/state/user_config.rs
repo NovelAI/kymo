@@ -282,6 +282,11 @@ impl UserConfigState {
         *self.config.peek()
     }
 
+    /// The current settings, subscribing the caller.
+    pub fn config(&self) -> UserConfig {
+        *self.config.read()
+    }
+
     pub fn font_size(&self) -> FontSize {
         self.config.read().font_size
     }
@@ -322,7 +327,7 @@ mod tests {
         serde_json::from_str(json).expect("valid stored config")
     }
 
-    /// A single-tab Save: `change` applied to the stored settings' effective config.
+    /// One committed change in a single tab: `change` applied to the stored settings' effective config.
     fn edit(stored: &mut StoredUserConfig, change: impl FnOnce(&mut UserConfig)) {
         let initial = stored.effective();
         let mut draft = initial;

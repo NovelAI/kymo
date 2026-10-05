@@ -777,60 +777,6 @@ fn InlineRunRename(
     }
 }
 
-/// Width drag for the sidebar. Lives entirely outside Dioxus: the width is a
-/// CSS var on `<html>`, which the VDOM never diffs, so a re-render can't
-/// clobber a mid-drag width and no per-mousemove Rust runs. Window listeners
-/// exist only for the drag's duration (same shape as the chart axis-pull).
-/// The width is 10-75% of the window width, so it follows window resizes.
-/// The minimum width keeps the sidebar always grabbable — collapse-to-zero
-/// (and the reopen affordance it required) is gone on purpose.
-const SIDEBAR_RESIZE_JS: &str = r#"(function(){
-  let clamp=function(p){return Math.max(10,Math.min(p,75))};
-  let pct=function(px){return clamp(px/window.innerWidth*100)};
-  let apply=function(p){document.documentElement.style.setProperty('--kymo-sidebar-w',p+'vw')};
-  let saved;
-  try{
-    let raw=localStorage.getItem('kymo_sidebar_w');
-    if(raw===null)raw=localStorage.getItem('mkdb2_sidebar_w');
-    saved=parseFloat(raw);
-  }catch(_){}
-  // Bundles before FRO-747 stored pixels, always at least 160; percentages are at most 75.
-  if(isFinite(saved))apply(saved>75?pct(saved):clamp(saved));
-  let h=document.querySelector('.sidebar-resize');
-  if(!h||h.__wired)return;h.__wired=true;
-  let sb=h.parentElement;
-  h.addEventListener('mousedown',function(ev){
-    if(ev.button!==0)return;
-    ev.preventDefault();
-    let live=true,p=pct(sb.getBoundingClientRect().width);
-    let resize=function(e){
-      p=pct(e.clientX-sb.getBoundingClientRect().left);
-      apply(p);
-    };
-    let move=function(e){
-      // A release outside the browser sends no mouseup; the next move's button state still tells us to finish.
-      if(e.buttons===0){finish();return}
-      resize(e);
-    };
-    let finish=function(e){
-      if(!live)return;live=false;
-      if(e&&Number.isFinite(e.clientX))resize(e);
-      window.removeEventListener('mousemove',move);
-      window.removeEventListener('mouseup',finish);
-      window.removeEventListener('blur',finish);
-      document.body.style.cursor='';
-      try{
-        localStorage.setItem('kymo_sidebar_w',String(p));
-        localStorage.removeItem('mkdb2_sidebar_w');
-      }catch(_){}
-    };
-    document.body.style.cursor='col-resize';
-    window.addEventListener('mousemove',move);
-    window.addEventListener('mouseup',finish);
-    window.addEventListener('blur',finish);
-  });
-})()"#;
-
 #[cfg(test)]
 mod selection_pick_tests {
     use std::collections::{HashMap, HashSet};

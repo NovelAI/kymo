@@ -6,7 +6,9 @@ use crate::components::icons::{
 use crate::components::metric_rect::{MetricRect, ResizeResult};
 use crate::components::section_drag::SectionDrag;
 use crate::state::layout_config::{MetricBinding, ProjectRef, RectOptions, RunRef};
-use crate::state::{DashboardState, DisplayType, RectConfig, SectionConfig, UserConfigState};
+use crate::state::{
+    DashboardState, DisplayType, PanelTarget, RectConfig, SectionConfig, UserConfigState,
+};
 use crate::util::{editor_trigger_id, primary};
 
 /// Greedy row-pack: each rect consumes its `column_span` units of the current
@@ -48,20 +50,8 @@ fn page_index_from_input(input: &str, total_pages: usize) -> Option<usize> {
 #[component]
 pub fn Section(
     config: SectionConfig,
-    /// Search needle from `MetricGrid` (lowercased; empty = show all). Filters rects for display only — `config` stays whole.
+    /// Search needle from `MetricGrid` (lowercased; empty = show all). Filters rects for display only.
     filter: String,
-    /// Settings intent: the payload's `rects` are never diffed for rect
-    /// edits — those go through the explicit per-rect intents below, so no
-    /// whole-section snapshot can be misread as edits to every rect.
-    on_update_settings: EventHandler<SectionConfig>,
-    /// Explicit per-rect edit intent.
-    on_update_rect: EventHandler<RectConfig>,
-    /// Explicit add intent — adds must not ride through a whole-section
-    /// snapshot, which can be stale against a base refresh.
-    on_add_rect: EventHandler<RectConfig>,
-    /// Explicit per-rect delete intent, by rect id (same reason).
-    on_delete_rect: EventHandler<String>,
-    on_delete: EventHandler<()>,
 ) -> Element {
     // Immutable id — keys rect ids; the label is what the user sees.
     let section_id = config.name.clone();
@@ -73,8 +63,16 @@ pub fn Section(
     let drag = use_context::<SectionDrag>();
     let (insert_before, insert_after) = drag.marker_on(&section_id);
     let dragging = drag.is_source(&section_id);
+    // Outlines the section the options panel edits; a memo, so opening the panel re-renders only that section.
+    let options_target = use_memo({
+        let section_id = section_id.clone();
+        move || {
+            state.options_panel.read().as_ref().is_some_and(
+                |p| matches!(&p.target, PanelTarget::Section(name) if *name == section_id),
+            )
+        }
+    });
 
-    // Display subset only; `config` stays whole because handlers and the section-settings snapshot need every rect.
     let display_rects: Vec<RectConfig> = config
         .rects
         .iter()
@@ -105,16 +103,17 @@ pub fn Section(
             "data-dragging": "{dragging}",
             "data-insert-before": "{insert_before}",
             "data-insert-after": "{insert_after}",
+            "data-options-target": "{options_target}",
             // The whole bar toggles collapse; the action buttons inside stop
             // propagation so they don't double as a toggle.
             div {
                 class: "section-header",
                 onmousedown: primary({
-                    let config = config.clone();
+                    let section_id = section_id.clone();
                     move |_| {
-                        let mut updated = config.clone();
-                        updated.set_collapsed(!collapsed, sections_visible);
-                        on_update_settings.call(updated);
+                        state.edit_section_settings(&section_id, |s| {
+                            s.set_collapsed(!collapsed, sections_visible)
+                        });
                     }
                 }),
                 span {
@@ -146,7 +145,6 @@ pub fn Section(
                     title: "Add metric",
                     onmousedown: primary({
                         let section_id_add = section_id.clone();
-                        let config_for_add = config.clone();
                         move |e: Event<MouseData>| {
                             e.stop_propagation();
                             // An active filter would hide the new blank rect; clear it first. Guarded — set on an already-empty filter still notifies subscribers.
@@ -155,15 +153,15 @@ pub fn Section(
                             }
                             // Expand before adding so the new rect is visible.
                             if collapsed {
-                                let mut updated = config_for_add.clone();
-                                updated.set_collapsed(false, sections_visible);
-                                on_update_settings.call(updated);
+                                state.edit_section_settings(&section_id_add, |s| {
+                                    s.set_collapsed(false, sections_visible)
+                                });
                             }
                             // Generated id, not a position: the layout base regenerates
                             // as metrics appear/disappear, so a length-based id could
                             // collide with an earlier user-added rect in the saved diff.
                             let id = crate::util::unique_id(&format!("{}-new", section_id_add));
-                            on_add_rect.call(RectConfig {
+                            state.add_rect(&section_id_add, RectConfig {
                                 id,
                                 label: String::new(),
                                 bindings: vec![MetricBinding {
@@ -186,12 +184,16 @@ pub fn Section(
                     id: "{editor_trigger_id}",
                     class: "section-action icon-button",
                     title: "Configure",
+                    aria_expanded: options_target(),
                     onmousedown: primary({
                         let section_id = section_id.clone();
+                        let trigger_id = editor_trigger_id.clone();
                         move |e: Event<MouseData>| {
                             e.stop_propagation();
-                            let mut editing = state.editing_section;
-                            editing.set(Some(section_id.clone()));
+                            state.open_options_panel(
+                                PanelTarget::Section(section_id.clone()),
+                                trigger_id.clone(),
+                            );
                         }
                     }),
                     GearIcon {}
@@ -201,12 +203,13 @@ pub fn Section(
                     title: "Delete section",
                     onmousedown: primary({
                         let section_label = section_label.clone();
+                        let section_id = section_id.clone();
                         move |e| {
                             e.stop_propagation();
                             if let Some(window) = web_sys::window() {
                                 let msg = format!("Delete section \"{}\"?", section_label);
                                 if window.confirm_with_message(&msg).unwrap_or(false) {
-                                    on_delete.call(());
+                                    state.delete_section(&section_id);
                                 }
                             }
                         }
@@ -277,8 +280,8 @@ pub fn Section(
                         {
                             let rect = display_rects[i].clone();
                             let rect_id_for_delete = rect.id.clone();
-                            let rect_for_resize = rect.clone();
-                            let config_for_resize = config.clone();
+                            let rect_id_for_resize = rect.id.clone();
+                            let section_for_resize = section_id.clone();
                             let chart_h = config.chart_height;
                             let max_cols = config.max_columns.max(1);
                             let span = rect.options.column_span.clamp(1, max_cols);
@@ -290,33 +293,21 @@ pub fn Section(
                                     MetricRect {
                                         config: rect.clone(),
                                         chart_height: chart_h,
-                                        max_columns: max_cols,
-                                        on_update: move |new_rect: RectConfig| {
-                                            on_update_rect.call(new_rect);
+                                        on_rename: {
+                                            let id = rect.id.clone();
+                                            move |label: String| {
+                                                state.edit_rect(&id, |r| r.label = label);
+                                            }
                                         },
-                                        on_delete: move |_| {
-                                            on_delete_rect.call(rect_id_for_delete.clone());
-                                        },
-                                        // One gesture, two intents: the height
-                                        // belongs to the section, the span to the
-                                        // rect. Fires once per drag (mouseup), so
-                                        // the split costs nothing per tick. Order
-                                        // matters like the add path: for user
-                                        // sections the settings intent stores the
-                                        // section whole from this (pre-span)
-                                        // snapshot, so the rect must land after.
+                                        on_delete: move |_| state.delete_rect(&rect_id_for_delete),
+                                        // One gesture, two intents: the height belongs to the section, the span to the rect. Fires once per drag (mouseup), so the split costs nothing per tick.
                                         on_resize: move |r: ResizeResult| {
                                             if r.height_delta != 0 {
-                                                let mut updated = config_for_resize.clone();
-                                                let new_h = (updated.chart_height as i32 + r.height_delta).clamp(100, 800) as u32;
-                                                updated.chart_height = new_h;
-                                                on_update_settings.call(updated);
+                                                let new_h = (chart_h as i32 + r.height_delta).clamp(100, 800) as u32;
+                                                state.edit_section_settings(&section_for_resize, |s| s.chart_height = new_h);
                                             }
                                             if let Some(new_span) = r.new_column_span {
-                                                let mut updated = rect_for_resize.clone();
-                                                updated.options.column_span =
-                                                    new_span.clamp(1, max_cols);
-                                                on_update_rect.call(updated);
+                                                state.edit_rect(&rect_id_for_resize, |r| r.options.column_span = new_span.clamp(1, max_cols));
                                             }
                                         },
                                     }

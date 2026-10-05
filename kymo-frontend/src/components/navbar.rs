@@ -1,10 +1,9 @@
 use dioxus::prelude::*;
 
 use crate::components::icons::{CloseIcon, CollapseAllIcon, ExpandAllIcon, GearIcon, ResetIcon};
-use crate::components::options_editor::ProjectDefaultsEditor;
 use crate::components::theme_toggle::ThemeToggle;
 use crate::route::Route;
-use crate::state::{DashboardState, DirectRunLoad, SectionConfig, UserConfigState};
+use crate::state::{DashboardState, DirectRunLoad, PanelTarget, SectionConfig, UserConfigState};
 use crate::util::{editor_trigger_id, is_app_escape, primary, unique_id};
 
 #[component]
@@ -15,7 +14,6 @@ pub fn Navbar() -> Element {
     let current_run = state.current_run.read().clone();
     // The breadcrumb carries the focused chart along (like the sidebar's run links), so the overlay follows dashboard navigation. Hook, so it must run unconditionally up here.
     let chart_focus = use_route::<Route>().chart_param();
-    let mut editing_defaults = use_signal(|| false);
     let defaults_trigger_id = editor_trigger_id("project-defaults", "");
 
     let mut panel_filter = state.panel_filter;
@@ -102,7 +100,7 @@ pub fn Navbar() -> Element {
                     value: "{filter_value}",
                     oninput: move |e: Event<FormData>| panel_filter.set(e.value()),
                     onkeydown: move |e: Event<KeyboardData>| {
-                        // Esc clears, matching the maximize/dialog dismissal idiom. Consumed only while there's a filter to clear, so one Esc doesn't also close a maximized chart; on an empty filter it falls through untouched — Signal::set notifies subscribers even on equal values, so an unconditional clear would re-render them for nothing.
+                        // Esc clears, matching the maximize/panel dismissal idiom. Consumed only while there's a filter to clear, so one Esc doesn't also close a maximized chart; on an empty filter it falls through untouched — Signal::set notifies subscribers even on equal values, so an unconditional clear would re-render them for nothing.
                         if is_app_escape(&e) && !panel_filter.peek().is_empty() {
                             e.prevent_default();
                             panel_filter.set(String::new());
@@ -149,8 +147,12 @@ pub fn Navbar() -> Element {
             button {
                 id: "{defaults_trigger_id}",
                 class: "navbar-action icon-button",
-                title: "Project chart defaults (inherited by every chart)",
-                onmousedown: primary(move |_| editing_defaults.set(true)),
+                title: "Project settings",
+                aria_expanded: state.options_panel.read().as_ref().is_some_and(|p| p.target == PanelTarget::ProjectDefaults),
+                onmousedown: primary({
+                    let trigger_id = defaults_trigger_id.clone();
+                    move |_| state.open_options_panel(PanelTarget::ProjectDefaults, trigger_id.clone())
+                }),
                 GearIcon {}
             }
             button {
@@ -168,12 +170,6 @@ pub fn Navbar() -> Element {
                 ResetIcon {}
             }
             ThemeToggle { class: "navbar-action" }
-        }
-        if *editing_defaults.read() {
-            ProjectDefaultsEditor {
-                return_focus_id: defaults_trigger_id.clone(),
-                on_close: move |_| editing_defaults.set(false),
-            }
         }
     }
 }

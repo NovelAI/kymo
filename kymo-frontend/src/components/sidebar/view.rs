@@ -413,14 +413,8 @@ pub fn Sidebar() -> Element {
                 }
             }
 
-            div {
-                class: "sidebar-resize",
-                onmounted: move |_| {
-                    spawn(async move {
-                        let _ = document::eval(SIDEBAR_RESIZE_JS).await;
-                    });
-                },
-            }
+            // Dragged by util/width_drag.js.
+            div { class: "sidebar-resize" }
         }
 
         if let Some(ColorPickerTarget { run_id, run_label, ordinal }) = color_picker_target {

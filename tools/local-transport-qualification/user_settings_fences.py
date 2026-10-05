@@ -1,7 +1,6 @@
-"""Browser fences for browser-local Settings preview and persistence."""
+"""Browser fences for browser-local Settings, saved as each change is made, and the options panel shell they share."""
 
 import argparse
-import json
 import math
 from urllib.parse import urlsplit
 
@@ -19,13 +18,9 @@ STORAGE_KEY = "kymo_user_config_v1"
 VIEWPORT = {"width": 1_440, "height": 900}
 
 
-def native_dialog(page: Page, name: str) -> Locator:
-    dialog = page.get_by_role("dialog", name=name, exact=True)
-    expect(dialog).to_be_visible()
-    assert dialog.evaluate("element => element.matches('dialog:modal')"), (
-        f"{name} did not enter the browser's modal top layer"
-    )
-    return dialog
+def options_panel(page: Page, name: str) -> Locator:
+    """The docked options panel titled `name` (an <aside>, so named complementary content)."""
+    return page.get_by_role("complementary", name=name, exact=True)
 
 
 def open_editor(
@@ -35,61 +30,45 @@ def open_editor(
         trigger.click()
     else:
         trigger.press(key)
-    dialog = native_dialog(page, name)
-    expect(dialog.locator(".modal")).to_be_focused()
-    return dialog
+    panel = options_panel(page, name)
+    expect(panel).to_be_visible()
+    expect(panel).to_be_focused()
+    return panel
 
 
-def backdrop_cancel(page: Page, dialog: Locator) -> None:
-    # Check the hit target so a layout change cannot turn this into a Cancel-button click.
-    assert dialog.evaluate("element => document.elementFromPoint(4, 4) === element"), (
-        "the viewport corner is not the native editor backdrop"
-    )
-    page.mouse.click(4, 4)
+def close_panel(page: Page, panel: Locator, trigger: Locator, how: str) -> None:
+    """Close with Esc (from focus inside the panel) or the close button; both keep the edits and return focus to the opener."""
+    if how == "Escape":
+        assert panel.evaluate("element => element.contains(document.activeElement)"), (
+            "Esc closes the panel only from focus inside it"
+        )
+        page.keyboard.press("Escape")
+    else:
+        assert how == "Close", f"unknown dismissal: {how}"
+        panel.get_by_role("button", name="Close", exact=True).click()
+    expect(panel).to_have_count(0)
+    expect(trigger).to_be_focused()
 
 
-def assert_native_focus(page: Page, dialog: Locator, trigger: Locator) -> None:
-    controls = dialog.locator(
-        "input:enabled, select:enabled, button:enabled, textarea:enabled, a[href]"
-    ).filter(visible=True)
-    first = controls.first
-    first.focus()
-    # Inertness must reject explicit background focus as well as keyboard navigation.
-    trigger.evaluate("element => element.focus()")
-    expect(first).to_be_focused()
-    count = controls.count()
-    for key, start in (("Tab", first), ("Shift+Tab", controls.last)):
-        # Walk through both boundaries; browser chrome may expose body at the wrap point.
-        start.focus()
-        moved = False
-        for _ in range(count + 3):
-            page.keyboard.press(key)
-            focus = start.evaluate(
-                """start => {
-                    const active = document.activeElement;
-                    return {
-                        inside: start.closest('dialog').contains(active),
-                        chrome: active === document.body,
-                        moved: active !== start && active.matches('input,select,button,textarea,a[href]'),
-                    };
-                }"""
-            )
-            assert focus["inside"] or focus["chrome"], (
-                f"{key} focused interactive background content: {focus}"
-            )
-            moved |= focus["inside"] and focus["moved"]
-        # Browser/OS preferences choose the control types visited; still require actual movement.
-        assert count < 2 or moved, f"{key} did not move between editor controls"
-
-
-def stored_config(page: Page) -> dict | None:
-    raw = page.evaluate("key => localStorage.getItem(key)", STORAGE_KEY)
-    if raw is None:
-        return None
-    value = json.loads(raw)
-    if not isinstance(value, dict):
-        raise AssertionError(f"stored settings are not an object: {value!r}")
-    return value
+def expect_stored(page: Page, expected: dict | None) -> None:
+    """Wait for the stored settings to equal `expected`: each change commits from its event handler, after the input event Playwright waits for."""
+    try:
+        page.wait_for_function(
+            """([key, expected]) => {
+                const raw = localStorage.getItem(key);
+                if (expected === null || raw === null) return raw === null && expected === null;
+                const value = JSON.parse(raw);
+                const keys = Object.keys(value).sort(), want = Object.keys(expected).sort();
+                return JSON.stringify(keys) === JSON.stringify(want)
+                    && want.every(k => JSON.stringify(value[k]) === JSON.stringify(expected[k]));
+            }""",
+            arg=[STORAGE_KEY, expected],
+            timeout=5_000,
+        )
+    except TimeoutError as error:
+        raise AssertionError(
+            f"stored settings {page.evaluate('key => localStorage.getItem(key)', STORAGE_KEY)} != expected {expected}"
+        ) from error
 
 
 def expect_single_click(page: Page, enabled: bool) -> None:
@@ -149,19 +128,16 @@ def load_with_held_stylesheet(page: Page, url: str) -> None:
                 route.fallback()
 
 
+def settings_trigger(page: Page) -> Locator:
+    return page.get_by_role("button", name="Settings", exact=True)
+
+
 def open_settings(page: Page, *, key: str | None = None) -> Locator:
-    trigger = page.get_by_role("button", name="Settings", exact=True)
-    return open_editor(page, trigger, "Settings", key=key)
+    return open_editor(page, settings_trigger(page), "Settings", key=key)
 
 
-def assert_settings_focus(page: Page, *, save_enabled: bool = False) -> None:
-    dialog = native_dialog(page, "Settings")
-    save = page.get_by_role("button", name="Save", exact=True)
-    if save_enabled:
-        expect(save).to_be_enabled()
-    else:
-        expect(save).to_be_disabled()
-    assert_native_focus(page, dialog, page.locator(".page-user-settings-trigger"))
+def close_settings(page: Page) -> None:
+    close_panel(page, options_panel(page, "Settings"), settings_trigger(page), "Close")
 
 
 def set_font_size(page: Page, pixels: int) -> None:
@@ -286,12 +262,26 @@ def run_fences(page: Page, *, dashboard_path: str | None = None) -> None:
     parsed = urlsplit(page.url)
     origin = f"{parsed.scheme}://{parsed.netloc}/"
     reset(page)
+    trigger = settings_trigger(page)
 
-    open_settings(page, key="Enter")
-    assert_settings_focus(page)
+    # The keyboard opens the panel with focus inside it and nothing to revert.
+    panel = open_settings(page, key="Enter")
+    # The Projects page's panel keeps its fixed width: Settings' font slider would resize a dragged rem width under the pointer.
+    expect(panel.locator(".options-panel-resize")).to_be_hidden()
+    revert = panel.get_by_role("button", name="Revert", exact=True)
+    expect(revert).to_be_disabled()
+    # Settings shows pressed while its panel is open, and pressing it again closes the panel.
+    expect(trigger).to_have_attribute("aria-expanded", "true")
+    trigger.press("Enter")
+    expect(panel).to_have_count(0)
+    expect(trigger).to_be_focused()
+    expect(trigger).to_have_attribute("aria-expanded", "false")
+    panel = open_settings(page, key="Enter")
     expect(
         page.get_by_role("checkbox", name="Single-click to exit chart zoom")
     ).to_be_checked()
+
+    # Each change applies and saves as it is made.
     for name in (
         "Show each run’s nearest point when hovering a gap",
         "Highlight all runs with the same name",
@@ -301,49 +291,46 @@ def run_fences(page: Page, *, dashboard_path: str | None = None) -> None:
         checkbox.check()
     expect_hover_settings(page, nearest=True, same_name=True)
     set_font_size(page, 18)
-    if stored_config(page) is not None:
-        raise AssertionError("font preview wrote localStorage before Save")
     expect(page.locator(".project-row-name").first).to_have_css("font-size", "18px")
-    assert_settings_focus(page, save_enabled=True)
-    page.get_by_role("button", name="Cancel").press("Space")
-    wait_font(page, 16)
-    expect_hover_settings(page)
-    page.wait_for_function(
-        "() => document.activeElement?.classList.contains('page-user-settings-trigger')"
+    expect_stored(
+        page,
+        {"font_size": 18, "show_nearest_point": True, "highlight_same_name": True},
     )
 
-    open_settings(page)
-    set_font_size(page, 18)
-    page.keyboard.press("Escape")
+    # Revert puts back the values the panel opened with and keeps it open.
+    expect(revert).to_be_enabled()
+    revert.press("Space")
     wait_font(page, 16)
-
-    open_settings(page)
-    set_font_size(page, 18)
-    page.get_by_role("checkbox", name="Single-click to exit chart zoom").uncheck()
-    page.locator("#kymo-show-nearest-point").check()
-    page.locator("#kymo-highlight-same-name").check()
-    expect_single_click(page, False)
-    expect_hover_settings(page, nearest=True, same_name=True)
-    backdrop_cancel(page, native_dialog(page, "Settings"))
-    wait_font(page, 16)
-    expect_single_click(page, True)
     expect_hover_settings(page)
+    expect_stored(page, None)
+    expect(revert).to_be_disabled()
+    expect(panel).to_be_visible()
 
-    # A route transition can unmount the dialog without dispatching any of
-    # its explicit dismissal events. The drop guard must still roll back.
-    open_settings(page)
+    # Esc and the close button both keep what was changed, and hand focus back.
     set_font_size(page, 18)
+    close_panel(page, panel, trigger, "Escape")
+    wait_font(page, 18)
+    expect_stored(page, {"font_size": 18})
+    panel = open_settings(page)
+    page.get_by_role("checkbox", name="Single-click to exit chart zoom").uncheck()
+    expect_single_click(page, False)
+    close_panel(page, panel, trigger, "Close")
+    expect_stored(page, {"font_size": 18, "single_click_unzoom": False})
+
+    # Leaving the page with the panel open keeps what was saved: nothing is a preview.
+    open_settings(page)
+    page.locator("#kymo-show-nearest-point").check()
     page.evaluate("document.querySelector('.trash-nav-link').click()")
     page.locator(".trash-page").wait_for()
-    wait_font(page, 16)
-    if stored_config(page) is not None:
-        raise AssertionError("route-unmounted preview persisted unexpectedly")
+    wait_font(page, 18)
+    expect_stored(
+        page,
+        {"font_size": 18, "single_click_unzoom": False, "show_nearest_point": True},
+    )
 
+    # A refused write applies nothing and says so; the next accepted change clears the alert.
     page.goto(origin, wait_until="domcontentloaded")
-    page.locator(".project-row").first.wait_for(timeout=20_000)
-
-    # A denied localStorage write keeps the draft open for a retry rather
-    # than reporting a session-only preview as saved.
+    reset(page)
     page.evaluate(
         """() => {
             window.__kymo_original_set_item = Storage.prototype.setItem;
@@ -352,54 +339,30 @@ def run_fences(page: Page, *, dashboard_path: str | None = None) -> None:
             };
         }"""
     )
-    open_settings(page)
-    set_font_size(page, 18)
-    page.locator("#kymo-show-nearest-point").check()
-    page.locator("#kymo-highlight-same-name").check()
-    page.get_by_role("button", name="Save").press("Enter")
-    wait_font(page, 18)
-    expect_hover_settings(page, nearest=True, same_name=True)
-    expect(page.get_by_role("dialog", name="Settings")).to_be_visible()
+    panel = open_settings(page)
+    # click(), not check(): the refused change must not stay checked.
+    page.locator("label:has(#kymo-highlight-same-name)").click()
     expect(page.get_by_role("alert")).to_contain_text("Could not save settings")
-    if stored_config(page) is not None:
-        raise AssertionError("blocked settings write unexpectedly reached localStorage")
+    expect(page.locator("#kymo-highlight-same-name")).not_to_be_checked()
+    slider = page.get_by_role("slider", name="Font size")
+    slider.press("ArrowRight")
+    expect(slider).to_have_value("16")
+    wait_font(page, 16)
+    expect_hover_settings(page)
+    expect_stored(page, None)
     page.evaluate(
         """() => {
             Storage.prototype.setItem = window.__kymo_original_set_item;
             delete window.__kymo_original_set_item;
         }"""
     )
-    page.get_by_role("button", name="Save").click()
-    page.get_by_role("dialog", name="Settings").wait_for(state="detached")
-    open_settings(page)
-    page.get_by_role("checkbox", name="Single-click to exit chart zoom").uncheck()
-    page.get_by_role("button", name="Save").click()
-    page.reload(wait_until="domcontentloaded")
-    page.locator(".project-row").first.wait_for(timeout=20_000)
-    wait_font(page, 18)
-    expect_single_click(page, False)
-    expect_hover_settings(page, nearest=True, same_name=True)
-    recovered = stored_config(page)
-    if recovered != {
-        "font_size": 18,
-        "single_click_unzoom": False,
-        "show_nearest_point": True,
-        "highlight_same_name": True,
-    }:
-        raise AssertionError(f"settings retry did not recover all values: {recovered}")
+    page.locator("#kymo-highlight-same-name").check()
+    expect(page.get_by_role("alert")).to_have_count(0)
+    expect_hover_settings(page, same_name=True)
+    expect_stored(page, {"highlight_same_name": True})
+    close_panel(page, panel, trigger, "Close")
 
-    open_settings(page)
-    page.get_by_role("checkbox", name="Single-click to exit chart zoom").check()
-    page.locator("#kymo-show-nearest-point").uncheck()
-    page.locator("#kymo-highlight-same-name").uncheck()
-    page.get_by_role("button", name="Save").click()
-    page.get_by_role("dialog", name="Settings").wait_for(state="detached")
-    if stored_config(page) != {
-        "font_size": 18,
-    }:
-        raise AssertionError("restoring the defaults retained a chart override")
-    expect_hover_settings(page)
-
+    # Sparse and unknown stored values survive edits; a default value is not stored.
     page.evaluate(
         f'localStorage.setItem({STORAGE_KEY!r}, \'{{"font_size":"large","future":true}}\')'
     )
@@ -411,24 +374,21 @@ def run_fences(page: Page, *, dashboard_path: str | None = None) -> None:
     page.get_by_role("checkbox", name="Single-click to exit chart zoom").uncheck()
     page.locator("#kymo-show-nearest-point").check()
     expect_hover_settings(page, nearest=True)
-    if stored_config(page) != {
-        "font_size": "large",
-        "future": True,
-    }:
-        raise AssertionError("checkbox preview wrote storage before Save")
-    page.get_by_role("button", name="Save").click()
-    wait_font(page, 18)
-    stored = stored_config(page)
-    if stored != {
-        "font_size": 18,
-        "single_click_unzoom": False,
-        "show_nearest_point": True,
-        "future": True,
-    }:
-        raise AssertionError(f"Save lost sparse/unknown settings: {stored}")
+    expect_stored(
+        page,
+        {
+            "font_size": 18,
+            "single_click_unzoom": False,
+            "show_nearest_point": True,
+            "future": True,
+        },
+    )
+    page.get_by_role("checkbox", name="Single-click to exit chart zoom").check()
+    expect_stored(page, {"font_size": 18, "show_nearest_point": True, "future": True})
+    close_settings(page)
     page.reload(wait_until="domcontentloaded")
     wait_font(page, 18)
-    expect_single_click(page, False)
+    expect_single_click(page, True)
     expect_hover_settings(page, nearest=True)
 
     if dashboard_path is not None:
@@ -437,7 +397,7 @@ def run_fences(page: Page, *, dashboard_path: str | None = None) -> None:
             page.goto(origin, wait_until="domcontentloaded")
             open_settings(page)
             set_font_size(page, pixels)
-            page.get_by_role("button", name="Save").click()
+            close_settings(page)
             page.set_viewport_size({"width": 640, "height": 900})
             dashboard_url = origin + dashboard_path.lstrip("/")
             if pixels == 24:
@@ -489,6 +449,37 @@ def run_fences(page: Page, *, dashboard_path: str | None = None) -> None:
                         )
             baseline = geometry
 
+        # Even too narrow for the charts' 20rem, an options panel docks beside them, never over them, at no less than 14rem and without overflowing.
+        defaults = page.get_by_title("Project settings")
+        panel = open_editor(page, defaults, "Project settings")
+        laid = panel.evaluate(
+            """panel => {
+                const box = panel.getBoundingClientRect();
+                const row = document.querySelector('.content-row').getBoundingClientRect();
+                const main = document.querySelector('.main-wrap').getBoundingClientRect();
+                const rem = parseFloat(getComputedStyle(document.documentElement).fontSize);
+                return {
+                    page_overflow: document.documentElement.scrollWidth - innerWidth,
+                    body_overflow: panel.querySelector('.options-panel-body').scrollWidth
+                        - panel.querySelector('.options-panel-body').clientWidth,
+                    under_floor: 14 * rem - box.width,
+                    over_charts: main.right - box.left,
+                    right: row.right - box.right,
+                    top: box.top - row.top,
+                };
+            }"""
+        )
+        assert_finite_geometry(laid)
+        if laid["page_overflow"] > 0 or laid["body_overflow"] > 0:
+            raise AssertionError(f"{pixels}px options panel overflowed: {laid}")
+        if (
+            laid["under_floor"] > 0.5
+            or laid["over_charts"] > 0.5
+            or any(abs(laid[key]) > 0.5 for key in ("right", "top"))
+        ):
+            raise AssertionError(f"narrow options panel is misplaced: {laid}")
+        close_panel(page, panel, defaults, "Escape")
+
         page.locator('.metric-rect button[title="Maximize"]').first.click()
         for height in (900, 700):
             page.set_viewport_size({"width": 640, "height": height})
@@ -508,6 +499,10 @@ def main() -> None:
     parser.add_argument(
         "--browser", choices=("chromium", "firefox", "webkit"), default="chromium"
     )
+    parser.add_argument(
+        "--dashboard-path",
+        help="also check a dashboard at 640px and 24px fonts, as CI does with /browser-e2e",
+    )
     args = parser.parse_args()
 
     with sync_playwright() as playwright:
@@ -515,7 +510,7 @@ def main() -> None:
         page = browser.new_page(viewport=VIEWPORT, device_scale_factor=1)
         try:
             page.goto(args.url, wait_until="domcontentloaded")
-            run_fences(page)
+            run_fences(page, dashboard_path=args.dashboard_path)
         finally:
             browser.close()
     print("user settings fences passed")

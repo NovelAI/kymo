@@ -18,6 +18,11 @@ use dioxus::prelude::{
 
 pub(crate) const TOP_LAYER_SELECTOR: &str = ":popover-open, dialog:modal";
 
+/// The options panel's element id; one panel is open at a time.
+pub const OPTIONS_PANEL_ID: &str = "kymo-panel";
+/// The maximize overlay.
+pub const MAXIMIZE_OVERLAY_ID: &str = "kymo-maximize";
+
 /// Format epoch milliseconds in the viewer's local timezone.
 pub fn local_time(ms: i64) -> String {
     js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms as f64))
@@ -124,6 +129,30 @@ pub fn editor_trigger_id(kind: &str, identity: &str) -> String {
         write!(id, "{byte:02x}").expect("writing to a String cannot fail");
     }
     id
+}
+
+/// Once the DOM has updated, focus the first of these ids that can take it (one inside an inert grid can't). With `only_if_lost`, only when focus has fallen back to the page, as when a closing panel takes it along; focus the user moved elsewhere stays put. Spawned at the root, since the caller's scope is often the one ending.
+pub fn focus_later(ids: &[&str], only_if_lost: bool) {
+    let ids = ids
+        .iter()
+        .map(|id| js_bridge::js_string(id))
+        .collect::<Vec<_>>()
+        .join(",");
+    let js = format!(
+        "requestAnimationFrame(()=>{{const a=document.activeElement;if({only_if_lost}&&a&&a!==document.body)return;for(const id of [{ids}]){{const e=document.getElementById(id);if(e){{e.focus();if(document.activeElement===e)break;}}}}}});"
+    );
+    dioxus::core::spawn_forever(async move {
+        let _ = dioxus::prelude::document::eval(&js).await;
+    });
+}
+
+/// Whether focus is on the element `id` or inside it.
+pub fn focus_is_within(id: &str) -> bool {
+    web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.active_element())
+        .and_then(|active| active.closest(&format!("#{id}")).ok().flatten())
+        .is_some()
 }
 
 /// `onmounted` handler that focuses its element at once, so keys typed right after the mount land in it (Chromium runs queued input before timers), and again one task later, because an element mounted by a mousedown handler loses focus to that press's default focus action.

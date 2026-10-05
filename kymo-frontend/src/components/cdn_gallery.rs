@@ -817,7 +817,7 @@ fn GalleryLightbox(
             tabindex: "-1",
             onmounted: move |event| {
                 let dialog = event.as_web_event().unchecked_into::<web_sys::HtmlDialogElement>();
-                // Shown in the flush that inserts it, so no key meets it as a plain dialog. Unlike EditorDialog (opened on mousedown, whose focus move must pass first), it opens on a click, after its press's focus move.
+                // Shown in the flush that inserts it, so no key meets it as a plain dialog: it opens on a click, after its press's focus move, so nothing moves focus away again.
                 let _ = dialog.show_modal();
                 // The dialog itself, not a control (Chromium picks the first button, ignoring autofocus on the dialog): a focused control that turns disabled drops focus out from under the keys.
                 let _ = dialog.focus();

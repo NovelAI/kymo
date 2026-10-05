@@ -1,71 +1,111 @@
 use dioxus::prelude::*;
 
-use crate::components::editor_dialog::EditorDialog;
-use crate::components::options_editor::{ChartOptionsForm, EditorSection};
-use crate::state::layout_config::{options_patch_between, RectOptions};
-use crate::state::SectionConfig;
+use crate::components::options_editor::{ChartOptionsForm, EditorSection, OPTIONS_ID_PREFIX};
+use crate::components::options_panel::OptionsPanel;
+use crate::state::layout_config::{RectOptions, MAX_SECTION_COLUMNS};
+use crate::state::{DashboardState, SectionConfig};
 use crate::util::use_live_apply;
 
-/// Edits section settings and chart defaults live. Cancel restores the initial
-/// config; Save closes. Renames update `display_name`; `name` stays the identity.
-/// Defaults start at `chart_current` and emit their diff from `chart_anchor`.
-/// The payload retains original `rects`: use `update_section_settings`, not rect edits.
+/// The section settings this editor owns, as one draft.
+#[derive(Clone, PartialEq)]
+struct SectionDraft {
+    display_name: String,
+    max_columns: u32,
+    rows_per_page: u32,
+    chart_opts: RectOptions,
+}
+
+/// The `display_name` a typed name stores: trimmed, and empty when it matches the id (a rename to the id is no rename at all).
+fn stored_display_name(typed: &str, name: &str) -> String {
+    let display = typed.trim();
+    if display == name {
+        String::new()
+    } else {
+        display.to_string()
+    }
+}
+
+/// Edits section settings and chart defaults live. Renames update `display_name`; `name` stays the identity.
+/// Chart defaults start at the section's resolved options and are stored as a sparse patch over the project level (`OptionsBaseline::write_fields`).
+/// Each change writes just the settings and chart-default fields it changed, Revert's restore included, so a collapse or chart-height drag beside the panel, or another tab's edit to anything else, survives.
 #[component]
 pub fn SectionEditor(
     return_focus_id: String,
     config: SectionConfig,
-    chart_anchor: RectOptions,
-    chart_current: RectOptions,
-    on_change: EventHandler<SectionConfig>,
     on_close: EventHandler<()>,
 ) -> Element {
-    let id_prefix = format!("{return_focus_id}-dialog");
-    // Live edits update `config`; build and restore from the open-time snapshot.
-    let original = use_hook(|| config.clone());
-    let mut draft_display_name = use_signal(|| config.display_name.clone());
-    let mut draft_max_columns = use_signal(|| config.max_columns.max(1));
-    let mut draft_rows_per_page = use_signal(|| config.rows_per_page);
-    let draft_chart_opts = use_signal(|| chart_current.clone());
-    let chart_open = use_signal(|| true);
+    let state = use_context::<DashboardState>();
+    // Resolved once: nothing else in this tab edits the project's or this section's defaults while the panel is open.
+    let chart_baseline = use_hook(|| state.chart_defaults_baseline(Some(&config.name)));
+    let initial = use_hook(|| SectionDraft {
+        display_name: stored_display_name(&config.display_name, &config.name),
+        max_columns: config.max_columns.max(1),
+        rows_per_page: config.rows_per_page,
+        chart_opts: chart_baseline.opened.clone(),
+    });
+    let mut draft_display_name = use_signal(|| initial.display_name.clone());
+    let mut draft_max_columns = use_signal(|| initial.max_columns);
+    let mut draft_rows_per_page = use_signal(|| initial.rows_per_page);
+    let mut draft_chart_opts = use_signal(|| initial.chart_opts.clone());
 
-    let updated_from_drafts = {
-        let original = original.clone();
-        let chart_anchor = chart_anchor.clone();
-        move || {
-            let mut updated = original.clone();
-            let display = draft_display_name.read().trim().to_string();
-            // A rename matching the id is no rename at all.
-            updated.display_name = if display == updated.name {
-                String::new()
-            } else {
-                display
-            };
-            updated.max_columns = (*draft_max_columns.read()).max(1);
-            updated.rows_per_page = *draft_rows_per_page.read();
-            updated.chart_defaults = options_patch_between(&chart_anchor, &draft_chart_opts.read());
-            updated
+    let name = config.name.clone();
+    // Holds what would be stored, so a name typed back to what it was leaves nothing to revert.
+    let current = {
+        let name = name.clone();
+        move || SectionDraft {
+            display_name: stored_display_name(&draft_display_name.read(), &name),
+            max_columns: *draft_max_columns.read(),
+            rows_per_page: *draft_rows_per_page.read(),
+            chart_opts: draft_chart_opts.read().clone(),
         }
     };
-
-    let cancel_live = use_live_apply(
-        original.clone(),
-        updated_from_drafts,
-        move |updated| on_change.call(updated),
-        move || on_close.call(()),
-    );
+    let mut cleared = use_signal(Vec::new);
+    let unchanged = current() == initial && cleared.read().is_empty();
+    use_live_apply(current, {
+        let chart_baseline = chart_baseline.clone();
+        move |previous: &SectionDraft, draft: SectionDraft| {
+            state.edit_section_settings(&name, |section| {
+                if draft.display_name != previous.display_name {
+                    section.display_name = draft.display_name;
+                }
+                if draft.max_columns != previous.max_columns {
+                    section.max_columns = draft.max_columns;
+                }
+                if draft.rows_per_page != previous.rows_per_page {
+                    section.rows_per_page = draft.rows_per_page;
+                }
+                chart_baseline.write_fields(
+                    &mut section.chart_defaults,
+                    &previous.chart_opts,
+                    &draft.chart_opts,
+                );
+            });
+        }
+    });
 
     rsx! {
-        EditorDialog {
-            return_focus_id,
+        OptionsPanel {
             title: "Configure section",
-            on_cancel: move |_| cancel_live(),
-            on_save: move |_| on_close.call(()),
+            target: config.display_name().to_string(),
+            return_focus_id,
+            revert_disabled: unchanged,
+            on_revert: {
+                let initial = initial.clone();
+                move |_| {
+                    draft_display_name.set(initial.display_name.clone());
+                    draft_max_columns.set(initial.max_columns);
+                    draft_rows_per_page.set(initial.rows_per_page);
+                    draft_chart_opts.set(initial.chart_opts.clone());
+                    state.restore_overrides(&std::mem::take(&mut *cleared.write()));
+                }
+            },
+            on_close,
 
             div { class: "editor-options",
                 div { class: "binding-field",
-                    label { r#for: "{id_prefix}-name", "Name" }
+                    label { r#for: "{OPTIONS_ID_PREFIX}-name", "Name" }
                     input {
-                        id: "{id_prefix}-name",
+                        id: "{OPTIONS_ID_PREFIX}-name",
                         r#type: "text",
                         value: "{draft_display_name}",
                         placeholder: "{config.name}",
@@ -76,25 +116,25 @@ pub fn SectionEditor(
                 }
 
                 div { class: "binding-field",
-                    label { r#for: "{id_prefix}-columns", "Columns" }
+                    label { r#for: "{OPTIONS_ID_PREFIX}-columns", "Columns" }
                     input {
-                        id: "{id_prefix}-columns",
+                        id: "{OPTIONS_ID_PREFIX}-columns",
                         r#type: "number",
                         min: "1",
-                        max: "12",
+                        max: "{MAX_SECTION_COLUMNS}",
                         value: "{draft_max_columns}",
                         oninput: move |e: Event<FormData>| {
                             if let Ok(v) = e.value().parse::<u32>() {
-                                draft_max_columns.set(v.clamp(1, 12));
+                                draft_max_columns.set(v.clamp(1, MAX_SECTION_COLUMNS));
                             }
                         },
                     }
                 }
 
                 div { class: "binding-field",
-                    label { r#for: "{id_prefix}-rows-per-page", "Rows / page" }
+                    label { r#for: "{OPTIONS_ID_PREFIX}-rows-per-page", "Rows / page" }
                     input {
-                        id: "{id_prefix}-rows-per-page",
+                        id: "{OPTIONS_ID_PREFIX}-rows-per-page",
                         r#type: "number",
                         min: "0",
                         value: "{draft_rows_per_page}",
@@ -108,13 +148,12 @@ pub fn SectionEditor(
 
                 EditorSection {
                     title: "Chart defaults",
-                    open: chart_open,
 
                     ChartOptionsForm {
-                        id_prefix: id_prefix.clone(),
                         draft: draft_chart_opts,
-                        anchor: chart_anchor.clone(),
+                        anchor: chart_baseline.anchor.clone(),
                         section: config.name.clone(),
+                        cleared,
                     }
                 }
             }
