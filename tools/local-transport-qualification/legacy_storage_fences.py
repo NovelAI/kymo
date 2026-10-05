@@ -114,7 +114,10 @@ def run_fences(page: Page, origin: str) -> None:
     assert all(after_visit.get(k) == v for k, v in legacy.items()), (
         f"a read-only visit changed legacy state: {after_visit}"
     )
-    written = sorted(k for k in after_visit if k.startswith("kymo_"))
+    # The reconnect schedule is transport state that every connect writes, with no legacy key to migrate.
+    written = sorted(
+        k for k in after_visit if k.startswith("kymo_") and k != "kymo_ws_reconnect"
+    )
     assert not written, f"a read-only visit wrote canonical keys: {written}"
 
     # 3. The first edit of each value writes kymo_* and retires mkdb2_*.
