@@ -25,8 +25,10 @@ Record kinds:
      mutation_version, reduced_mutation_version)
 """
 
+import bisect
 import errno
 import hashlib
+import io
 import logging
 import os
 import pickle
@@ -268,9 +270,38 @@ def quarantine_spool(path: str) -> str:
     return _retire_spool(path, ".rejected")
 
 
+class _SpoolFile(io.FileIO):
+    """The spool's raw file: while discarding, writes are dropped, so a failed writer can empty its buffer without its stale bytes reaching the file.
+
+    It keeps its own offset, which counts the bytes that reached the file: the writer asks for every record's end, and FileIO's tell() would cost a syscall each time. The writer's lock makes it the file's only appender.
+    """
+
+    discarding = False
+
+    def __init__(self, fd: int, mode: str):
+        super().__init__(fd, mode)
+        self._offset = super().tell()
+
+    def write(self, b) -> int:
+        if self.discarding:
+            return memoryview(b).nbytes
+        written = super().write(b)
+        self._offset += written
+        return written
+
+    def seek(self, pos: int, whence: int = os.SEEK_SET) -> int:
+        self._offset = super().seek(pos, whence)
+        return self._offset
+
+    def tell(self) -> int:
+        return self._offset
+
+
 class SpoolWriter:
     """Append-only spool writer. Opens the file (and writes the header) lazily
-    on the first record, so no file appears on runs that flush cleanly."""
+    on the first record, so no file appears on runs that flush cleanly.
+
+    A failed write or flush cuts the file back to its last whole record, since a reader rejects a file whose last record is torn. ``count`` is the records written, less any a cut removed; those still buffered reach the file at the next flush."""
 
     def __init__(self, path: str, header: dict):
         self._path = path
@@ -280,6 +311,10 @@ class SpoolWriter:
         self._unsynced = False  # bytes written since the last durability barrier
         self._entry_synced = False  # the file's directory entry is durable
         self.count = 0
+        # The end of the last flushed record, then the end of each record written since.
+        self._record_ends = [0]
+        # A torn record could not be cut off, so nothing more may follow it.
+        self._torn = False
 
     @property
     def path(self) -> str:
@@ -296,13 +331,14 @@ class SpoolWriter:
             fchmod = getattr(os, "fchmod", None)
             if fchmod is not None:
                 fchmod(fd, mode)
-            self._fh = os.fdopen(fd, "ab")
+            raw = _SpoolFile(fd, "a")
         except BaseException:
             try:
                 os.close(fd)
             except OSError:
                 pass
             raise
+        self._fh = io.BufferedWriter(raw)
         # Advisory writer lock, held while the file is open: sync renames replayed files to .sent, and renaming a file a live writer still appends to would strand every later record in the .sent inode. Best-effort — where flock is unsupported or node-local (NFSv3/nolock mounts) sync's only backstop is its size-growth check during the replay, so an IDLE live writer there can still be renamed out from under; accepted residual.
         try:
             import fcntl
@@ -310,16 +346,44 @@ class SpoolWriter:
             fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except (ImportError, OSError):
             pass
-        if self._fh.tell() == 0:
-            pickle.dump(self._header, self._fh, protocol=pickle.HIGHEST_PROTOCOL)
+        self._record_ends = [self._fh.tell()]
         self._unsynced = True
+        if self._fh.tell() == 0:
+            try:
+                pickle.dump(self._header, self._fh, protocol=pickle.HIGHEST_PROTOCOL)
+                # On disk at once, so a failed first record cannot take the header with it.
+                self._fh.flush()
+                self._record_ends = [self._fh.tell()]
+            except BaseException:
+                # Leave an empty file rather than a torn header; the next write opens it again.
+                try:
+                    self._discard()
+                finally:
+                    fh, self._fh = self._fh, None
+                    fh.close()
+                raise
 
     def write(self, record: tuple) -> None:
         if self._sealed:
             raise RuntimeError(f"cannot append to sealed spool {self._path}")
+        self._raise_if_torn()
         if self._fh is None:
             self._open()
-        pickle.dump(record, self._fh, protocol=pickle.HIGHEST_PROTOCOL)
+        try:
+            pickle.dump(record, self._fh, protocol=pickle.HIGHEST_PROTOCOL)
+        except BaseException:
+            # Keep the whole records buffered before the failed one if they can still reach the file; the cut removes the failed one either way.
+            try:
+                self._fh.flush()
+            finally:
+                self._discard()
+            raise
+        self._record_ends.append(self._fh.tell())
+        if len(self._record_ends) > 8192:
+            # Records already wholly on disk survive any cut, so only the last of their ends is needed.
+            del self._record_ends[
+                : bisect.bisect_right(self._record_ends, self._fh.raw.tell()) - 1
+            ]
         self._unsynced = True
         self.count += 1
 
@@ -329,9 +393,46 @@ class SpoolWriter:
         The upload worker calls this before it releases delivery accounting, so
         terminating the worker cannot discard an already-accounted buffer tail.
         The final close still performs the more expensive durability fsync.
+        A failed flush drops the records that had not wholly reached the file, which ``count`` then omits.
         """
-        if self._fh is not None:
+        if self._fh is None:
+            return
+        self._raise_if_torn()
+        try:
             self._fh.flush()
+        except BaseException:
+            self._discard()
+            raise
+        self._record_ends = [self._fh.tell()]
+
+    def _raise_if_torn(self) -> None:
+        if self._torn:
+            raise OSError(
+                errno.EIO,
+                f"spool {self._path} ends in a torn record it could not cut off",
+            )
+
+    def _discard(self) -> None:
+        """Drop the buffered bytes unwritten and cut the file back to the last whole record it holds."""
+        raw = self._fh.raw
+        raw.discarding = True
+        try:
+            self._fh.flush()
+        finally:
+            raw.discarding = False
+        # Records whose end reached the file are whole; what reached it past the last of them is torn.
+        whole = bisect.bisect_right(self._record_ends, raw.tell())
+        # Adjusted before the truncation can fail: a torn cut must never leave the dropped records counted as spooled.
+        self.count -= len(self._record_ends) - whole
+        size = self._record_ends[whole - 1]
+        try:
+            os.ftruncate(raw.fileno(), size)
+            self._fh.seek(size)
+        except BaseException:
+            self._torn = True
+            raise
+        self._record_ends = [size]
+        self._unsynced = True
 
     def seal(self) -> Optional[str]:
         """Make a nonempty spool immutable while retaining its writer lock.
@@ -365,7 +466,7 @@ class SpoolWriter:
         """
         if self._fh is None or not self._unsynced:
             return
-        self._fh.flush()
+        self.flush()
         os.fsync(self._fh.fileno())
         if not self._entry_synced:
             # A synced file whose directory entry is not durable can vanish on power loss, and so can a spool directory this writer just created.

@@ -42,7 +42,12 @@ import uuid
 
 import grpc
 
-from kymo._cdn import content_id, gallery_item, gallery_manifest, metadata_manifest
+from kymo._cdn import (
+    content_id,
+    encoded_gallery_item,
+    gallery_manifest,
+    metadata_manifest,
+)
 from kymo._env import reject_legacy_client_env, string as _env_string
 from kymo._generated import kymo_pb2, kymo_pb2_grpc
 from kymo._log import logger as _log
@@ -188,13 +193,17 @@ def _spool_run_key(path: str, server_override: str = "") -> tuple[str, str, str]
     )
 
 
-def _quarantine_if_unchanged(path: str, size_before: int, reason: str) -> bool:
-    """Quarantine static bad input; retain a file that may still be growing."""
+def _quarantine_if_unchanged(
+    path: str, size_before: int, reason: str, quarantined_files: set[str] | None
+) -> bool:
+    """Quarantine static bad input, recording it so later spools stay eligible; retain a file that may still be growing."""
     if os.stat(path).st_size != size_before:
         print(f"    invalid input ({reason}), but file grew — kept (re-sync is safe)")
         return False
     print(f"    permanently invalid — quarantined: {reason}")
     rejected_path = quarantine_spool(path)
+    if quarantined_files is not None:
+        quarantined_files.add(rejected_path)
     print(
         f"    source quarantined as {os.path.basename(rejected_path)} "
         "without sending any records"
@@ -302,20 +311,6 @@ def _current_cdn_key(stub, project_id, run_id, metric_name, step):
         return None
 
 
-def _gallery_item(entry: dict, resource_id: str) -> dict:
-    if entry["kind"] == "image":
-        return gallery_item(
-            resource_id,
-            extension=entry["ext"],
-            caption=entry.get("caption"),
-        )
-    return gallery_item(
-        resource_id,
-        content_type=entry.get("content_type", "application/octet-stream"),
-        filename=entry.get("filename", ""),
-    )
-
-
 def _replay_cdn_record(
     stub,
     http_client,
@@ -369,7 +364,7 @@ def _replay_cdn_record(
             ]
             prospective_bytes = gallery_manifest(
                 [
-                    _gallery_item(entry, expected_id)
+                    encoded_gallery_item(entry, expected_id)
                     for entry, expected_id in expected_resources
                 ]
             )
@@ -416,7 +411,7 @@ def _replay_cdn_record(
                         manifest_changed = True
                         continue
                     raise
-                items.append(_gallery_item(entry, resource_id))
+                items.append(encoded_gallery_item(entry, resource_id))
         if manifest_changed:
             # Even with zero usable items, log an EMPTY manifest: the original run may have left a pending:* placeholder at this step, and only a real manifest clears it (see _process_cdn_batch).
             encoded_manifest = gallery_manifest(items)
@@ -657,7 +652,9 @@ def replay_file(
     except Exception as error:
         if header is not None and header.get("target_kind") == "local" and server:
             raise
-        return _quarantine_if_unchanged(path, size_before, f"invalid header: {error}")
+        return _quarantine_if_unchanged(
+            path, size_before, f"invalid header: {error}", quarantined_files
+        )
     local_installation_uuid = (
         destination.removeprefix("local:")
         if header.get("target_kind") == "local"
@@ -676,7 +673,9 @@ def replay_file(
     except (MemoryError, OSError):
         raise
     except Exception as error:
-        return _quarantine_if_unchanged(path, size_before, f"invalid header: {error}")
+        return _quarantine_if_unchanged(
+            path, size_before, f"invalid header: {error}", quarantined_files
+        )
 
     print(
         f"  {os.path.basename(path)}: run {header.get('run_name', '?')!r} ({run_id[:8]}…) → {destination}"
@@ -719,11 +718,7 @@ def replay_file(
         reason = f"{kind}: {error}"
         if permanent_error_count > 1:
             reason += f" ({permanent_error_count - 1} additional invalid record(s))"
-        return _quarantine_if_unchanged(
-            path,
-            size_before,
-            reason,
-        )
+        return _quarantine_if_unchanged(path, size_before, reason, quarantined_files)
     if unknown_kinds:
         print(
             f"    unknown record kinds {sorted(unknown_kinds)} — upgrade kymo to replay; nothing sent, file kept"
@@ -755,7 +750,9 @@ def replay_file(
                     expected_installation_uuid=local_installation_uuid
                 )
             except LocalInstallationMismatch as error:
-                return _quarantine_if_unchanged(path, size_before, str(error))
+                return _quarantine_if_unchanged(
+                    path, size_before, str(error), quarantined_files
+                )
         server_address = local_endpoint.grpc_target
         cdn_url = local_endpoint.upload_origin
     else:

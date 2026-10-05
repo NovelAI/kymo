@@ -11,6 +11,7 @@ accept in time are spooled to disk (kymo.spool) and delivered later by
 import atexit
 import base64
 import collections
+import contextlib
 import copy
 import io
 import json
@@ -49,7 +50,7 @@ except (ImportError, RuntimeError) as e:
         f"the installed grpc/protobuf runtime (original error: {e})"
     ) from e
 from kymo import _gpu
-from kymo._cdn import gallery_item, gallery_manifest, metadata_manifest
+from kymo._cdn import encoded_gallery_item, gallery_manifest, metadata_manifest
 from kymo._log import logger as _log
 from kymo.api import _check_fork_safe
 from kymo._wire import (
@@ -267,6 +268,15 @@ _upload_terminal: Optional[multiprocessing.Value] = None
 # Monotonic deadline for the upload worker, 0.0 = none. Once passed, the worker
 # stops sending and spools the rest — bounded shutdown.
 _shutdown_deadline: Optional[multiprocessing.Value] = None
+# Galleries the worker no longer holds as raw pixels (encoded, spooled or dropped), and whether either upload lane writes new work to disk; _await_encoder paces gallery calls by them.
+_galleries_released = None  # multiprocessing.RawValue("q")
+_lanes_on_disk = None  # multiprocessing.RawValue("i")
+# Galleries published by this process and its fork children, whose galleries the worker releases too.
+_galleries_published = None  # multiprocessing.RawValue("q")
+# How many this process's latest gallery-publishing call published: the depth left raw without waiting.
+_previous_galleries = 0
+# Set when shutdown begins, so a log() waiting for the encoder lets it proceed.
+_finishing = False
 # Spool path chosen at init so the parent can report it even if the worker
 # was killed before logging it.
 _spool_path: str = ""
@@ -313,6 +323,8 @@ _rich_mutation_seq = None  # multiprocessing.Value("I") when versioning is negot
 _pending: collections.deque = collections.deque()
 # Reentrant: the shutdown signal handler runs on the main thread, possibly inside log().
 _pending_lock = threading.RLock()
+# What log() holds instead when it publishes no gallery.
+_NO_LOCK = contextlib.nullcontext()
 # Set when a value was dropped after its log() returned; wait_for_upload() and finish() then report incomplete delivery.
 _pending_incomplete = False
 # Host copies and pickled rich items the pending calls may hold before log() waits for the oldest.
@@ -435,6 +447,8 @@ def init(
     global _system_poller, _server_address, _shutdown_deadline, _spool_path, _spool_dir
     global _session_id
     global _upload_failure, _upload_spooled, _upload_terminal
+    global _galleries_released, _lanes_on_disk, _galleries_published
+    global _previous_galleries, _finishing
     global _mode, _local_installation_uuid
     global _rich_writer_epoch, _rich_mutation_seq
     global _exit_code, _last_log_duration_ms
@@ -557,6 +571,12 @@ def init(
     _upload_spooled = multiprocessing.Value("i", 0)
     _upload_terminal = multiprocessing.Value("i", 0)
     _shutdown_deadline = multiprocessing.Value("d", 0.0)
+    _galleries_released = multiprocessing.RawValue("q", 0)
+    _lanes_on_disk = multiprocessing.RawValue("i", 0)
+    # Unlocked: an increment a fork child loses to a race only lets a later call wait less.
+    _galleries_published = multiprocessing.RawValue("q", 0)
+    _previous_galleries = 0
+    _finishing = False
     _spool_dir = spool_dir
     _session_id = uuid.uuid4().hex
     _spool_path = make_spool_path(
@@ -589,6 +609,8 @@ def init(
             _upload_terminal,
             _session_id,
             local_endpoint.worker_config() if local_endpoint is not None else None,
+            _galleries_released,
+            _lanes_on_disk,
         ),
         daemon=True,
     )
@@ -723,6 +745,7 @@ def log(metrics: dict, step: int) -> None:
 
     numeric_points = []
     cdn_batches = []
+    galleries = 0  # among cdn_batches
     # CUDA values, read asynchronously once CUDA is initialized.
     torch = _gpu.cuda_torch()
     if torch is not None:
@@ -772,6 +795,8 @@ def log(metrics: dict, step: int) -> None:
                 # The queued copies' data becomes the host copies.
                 items = [copy.copy(item) for item in items]
                 batches = gpu_batches
+            else:
+                galleries += 1
             batches.append(_rich_queue_tuple("cdn_batch", name, step, items, now_ms))
         elif isinstance(value, list):
             for i, v in enumerate(value):
@@ -794,34 +819,42 @@ def log(metrics: dict, step: int) -> None:
                 ("numeric_ts", name, step, _normalize_numeric_value(value), now_ms)
             )
 
-    # Freeze public rich work before draining captured text: Queue.put() returns
-    # before its feeder pickles, so passing the live object could fail later or
-    # observe a caller mutation after log() returned. Numeric/text tuples contain
-    # primitives and stay on the no-synchronous-snapshot fast path. Rich log()
-    # latency is intentionally proportional to the snapshot size.
-    rich_queue_items = _snapshot_rich_queue_items(cdn_batches)
+    # Held from the encoder check to the publication, so concurrent callers cannot all pass one check.
+    with _pending_lock if galleries else _NO_LOCK:
+        pending = bool(gpu_scalars or gpu_batches or _pending)
+        if galleries and not pending:
+            # Before the snapshot, so a waiting call holds no copy of its images yet.
+            _await_encoder()
+        # Freeze public rich work before draining captured text: Queue.put() returns
+        # before its feeder pickles, so passing the live object could fail later or
+        # observe a caller mutation after log() returned. Numeric/text tuples contain
+        # primitives and stay on the no-synchronous-snapshot fast path. Rich log()
+        # latency is intentionally proportional to the snapshot size.
+        rich_queue_items = _snapshot_rich_queue_items(cdn_batches)
 
-    if gpu_scalars or gpu_batches or _pending:
-        _queue_pending_log(
-            torch,
-            _PendingLog(
-                numeric_points,
-                rich_queue_items,
-                step=step,
-                timestamp_ms=now_ms,
-                gpu_keys=gpu_keys,
-                gpu_batches=gpu_batches,
-            ),
-            gpu_scalars,
+        if pending:
+            _queue_pending_log(
+                torch,
+                _PendingLog(
+                    numeric_points,
+                    rich_queue_items,
+                    step=step,
+                    timestamp_ms=now_ms,
+                    gpu_keys=gpu_keys,
+                    gpu_batches=gpu_batches,
+                    galleries=galleries,
+                ),
+                gpu_scalars,
+            )
+            # Published in call order, now or later; the captured text below never waits.
+            numeric_points, rich_queue_items, galleries = [], [], 0
+
+        # Drain stdout/stderr buffers (keyed by timestamp, independent of step). Destructive — keep below anything that can raise (bad name, un-floatable value), or a failed log() discards the captured text.
+        numeric_points.extend(_drain_capture_points(now_ms))
+        _publish_queue_items(
+            ([numeric_points] if numeric_points else []) + rich_queue_items,
+            galleries=galleries,
         )
-        # Published in call order, now or later; the captured text below never waits.
-        numeric_points, rich_queue_items = [], []
-
-    # Drain stdout/stderr buffers (keyed by timestamp, independent of step). Destructive — keep below anything that can raise (bad name, un-floatable value), or a failed log() discards the captured text.
-    text_points = _drain_capture_points(now_ms)
-
-    all_points = numeric_points + text_points
-    _publish_queue_items(([all_points] if all_points else []) + rich_queue_items)
 
     _warn_if_backlogged()
     _last_log_duration_ms = (time.perf_counter() - t0) * 1000.0
@@ -1004,13 +1037,16 @@ def _delivery_status_snapshot(timeout: float) -> tuple[int, int, int] | None:
         lock.release()
 
 
-def _publish_queue_items(items: list, *, hard_deadline: Optional[float] = None) -> None:
-    """Publish queue groups with exact producer-side backlog accounting.
+def _publish_queue_items(
+    items: list, *, hard_deadline: Optional[float] = None, galleries: int = 0
+) -> None:
+    """Publish queue groups with exact producer-side backlog accounting; galleries counts the galleries among them, for _await_encoder.
 
     Status must increase before publication because the worker can consume a
     group immediately.  If a later put fails synchronously, retain ownership of
     groups whose puts returned and roll back only the unpublished suffix.
     """
+    global _previous_galleries
     total = sum(_queue_item_size(item) for item in items)
     if total == 0:
         return
@@ -1036,6 +1072,30 @@ def _publish_queue_items(items: list, *, hard_deadline: Optional[float] = None) 
         except Exception as accounting_error:
             _log.error("failed to roll back upload accounting: %s", accounting_error)
         raise
+    if galleries and _galleries_published is not None:
+        _galleries_published.value += galleries
+        _previous_galleries = galleries
+
+
+_ENCODER_POLL_INTERVAL = 0.001
+
+
+def _await_encoder() -> None:
+    """Hold a call that publishes galleries while a gallery published before the previous gallery-publishing call is still raw in the worker.
+
+    One call encoding and the next queued behind it keep the encoder busy, so a third waits here rather than pile raw copies up in the worker when images are logged faster than one encoder thread encodes them.
+    It never waits while either lane writes new work to disk: disk writes, not encoding, would then set the pace, and a server outage must never delay training.
+    """
+    if _galleries_released is None or os.getpid() != _init_pid:
+        return
+    while (
+        _galleries_published.value - _galleries_released.value > _previous_galleries
+        and not _lanes_on_disk.value
+        and not _raw_shared_value(_upload_terminal)
+        and not _finishing
+        and _upload_process.is_alive()
+    ):
+        time.sleep(_ENCODER_POLL_INTERVAL)
 
 
 def _warn_if_backlogged() -> None:
@@ -1076,9 +1136,12 @@ class _PendingLog:
         timestamp_ms: int = 0,
         gpu_keys: list = (),
         gpu_batches: list = (),
+        galleries: int = 0,
     ):
         self.points = points
         self.rich = rich
+        # Galleries among rich; the GPU batches are counted once snapshotted.
+        self.galleries = galleries
         self.step = step
         self.timestamp_ms = timestamp_ms
         self.gpu_keys = gpu_keys
@@ -1111,7 +1174,7 @@ def _queue_pending_log(torch, entry: _PendingLog, gpu_scalars: list) -> None:
         held = entry.nbytes + sum(pending.nbytes for pending in _pending)
         while _pending and held > _PENDING_MAX_BYTES:
             held -= _pending[0].nbytes
-            _publish_oldest_pending(None)
+            _publish_oldest_pending(None, wait_for_encoder=True)
         images = [image for batch in entry.gpu_batches for image in batch[3]]
         if gpu_scalars or images:
             entry.reads = _gpu.Reads(
@@ -1121,13 +1184,13 @@ def _queue_pending_log(torch, entry: _PendingLog, gpu_scalars: list) -> None:
                 image.data = host
         _pending.append(entry)
         # A past deadline publishes only the calls whose copies have completed.
-        _publish_pending(0.0)
+        _publish_pending(0.0, wait_for_encoder=True)
 
 
-def _publish_pending(deadline: Optional[float]) -> bool:
+def _publish_pending(deadline: Optional[float], *, wait_for_encoder=False) -> bool:
     """Publish the pending calls, oldest first, as their copies complete, waiting until the time.monotonic() deadline (None: as long as they take); True once none remain."""
     while _pending:
-        if not _publish_oldest_pending(deadline):
+        if not _publish_oldest_pending(deadline, wait_for_encoder=wait_for_encoder):
             return False
     return True
 
@@ -1137,10 +1200,12 @@ def _publish_oldest_pending(
     *,
     drop_unfinished: bool = False,
     hard_deadline: Optional[float] = None,
+    wait_for_encoder: bool = False,
 ) -> bool:
     """Publish the oldest pending call once its copies complete, waiting until the time.monotonic() deadline (None: as long as they take).
 
     If they have not completed by then, return False and keep it, or with drop_unfinished publish it without its GPU values; a CUDA error does the latter.
+    A call published from log() (wait_for_encoder) that has galleries first waits for the encoder, as log() does.
     """
     global _pending_incomplete
     entry = _pending[0]
@@ -1155,10 +1220,16 @@ def _publish_oldest_pending(
             # A CUDA error is sticky: the copies never complete, and freeing them would abort the process.
             _gpu.unfreeable.append(entry.reads)
             failure = f"reading them failed: {error}"
+    if wait_for_encoder and (entry.galleries or (entry.gpu_batches and not failure)):
+        _await_encoder()
+    # A signal handler that returns after finish() (one kymo chains to) may have published it during a wait above.
+    if not _pending or _pending[0] is not entry:
+        return True
     # Popped and marked incomplete before publishing: a shutdown signal handler that interrupts the publication must neither publish it again nor report it complete. The flag is restored once it has been published.
     _pending.popleft()
     incomplete, _pending_incomplete = _pending_incomplete, True
     points, rich, dropped = entry.points, entry.rich, []
+    galleries = entry.galleries
     if failure is not None:
         _log.warning(
             "dropped %d GPU value(s) of step %d: %s",
@@ -1185,6 +1256,7 @@ def _publish_oldest_pending(
         for batch in entry.gpu_batches:
             try:
                 rich.extend(_snapshot_rich_queue_items([batch]))
+                galleries += 1
             except TypeError:
                 dropped.append(batch[1])
     if dropped:
@@ -1197,7 +1269,9 @@ def _publish_oldest_pending(
         incomplete = True
     try:
         _publish_queue_items(
-            ([points] if points else []) + rich, hard_deadline=hard_deadline
+            ([points] if points else []) + rich,
+            hard_deadline=hard_deadline,
+            galleries=galleries,
         )
     except Exception as error:
         _log.warning("failed to publish the values of step %d: %s", entry.step, error)
@@ -1343,15 +1417,17 @@ def wait_for_upload(timeout: Optional[float] = None) -> bool:
                 )
             if failure == _WORKER_EXIT_DATA_LOSS:
                 raise RuntimeError(
-                    "kymo server rejected a rich-media update with DATA_LOSS; "
-                    "its spool segment was quarantined as *.rejected (the "
-                    "worker log names the file and reason); later data remains "
-                    "eligible for delivery"
+                    "an upload spool segment was quarantined as *.rejected: "
+                    "the kymo server rejected a rich-media update in it with "
+                    "DATA_LOSS, or it held records that can never be delivered "
+                    "(the worker log names the file and reason); later data "
+                    "remains eligible for delivery"
                 )
             raise RuntimeError(
                 "kymo upload worker could not spool one or more undelivered "
-                "points; delivery failed (disk full, spool unavailable, or a "
-                "queued item the worker could not decode; see its log)"
+                "points; delivery failed (disk full, spool unavailable, a "
+                "gallery it could not encode, or a queued item it could not "
+                "decode; see its log)"
             )
         if spooled:
             _log.warning(
@@ -1920,22 +1996,32 @@ def _drain_queue_to_spool(
         _log.warning("failed to publish the upload queue salvage fence: %s", error)
         return 0
 
-    salvaged = 0
+    dropped = 0  # points left unwritten after a failed write
 
     def consume(item) -> None:
-        nonlocal salvaged
+        nonlocal dropped
         if item is None:
+            return
+        if dropped:
+            dropped += _queue_item_size(item)
             return
         try:
             point_tuples = _decode_queue_item(item)
         except Exception as error:
             _log.warning("failed to decode a rich queue item during salvage: %s", error)
             return
-        for point_tuple in point_tuples:
+        for index, point_tuple in enumerate(point_tuples):
+            held = spool.count
             try:
-                salvaged += _spill_tuple(spool, point_tuple)
+                _spill_tuple(spool, point_tuple)
             except Exception as e:
-                _log.warning("failed to spool a point during salvage: %s", e)
+                # A failed write is normally disk-wide, and the writer has cut its record off, with any earlier records that had not reached the file: stop writing, but keep draining to the fence.
+                dropped += len(point_tuples) - index + held - spool.count
+                _log.warning(
+                    "failed to spool during salvage; dropping the rest of the queue: %s",
+                    e,
+                )
+                return
 
     complete = _drain_queue_until(
         source,
@@ -1947,7 +2033,10 @@ def _drain_queue_to_spool(
     )
     if not complete:
         _log.warning("upload queue salvage ended before its owner fence")
-    return salvaged
+    if dropped:
+        _log.error("parent salvage dropped %d point(s) after a failed write", dropped)
+    # The writer's count leaves out the records a failed write cut off.
+    return spool.count
 
 
 def _report_spool(paths: list[str]) -> bool:
@@ -2259,13 +2348,15 @@ def _drain_and_shutdown(flush_timeout: Optional[float] = None) -> bool:
         _local_installation_uuid, \
         _url_base, \
         _rich_writer_epoch, \
-        _rich_mutation_seq
+        _rich_mutation_seq, \
+        _finishing
 
     if not _is_initialized:
         return True
     # Raw os.fork() children (NOT multiprocessing children — those skip atexit) inherit this module's state and hooks; see _init_pid. Only the initializing process may shut the shared worker down.
     if _init_pid is not None and os.getpid() != _init_pid:
         return True
+    _finishing = True
 
     if flush_timeout is None:
         flush_timeout = _default_flush_timeout()
@@ -2544,6 +2635,68 @@ def _encode_resource(res: "Resource") -> tuple[bytes, str]:
     return res.data, ext
 
 
+class _EncodedItems:
+    """A gallery's items encoded once, in the spool's entry form, replacing the Image/Resource list in a worker's queued cdn_batch tuple."""
+
+    __slots__ = ("entries", "dropped", "nbytes")
+
+    def __init__(self, entries: list[dict], dropped: bool):
+        self.entries = entries
+        # An item failed to encode, so the manifest must publish under the reduced mutation version.
+        self.dropped = dropped
+        # Captions and filenames keep lone surrogates until display, so a strict encode would raise.
+        self.nbytes = sum(
+            len(value.encode("utf-8", "surrogatepass"))
+            if isinstance(value, str)
+            else len(value)
+            for entry in entries
+            for value in entry.values()
+            if isinstance(value, (str, bytes))
+        )
+
+
+def _encode_cdn_items(name: str, step: int, items: list) -> _EncodedItems:
+    """Encode a gallery's items in place, each into its spool entry, or None when it cannot be encoded (dropped with a warning, since a retry can never fix it).
+
+    Replacing each item as it is encoded releases its arrays at once, so a gallery is never held both whole and encoded, and a retry after a MemoryError resumes at the item that raised. Callers pass a decoded snapshot, never a list given to log().
+    """
+    for index, item in enumerate(items):
+        try:
+            if isinstance(item, Image):
+                data, ext = _encode_image(item)
+                entry = {
+                    "kind": "image",
+                    "data": data,
+                    "ext": ext,
+                    "caption": item.caption,
+                }
+            elif isinstance(item, Resource):
+                data, ext = _encode_resource(item)
+                entry = {
+                    "kind": "resource",
+                    "data": data,
+                    "ext": ext,
+                    "content_type": item.content_type,
+                    "filename": item.filename,
+                }
+            else:
+                # Encoded or dropped by an earlier attempt.
+                continue
+        except MemoryError:
+            raise
+        except Exception as e:
+            entry = None
+            _log.warning(
+                "failed to encode CDN item (%s step %d) — dropping it: %s",
+                name,
+                step,
+                e,
+            )
+        items[index] = entry
+    entries = [entry for entry in items if entry is not None]
+    return _EncodedItems(entries, dropped=len(entries) < len(items))
+
+
 def _send_unary_point(stub, project_id: str, run_id: str, point) -> bool:
     batch = kymo_pb2.MetricsBatch(project_id=project_id, run_id=run_id, points=[point])
     try:
@@ -2566,14 +2719,14 @@ def _process_cdn_batch(
     run_id: str,
     metric_name: str,
     step: int,
-    items: list,
+    items: _EncodedItems,
     deadline_fn=None,
     send_placeholder: bool = True,
     timestamp_ms: Optional[int] = None,
     mutation_version: Optional[int] = None,
     reduced_mutation_version: Optional[int] = None,
 ) -> bool:
-    """Upload CDN items, create manifest, log to gRPC. Returns True on success
+    """Upload encoded CDN items, create manifest, log to gRPC. Returns True on success
     (the batch is fully dealt with) — False means RETRYABLE: the caller keeps
     the batch queued, and re-running this whole function is safe (manifest
     re-sends replace themselves, re-uploads dedup by content hash) PROVIDED
@@ -2600,59 +2753,29 @@ def _process_cdn_batch(
         except _TerminalRunError:
             raise
 
-    # 2. Encode and upload ONE ITEM AT A TIME — peak memory is the raw gallery plus a single encoded image (an encode-all-then-upload split holds every encoded byte simultaneously, an OOM risk for giant galleries). The error classes stay distinct: encode failures (bad array shape, unsupported type) are PERMANENT — a retry can never fix them, so the item is dropped with a log and the rest of the batch survives; upload failures are transient (network/server) and fail the whole batch for retry — committing a manifest missing the failed items would silently thin the gallery. A retry re-encodes the already-uploaded prefix (the CDN dedups by content hash). The deadline check covers the encodes too: past it the caller spools the batch anyway (re-encoding there), so finishing encodes here is pure shutdown latency against the parent's kill grace.
+    # 2. Upload the encoded items. A CDN rejection drops its item, like an encode failure; any other upload failure is transient and fails the whole batch for retry — committing a manifest missing the failed items would silently thin the gallery. A retry re-uploads the already-uploaded prefix (the CDN dedups by content hash). Past the deadline the caller spools the batch, so finishing uploads here is pure shutdown latency against the parent's kill grace.
     manifest_items = []
-    manifest_changed = False
-    for item in items:
-        data = None
+    manifest_changed = items.dropped
+    for entry in items.entries:
+        if deadline_fn is not None and deadline_fn():
+            return False
         try:
-            if deadline_fn is not None and deadline_fn():
-                return False
-            try:
-                if isinstance(item, Image):
-                    data, ext = _encode_image(item)
-                    entry_args = {
-                        "extension": ext,
-                        "caption": item.caption,
-                    }
-                elif isinstance(item, Resource):
-                    data, ext = _encode_resource(item)
-                    entry_args = {
-                        "content_type": item.content_type,
-                        "filename": item.filename,
-                    }
-                else:
-                    continue
-            except MemoryError:
-                raise
-            except Exception as e:
+            resource_id = _upload_to_cdn(
+                http_client, cdn_url, entry["data"], entry["ext"]
+            )
+        except Exception as e:
+            if _is_permanent_upload_error(e):
                 manifest_changed = True
                 _log.warning(
-                    "failed to encode CDN item (%s step %d) — dropping it: %s",
+                    "CDN rejected item (%s step %d) — dropping it: %s",
                     metric_name,
                     step,
                     e,
                 )
                 continue
-            try:
-                resource_id = _upload_to_cdn(http_client, cdn_url, data, ext)
-            except Exception as e:
-                if _is_permanent_upload_error(e):
-                    manifest_changed = True
-                    _log.warning(
-                        "CDN rejected item (%s step %d) — dropping it: %s",
-                        metric_name,
-                        step,
-                        e,
-                    )
-                    continue
-                _log.warning("failed to upload resource: %s", e)
-                return False
-            manifest_items.append(gallery_item(resource_id, **entry_args))
-        finally:
-            # Release this potentially multi-MiB payload on every path before
-            # encoding the next item or building/uploading the manifest.
-            data = None
+            _log.warning("failed to upload resource: %s", e)
+            return False
+        manifest_items.append(encoded_gallery_item(entry, resource_id))
 
     if not manifest_items:
         # Fall through and log an EMPTY manifest rather than returning early: the placeholder is already in the store, and consuming the batch without replacing it left the gallery cell "Uploading…" forever (a re-logged step even masked its previous valid manifest with an eternal placeholder).
@@ -2738,9 +2861,10 @@ _CONNECT_POLL_TIMEOUT = 0.25
 # workers that observed the same restart from hammering the replacement pod in
 # lockstep. Ordinary in-memory stream retries retain the low-latency 5s cap.
 _RECOVERY_MAX_DELAY = 60.0
-# Attempts on one CDN batch before it's spooled for kymo.sync (exponential backoff, 2s..60s — a few minutes of outage total). Permanent rejections (server 400s the content) also land here rather than wedging the queue head forever.
+# Attempts on one CDN batch before the rich lane fails over to the spool (exponential backoff, 2s..60s — a few minutes of outage total). Permanent rejections (server 400s the content) also land here rather than wedging the queue head forever.
 _CDN_MAX_ATTEMPTS = 8
-# Worker exit code: some points reached neither the server nor the spool (a spool write failed, e.g. disk full, or a queued snapshot would not unpickle in the worker). finish() must not report success.
+# Worker exit code: some points reached neither the server nor the spool.
+# A spool write failed (e.g. disk full), a gallery could not be encoded for the spool, or a queued snapshot would not unpickle in the worker. finish() must not report success.
 _WORKER_EXIT_SPOOL_FAILED = 2
 # The worker stopped without observing the owner's shutdown marker. The parent
 # must run its fenced salvage path before delivery can be claimed.
@@ -2784,9 +2908,9 @@ _DEFAULT_MAX_BUFFER_POINTS = 2_000_000
 _DEFAULT_MAX_BUFFER_BYTES = 256 * 1024 * 1024
 _RECOVERY_MAX_BUFFER_POINTS = _MAX_UNACKED_POINTS
 _RECOVERY_MAX_BUFFER_BYTES = 32 * 1024 * 1024
-# Bound ordered CDN entries; rich entries may retain raw image arrays.
+# Bound ordered CDN entries; retain_queue_item in _upload_worker says what a queued gallery is charged.
 _MAX_CDN_QUEUE = 1_000
-_MAX_CDN_QUEUE_BYTES = 256 * 1024 * 1024
+_MAX_CDN_QUEUE_BYTES = 2 * 1024 * 1024 * 1024
 _ORDERED_CDN_KINDS = (
     "cdn_batch",
     "metadata_batch",
@@ -2818,6 +2942,11 @@ class _RetainedLane:
         self.items.append(item)
         self.sizes.append(size)
         self.total_bytes += size
+
+    def replace(self, index: int, item: tuple, size: int) -> None:
+        self.items[index] = item
+        self.total_bytes += size - self.sizes[index]
+        self.sizes[index] = size
 
     def discard_prefix(self, count: int) -> None:
         if count <= 0:
@@ -2952,9 +3081,8 @@ def _spool_header(
     return header
 
 
-def _spill_tuple(spool, point_tuple: tuple) -> int:
-    """Write one queue tuple to the spool, pre-encoding CDN payloads so the
-    file is self-contained. Returns 1 (queue_status units) always."""
+def _spool_record(point_tuple: tuple) -> tuple:
+    """The spool record for one queue tuple, encoding CDN payloads not yet encoded so the file is self-contained."""
     kind = point_tuple[0]
     if kind in ("metadata_batch", "metadata_batch_mutation"):
         import json
@@ -2965,104 +3093,79 @@ def _spill_tuple(spool, point_tuple: tuple) -> int:
             _, name, step, metadata_obj = point_tuple
         data = json.loads(json.dumps(metadata_obj.data, default=str, allow_nan=False))
         if kind == "metadata_batch_mutation":
-            spool.write(
-                (
-                    "metadata_json_mutation",
-                    name,
-                    step,
-                    data,
-                    timestamp_ms,
-                    mutation_version,
-                )
-            )
-        else:
-            spool.write(("metadata_json", name, step, data))
-    elif kind in ("cdn_batch", "cdn_batch_mutation"):
-        if kind == "cdn_batch_mutation":
-            (
-                _,
+            return (
+                "metadata_json_mutation",
                 name,
                 step,
-                items,
+                data,
                 timestamp_ms,
                 mutation_version,
-                reduced_mutation_version,
-            ) = point_tuple
-        else:
-            _, name, step, items = point_tuple
-        encoded = []
-        manifest_changed = False
-        for item in items:
-            try:
-                if isinstance(item, Image):
-                    data, ext = _encode_image(item)
-                    encoded.append(
-                        {
-                            "kind": "image",
-                            "data": data,
-                            "ext": ext,
-                            "caption": item.caption,
-                        }
-                    )
-                elif isinstance(item, Resource):
-                    data, ext = _encode_resource(item)
-                    encoded.append(
-                        {
-                            "kind": "resource",
-                            "data": data,
-                            "ext": ext,
-                            "content_type": item.content_type,
-                            "filename": item.filename,
-                        }
-                    )
-            except MemoryError:
-                raise
-            except Exception as e:
-                manifest_changed = True
-                _log.warning(
-                    "failed to encode CDN item for spool (%s step %d): %s",
-                    name,
-                    step,
-                    e,
-                )
-        # Written even when every item failed to encode. Legacy batches may
-        # need an empty manifest to clear their pending:* placeholder;
-        # versioned batches still represent a real empty-gallery mutation.
-        if kind == "cdn_batch_mutation":
-            if manifest_changed:
-                mutation_version = reduced_mutation_version
-                reduced_mutation_version = None
-            if reduced_mutation_version is None:
-                spool.write(
-                    (
-                        "cdn_batch_encoded_mutation",
-                        name,
-                        step,
-                        encoded,
-                        timestamp_ms,
-                        mutation_version,
-                    )
-                )
-            else:
-                # A distinct kind makes the extra field forward-safe: older
-                # replay tools preserve unknown records instead of rejecting a
-                # valid newer tuple as malformed.
-                spool.write(
-                    (
-                        "cdn_batch_encoded_mutation_reserved",
-                        name,
-                        step,
-                        encoded,
-                        timestamp_ms,
-                        mutation_version,
-                        reduced_mutation_version,
-                    )
-                )
-        else:
-            spool.write(("cdn_batch_encoded", name, step, encoded))
+            )
+        return ("metadata_json", name, step, data)
+    if kind not in ("cdn_batch", "cdn_batch_mutation"):
+        return point_tuple
+    if kind == "cdn_batch_mutation":
+        (
+            _,
+            name,
+            step,
+            items,
+            timestamp_ms,
+            mutation_version,
+            reduced_mutation_version,
+        ) = point_tuple
     else:
-        spool.write(point_tuple)
-    return 1
+        _, name, step, items = point_tuple
+    # The worker's encoder may already have encoded this gallery.
+    if not isinstance(items, _EncodedItems):
+        items = _encode_cdn_items(name, step, items)
+    # Recorded even when every item failed to encode. Legacy batches may
+    # need an empty manifest to clear their pending:* placeholder;
+    # versioned batches still represent a real empty-gallery mutation.
+    if kind == "cdn_batch":
+        return ("cdn_batch_encoded", name, step, items.entries)
+    if items.dropped:
+        mutation_version = reduced_mutation_version
+        reduced_mutation_version = None
+    if reduced_mutation_version is None:
+        return (
+            "cdn_batch_encoded_mutation",
+            name,
+            step,
+            items.entries,
+            timestamp_ms,
+            mutation_version,
+        )
+    # A distinct kind makes the extra field forward-safe: older
+    # replay tools preserve unknown records instead of rejecting a
+    # valid newer tuple as malformed.
+    return (
+        "cdn_batch_encoded_mutation_reserved",
+        name,
+        step,
+        items.entries,
+        timestamp_ms,
+        mutation_version,
+        reduced_mutation_version,
+    )
+
+
+def _spill_tuple(spool, point_tuple: tuple) -> bool:
+    """Write one queue tuple to the spool, returning whether it was written.
+
+    False means its record could not be built, such as a gallery too large to encode in the memory left (never reduced to the images that did encode): the point is lost, but nothing was written, so later points still spool. An exception comes from the write, after the writer has cut the failed record off.
+    """
+    try:
+        record = _spool_record(point_tuple)
+    except Exception as error:
+        _log.error(
+            "could not encode %r for the spool — 1 point LOST: %r",
+            point_tuple[:3],
+            error,
+        )
+        return False
+    spool.write(record)
+    return True
 
 
 def _validated_ack_delta(cumulative: int, last_cumulative: int, inflight_n: int) -> int:

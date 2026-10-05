@@ -65,3 +65,18 @@ def gallery_item(
         }
     item["resource"] = resource_id
     return item
+
+
+def encoded_gallery_item(entry: dict, resource_id: str) -> dict:
+    """Build the manifest entry for one encoded gallery entry, as live upload and spool replay both store it."""
+    if entry["kind"] == "image":
+        return gallery_item(
+            resource_id,
+            extension=entry["ext"],
+            caption=entry.get("caption"),
+        )
+    return gallery_item(
+        resource_id,
+        content_type=entry.get("content_type", "application/octet-stream"),
+        filename=entry.get("filename", ""),
+    )
