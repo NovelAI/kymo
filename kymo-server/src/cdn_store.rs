@@ -3,11 +3,13 @@
 //! Realized as a closed enum rather than a trait: the backend set is closed (filesystem, the
 //! default in both modes, and opt-in GCS) and enum dispatch keeps async methods dyn-safe without
 //! an async_trait dependency.
-//! Routes validate keys (hosted vs local grammars differ); the store receives validated keys.
+//! The hosted routes validate the hosted key grammar; `FsStore::get` checks the local one, so
+//! every filesystem serves one spelling of a key, as GCS does.
 
 use std::io::SeekFrom;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use futures::stream::Stream;
@@ -61,7 +63,7 @@ impl From<anyhow::Error> for StoreError {
 
 pub type ByteStream = Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send>>;
 
-/// How a successful `put_if_absent` acked. `Existing` is a dedup hit: the object's creation time predates this ack, which the collector must learn from its ack log (docs/cdn-gcs-migration.md § Garbage collection).
+/// How a successful `put_if_absent` acked. `Existing` is a dedup hit, which leaves the object's creation time old: with GCS the collector learns of it from its ack log, and the filesystem store marks the file itself (docs/cdn-gcs-migration.md § Garbage collection).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PutOutcome {
     Created,
@@ -87,9 +89,10 @@ pub enum CdnStore {
 }
 
 impl CdnStore {
-    /// Store `body` under `key`, or ack bare if the key already exists — content-addressed keys
-    /// make the existing bytes identical by construction, so dedup needs no verification read
-    /// (docs/cdn-gcs-migration.md).
+    /// Store `body` under `key`, trusting existing content on a dedup hit: content-addressed keys
+    /// make the bytes identical by construction, so dedup needs no verification read
+    /// (docs/cdn-gcs-migration.md). A filesystem hit refreshes a stale mark, or rewrites a file it
+    /// can't mark.
     pub async fn put_if_absent(&self, key: &str, body: Bytes) -> anyhow::Result<PutOutcome> {
         match self {
             CdnStore::Fs(s) => s.put_if_absent(key, &body).await,
@@ -132,8 +135,124 @@ fn resolve_range(range: Option<ByteRange>, total_len: u64) -> Result<(u64, u64),
     }
 }
 
+#[derive(Clone)]
 pub struct FsStore {
     root: PathBuf,
+    /// `MARK_INTERVAL`, shorter only in tests: nothing can backdate a ctime.
+    mark_interval: Duration,
+}
+
+/// A dedup hit moves a file's ctime only when it is older than this, so a ctime can trail the last upload by this much and the collector adds it to its grace (cdn_gc.rs).
+pub(crate) const MARK_INTERVAL: Duration = Duration::from_secs(24 * 3600);
+
+/// Whether `path` exists with a fresh mark, after refreshing a stale one.
+///
+/// The collector's grace counts from a file's ctime, so a dedup hit must move it: a re-upload's reference can arrive later. Unlike mtime, no file-level copy or restore can carry ctime backwards. A refreshed mark is synced before the upload is acked.
+///
+/// `false` means absent, or present but unmarkable (unreadable, not writable, or a mount that ignores the touch); the caller then rewrites the file, which marks the new inode.
+async fn marked(path: &Path, interval: Duration) -> bool {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        // Only a regular file can carry the mark; anything else is left to the rewrite, which replaces it: opening a FIFO would block, and a symlink's target isn't the key's file.
+        if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
+            return false;
+        }
+        // Not through a symlink swapped in since the lstat.
+        let Ok(file) = std::fs::File::options()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+        else {
+            return false;
+        };
+        let fresh = || {
+            file.metadata()
+                .is_ok_and(|meta| changed_within(&meta, interval))
+        };
+        if fresh() {
+            return true;
+        }
+        // Null times: the kernel stamps the current time itself, which needs only write permission (explicit times need ownership).
+        let touched = unsafe { libc::futimens(file.as_raw_fd(), std::ptr::null()) } == 0;
+        touched && fresh() && file.sync_all().is_ok()
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Whether `meta`'s ctime is within `window` of now (a future ctime counts).
+fn changed_within(meta: &std::fs::Metadata, window: Duration) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // A ctime before 1970 is stale, so the mark refreshes it.
+    let Ok(seconds) = u64::try_from(meta.ctime()) else {
+        return false;
+    };
+    let changed = UNIX_EPOCH + Duration::new(seconds, meta.ctime_nsec() as u32);
+    SystemTime::now()
+        .duration_since(changed)
+        .map_or(true, |age| age < window)
+}
+
+/// One entry of a collector listing (the bucket's, or [`FsStore::walk`]).
+pub(crate) enum Listed {
+    /// An object a viewer can open by its key. `created` starts its grace: GCS last-modified, or a file's ctime.
+    Object {
+        key: String,
+        size: u64,
+        created: u32,
+    },
+    /// Outside the key grammar; counted, never collected.
+    Foreign { size: u64 },
+    /// Whatever it leads to is beyond the inventory, so it disarms deletion.
+    Symlink,
+}
+
+/// One level of [`FsStore::walk`]; `prefix` is the shard names above it, so `"abcd"` lists files.
+fn walk_level(
+    dir: &Path,
+    prefix: &str,
+    each: &mut dyn FnMut(Listed) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let meta = match entry.metadata() {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let listed = match entry.file_name().into_string() {
+            _ if meta.is_symlink() => Listed::Symlink,
+            Ok(shard)
+                if prefix.len() < 4
+                    && meta.is_dir()
+                    && shard.len() == 2
+                    && shard.bytes().all(|b| b.is_ascii_hexdigit()) =>
+            {
+                walk_level(&entry.path(), &format!("{prefix}{shard}"), each)?;
+                continue;
+            }
+            Ok(key)
+                if prefix.len() == 4
+                    && meta.is_file()
+                    && crate::cdn::validate_local_key(&key)
+                    && key[..4] == *prefix =>
+            {
+                Listed::Object {
+                    created: meta.ctime().clamp(0, u32::MAX.into()) as u32,
+                    size: meta.len(),
+                    key,
+                }
+            }
+            _ => Listed::Foreign {
+                size: if meta.is_file() { meta.len() } else { 0 },
+            },
+        };
+        each(listed)?;
+    }
+    Ok(())
 }
 
 async fn sync_directory(path: &std::path::Path) -> std::io::Result<()> {
@@ -142,12 +261,15 @@ async fn sync_directory(path: &std::path::Path) -> std::io::Result<()> {
 
 impl FsStore {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            mark_interval: MARK_INTERVAL,
+        }
     }
 
     /// `{root}/{hash[0:2]}/{hash[2:4]}/{key}` — the fanout is a filesystem-inode artifact and
     /// does not exist in other backends (GCS names are flat, per the design doc).
-    fn path_for(&self, key: &str) -> PathBuf {
+    pub(crate) fn path_for(&self, key: &str) -> PathBuf {
         // The routes' grammar is the one rule; assert it so the contract is enforced, not
         // folklore (a valid hosted key has ≥4 hex chars before its single dot, making the
         // slicing below safe).
@@ -155,8 +277,15 @@ impl FsStore {
             crate::cdn::validate_hosted_key(key),
             "store received an unvalidated key: {key}"
         );
-        let hash = key.split('.').next().unwrap_or(key);
-        self.root.join(&hash[..2]).join(&hash[2..4]).join(key)
+        self.root.join(&key[..2]).join(&key[2..4]).join(key)
+    }
+
+    /// Walks the fanout for the collector's inventory, without following symlinks (`DirEntry::metadata` is an lstat). An object is a regular file with a canonical name (`validate_local_key`, which every uploaded key meets) at exactly its `path_for`. A symlink anywhere it looks is reported as one; everything else, temps and files under any other name or path included, is foreign. An error from `each` stops the walk with it; files that vanish mid-walk are skipped, and a shard that vanishes fails it.
+    pub(crate) fn walk(
+        &self,
+        each: &mut dyn FnMut(Listed) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        walk_level(&self.root, "", each)
     }
 
     async fn put_if_absent(&self, key: &str, body: &[u8]) -> anyhow::Result<PutOutcome> {
@@ -165,7 +294,7 @@ impl FsStore {
         let dir = path.parent().unwrap();
         let first_level = dir.parent().unwrap();
 
-        // Opportunistic GC of orphaned temps in this shard dir: the Drop guard below can't run through SIGTERM's process::exit (deploys!) or a hard kill, and the store has no other GC. Stale = older than an hour; no live upload holds a temp that long. Runs on EVERY upload, dedup hits included — an orphan's own retry completes, takes the dedup branch forever after, and would otherwise never revisit this shard (cold shards see unrelated new content ~once per 65k uploads). Shard dirs are content-hash fanout, so the readdir is a handful of entries.
+        // Sweep this shard's orphaned temps, older than an hour (no live upload holds one that long). The Drop guard below misses SIGTERM's process::exit and hard kills, and the collector never removes temps, which are outside the key grammar. Dedup hits sweep too: an orphan's own retry completes and takes the dedup branch from then on, while a cold shard sees new content about once per 65k uploads. A shard dir holds a handful of entries.
         if let Ok(mut rd) = fs::read_dir(dir).await {
             while let Ok(Some(ent)) = rd.next_entry().await {
                 if ent.file_name().to_string_lossy().ends_with(".tmp")
@@ -182,8 +311,8 @@ impl FsStore {
             }
         }
 
-        // Dedup: if file exists, skip write
-        let outcome = if !path.exists() {
+        // Dedup: an existing file is acked without a write once its mark is fresh; one that can't be marked is rewritten below.
+        let outcome = if !marked(&path, self.mark_interval).await {
             fs::create_dir_all(dir)
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to create dir: {e}"))?;
@@ -194,7 +323,7 @@ impl FsStore {
                     .map_err(|e| anyhow::anyhow!("Failed to sync CDN fanout: {e}"))?;
             }
 
-            // Write to a temp name and rename into place: this dedup branch trusts bare existence forever, so a crash or disk-full mid-write must never leave a truncated file at the final content-addressed path (readers also never observe partial content). Concurrent uploads of the same content race benignly — both temps hold identical bytes and rename atomically replaces.
+            // Write to a temp name and rename into place: the dedup branch never re-reads a stored file, so a crash or disk-full mid-write must never leave a truncated file at the final content-addressed path (readers also never observe partial content). Concurrent uploads of the same content race benignly — both temps hold identical bytes and rename atomically replaces.
             // Counter, not wall clock: two tasks storing identical content in the same clock tick would share one tmp path — and File::create truncates, so their interleaved writes could be promoted to the trusted final name. The counter is unique for the process's lifetime; the pid keeps a restarted server clear of a predecessor's orphans.
             static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let tmp = dir.join(format!(
@@ -202,7 +331,7 @@ impl FsStore {
                 std::process::id(),
                 TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
-            // Drop-guard removes the temp on ANY exit that didn't rename it — errors, but also cancellation (the uploader's client timeout dropping the connection while the write stalls on a slow volume), which skips ordinary error handling entirely. The store has no GC, so an unguarded temp would sit forever. Only a hard kill mid-write can still leak one.
+            // Drop-guard removes the temp on ANY exit that didn't rename it — errors, but also cancellation (the uploader's client timeout dropping the connection while the write stalls on a slow volume), which skips ordinary error handling entirely. Only a hard kill mid-write still leaves one, for the sweep above.
             struct TmpGuard(Option<std::path::PathBuf>);
             impl Drop for TmpGuard {
                 fn drop(&mut self) {
@@ -240,6 +369,10 @@ impl FsStore {
     }
 
     async fn get(&self, key: &str, range: Option<ByteRange>) -> Result<StoreRead, StoreError> {
+        // Uploads store only canonical names, and a case-insensitive volume would otherwise open one under another spelling of its key. Refusing the rest keeps lookups case-exact on every filesystem, as on GCS, so the collector can match keys exactly.
+        if !crate::cdn::validate_local_key(key) {
+            return Err(StoreError::NotFound);
+        }
         let path = self.path_for(key);
         let mut file = match fs::File::open(&path).await {
             Ok(f) => f,
@@ -283,9 +416,29 @@ impl FsStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use futures::TryStreamExt;
 
     use crate::cdn_store::gcs_test_support::{assert_range_contract, collect, EMPTY_KEY, KEY};
+
+    /// A mark is due by ctime, which a restore keeping mtime can't set back: a file whose mtime says 60 days is still fresh.
+    #[test]
+    fn a_restored_mtime_leaves_a_mark_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file");
+        std::fs::write(&path, "x").unwrap();
+        let old = SystemTime::now() - Duration::from_secs(60 * 24 * 3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        assert!(changed_within(
+            &std::fs::metadata(&path).unwrap(),
+            Duration::from_secs(3600)
+        ));
+    }
 
     #[tokio::test]
     async fn fs_store_dedups_and_honors_the_shared_range_contract() {
@@ -295,7 +448,7 @@ mod tests {
             store.put_if_absent(KEY, b"0123456789").await.unwrap(),
             PutOutcome::Created
         );
-        // Dedup trusts bare existence: a second put under the same key must ack without
+        // Dedup never re-reads the stored file: a second put under the same key must ack without
         // touching the stored bytes (deliberately different bytes here to make an overwrite
         // visible — content-addressing forbids this input in production). The contract's full
         // read then pins that the original bytes survived.
@@ -305,6 +458,29 @@ mod tests {
         );
         store.put_if_absent(EMPTY_KEY, b"").await.unwrap();
         assert_range_contract(&CdnStore::Fs(store)).await;
+    }
+
+    #[tokio::test]
+    async fn only_the_canonical_spelling_of_a_key_is_served() {
+        let root = tempfile::tempdir().unwrap();
+        let store = FsStore::new(root.path().to_path_buf());
+        store.put_if_absent(KEY, b"0123456789").await.unwrap();
+        assert!(store.get(KEY, None).await.is_ok());
+        // A case-insensitive volume would open the file under either spelling; a case-sensitive one gets a file there too, which the guard must refuse as well.
+        let (hash, ext) = KEY.split_once('.').unwrap();
+        for other in [KEY.to_uppercase(), format!("{hash}.{}", ext.to_uppercase())] {
+            let path = root
+                .path()
+                .join(&other[..2])
+                .join(&other[2..4])
+                .join(&other);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"0123456789").unwrap();
+            assert!(
+                matches!(store.get(&other, None).await, Err(StoreError::NotFound)),
+                "{other}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -347,5 +523,115 @@ mod tests {
             .unwrap();
         let err = read.stream.try_collect::<Vec<Bytes>>().await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    fn ctime(path: &Path) -> (i64, i64) {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(path).unwrap();
+        (meta.ctime(), meta.ctime_nsec())
+    }
+
+    #[tokio::test]
+    async fn a_dedup_hit_marks_a_stale_file_and_leaves_a_fresh_one() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let store = FsStore::new(root.path().to_path_buf());
+        store.put_if_absent(KEY, b"0123456789").await.unwrap();
+        let path = store.path_for(KEY);
+        let created = ctime(&path);
+        // Fresh within the interval: a dedup hit writes nothing.
+        assert_eq!(
+            store.put_if_absent(KEY, b"0123456789").await.unwrap(),
+            PutOutcome::Existing
+        );
+        assert_eq!(ctime(&path), created);
+        // Stale under a short interval: a dedup hit touches the file instead of writing it.
+        let store = FsStore {
+            mark_interval: Duration::from_millis(200),
+            ..store
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        assert_eq!(
+            store.put_if_absent(KEY, b"0123456789").await.unwrap(),
+            PutOutcome::Existing
+        );
+        assert!(ctime(&path) > created);
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        // An absent file has nothing to mark, so the upload writes it.
+        assert!(!marked(&root.path().join("absent"), MARK_INTERVAL).await);
+        // A symlink isn't the key's file, even when what it leads to is fresh: it's replaced by the upload.
+        std::fs::remove_file(&path).unwrap();
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::write(&elsewhere, b"other bytes").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+        assert_eq!(
+            store.put_if_absent(KEY, b"0123456789").await.unwrap(),
+            PutOutcome::Created
+        );
+        assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
+        assert_eq!(std::fs::read(&path).unwrap(), b"0123456789");
+        assert_eq!(std::fs::read(&elsewhere).unwrap(), b"other bytes");
+        // So is a FIFO, which opening would block on.
+        std::fs::remove_file(&path).unwrap();
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        assert_eq!(
+            store.put_if_absent(KEY, b"0123456789").await.unwrap(),
+            PutOutcome::Created
+        );
+        assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
+    }
+
+    #[test]
+    fn the_walk_lists_only_canonical_files_at_their_fanout_path() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = tempfile::tempdir().unwrap();
+        let store = FsStore::new(root.path().to_path_buf());
+        let write = |path: &Path, body: &[u8]| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        };
+        let canonical = format!("{}.png", "ab".repeat(32));
+        let legacy = "abab.PNG";
+        let linked = format!("{}.json", "ab".repeat(32));
+        let misplaced = format!("{}.png", "cd".repeat(32));
+        let shard = root.path().join("ab").join("ab");
+        write(&store.path_for(&canonical), b"canonical");
+        write(&store.path_for(legacy), b"legacy");
+        std::os::unix::fs::symlink(store.path_for(&canonical), store.path_for(&linked)).unwrap();
+        write(&shard.join(format!("{canonical}.1.2.tmp")), b"temp");
+        write(&shard.join(&misplaced), b"misplaced");
+        // APFS refuses a name that isn't UTF-8; Linux filesystems accept it.
+        let non_utf8 =
+            std::fs::write(shard.join(std::ffi::OsStr::from_bytes(b"\xff.png")), b"x").is_ok();
+        std::fs::create_dir(shard.join(format!("{}.bin", "ab".repeat(32)))).unwrap();
+        write(&root.path().join("README"), b"stray");
+        std::fs::create_dir(root.path().join("zz")).unwrap();
+        // A shard moved elsewhere and linked back.
+        let moved = tempfile::tempdir().unwrap();
+        write(
+            &moved.path().join(format!("{}.png", "cd".repeat(32))),
+            b"moved",
+        );
+        std::os::unix::fs::symlink(moved.path(), root.path().join("cd")).unwrap();
+
+        let (mut objects, mut symlinks, mut foreign) = (Vec::new(), 0, 0);
+        store
+            .walk(&mut |entry| {
+                match entry {
+                    Listed::Object { key, .. } => objects.push(key),
+                    Listed::Symlink => symlinks += 1,
+                    Listed::Foreign { .. } => foreign += 1,
+                }
+                Ok(())
+            })
+            .unwrap();
+        objects.sort();
+        assert_eq!(objects, [canonical]);
+        // The linked file and the linked shard, whose contents the walk doesn't enter.
+        assert_eq!(symlinks, 2);
+        // The legacy name, the temp, the misplaced file, the key-named directory, the two strays at the root, and the non-UTF-8 name.
+        assert_eq!(foreign, 6 + usize::from(non_utf8));
     }
 }

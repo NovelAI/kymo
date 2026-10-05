@@ -75,7 +75,6 @@ pub(crate) async fn serve(
                 hosted_cdn_router(
                     cdn_state,
                     ws_proxy::WsState::hosted(service.clone(), browser_origins.clone()),
-                    // Frontend alert delivery is hosted-only (local runtime has no Prometheus).
                     alerts::AlertsState::from_env()?,
                     &browser_origins,
                 ),
@@ -184,15 +183,20 @@ fn metrics_router(prometheus: metrics_exporter_prometheus::PrometheusHandle) -> 
 fn hosted_cdn_router(
     cdn_state: Arc<cdn::CdnState>,
     ws_state: ws_proxy::WsState,
-    alerts: Option<Arc<alerts::AlertsState>>,
+    prometheus: Option<Arc<alerts::AlertsState>>,
     browser_origins: &ws_proxy::AllowedOrigins,
 ) -> Router {
+    let alerts = alerts::router(
+        prometheus,
+        cdn_state.collector_status.clone(),
+        browser_origins,
+    );
     let app = hosted_cdn_routes(cdn_state).merge(
         Router::new()
             .route(HOSTED_WS_PATH, get(ws_proxy::ws_handler))
             .with_state(ws_state),
     );
-    app.merge(alerts::router(alerts, browser_origins))
+    app.merge(alerts)
 }
 
 fn hosted_cdn_routes(cdn_state: Arc<cdn::CdnState>) -> Router {
@@ -246,9 +250,12 @@ fn local_cdn_router(
         .allow_origin(browser_origins.cors_policy())
         .allow_methods([Method::GET, Method::OPTIONS]);
     let activity = cdn_state.activity.clone();
+    let alerts = alerts::local_router(cdn_state.collector_status.clone(), &browser_origins);
     Router::new()
         .route(CDN_RESOURCE_PATH, get(cdn::serve_local))
         .layer(cors)
+        .with_state(cdn_state)
+        .merge(alerts)
         .layer(axum::middleware::from_fn_with_state(
             activity,
             count_browser_work,
@@ -257,7 +264,6 @@ fn local_cdn_router(
             loopback_hosts(cdn_addr),
             require_loopback_host,
         ))
-        .with_state(cdn_state)
 }
 
 async fn count_browser_work(
@@ -374,7 +380,8 @@ mod tests {
         Arc::new(cdn::CdnState {
             store: crate::cdn_store::CdnStore::Fs(crate::cdn_store::FsStore::new(root.to_owned())),
             activity: crate::activity::ActivityTracker::new_local(),
-            uploads: None,
+            uploads: Default::default(),
+            collector_status: Default::default(),
         })
     }
 
@@ -579,26 +586,50 @@ mod tests {
     async fn local_browser_listeners_answer_only_their_loopback_host_names() {
         let temporary = tempfile::tempdir().unwrap();
         let app = local_cdn(cdn_state(temporary.path()));
-        for (host, expected) in [
-            (Some(CDN_ADDR), StatusCode::NOT_FOUND),
-            (Some("localhost:18081"), StatusCode::NOT_FOUND),
-            (Some("127.0.0.1:18080"), StatusCode::MISDIRECTED_REQUEST),
+        // The fence covers the routes merged in beside `/cdn`; past it, an answer still wants an Origin.
+        for (method, path, admitted) in [
             (
-                Some("attacker.example:18081"),
-                StatusCode::MISDIRECTED_REQUEST,
+                http::Method::GET,
+                format!("/cdn/{}.png", "f".repeat(64)),
+                StatusCode::NOT_FOUND,
             ),
-            (None, StatusCode::MISDIRECTED_REQUEST),
+            (http::Method::GET, "/alerts".to_owned(), StatusCode::OK),
+            (
+                http::Method::POST,
+                "/media-cleanup/1/delete".to_owned(),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                http::Method::POST,
+                "/media-cleanup/1/keep".to_owned(),
+                StatusCode::FORBIDDEN,
+            ),
         ] {
-            let mut request = Request::get(format!("/cdn/{}.png", "f".repeat(64)))
-                .body(Body::empty())
-                .unwrap();
-            if let Some(host) = host {
-                request
-                    .headers_mut()
-                    .insert(header::HOST, host.parse().unwrap());
+            for (host, ours) in [
+                (Some(CDN_ADDR), true),
+                (Some("localhost:18081"), true),
+                (Some("127.0.0.1:18080"), false),
+                (Some("attacker.example:18081"), false),
+                (None, false),
+            ] {
+                let mut request = Request::builder()
+                    .method(method.clone())
+                    .uri(&path)
+                    .body(Body::empty())
+                    .unwrap();
+                if let Some(host) = host {
+                    request
+                        .headers_mut()
+                        .insert(header::HOST, host.parse().unwrap());
+                }
+                let response = app.clone().oneshot(request).await.unwrap();
+                let expected = if ours {
+                    admitted
+                } else {
+                    StatusCode::MISDIRECTED_REQUEST
+                };
+                assert_eq!(response.status(), expected, "{method} {path} {host:?}");
             }
-            let response = app.clone().oneshot(request).await.unwrap();
-            assert_eq!(response.status(), expected, "{host:?}");
         }
     }
 }

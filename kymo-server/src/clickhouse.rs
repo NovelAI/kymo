@@ -37,6 +37,10 @@ const RICH_REGISTRY_OUTBOX_VIEW: &str = "mkdb2.rich_metric_registry_outbox_mv";
 const CDN_ACKS_TABLE: &str = "mkdb2.cdn_acks";
 const CDN_MANIFEST_CHILDREN_TABLE: &str = "mkdb2.cdn_manifest_children";
 const CDN_GC_SCRATCH_TABLE: &str = "mkdb2.cdn_gc_scratch";
+const CDN_GC_INDEX_CHECKS_TABLE: &str = "mkdb2.cdn_gc_index_checks";
+const CDN_GC_QUESTION_TABLE: &str = "mkdb2.cdn_gc_question";
+/// How long a recorded index check stands. A fault the fingerprint can't see (index marks written since by merges or `MATERIALIZE INDEX`, data the check never held, a changed server profile) keeps passes trusting the index until then, so this bounds how long such a fault can drop references; each re-check costs one unindexed read.
+const INDEX_CHECK_DAYS: u32 = 7;
 /// A dedup upload waits on this insert; its failure fails the upload into the client spool.
 const CDN_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -299,7 +303,7 @@ struct CdnAckRow {
     acked_at: u32,
 }
 
-/// A bucket listing row (`kind` is always `inventory`).
+/// A scratch-table row; the listing writes `inventory` rows.
 #[derive(Debug, Serialize, clickhouse::Row)]
 pub struct CdnInventoryRow {
     pub kind: &'static str,
@@ -316,13 +320,36 @@ pub struct CdnManifestRow {
 }
 
 #[derive(Debug, Deserialize, clickhouse::Row)]
+#[cfg_attr(test, derive(Serialize))]
 pub struct CdnGcKeySize {
     pub key: String,
     pub size: u64,
 }
 
+/// Field order must match `ChClient::cdn_gc_index_comparison`.
+#[derive(Debug, Deserialize, clickhouse::Row)]
+#[cfg_attr(test, derive(Serialize))]
+pub struct CdnGcIndexComparison {
+    /// Keys the unindexed scan found.
+    pub roots: u64,
+    /// Those the indexed scan didn't, with a sample.
+    pub missed: u64,
+    pub sample: Vec<String>,
+}
+
+/// The stored question (`ChClient::cdn_gc_question`), standing until Keep or the pass that "Delete them" approved withdraws it; field order must match it.
+#[derive(Clone, Copy, Deserialize, clickhouse::Row)]
+#[cfg_attr(test, derive(Serialize))]
+pub struct CdnGcQuestion {
+    pub id: u64,
+    pub objects: u64,
+    pub bytes: u64,
+    pub ceiling: u64,
+}
+
 /// Field order must match `ChClient::cdn_gc_report` (the RowBinary decoder is positional).
 #[derive(Debug, Default, Deserialize, clickhouse::Row)]
+#[cfg_attr(test, derive(Serialize))]
 pub struct CdnGcReport {
     pub referenced_objects: u64,
     pub referenced_bytes: u64,
@@ -1978,7 +2005,7 @@ impl ChClient {
             .execute()
             .await
             .context("creating the CDN manifest-children cache")?;
-        // Per-pass working set, truncated at each pass start. `kind` is `inventory` (the bucket listing), `ref` (referenced keys), `unparsed` (roots awaiting a manifest parse), or `candidate` (deletable keys).
+        // Per-pass working set, truncated at each pass start. `kind` is `inventory` (the bucket listing), `ref` (referenced keys), `indexed_ref` (the indexed scan's, while its index is checked), `unparsed` (roots awaiting a manifest parse), `candidate` (deletable keys), or `approved` (the candidates an approved question named).
         self.client
             .query(&format!(
                 "CREATE TABLE IF NOT EXISTS {CDN_GC_SCRATCH_TABLE} (
@@ -1992,6 +2019,32 @@ impl ChClient {
             .execute()
             .await
             .context("creating the CDN collector's scratch table")?;
+        // Root-scan fingerprints (`cdn_gc_index_fingerprint`) under which a check passed (`Collector::check_index`).
+        self.client
+            .query(&format!(
+                "CREATE TABLE IF NOT EXISTS {CDN_GC_INDEX_CHECKS_TABLE} (
+                    fingerprint String,
+                    checked_at  DateTime
+                ) ENGINE = ReplacingMergeTree(checked_at)
+                ORDER BY fingerprint"
+            ))
+            .execute()
+            .await
+            .context("creating the CDN collector's index checks")?;
+        // The local question over the ceiling, at most one row (`ChClient::cdn_gc_ask`): its candidates when asked, kept until Keep or, after Delete, its pass withdraws it.
+        self.client
+            .query(&format!(
+                "CREATE TABLE IF NOT EXISTS {CDN_GC_QUESTION_TABLE} (
+                    id      UInt64,
+                    keys    Array(String),
+                    bytes   UInt64,
+                    ceiling UInt64
+                ) ENGINE = MergeTree
+                ORDER BY tuple()"
+            ))
+            .execute()
+            .await
+            .context("creating the CDN collector's question")?;
         Ok(())
     }
 
@@ -2059,17 +2112,153 @@ impl ChClient {
             .context("inserting the CDN inventory")
     }
 
-    /// Referenced roots: every physical row's key in both metric tables — superseded and trashed-but-unpurged rows included — restricted to the hosted key grammar.
-    pub async fn cdn_gc_collect_roots(&self, key_pattern: &str) -> Result<()> {
+    /// Referenced roots into scratch rows of `kind`: every physical row's key in both metric tables — superseded and trashed-but-unpurged rows included — restricted to the hosted key grammar. Unless `indexed`, the scan reads every granule, whatever `idx_cdn_key` would prune.
+    pub async fn cdn_gc_collect_roots(&self, kind: &str, indexed: bool) -> Result<()> {
+        self.cdn_gc_roots(
+            &format!("INSERT INTO {CDN_GC_SCRATCH_TABLE} (kind, key)"),
+            kind,
+            indexed,
+        )
+        .execute()
+        .await
+        .context("collecting referenced CDN roots")
+    }
+
+    /// What the indexed root scan's result depends on: the server version, every skip index and the `cdn_key` type of both metric tables (a line each), then the statement with its settings and key pattern. Stored whole, so a recorded check shows what it covered.
+    pub async fn cdn_gc_index_fingerprint(&self) -> Result<String> {
+        let mut facts = self
+            .client
+            .query(
+                "SELECT version()
+                 UNION ALL
+                 SELECT concat(table, '.', name, ' ', type_full, ' ', expr, ' ', toString(granularity))
+                 FROM system.data_skipping_indices
+                 WHERE database = 'mkdb2' AND table IN ('metrics', 'rich_metrics')
+                 UNION ALL
+                 SELECT concat(table, '.cdn_key ', type)
+                 FROM system.columns
+                 WHERE database = 'mkdb2' AND table IN ('metrics', 'rich_metrics') AND name = 'cdn_key'",
+            )
+            .fetch_all::<String>()
+            .await
+            .context("reading the root scan's fingerprint")?;
+        facts.sort();
+        facts.push(cdn_gc_roots_select(true));
+        facts.extend(
+            COMPLETE_READ_SETTINGS
+                .into_iter()
+                .chain(CDN_GC_SETTINGS)
+                .map(|(name, value)| format!("{name} = {value}")),
+        );
+        facts.push(crate::cdn::hosted_key_pattern());
+        Ok(facts.join("\n"))
+    }
+
+    /// Whether a pass checked the index under `fingerprint` within the last `INDEX_CHECK_DAYS`.
+    pub async fn cdn_gc_index_checked(&self, fingerprint: &str) -> Result<bool> {
+        self.client
+            .query(&format!(
+                "SELECT count() > 0 FROM {CDN_GC_INDEX_CHECKS_TABLE}
+                 WHERE fingerprint = ? AND checked_at > now() - INTERVAL {INDEX_CHECK_DAYS} DAY"
+            ))
+            .bind(fingerprint)
+            .fetch_one::<bool>()
+            .await
+            .context("reading the CDN collector's index checks")
+    }
+
+    /// The unindexed scan's roots (scratch `ref`) against the indexed scan's (`indexed_ref`). Keys inserted between the scans are in `indexed_ref` alone, so they never count as missed.
+    pub async fn cdn_gc_index_comparison(&self) -> Result<CdnGcIndexComparison> {
         self.gc_client()
             .query(&format!(
-                "INSERT INTO {CDN_GC_SCRATCH_TABLE} (kind, key) {}",
-                cdn_gc_roots_select()
+                "WITH key NOT IN (SELECT key FROM {CDN_GC_SCRATCH_TABLE} WHERE kind = 'indexed_ref') AS missing
+                 SELECT count() AS roots, countIf(missing) AS missed, groupArrayIf(10)(key, missing) AS sample
+                 FROM {CDN_GC_SCRATCH_TABLE}
+                 WHERE kind = 'ref'"
             ))
-            .bind(key_pattern)
+            .fetch_one::<CdnGcIndexComparison>()
+            .await
+            .context("comparing the indexed root scan")
+    }
+
+    /// The granules `idx_cdn_key` kept and the ones it considered in the indexed root scan's plan; `None` when the plan has no such step.
+    pub async fn cdn_gc_index_granules(&self) -> Result<Option<(u64, u64)>> {
+        let plan = self
+            .cdn_gc_roots("EXPLAIN json = 1, indexes = 1", "ref", true)
+            .fetch_all::<String>()
+            .await
+            .context("planning the indexed root scan")?
+            .join("\n");
+        Ok(cdn_key_index_granules(
+            &serde_json::from_str(&plan).context("parsing the root scan's plan")?,
+        ))
+    }
+
+    /// `prefix` and the referenced-roots SELECT, bound: one builder, so the check's EXPLAIN plans exactly what a pass runs.
+    fn cdn_gc_roots(&self, prefix: &str, kind: &str, indexed: bool) -> clickhouse::query::Query {
+        self.gc_client()
+            .query(&format!("{prefix} {}", cdn_gc_roots_select(indexed)))
+            .bind(kind)
+            .bind(crate::cdn::hosted_key_pattern())
+    }
+
+    /// The standing question, if any.
+    pub async fn cdn_gc_question(&self) -> Result<Option<CdnGcQuestion>> {
+        self.client
+            .query(&format!(
+                "SELECT id, length(keys), bytes, ceiling FROM {CDN_GC_QUESTION_TABLE} ORDER BY id DESC LIMIT 1"
+            ))
+            .fetch_optional()
+            .await
+            .context("reading the CDN collector's question")
+    }
+
+    /// Asks about the scratch candidates: one row, so it lands whole or not at all.
+    pub async fn cdn_gc_ask(&self, id: u64, ceiling: u64) -> Result<()> {
+        self.gc_client()
+            .query(&format!(
+                "INSERT INTO {CDN_GC_QUESTION_TABLE} (id, keys, bytes, ceiling)
+                 SELECT ?, groupArray(key), sum(size), ? FROM {CDN_GC_SCRATCH_TABLE}
+                 WHERE kind = 'candidate'"
+            ))
+            .bind(id)
+            .bind(ceiling)
             .execute()
             .await
-            .context("collecting referenced CDN roots")
+            .context("recording the CDN collector's question")
+    }
+
+    /// "Keep them": question `id`'s keys count as re-uploaded at `now`, so the candidate query (`cdn_gc_collect_candidates`) leaves them out for the grace. Idempotent until the question is withdrawn.
+    pub async fn cdn_gc_keep_question(&self, id: u64, now: u32) -> Result<()> {
+        self.gc_client()
+            .query(&format!(
+                "INSERT INTO {CDN_ACKS_TABLE} (key, acked_at)
+                 SELECT arrayJoin(keys), toDateTime(?) FROM {CDN_GC_QUESTION_TABLE} WHERE id = ?"
+            ))
+            .bind(now)
+            .bind(id)
+            .execute()
+            .await
+            .context("keeping the CDN candidates a question named")
+    }
+
+    pub async fn cdn_gc_withdraw_question(&self) -> Result<()> {
+        self.client
+            .query(&format!("TRUNCATE TABLE {CDN_GC_QUESTION_TABLE}"))
+            .execute()
+            .await
+            .context("withdrawing the CDN collector's question")
+    }
+
+    pub async fn record_cdn_gc_index_check(&self, fingerprint: &str) -> Result<()> {
+        self.gc_client()
+            .query(&format!(
+                "INSERT INTO {CDN_GC_INDEX_CHECKS_TABLE} (fingerprint, checked_at) VALUES (?, now())"
+            ))
+            .bind(fingerprint)
+            .execute()
+            .await
+            .context("recording the CDN collector's index check")
     }
 
     /// Stored roots with no children row under this links version, for the manifest parse.
@@ -2165,7 +2354,7 @@ impl ChClient {
             .with_context(|| format!("counting the CDN collector's {kind} keys"))
     }
 
-    /// One keyset page of a scratch kind, in key order.
+    /// Scratch keys of `kind` after `after`, in key order.
     pub async fn cdn_gc_page(
         &self,
         kind: &str,
@@ -2185,6 +2374,21 @@ impl ChClient {
             .fetch_all::<CdnGcKeySize>()
             .await
             .with_context(|| format!("paging the CDN collector's {kind} keys"))
+    }
+
+    /// The candidates question `id` named, which "Delete them" approved, as scratch kind `approved`.
+    pub async fn cdn_gc_collect_approved(&self, id: u64) -> Result<()> {
+        self.gc_client()
+            .query(&format!(
+                "INSERT INTO {CDN_GC_SCRATCH_TABLE} (kind, key, size)
+                 SELECT 'approved', key, size FROM {CDN_GC_SCRATCH_TABLE}
+                 WHERE kind = 'candidate'
+                   AND key IN (SELECT arrayJoin(keys) FROM {CDN_GC_QUESTION_TABLE} WHERE id = ?)"
+            ))
+            .bind(id)
+            .execute()
+            .await
+            .context("collecting the CDN candidates a question approved")
     }
 
     /// Referenced keys missing from the bucket, the first `limit` in key order.
@@ -2212,15 +2416,13 @@ impl ChClient {
         if keys.is_empty() {
             return Ok(Default::default());
         }
-        let placeholders = vec!["?"; keys.len()].join(", ");
-        let mut query = self.gc_client().query(&format!(
-            "SELECT DISTINCT key FROM {CDN_ACKS_TABLE}
-             WHERE key IN ({placeholders}) AND acked_at >= toDateTime(?)"
-        ));
-        for key in keys {
-            query = query.bind(key);
-        }
-        Ok(query
+        Ok(self
+            .gc_client()
+            .query(&format!(
+                "SELECT DISTINCT key FROM {CDN_ACKS_TABLE}
+                 WHERE key IN ? AND acked_at >= toDateTime(?)"
+            ))
+            .bind(keys)
             .bind(cutoff)
             .fetch_all::<String>()
             .await
@@ -2231,7 +2433,7 @@ impl ChClient {
 }
 
 /// Every reader takes a result as complete and current, so no server profile may shorten one or answer from an older snapshot: the caches would store a partial series as whole, under a watermark above the missing rows, and the CDN collector would delete reachable objects. Every overflow mode throws instead of `break`, `limit` and `offset` are 0, and the query cache is off (ClickHouse's defaults). Every client carries these (`ChClient::configured`).
-pub(crate) const COMPLETE_READ_SETTINGS: [(&str, &str); 14] = [
+const COMPLETE_READ_SETTINGS: [(&str, &str); 14] = [
     ("read_overflow_mode", "throw"),
     ("read_overflow_mode_leaf", "throw"),
     ("set_overflow_mode", "throw"),
@@ -2249,25 +2451,48 @@ pub(crate) const COMPLETE_READ_SETTINGS: [(&str, &str); 14] = [
 ];
 
 /// The GC's heavy statements, on top of [`COMPLETE_READ_SETTINGS`]: a memory cap fails the statement rather than the server (a ClickHouse OOM takes concurrent ingest with it), and two threads keep full scans off the dashboards' cores. The scratch table's sort key would make each `IN` set be built twice, once more for index analysis that prunes nothing here, which doubles set memory. Sync inserts: scratch batches are large, one part each.
-pub(crate) const CDN_GC_SETTINGS: [(&str, &str); 4] = [
+const CDN_GC_SETTINGS: [(&str, &str); 5] = [
     ("use_index_for_in_with_subqueries", "0"),
     ("async_insert", "0"),
     ("max_memory_usage", "4294967296"), // 4 GiB
     ("max_threads", "2"),
+    // New in 25.3, so an older server fails every GC statement (self-hosting.md states the minimum); on by default from 25.4. It skips granules on an earlier query's say-so, which a check of the index couldn't see.
+    ("use_query_condition_cache", "0"),
 ];
 
-/// The CDN collector's referenced-roots SELECT; `?` is the hosted key pattern. `idx_cdn_key` limits its metrics half to granules holding a non-NULL `cdn_key`, and ClickHouse reads a part without the index whole, so the key set is the same with or without it. Deliberately no `force_data_skipping_indices`: ClickHouse 25.3 accepts it while no part has the index materialized, so it cannot catch the unmaterialized case, and it fails the statement once the index is missing from the table definition, which would block every pass over an optimization.
-pub(crate) fn cdn_gc_roots_select() -> String {
+/// The CDN collector's referenced-roots SELECT; its `?`s are the scratch kind and the hosted key pattern. `idx_cdn_key` limits its metrics half to granules holding a non-NULL `cdn_key`, and ClickHouse reads a part without the index whole, so the key set should be the same with or without it; the collector trusts that only once it has checked it (`Collector::check_index`). Deliberately no `force_data_skipping_indices`: ClickHouse 25.3 accepts it while no part has the index materialized, so it cannot catch the unmaterialized case, and it fails the statement once the index is missing from the table definition, which would block every pass over an optimization.
+fn cdn_gc_roots_select(indexed: bool) -> String {
     format!(
-        "SELECT 'ref', key FROM (
+        "SELECT ?, key FROM (
              SELECT assumeNotNull(cdn_key) AS key FROM {METRICS_TABLE}
              WHERE cdn_key IS NOT NULL
              UNION ALL
              SELECT cdn_key AS key FROM {RICH_METRICS_TABLE}
          )
          WHERE match(key, ?)
-         GROUP BY key"
+         GROUP BY key
+         SETTINGS use_skip_indexes = {}",
+        u8::from(indexed)
     )
+}
+
+/// `(selected, initial)` granules of the skip index `idx_cdn_key` in an `EXPLAIN json = 1, indexes = 1` plan.
+fn cdn_key_index_granules(node: &serde_json::Value) -> Option<(u64, u64)> {
+    match node {
+        serde_json::Value::Object(fields) => {
+            if fields.get("Type").and_then(|t| t.as_str()) == Some("Skip")
+                && fields.get("Name").and_then(|n| n.as_str()) == Some("idx_cdn_key")
+            {
+                return Some((
+                    fields.get("Selected Granules")?.as_u64()?,
+                    fields.get("Initial Granules")?.as_u64()?,
+                ));
+            }
+            fields.values().find_map(cdn_key_index_granules)
+        }
+        serde_json::Value::Array(items) => items.iter().find_map(cdn_key_index_granules),
+        _ => None,
+    }
 }
 
 fn validate_local_url(url: &str) -> Result<()> {

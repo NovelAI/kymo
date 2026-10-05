@@ -150,7 +150,7 @@ class Fixture:
         if parsed.hostname in ("fonts.googleapis.com", "fonts.gstatic.com"):
             route.fulfill(body="", content_type="text/css")
         elif path == "/alerts":
-            route.fulfill(json={"alerts": []}, headers=headers)
+            route.fulfill(json=[], headers=headers)
         elif path == "/cdn/probe/pixel.png":
             route.fulfill(body=PNG, content_type="image/png", headers=headers)
         elif path.startswith("/cdn/probe/") and path.endswith(".json"):

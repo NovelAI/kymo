@@ -265,7 +265,7 @@ def fixture_page(browser: Browser, origin: str, peer: Peer):
             peer.errors.append(f"unexpected request: {route.request.url}")
             route.abort()
         elif urlsplit(route.request.url).path == "/alerts":
-            route.fulfill(json={"alerts": []})
+            route.fulfill(json=[])
         else:
             route.continue_()
 

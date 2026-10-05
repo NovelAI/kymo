@@ -250,9 +250,10 @@ input[type="checkbox"]:checked::before {
     gap: var(--spacing-sm);
     padding: var(--spacing-xs) var(--spacing-md);
 }
-.notice-text { min-width: 0; }
-.notice-dismiss {
-    margin-left: auto;
+/* The text takes the row's slack, so the buttons sit at the right. */
+.notice-text { min-width: 0; margin-right: auto; }
+/* Dismiss is quiet; a question's answers read as live buttons, alike. */
+.notice-button {
     white-space: nowrap;
     background: none;
     border: 1px solid var(--bg3);
@@ -261,7 +262,10 @@ input[type="checkbox"]:checked::before {
     padding: 0 var(--spacing-sm);
     cursor: pointer;
 }
-.notice-dismiss:hover { color: var(--text-main); }
+.notice-button:hover:not(:disabled) { color: var(--text-main); }
+.notice-answer:not(:disabled) { color: var(--text-main); border-color: var(--text-disabled); }
+.notice-answer:hover:not(:disabled) { border-color: var(--text-main); }
+.notice-button:disabled { cursor: default; }
 
 /* === Navbar === */
 .navbar {

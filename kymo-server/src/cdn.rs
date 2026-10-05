@@ -11,8 +11,10 @@ use crate::cdn_store::{ByteRange, CdnStore, StoreError};
 pub struct CdnState {
     pub store: CdnStore,
     pub(crate) activity: Arc<crate::activity::ActivityTracker>,
-    /// Hosted gcs mode: uploads go through the collector's fence and ack log.
-    pub(crate) uploads: Option<crate::cdn_gc::Uploads>,
+    /// Every upload goes through the collector's fence.
+    pub(crate) uploads: crate::cdn_gc::Uploads,
+    /// The collector's conditions, for `/alerts`, and its question's answers.
+    pub(crate) collector_status: Arc<crate::cdn_gc::Status>,
 }
 
 /// The CDN upload envelope: the routes' `DefaultBodyLimit`.
@@ -50,7 +52,7 @@ pub(crate) fn hosted_key_pattern() -> String {
 
 /// Local raw-ID v1 refines the hosted grammar: exactly a full SHA-256 hash, nothing uppercase —
 /// so case-insensitive filesystems such as default APFS cannot alias two textual IDs to one object.
-fn validate_local_key(key: &str) -> bool {
+pub(crate) fn validate_local_key(key: &str) -> bool {
     // A hosted-valid key has exactly one dot, so everything before the first is the hash.
     let hash_len = key.find('.').unwrap_or(key.len());
     validate_hosted_key(key) && hash_len == 64 && !key.bytes().any(|b| b.is_ascii_uppercase())
@@ -85,15 +87,15 @@ pub async fn upload(
 
     let key = content_key(&body, &ext);
     // The store logs stored/dedup itself; this is the one log line per failed upload.
-    let stored = match &state.uploads {
-        Some(uploads) => uploads.put(&state.store, &key, body).await,
-        None => state.store.put_if_absent(&key, body).await,
-    };
-    stored.map_err(|e| {
-        let error = format!("{e:#}");
-        tracing::warn!(key = %key, error = %error, "CDN upload failed");
-        (StatusCode::INTERNAL_SERVER_ERROR, error)
-    })?;
+    state
+        .uploads
+        .put(&state.store, &key, body)
+        .await
+        .map_err(|e| {
+            let error = format!("{e:#}");
+            tracing::warn!(key = %key, error = %error, "CDN upload failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, error)
+        })?;
 
     Ok(axum::Json(serde_json::json!({ "resource_id": key })))
 }
@@ -177,9 +179,6 @@ pub async fn serve_local(
     method: axum::http::Method,
     headers: HeaderMap,
 ) -> Result<Response, (StatusCode, String)> {
-    if !validate_local_key(&key) {
-        return Err((StatusCode::NOT_FOUND, "Not found".to_string()));
-    }
     let range = parse_range_header(&method, &headers);
     serve_from_store(&state, key, "private, no-store", range).await
 }
@@ -197,7 +196,7 @@ async fn serve_from_store(
         Err(StoreError::NotFound) => {
             // The CDN collector's alarm (docs/cdn-gcs-migration.md § Garbage collection); the key is what a restore from soft delete needs.
             metrics::counter!("mkdb2_cdn_not_found_total").increment(1);
-            tracing::info!(key = %key, "CDN object not found");
+            tracing::info!(key = ?key, "CDN object not found");
             return Err((StatusCode::NOT_FOUND, "Not found".to_string()));
         }
         Err(StoreError::RangeNotSatisfiable { total_len }) => {
@@ -211,7 +210,7 @@ async fn serve_from_store(
         }
         // The store's messages are already user-shaped ("Failed to read file: …" etc.).
         Err(StoreError::Other(e)) => {
-            tracing::warn!(key = %key, error = %e, "CDN read failed");
+            tracing::warn!(key = ?key, error = %e, "CDN read failed");
             return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
         }
     };
@@ -268,7 +267,8 @@ mod tests {
         Arc::new(CdnState {
             store: CdnStore::Fs(FsStore::new(root.to_path_buf())),
             activity: crate::activity::ActivityTracker::disabled(),
-            uploads: None,
+            uploads: Default::default(),
+            collector_status: Default::default(),
         })
     }
 
@@ -451,7 +451,8 @@ mod tests {
         let state = Arc::new(CdnState {
             store: CdnStore::Fs(FsStore::new(root.path().to_path_buf())),
             activity: activity.clone(),
-            uploads: None,
+            uploads: Default::default(),
+            collector_status: Default::default(),
         });
         let key = "aabbccdd0123456789aabbccdd0123456789aabbccdd0123456789aabbccdd01.txt";
         state

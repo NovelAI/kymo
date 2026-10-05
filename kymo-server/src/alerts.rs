@@ -7,25 +7,27 @@
 //! interval regardless of open tabs. A failed Prometheus fetch (unreachable, non-2xx, malformed) is a 503,
 //! never an empty list: "unknown" and "nothing firing" differ, and the frontend keeps its last set
 //! through a 503, so a firing alert survives a Prometheus restart; an outage logs one warn and one
-//! info on recovery. `KYMO_PROMETHEUS_URL` unset disables the proxy, but the route stays mounted
-//! and answers `[]` so the frontend never meets a CORS-less 404 (the local runtime mounts neither
-//! this router nor the poll).
+//! info on recovery. With `KYMO_PROMETHEUS_URL` unset, as always in local mode, the route answers
+//! the CDN collector's own conditions instead (`cdn_gc::Status`); local mode adds the user's
+//! answers to the collector's question over its ceiling.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use axum::extract::State;
-use axum::routing::get;
+use axum::extract::{Path, State};
+use axum::routing::{get, post};
 use axum::{Json, Router};
-use http::{Method, StatusCode};
+use http::{HeaderMap, Method, StatusCode};
 use serde::Serialize;
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 
+use crate::cdn_gc;
 use crate::ws_proxy::AllowedOrigins;
 
 const PROMETHEUS_URL_ENV: &str = "KYMO_PROMETHEUS_URL";
 const ALERTS_PATH: &str = "/alerts";
+const ANSWER_PATH: &str = "/media-cleanup/{question}/{answer}";
 /// Rules evaluate every 15s and the frontend polls every 30s; a 10s cache keeps upstream load at
 /// one request per interval however many tabs poll.
 const CACHE_TTL: Duration = Duration::from_secs(10);
@@ -33,14 +35,17 @@ const CACHE_TTL: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The allowlist: exactly what the banner shows. Descriptions stay in Grafana (operator detail).
-#[derive(Clone, Serialize)]
-struct UserAlert {
-    name: String,
-    summary: String,
-    class: Option<String>,
-    /// Prometheus's `activeAt`: the frontend keys dismissal on it, so a cleared-then-refired
-    /// alert reappears.
-    active_at: String,
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct UserAlert {
+    pub(crate) name: String,
+    pub(crate) summary: String,
+    pub(crate) class: Option<String>,
+    /// Prometheus's `activeAt`, or when a collector condition began: the frontend keys dismissal
+    /// on it, so a cleared-then-refired alert reappears.
+    pub(crate) active_at: String,
+    /// The id of the collector's question, which a local user answers (`ANSWER_PATH`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) question: Option<u64>,
 }
 
 /// The last refresh: when it ran and what it produced (`None` = the fetch failed).
@@ -57,10 +62,11 @@ pub(crate) struct AlertsState {
 }
 
 impl AlertsState {
-    /// `None` when the env is unset (route disabled); a set but malformed URL is a startup error.
+    /// `None` when the env is unset (`/alerts` then serves the collector's conditions); a set but
+    /// malformed URL is a startup error.
     pub(crate) fn from_env() -> anyhow::Result<Option<Arc<Self>>> {
         let Some(base) = crate::env::optional_string(PROMETHEUS_URL_ENV) else {
-            tracing::info!("alert proxy disabled ({PROMETHEUS_URL_ENV} unset)");
+            tracing::info!("alert proxy disabled ({PROMETHEUS_URL_ENV} unset): /alerts serves the media collector's conditions");
             return Ok(None);
         };
         let state = Self::new(&base)?;
@@ -155,28 +161,34 @@ fn select_user_alerts(body: &str) -> anyhow::Result<Vec<UserAlert>> {
             summary: text(&a["annotations"]["summary"]),
             class: a["labels"]["class"].as_str().map(str::to_owned),
             active_at: text(&a["activeAt"]),
+            question: None,
         })
         .collect();
     selected.sort_by(|x, y| (&x.name, &x.class).cmp(&(&y.name, &y.class)));
     Ok(selected)
 }
 
+/// Without Prometheus, nothing evaluates the collector's gauges, so the collector's own conditions answer.
 async fn get_alerts(
-    State(state): State<Option<Arc<AlertsState>>>,
+    State((prometheus, collector)): State<(Option<Arc<AlertsState>>, Arc<cdn_gc::Status>)>,
 ) -> Result<Json<Vec<UserAlert>>, StatusCode> {
-    match state {
+    match prometheus {
         Some(state) => state
             .firing()
             .await
             .map(Json)
             .ok_or(StatusCode::SERVICE_UNAVAILABLE),
-        None => Ok(Json(Vec::new())),
+        None => Ok(Json(collector.alerts())),
     }
 }
 
-/// The `/alerts` sub-router — always mounted on the hosted listener (disabled ⇒ `[]`), fenced to
-/// the browser-origin allowlist by CORS (the CDN routes' open CORS is for media).
-pub(crate) fn router(state: Option<Arc<AlertsState>>, browser_origins: &AllowedOrigins) -> Router {
+/// The `/alerts` sub-router — always mounted on the CDN listener, fenced to the browser-origin
+/// allowlist by CORS (the hosted CDN routes' open CORS is for media).
+pub(crate) fn router(
+    prometheus: Option<Arc<AlertsState>>,
+    collector: Arc<cdn_gc::Status>,
+    browser_origins: &AllowedOrigins,
+) -> Router {
     Router::new()
         .route(ALERTS_PATH, get(get_alerts))
         .layer(
@@ -184,7 +196,46 @@ pub(crate) fn router(state: Option<Arc<AlertsState>>, browser_origins: &AllowedO
                 .allow_origin(browser_origins.cors_policy())
                 .allow_methods([Method::GET]),
         )
-        .with_state(state)
+        .with_state((prometheus, collector))
+}
+
+/// POST `/media-cleanup/{question}/delete|keep`: the local user's answer to the collector's question over its ceiling, recorded before it's acknowledged. CORS can't stop another page's simple POST, so `Origin` must be present and allowed, as for the local WebSocket. An answer to a question that no longer stands (answered elsewhere) is 409.
+async fn answer(
+    State((status, origins)): State<(Arc<cdn_gc::Status>, AllowedOrigins)>,
+    headers: HeaderMap,
+    Path((question, answer)): Path<(u64, cdn_gc::Answer)>,
+) -> StatusCode {
+    if !origins.permits_exact_headers(&headers) {
+        return StatusCode::FORBIDDEN;
+    }
+    match status.answer(question, answer, SystemTime::now).await {
+        Ok(true) => StatusCode::NO_CONTENT,
+        Ok(false) => StatusCode::CONFLICT,
+        Err(error) => {
+            tracing::error!(
+                error = format!("{error:#}"),
+                "recording an answer to the media cleanup question failed"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+/// Local mode's `/alerts` (the collector's conditions) and the routes that answer its over-limit notice.
+pub(crate) fn local_router(
+    status: Arc<cdn_gc::Status>,
+    browser_origins: &AllowedOrigins,
+) -> Router {
+    router(None, status.clone(), browser_origins).merge(
+        Router::new()
+            .route(ANSWER_PATH, post(answer))
+            .layer(
+                CorsLayer::new()
+                    .allow_origin(browser_origins.cors_policy())
+                    .allow_methods([Method::POST]),
+            )
+            .with_state((status, browser_origins.clone())),
+    )
 }
 
 #[cfg(test)]
@@ -291,6 +342,7 @@ mod tests {
     fn app(base: &str) -> Router {
         router(
             Some(Arc::new(AlertsState::new(base).unwrap())),
+            Default::default(),
             &AllowedOrigins::parse(ORIGIN).unwrap(),
         )
     }
@@ -360,9 +412,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disabled_proxy_answers_an_empty_list_with_the_cors_fence() {
+    async fn without_prometheus_the_collector_answers_with_the_cors_fence() {
+        let collector = Arc::new(cdn_gc::Status::default());
+        let condition = UserAlert {
+            name: "MediaCleanupOverLimit".to_owned(),
+            summary: "asked".to_owned(),
+            class: None,
+            active_at: "2026-10-05T00:00:00Z".to_owned(),
+            question: Some(7),
+        };
+        collector.publish(vec![condition.clone()]);
         let app = router(
             None,
+            collector,
             &AllowedOrigins::parse(&format!("{ORIGIN},http://localhost:*")).unwrap(),
         );
         let response = poll(app.clone(), Some(ORIGIN)).await;
@@ -371,13 +433,108 @@ mod tests {
             response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
             ORIGIN
         );
-        let body = to_bytes(response.into_body(), 64).await.unwrap();
-        assert_eq!(&body[..], b"[]");
+        // The bar reads exactly these fields, the question's id included.
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!([condition])
+        );
         // A loopback wildcard-port entry echoes the exact requesting origin.
         let response = poll(app, Some("http://localhost:4321")).await;
         assert_eq!(
             response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
             "http://localhost:4321"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cleanup_answer_needs_an_allowed_origin_and_its_question() {
+        use ::clickhouse::test::{handlers, status, Mock};
+        let question = crate::clickhouse::CdnGcQuestion {
+            id: 7,
+            objects: 10,
+            bytes: 100,
+            ceiling: 5,
+        };
+        let notice = UserAlert {
+            name: "MediaCleanupOverLimit".to_owned(),
+            summary: String::new(),
+            class: None,
+            active_at: String::new(),
+            question: Some(7),
+        };
+        for (answer, statements) in [("delete", 0), ("keep", 2)] {
+            let mock = Mock::new();
+            let collector = Arc::new(cdn_gc::Status::new(Arc::new(
+                crate::clickhouse::ChClient::new(mock.url()).unwrap(),
+            )));
+            collector.publish(vec![notice.clone()]);
+            let app = local_router(collector.clone(), &AllowedOrigins::parse(ORIGIN).unwrap());
+            let path = format!("/media-cleanup/7/{answer}");
+            let post = |origin: Option<&str>| {
+                let mut request = Request::post(&path);
+                if let Some(origin) = origin {
+                    request = request.header(header::ORIGIN, origin);
+                }
+                app.clone().oneshot(request.body(Body::empty()).unwrap())
+            };
+            // Another page's simple POST carries its own origin; a client without one isn't a browser on the dashboard. Neither reaches ClickHouse, whose mock fails any request it wasn't given.
+            for origin in [None, Some("http://evil.example")] {
+                assert_eq!(
+                    post(origin).await.unwrap().status(),
+                    StatusCode::FORBIDDEN,
+                    "{answer}"
+                );
+            }
+            // A ClickHouse error leaves the question standing, in the bar too.
+            mock.add(handlers::failure(status::INTERNAL_SERVER_ERROR));
+            assert_eq!(
+                post(Some(ORIGIN)).await.unwrap().status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{answer}"
+            );
+            assert_eq!(collector.alerts().len(), 1, "{answer}");
+            mock.add(handlers::provide(vec![question]));
+            for _ in 0..statements {
+                mock.add(handlers::record_ddl());
+            }
+            let response = post(Some(ORIGIN)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT, "{answer}");
+            assert_eq!(
+                response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+                ORIGIN
+            );
+            assert!(collector.alerts().is_empty(), "{answer}");
+            // Answered, by Delete still standing until its pass: either way it's 409.
+            if answer == "keep" {
+                mock.add(handlers::provide(
+                    Vec::<crate::clickhouse::CdnGcQuestion>::new(),
+                ));
+            }
+            assert_eq!(
+                post(Some(ORIGIN)).await.unwrap().status(),
+                StatusCode::CONFLICT,
+                "{answer}"
+            );
+        }
+        let app = local_router(
+            Arc::new(cdn_gc::Status::default()),
+            &AllowedOrigins::parse(ORIGIN).unwrap(),
+        );
+        let post = |path: &'static str, origin: Option<&str>| {
+            let mut request = Request::post(path);
+            if let Some(origin) = origin {
+                request = request.header(header::ORIGIN, origin);
+            }
+            app.clone().oneshot(request.body(Body::empty()).unwrap())
+        };
+        // Another answer never reaches ClickHouse.
+        assert_eq!(
+            post("/media-cleanup/7/maybe", Some(ORIGIN))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
         );
     }
 }

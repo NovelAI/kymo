@@ -19,7 +19,7 @@ Nothing in hosted mode authenticates. Anyone who can reach the gRPC port can rea
 
 ## Databases
 
-Local mode runs PostgreSQL 17 and ClickHouse 25.3 LTS, the tested versions. The server creates and upgrades its schema at startup and opens its listeners only after that finishes:
+Local mode runs PostgreSQL 17 and ClickHouse 25.3 LTS, the tested versions. ClickHouse must be 25.3 or later: the media collector turns off a setting older versions reject. The server creates and upgrades its schema at startup and opens its listeners only after that finishes:
 
 - **PostgreSQL**: tables, indexes, and constraints in the `DATABASE_URL` database, so its role must be able to create and alter them.
 - **ClickHouse**: the database `mkdb2` (a fixed name), with tables and materialized views. The user needs full rights on `mkdb2.*` (create, alter, rename, drop, insert, select, truncate; the rename and drop are for one-time schema migrations), `SYSTEM FLUSH ASYNC INSERT QUEUE`, read access to `system` tables, and permission to set the `async_insert` settings, so no read-only or constrained profile. Hosted mode reaches ClickHouse over plain HTTP.
@@ -38,11 +38,11 @@ Settings are environment variables; an unset one takes its default.
 | `KYMO_CDN_BACKEND` | `filesystem` | Media store: `filesystem` or `gcs` |
 | `KYMO_CDN_ROOT` | `/data/cdn` | Media directory for the filesystem store |
 | `KYMO_CDN_GCS_BUCKET`, `GOOGLE_APPLICATION_CREDENTIALS` | none | Bucket and Google credential file (a `service_account` key, or an `external_account` federation config without impersonation), both required for `gcs` |
-| `KYMO_CDN_GC` | `report` | Media garbage collector for the `gcs` store: `off`, `report` (counts only), or `delete` |
-| `KYMO_CDN_GC_CREDENTIALS` | none | Credential file for `delete`: an `external_account` config that impersonates a service account allowed to delete in the bucket |
-| `KYMO_CDN_GC_MAX_CANDIDATES` | the larger of 1% of referenced objects and 10,000 | With `delete`, a pass with more candidates deletes nothing; raise it for a deliberate large purge, then unset it |
+| `KYMO_CDN_GC` | `delete` for `filesystem`, `report` for `gcs` | Media garbage collector: `off`, `report` (counts only), or `delete` (see Storage and backups) |
+| `KYMO_CDN_GC_CREDENTIALS` | none | With `gcs`, the credential file for `delete`: an `external_account` config that impersonates a service account allowed to delete in the bucket |
+| `KYMO_CDN_GC_MAX_CANDIDATES` | 10,000 plus 10% of referenced objects | With `delete`, a pass with more candidates deletes nothing; raise it for a deliberate large purge, then unset it |
 | `KYMO_RUN_REAPER_ENABLED` | `false` | Permanently delete runs whose Trash retention expired (see below) |
-| `KYMO_PROMETHEUS_URL` | unset | Prometheus whose firing alerts the dashboard shows |
+| `KYMO_PROMETHEUS_URL` | unset | Prometheus whose firing alerts the dashboard shows; unset, it shows the media collector's own conditions |
 | `KYMO_IMPORT_ENABLED` | `false` | Accept wandb imports (`tools/wandb-import/import_to_kymo.py`). Enable it only while importing: an import can backdate and terminate any run it names. |
 | `RUST_LOG` | `info` | Log filter |
 
@@ -50,13 +50,21 @@ Capacity knobs: `KYMO_INGEST_BYTE_CAP` (bytes of buffered ingest, default 512 Mi
 
 ## Storage and backups
 
-The filesystem store keeps each logged image or file once, named by its content hash, under `KYMO_CDN_ROOT`. It never shrinks: deleting runs frees database space but not media, so size the volume for everything ever logged.
+The filesystem store keeps each logged image or file once, named by its content hash, under `KYMO_CDN_ROOT`. By default a garbage collector deletes media that nothing references, which becomes eligible 30 to 31 days after its last upload, even as a duplicate:
+- It deletes nothing until 31 days after the first start of a server with the collector.
+- Deletion is final; there's no trash. Back up the media directory to be able to undo it.
+- A pass deletes nothing if it finds more candidates than its ceiling (`KYMO_CDN_GC_MAX_CANDIDATES`), a gallery or file list it can't read, or a symlink in the media directory or its two-character shard directories (what it leads to is outside the collector's view).
+- The dashboard's notice bar reports each of these, referenced media found missing, and failed passes. With `KYMO_PROMETHEUS_URL` set, alert on the `mkdb2_cdn_gc_*` gauges in Prometheus instead.
+- `KYMO_CDN_GC=report` only counts; `off` stops it. Run `report` while rebuilding `metrics` or `rich_metrics` by hand.
+- A duplicate upload refreshes the stored file's timestamps, or rewrites the file, so the server's user must be able to write the media directory.
+- Keep the media directory on a local POSIX filesystem (ext4, XFS, btrfs, ZFS, APFS). The collector dates files by ctime, which FAT, exFAT, SMB and some FUSE mounts let a copy or restore set back.
+- Use one media directory per pair of databases: a deployment sharing another's would see only its own references and delete the other's media.
 
 With the `gcs` store, a garbage collector lists the bucket every few hours and publishes how much media nothing references. By default it only reports. With `KYMO_CDN_GC=delete` it also deletes objects that are unreferenced and weren't uploaded (even as a duplicate) in the last 30 days, and deletes nothing until its upload log covers those 30 days. A `gcs` server records each upload of already-stored media in ClickHouse before acknowledging it, so while ClickHouse is down those uploads fail and wait in the client's spool.
 
-Back up PostgreSQL and ClickHouse together, with the server stopped, and with the filesystem store the media directory too. With `gcs`, the bucket holds the media; if the collector deletes, the bucket's soft delete is the only undo. A database backup can also reference media the collector deleted after it was taken, so with `delete`, keep the bucket's soft-delete retention at least as long as the age of any backup you might restore.
+Back up PostgreSQL and ClickHouse together, with the server stopped, and with the filesystem store the media directory too. With `gcs`, the bucket holds the media, and its soft delete is the only undo of the collector's deletes. A database backup can reference media the collector deleted after it was taken, so keep media backups (with `gcs` and `delete`, the bucket's soft-delete retention) at least as long as the age of any database backup you might restore.
 
-With `gcs`, restoring ClickHouse from a backup or running a server older than the collector loses upload-log entries, which a later `delete` would then trust. Afterwards, once a server with the collector is running again, run `INSERT INTO mkdb2.cdn_acks VALUES ('', now())`, so deletion waits a fresh 30 days.
+With `gcs`, restoring ClickHouse from a backup or running a server older than the collector loses upload-log entries, which a later `delete` would then trust. Afterwards, once a server with the collector is running again, run `INSERT INTO mkdb2.cdn_acks VALUES ('', now())`, so deletion waits a fresh 30 days. With the filesystem store, do the same after running a server older than its collector against the media directory, since that server doesn't record duplicate uploads, and after rolling the media directory back to a snapshot (ZFS, btrfs, LVM, a VM disk), which restores old file timestamps. With either store, do the same after correcting a server clock that ran more than 30 days slow, since everything it dated looks that much older.
 
 ## Run exactly one server
 

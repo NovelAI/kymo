@@ -154,6 +154,8 @@ Spool creation, retirement, and quarantine sync the affected directory entries, 
 
 The registry is reconciled from ClickHouse on local boot through the existing type-upgrading, canonical-run-only registration path. Physical deletion of expired runs is always enabled locally; its first pass runs a minute after boot, then hourly, because an idle-stopped stack may not live long enough for hosted's one-interval startup delay.
 
+Media that nothing references is deleted too, with no opt-out: it becomes eligible 30 to 31 days after its last upload, even as a duplicate, and an installation deletes none until 31 days after its first start with the collector. Each start runs a pass 10 minutes in (idle stop waits an hour; `kymo stop` sooner only delays it), and a pass holds off idle stop until it ends. A pass deletes nothing if it finds more candidates than its safety limit (10,000 plus 10% of the referenced files), a gallery or file list it can't read, or a symlink in the media directory or its two-character shard directories. The notice bar reports each of these, as well as referenced media found missing and failed passes. Past the limit it asks the user, with no Dismiss, whether to delete those files permanently or keep them for 30 more days while cleanup continues for other media, and deletes nothing until the user answers, across restarts too.
+
 ## Data locations, deletion, and backup
 
 There are no `uninstall`, `reset`, `backup`, or `restore` commands in this ticket.
@@ -191,7 +193,7 @@ Required automated or release-qualification coverage:
 4. The persisted dashboard/CDN ports survive stop/start and compatible reinstall. A port conflict produces an actionable error without mutating the pinned URL; `kymo ports` replaces ports only while stopped.
 5. `run_url()` remains unchanged across restart and does not wake a stopped stack. `open_run()` wakes it, checks the installation UUID, returns the URL, and its timed hold prevents shutdown during browser launch.
 6. An open frontend WebSocket prevents idle shutdown; once it closes and runs are inactive, the complete stack stops a full idle timeout later. Empty streams and quiet workers neither hold nor wake it. `kymo stop` waits out a launch; `kymo stop --hold` keeps a waking client out.
-7. Local dashboard/CDN/server listeners are loopback-only and refuse other Host names. Browser CDN has GET/HEAD/OPTIONS but no upload or WebSocket route; upload remains authenticated on its Unix socket.
+7. Local dashboard/CDN/server listeners are loopback-only and refuse other Host names. Browser CDN serves media and `GET /alerts`, plus the media-cleanup answers (`POST` delete or keep, which need the dashboard's `Origin`), but no upload or WebSocket route; upload remains authenticated on its Unix socket.
 8. Local release bundle contains all fonts/scripts/styles/WASM, makes zero external requests with network disabled, and contains no hosted service endpoint. Hosted `/grpc-ws` framing and unauthenticated hosted upload remain unchanged.
 9. Numeric, tagged, text, image, resource, metadata, Trash restore, purge, dashboard, spool replay, mutation ordering, and DATA_LOSS quarantine work locally.
 10. Legacy hosted clients that omit the additive writer/mutation fields retain legacy behavior. Checked-in Python protobuf stubs match the source.
@@ -231,3 +233,4 @@ Also settled: a native launcher instead of Docker Compose (no Docker Desktop pre
 - 2026-09-28: The supervised server enables the bulk-import lane, and the W&B importer's `--local` imports into local mode.
 - 2026-09-30: A viewer restarts the idle hour: closing a dashboard WebSocket or serving the dashboard shell resets the idle clock, replacing a 10-second reconnect grace and a 60-second page-load grace. A dashboard closed long after the last logging used to let the stack stop about 10 seconds later, so a viewer whose SSH tunnel dropped came back to a stopped stack.
 - 2026-10-02: Another build of the catalog's PostgreSQL major release is replaced at the next start instead of refusing every command, which would have stranded every installation at the first catalog change. Stopping no longer fences older launchers out.
+- 2026-10-05: Unreferenced media is deleted 30 days after its last upload (AI-1514); the media store used to grow forever.

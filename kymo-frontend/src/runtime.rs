@@ -72,6 +72,11 @@ pub(crate) fn alerts_url() -> String {
     format!("{}/alerts", config().cdn_origin)
 }
 
+/// Where the bar posts its answer `choice` ("delete" or "keep") to the local collector's question with id `question`, on the same listener (see components/notice_bar.rs).
+pub(crate) fn media_cleanup_url(question: u64, choice: &str) -> String {
+    format!("{}/media-cleanup/{question}/{choice}", config().cdn_origin)
+}
+
 #[cfg(feature = "local-runtime")]
 fn load() -> Result<RuntimeConfig, String> {
     let window = web_sys::window().ok_or("browser window is unavailable")?;

@@ -417,13 +417,13 @@ fn cdn_backend_mode(value: Option<&std::ffi::OsStr>) -> anyhow::Result<CdnBacken
     }
 }
 
-/// Validates the whole CDN env surface up front (docs/cdn-gcs-migration.md: gcs mode with incomplete GCS config fails startup — no silent fallback to the filesystem). `None` is the filesystem store; in gcs mode every credential file is opened and decoded here, before any database work (fail closed, no ambient ADC).
-fn cdn_preflight() -> anyhow::Result<Option<(cdn_store::GcsStore, cdn_gc::Config)>> {
+/// Validates the whole CDN env surface up front (docs/cdn-gcs-migration.md: gcs mode with incomplete GCS config fails startup — no silent fallback to the filesystem). A `None` store is the filesystem store; in gcs mode every credential file is opened and decoded here, before any database work (fail closed, no ambient ADC).
+fn cdn_preflight() -> anyhow::Result<(Option<cdn_store::GcsStore>, cdn_gc::Config)> {
     cdn_store::register_cdn_metrics();
     if cdn_backend_mode(std::env::var_os("KYMO_CDN_BACKEND").as_deref())?
         == CdnBackendMode::Filesystem
     {
-        return Ok(None);
+        return Ok((None, cdn_gc::Config::from_env(None)?));
     }
     let bucket = env::optional_string("KYMO_CDN_GCS_BUCKET")
         .ok_or_else(|| anyhow::anyhow!("KYMO_CDN_BACKEND=gcs requires KYMO_CDN_GCS_BUCKET"))?;
@@ -434,11 +434,11 @@ fn cdn_preflight() -> anyhow::Result<Option<(cdn_store::GcsStore, cdn_gc::Config
             "KYMO_CDN_BACKEND=gcs requires GOOGLE_APPLICATION_CREDENTIALS (a non-empty credential file path)"
         )
     })?;
-    let gc_config = cdn_gc::Config::from_env(&bucket)?;
-    Ok(Some((
-        cdn_store::GcsStore::new(bucket, &credentials)?,
+    let gc_config = cdn_gc::Config::from_env(Some(&bucket))?;
+    Ok((
+        Some(cdn_store::GcsStore::new(bucket, &credentials)?),
         gc_config,
-    )))
+    ))
 }
 
 pub async fn run() -> anyhow::Result<()> {
@@ -461,10 +461,10 @@ pub async fn run() -> anyhow::Result<()> {
     let pg_url = env::string_or("DATABASE_URL", "postgres://mkdb2@localhost:5432/mkdb2");
     let transport = transport::TransportConfig::from_env()?;
     // Hosted only — local-runtime is always the filesystem store and must not be steered by ambient env.
-    let gcs = if matches!(transport, transport::TransportConfig::Hosted { .. }) {
+    let (gcs, gc_config) = if matches!(transport, transport::TransportConfig::Hosted { .. }) {
         cdn_preflight()?
     } else {
-        None
+        (None, cdn_gc::Config::local())
     };
     let local_security = match &transport {
         transport::TransportConfig::Hosted { .. } => None,
@@ -593,18 +593,28 @@ pub async fn run() -> anyhow::Result<()> {
 
     let cdn_root = PathBuf::from(env::string_or("KYMO_CDN_ROOT", "/data/cdn"));
     // The gcs mode has no CDN volume: nothing to create, and the disk gauge is replaced by the collector's bucket inventory gauges (docs/cdn-gcs-migration.md § Observability).
-    let (cdn_store, cdn_disk, cdn_uploads) = match gcs {
+    let (cdn_store, cdn_disk, media) = match gcs {
         None => {
             tokio::fs::create_dir_all(&cdn_root).await?;
             let fs = cdn_store::FsStore::new(cdn_root.clone());
-            (cdn_store::CdnStore::Fs(fs), Some(cdn_root), None)
+            (
+                cdn_store::CdnStore::Fs(fs.clone()),
+                Some(cdn_root),
+                cdn_gc::Media::Files(fs),
+            )
         }
-        Some((gcs, gc_config)) => {
-            let (uploads, collector) = cdn_gc::start(gc_config, gcs.reads(), ch.clone()).await?;
-            collector.spawn();
-            (cdn_store::CdnStore::Gcs(gcs), None, Some(uploads))
+        Some(gcs) => {
+            let reads = gcs.reads();
+            (
+                cdn_store::CdnStore::Gcs(gcs),
+                None,
+                cdn_gc::Media::Bucket(reads),
+            )
         }
     };
+    let (uploads, collector) =
+        cdn_gc::start(gc_config, media, ch.clone(), activity.clone()).await?;
+    let collector_status = collector.spawn();
 
     // ClickHouse's exporter does not cover the CDN volume or this container's
     // cgroup pressure, so publish those gauges from the server process.
@@ -622,7 +632,8 @@ pub async fn run() -> anyhow::Result<()> {
         Arc::new(cdn::CdnState {
             store: cdn_store,
             activity,
-            uploads: cdn_uploads,
+            uploads,
+            collector_status,
         }),
         prom_handle,
     )
