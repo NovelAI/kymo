@@ -77,14 +77,14 @@ impl ShownAxis {
         }
     }
 
-    fn of_options(log_x: bool, options: &RectOptions) -> Self {
+    fn of_options(options: &RectOptions) -> Self {
         use crate::state::layout_config::XAxisMode;
         let time = matches!(
             options.x_axis_mode,
             XAxisMode::RelativeTime | XAxisMode::WallTime
         );
         ShownAxis {
-            log_x,
+            log_x: options.log_x,
             time,
             wall: matches!(options.x_axis_mode, XAxisMode::WallTime),
             x_metric: if time {
@@ -240,6 +240,7 @@ mod shown_axis_tests {
             let options = RectOptions {
                 x_axis_mode: mode,
                 x_axis_metric: metric.to_string(),
+                log_x,
                 ..Default::default()
             };
             // The request the fetch builds from these options.
@@ -254,7 +255,7 @@ mod shown_axis_tests {
                 ..Default::default()
             };
             let shown = ShownAxis::of_request(&request);
-            assert_eq!(shown, ShownAxis::of_options(log_x, &options));
+            assert_eq!(shown, ShownAxis::of_options(&options));
             assert_eq!(request.x_series.is_some(), !use_ts && !metric.is_empty());
             assert_eq!(shown.step_axis(), !use_ts && metric.is_empty());
             assert_eq!(
@@ -348,11 +349,9 @@ mod shown_axis_tests {
 pub(super) fn NumericContent(
     /// The panel's resolved refs, from AutoContent's single resolution pass.
     refs: Memo<Rc<Vec<SeriesRef>>>,
-    #[props(default = false)] log_x: bool,
-    #[props(default = false)] log_y: bool,
-    #[props(default = 280)] chart_height: u32,
-    #[props(default = 0)] color_version: u64,
-    #[props(default)] options: RectOptions,
+    chart_height: u32,
+    color_version: u64,
+    options: RectOptions,
     loading: Signal<bool>,
     zone: Signal<Zone>,
     cache_key: String,
@@ -677,7 +676,7 @@ pub(super) fn NumericContent(
     let shown_axis = chart_to_show
         .as_ref()
         .map(|answer| ShownAxis::of_request(&answer.request))
-        .unwrap_or_else(|| ShownAxis::of_options(log_x, &options));
+        .unwrap_or_else(|| ShownAxis::of_options(&options));
     let x_label = shown_axis.x_label();
     let shown_smoothed = chart_to_show
         .as_ref()
@@ -766,7 +765,7 @@ pub(super) fn NumericContent(
                     // Step charts render log-x as log(x+1), matching the server's bucket ladder (time axes fold their +1ms into the ms->s transform above; custom-x keeps plain log).
                     log_shift: shown_axis.log_x && shown_axis.step_axis(),
                     time_log_shift: time_log_shift,
-                    log_y: log_y,
+                    log_y: options.log_y,
                     height: chart_height,
                     color_version: color_version,
                     smoothed: shown_smoothed,

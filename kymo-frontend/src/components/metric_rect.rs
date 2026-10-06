@@ -599,9 +599,9 @@ fn AutoContent(
     rect_id: String,
     bindings: Vec<MetricBinding>,
     display_type_hint: DisplayType,
-    #[props(default = 280)] chart_height: u32,
-    #[props(default = 0)] color_version: u64,
-    #[props(default)] options: RectOptions,
+    chart_height: u32,
+    color_version: u64,
+    options: RectOptions,
     /// Flipped true while a leaf content's data query is in flight, so the
     /// parent MetricRect can show a spinner and the leaves can gate their
     /// own version-driven refetches against being cancelled mid-flight.
@@ -788,7 +788,7 @@ fn AutoContent(
                 TextStreamViewer { stream_refs: refs.read().to_vec(), height: chart_height, x_axis_mode: crate::state::layout_config::XAxisMode::RelativeTime, zone: Some(zone), persist_key: cache_key.clone() }
             },
             DisplayType::Numeric => rsx! {
-                NumericContent { refs: refs, log_x: options.log_x, log_y: options.log_y, chart_height: chart_height, color_version: color_version, options: options.clone(), loading: loading, zone: zone, cache_key: cache_key.clone() }
+                NumericContent { refs: refs, chart_height: chart_height, color_version: color_version, options: options.clone(), loading: loading, zone: zone, cache_key: cache_key.clone() }
             },
         }
     };
@@ -849,11 +849,11 @@ enum CdnFetch {
 #[component]
 fn CdnContent(
     refs: Memo<Rc<Vec<SeriesRef>>>,
-    #[props(default = 280)] chart_height: u32,
-    #[props(default)] cdn_display_mode: CdnDisplayMode,
+    chart_height: u32,
+    cdn_display_mode: CdnDisplayMode,
     loading: Signal<bool>,
     cdn_class: Signal<Option<String>>,
-    #[props(default = false)] metadata_diff_only: bool,
+    metadata_diff_only: bool,
     zone: Signal<Zone>,
     cache_key: String,
 ) -> Element {

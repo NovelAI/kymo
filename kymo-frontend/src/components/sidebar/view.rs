@@ -226,13 +226,13 @@ pub fn Sidebar() -> Element {
     if let Some(orphan) = color_picker_target.take_if(|target| row_gone(&target.run_id)) {
         picking_color_for.set(None);
         // The picker may own focus; fall back like any other close.
-        focus_run_overflow_trigger(orphan.ordinal, true);
+        focus_run_overflow_trigger(orphan.ordinal);
     }
     // The rename editor closes the same way, including one armed after its row unmounted.
     let mut active_rename = rename_target.read().clone();
     if let Some(orphan) = active_rename.take_if(|target| row_gone(&target.run_id)) {
         rename_target.set(None);
-        focus_run_overflow_trigger(orphan.ordinal, true);
+        focus_run_overflow_trigger(orphan.ordinal);
     }
     let selected = state.selected_runs.read();
     let pending_count = pending_trash.len();
@@ -417,12 +417,13 @@ pub fn Sidebar() -> Element {
             div { class: "sidebar-resize" }
         }
 
-        if let Some(ColorPickerTarget { run_id, run_label, ordinal }) = color_picker_target {
+        if let Some(ColorPickerTarget { run_id, run_label, ordinal, opened }) = color_picker_target {
             {
                 let color = run_color(&run_id, ordinal);
                 let (color_run_id, opened_color) = (run_id.clone(), color.clone());
                 rsx! {
                     ColorPicker {
+                        key: "{opened}",
                         run_id,
                         run_label,
                         current_color: color,
@@ -434,9 +435,7 @@ pub fn Sidebar() -> Element {
                                 let v = *state.color_version.read();
                                 state.color_version.set(v + 1);
                             }
-                            // Pointer light-dismiss may already have moved focus
-                            // to another control; do not steal it back.
-                            focus_run_overflow_trigger(ordinal, true);
+                            focus_run_overflow_trigger(ordinal);
                         },
                     }
                 }
@@ -483,15 +482,16 @@ impl RowContext {
     fn in_sidebar(self, f: impl FnOnce()) {
         Runtime::current().in_scope(self.sidebar, f)
     }
+}
 
-    /// Finish the native dismissal of a row's overflow menu, then `act`.
-    fn after_menu_hides(self, ordinal: u64, act: impl FnOnce() + 'static) {
-        self.in_sidebar(|| {
-            spawn(async move {
-                hide_run_popover(&format!("run-overflow-menu-{ordinal}")).await;
-                act();
-            });
-        });
+/// Hide a row's overflow menu, which hands focus back to its ⋯ when focus was inside.
+fn hide_run_menu(ordinal: u64) {
+    if let Some(menu) = web_sys::window().and_then(|window| {
+        window
+            .document()?
+            .get_element_by_id(&format!("run-overflow-menu-{ordinal}"))
+    }) {
+        let _ = menu.unchecked_into::<web_sys::HtmlElement>().hide_popover();
     }
 }
 
@@ -718,7 +718,7 @@ fn RunRow(
                             on_close: move |restore_focus: bool| {
                                 rename_target.set(None);
                                 if restore_focus {
-                                    row.in_sidebar(|| focus_run_overflow_trigger(ordinal, false));
+                                    focus_run_overflow_trigger(ordinal);
                                 }
                             },
                             on_renamed: move |run_name: String| {
@@ -754,9 +754,6 @@ fn RunRow(
                     aria_controls: "{menu_id}",
                     popovertarget: "{menu_id}",
                     popovertargetaction: "toggle",
-                    onmousedown: primary(move |e: Event<MouseData>| {
-                        e.stop_propagation();
-                    }),
                     MoreIcon {}
                 }
                 div {
@@ -766,13 +763,16 @@ fn RunRow(
                     popover: "auto",
                     role: "dialog",
                     aria_label: "Actions for {display_name}",
+                    // A press's default action focuses what it lands on, or <body> when that can't take focus (the divider, a button in WebKit, or an item, which hides this menu on press). Cancelling every press here keeps focus where it was or where the item put it: the picker, the rename input, or the ⋯ the hiding menu hands it back to. Anything added here must let its press bubble to this handler, and a field here could not be focused by clicking it.
+                    onmousedown: |e| e.prevent_default(),
                     button {
                         autofocus: true,
-                        popovertarget: "{menu_id}",
-                        popovertargetaction: "hide",
                         onmousedown: primary({
                             let copied_name = run.run_name.clone();
-                            move |_| crate::util::clipboard::write_text(&copied_name)
+                            move |_| {
+                                crate::util::clipboard::write_text(&copied_name);
+                                hide_run_menu(ordinal);
+                            }
                         }),
                         "Copy run name"
                     }
@@ -788,24 +788,26 @@ fn RunRow(
                             move |_| {
                                 trash_feedback.set(String::new());
                                 action_feedback.set(String::new());
-                                let target = target.clone();
-                                row.after_menu_hides(ordinal, move || rename_target.set(Some(target)));
+                                hide_run_menu(ordinal);
+                                rename_target.set(Some(target.clone()));
                             }
                         }),
                         "Rename"
                     }
                     button {
                         onmousedown: primary({
-                            let target = ColorPickerTarget {
-                                run_id: run.run_id.clone(),
-                                run_label: display_name.clone(),
-                                ordinal,
-                            };
+                            let (run_id, run_label) = (run.run_id.clone(), display_name.clone());
                             move |_| {
                                 action_feedback.set(String::new());
-                                let target = target.clone();
                                 // The picker is anchored to the row trigger, so pointer and keyboard activation place it identically after the menu exits.
-                                row.after_menu_hides(ordinal, move || picking_color_for.set(Some(target)));
+                                hide_run_menu(ordinal);
+                                let opened = picking_color_for.peek().as_ref().map_or(0, |target| target.opened + 1);
+                                picking_color_for.set(Some(ColorPickerTarget {
+                                    run_id: run_id.clone(),
+                                    run_label: run_label.clone(),
+                                    ordinal,
+                                    opened,
+                                }));
                             }
                         }),
                         span {
@@ -817,16 +819,12 @@ fn RunRow(
                     }
                     div { class: "run-overflow-divider" }
                     button {
-                        popovertarget: "{menu_id}",
-                        popovertargetaction: "hide",
                         onmousedown: primary({
                             let project_id = run.project_id.clone();
                             let run_id = run.run_id.clone();
                             move |_| {
-                                let (project_id, run_id) = (project_id.clone(), run_id.clone());
-                                row.after_menu_hides(ordinal, move || {
-                                    submit_trash_runs(project_id, vec![run_id], mutation_ui)
-                                });
+                                hide_run_menu(ordinal);
+                                row.in_sidebar(|| submit_trash_runs(project_id.clone(), vec![run_id.clone()], mutation_ui));
                             }
                         }),
                         TrashIcon {}

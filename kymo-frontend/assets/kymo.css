@@ -1587,6 +1587,8 @@ input[type="checkbox"]:checked::before {
 .cdn-image-item img {
     width: 100%;
     height: auto;
+    /* A loaded image keeps its own ratio; one missing (404) or still loading has none and gets a square (capped by max-height) instead of a 2px line: nothing to see, click or ring when focused. */
+    aspect-ratio: auto 1 / 1;
     max-height: 240px;
     object-fit: contain;
     cursor: pointer;

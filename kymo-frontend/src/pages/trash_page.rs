@@ -14,7 +14,7 @@ use crate::state::trash::{
     clock_wait_ms, compact_duration, effective_lifecycle, extrapolated_now_ms, lookup_trashed_runs,
     monotonic_now_ms,
 };
-use crate::util::{local_time, primary};
+use crate::util::{js_bridge::js_string, local_time, primary};
 
 const TRASH_PAGE_SIZE: u32 = 100;
 const RESTORE: &str = "Restore";
@@ -112,9 +112,8 @@ async fn remove_trash_row_with_focus(
     project_id: &str,
     run_id: &str,
 ) {
-    let encoded_project_id =
-        serde_json::to_string(project_id).unwrap_or_else(|_| "\"\"".to_string());
-    let encoded_run_id = serde_json::to_string(run_id).unwrap_or_else(|_| "\"\"".to_string());
+    let encoded_project_id = js_string(project_id);
+    let encoded_run_id = js_string(run_id);
     let script = format!(
         "(()=>{{\
             const rows=[...document.querySelectorAll('tr.trash-run')];\

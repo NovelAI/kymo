@@ -9,6 +9,7 @@ use dioxus::core::Task;
 use dioxus::html::input_data::MouseButton;
 use dioxus::prelude::*;
 use dioxus::web::WebEventExt;
+use wasm_bindgen::JsCast;
 
 use crate::components::color_picker::ColorPicker;
 use crate::components::icons::{CloseIcon, MoreIcon, TrashIcon};
@@ -56,11 +57,13 @@ struct RenameRunTarget {
     ordinal: u64,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 struct ColorPickerTarget {
     run_id: String,
     run_label: String,
     ordinal: u64,
+    /// Numbers each "Change color…" to key the picker: a browser can hide an open popover without its toggle event (WebKit's showModal and element fullscreen), and only a fresh mount shows it again.
+    opened: u64,
 }
 
 /// Whether any name repeats; callers then give every entry its "#ordinal", not just the repeats.
@@ -499,7 +502,7 @@ fn close_trash_picker(
 
 /// The id of the ⋯ trigger that inherits focus from `run_id`'s row as it is trashed: the next row's, else the previous row's, else empty (the run filter takes it). The rows are the run list's only elements, so a row's element siblings are its neighbours.
 ///
-/// `None` unless focus is on that row's ⋯ (bulk mode draws none), where the closing menu hands it back. A Safari click leaves it on the page instead; a reply landing within a frame of the press can still find it on the menu's first item (inside the row), and one landing later may find it wherever the user moved on to.
+/// `None` unless focus is on that row's ⋯ (bulk mode draws none), where the closing menu hands it back. After a Safari click it is instead on the hidden menu's first item (inside the row) for about a frame, then on the page; a later reply may find it wherever the user moved on to.
 fn row_focus_heir(run_id: &str) -> Option<String> {
     let trigger = web_sys::window()?.document()?.active_element()?;
     if !trigger.matches(".run-overflow-trigger").ok()? {
@@ -525,37 +528,27 @@ fn focus_when_mounted(
 ) {
     let primary_id = js_string(primary_id);
     let fallback_selector = fallback_selector.map_or_else(|| "null".to_string(), js_string);
-    spawn(async move {
-        let _ = document::eval(&format!(
-            "(()=>{{\
-                let attempts=0;\
-                const focus=()=>{{\
-                    if({preserve_existing_focus}&&document.activeElement&&document.activeElement!==document.body)return;\
-                    const target=document.getElementById({primary_id})\
-                        ||({fallback_selector}&&document.querySelector({fallback_selector}));\
-                    if(target){{target.focus();return;}}\
-                    if(attempts++<10)requestAnimationFrame(focus);\
-                }};\
-                requestAnimationFrame(focus);\
-            }})()"
-        ))
-        .await;
-    });
-}
-
-async fn hide_run_popover(menu_id: &str) {
-    let menu_id = js_string(menu_id);
     let _ = document::eval(&format!(
-        "try{{document.getElementById({menu_id})?.hidePopover()}}catch(_){{}}"
-    ))
-    .await;
+        "(()=>{{\
+            let attempts=0;\
+            const focus=()=>{{\
+                if({preserve_existing_focus}&&document.activeElement&&document.activeElement!==document.body)return;\
+                const target=document.getElementById({primary_id})\
+                    ||({fallback_selector}&&document.querySelector({fallback_selector}));\
+                if(target){{target.focus();return;}}\
+                if(attempts++<10)requestAnimationFrame(focus);\
+            }};\
+            requestAnimationFrame(focus);\
+        }})()"
+    ));
 }
 
-fn focus_run_overflow_trigger(ordinal: u64, preserve_existing_focus: bool) {
+/// Focus the row's ⋯ (the run filter once the row is gone) when focus was lost, not when the user already moved it: pressing a control while a rename reply was pending, or light-dismissing the picker onto one.
+fn focus_run_overflow_trigger(ordinal: u64) {
     focus_when_mounted(
         &format!("run-overflow-trigger-{ordinal}"),
         Some(".sidebar-filter:not(:disabled)"),
-        preserve_existing_focus,
+        true,
     );
 }
 
@@ -613,8 +606,7 @@ fn InlineRunRename(
     } else {
         String::new()
     };
-    let input_id = format!("run-rename-input-{}", target.ordinal);
-    let error_id = format!("{input_id}-error");
+    let error_id = format!("run-rename-error-{}", target.ordinal);
 
     let submit = {
         let target = target.clone();
@@ -702,7 +694,6 @@ fn InlineRunRename(
             class: "run-name-host run-name-inline-host",
             aria_busy: *busy.read(),
             input {
-                id: "{input_id}",
                 class: if validation_error.is_empty() {
                     "run-name-inline-input"
                 } else {
@@ -715,18 +706,11 @@ fn InlineRunRename(
                 aria_invalid: (!validation_error.is_empty()).then_some("true"),
                 aria_describedby: (!validation_error.is_empty()).then_some(error_id.as_str()),
                 title: (!validation_error.is_empty()).then_some(validation_error.as_str()),
-                onmounted: {
-                    let input_id = input_id.clone();
-                    move |_| {
-                        let input_id = serde_json::to_string(&input_id)
-                            .unwrap_or_else(|_| "\"\"".to_string());
-                        spawn(async move {
-                            let _ = document::eval(&format!(
-                                "requestAnimationFrame(()=>{{const input=document.getElementById({input_id});if(input){{input.focus();input.select()}}}})"
-                            ))
-                            .await;
-                        });
-                    }
+                // Focused at once: the overflow menu cancels the default action of the press on Rename (view.rs), which would blur the input, and a blur ends the rename.
+                onmounted: move |e| {
+                    let input = e.as_web_event().unchecked_into::<web_sys::HtmlInputElement>();
+                    let _ = input.focus();
+                    input.select();
                 },
                 oninput: move |e: Event<FormData>| {
                     draft.set(e.value());

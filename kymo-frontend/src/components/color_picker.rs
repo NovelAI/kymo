@@ -1,6 +1,6 @@
 use dioxus::prelude::*;
 use dioxus::web::WebEventExt;
-use wasm_bindgen::JsValue;
+use wasm_bindgen::JsCast;
 
 use crate::components::uplot_chart::PALETTE;
 use crate::util::{local_storage, primary};
@@ -15,42 +15,24 @@ pub fn ColorPicker(
 ) -> Element {
     let storage_key = format!("kymo_color_{}", run_id);
     let legacy_storage_key = format!("mkdb2_color_{}", run_id);
-    let picker_id = format!("run-color-picker-{anchor_ordinal}");
     let dialog_label = format!("Color for {run_label}");
 
     rsx! {
         div {
-            id: "{picker_id}",
             class: "color-picker",
             style: "position-anchor: --run-overflow-{anchor_ordinal};",
             popover: "auto",
             role: "dialog",
             aria_label: "{dialog_label}",
             tabindex: "-1",
-            onmounted: {
-                let picker_id = picker_id.clone();
-                move |_| {
-                    let picker_id = serde_json::to_string(&picker_id)
-                        .unwrap_or_else(|_| "\"\"".to_string());
-                    spawn(async move {
-                        let _ = document::eval(&format!(
-                            "const picker=document.getElementById({picker_id});\
-                             picker?.showPopover();\
-                             picker?.focus();"
-                        ))
-                        .await;
-                    });
-                }
+            onmounted: move |e| {
+                let picker = e.as_web_event().unchecked_into::<web_sys::HtmlElement>();
+                let _ = picker.show_popover();
+                let _ = picker.focus();
             },
             ontoggle: move |e: Event<ToggleData>| {
-                let event = e.data().as_web_event();
-                let new_state = js_sys::Reflect::get(
-                    event.as_ref(),
-                    &JsValue::from_str("newState"),
-                )
-                .ok()
-                .and_then(|value| value.as_string());
-                if new_state.as_deref() == Some("closed") {
+                let event = e.as_web_event().unchecked_into::<web_sys::ToggleEvent>();
+                if event.new_state() == "closed" {
                     on_close.call(());
                 }
             },
@@ -60,22 +42,20 @@ pub fn ColorPicker(
             }
 
             div { class: "color-picker-palette",
-                for color in PALETTE.iter() {
+                for color in PALETTE.iter().copied() {
                     {
-                        let c = (*color).to_string();
-                        let c2 = c.clone();
                         let key = storage_key.clone();
                         let legacy_key = legacy_storage_key.clone();
-                        let active = current_color == c;
+                        let active = current_color == color;
                         rsx! {
                             button {
                                 class: if active { "color-swatch color-swatch-active" } else { "color-swatch" },
-                                style: "background: {c};",
-                                title: "Use {c}",
-                                aria_label: "Use color {c}",
+                                style: "background: {color};",
+                                title: "Use {color}",
+                                aria_label: "Use color {color}",
                                 aria_pressed: active,
                                 onmousedown: primary(move |_| {
-                                    local_storage::set_migrating(&key, &legacy_key, &c2);
+                                    local_storage::set_migrating(&key, &legacy_key, color);
                                     on_close.call(());
                                 }),
                             }

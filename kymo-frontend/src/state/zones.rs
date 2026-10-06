@@ -16,7 +16,7 @@ const st=new Map();
 const dirty=new Map();
 let scheduled=false;
 function flush(){scheduled=false;if(!dirty.size)return;const b=[...dirty];dirty.clear();try{dioxus.send(b);}catch(_){td();}}
-function queue(s){if(s.v===null||s.n===null)return;dirty.set(s.id,s.v?(locked?1:2):(s.n?1:0));if(!scheduled){scheduled=true;requestAnimationFrame(flush);}}
+function queue(s){if(s.v===null||s.n===null)return;dirty.set(s.id,s.v?(covered?1:2):(s.n?1:0));if(!scheduled){scheduled=true;requestAnimationFrame(flush);}}
 function cb(k){return function(es){for(const e of es){const s=st.get(e.target);if(s){s[k]=e.isIntersecting;queue(s);}}};}
 // Root at the SCROLL CONTAINER, not the viewport: targets are clipped by
 // every scrollable ancestor BEFORE intersecting the (margin-expanded)
@@ -26,9 +26,9 @@ function cb(k){return function(es){for(const e of es){const s=st.get(e.target);i
 const sc=document.querySelector('main.main-content');
 const vo=new IntersectionObserver(cb('v'),{root:sc});
 const no=new IntersectionObserver(cb('n'),{root:sc,rootMargin:'100% 0px 100% 0px'});
-// Occlusion: IntersectionObserver is geometry-only — z-order is not an input, so the maximize overlay covering the grid fires no events. The scroll container is inert exactly while the overlay is up (dashboard_layout.rs), and intersecting slots then cap at Near: canvases unmount (leaving the cursor-sync and highlight-redraw loops to the overlay chart) but data stays warm for an instant close. Only intersecting slots' codes depend on the lock, so a flip re-queues exactly those — every queued entry is a real change.
-let locked=!!sc&&sc.hasAttribute('inert');
-const lo=new MutationObserver(function(){const l=sc.hasAttribute('inert');if(l!==locked){locked=l;for(const s of st.values())if(s.v)queue(s);}});
+// Occlusion: IntersectionObserver is geometry-only — z-order is not an input, so the maximize overlay covering the grid fires no events. The scroll container is inert exactly while the overlay is up (dashboard_layout.rs), and intersecting slots then cap at Near: canvases unmount (leaving the cursor-sync and highlight-redraw loops to the overlay chart) but data stays warm for an instant close. Only intersecting slots' codes depend on `covered`, so a flip re-queues exactly those — every queued entry is a real change.
+let covered=!!sc&&sc.hasAttribute('inert');
+const lo=new MutationObserver(function(){const c=sc.hasAttribute('inert');if(c!==covered){covered=c;for(const s of st.values())if(s.v)queue(s);}});
 if(sc)lo.observe(sc,{attributes:true,attributeFilter:['inert']});
 function add(el){if(st.has(el))return;st.set(el,{id:el.dataset.slotId,v:null,n:null});vo.observe(el);no.observe(el);}
 function rm(el){if(st.delete(el)){vo.unobserve(el);no.unobserve(el);}}
