@@ -36,20 +36,20 @@ const EXPLICIT_METADATA_RETRY: Duration = Duration::from_secs(5);
 /// Available chart height after the measured content area and font-sized chrome.
 static MAXIMIZED_CHART_HEIGHT: GlobalSignal<u32> = Signal::global(|| 280);
 
-/// First measurement immediate, later ones debounced 100 ms so a window drag settles before the maximized chart follows. Mounted through the js_bridge registry so an unmounted layout never leaves an observer and its timer alive.
+/// Sent at once for the first measurement (a `?chart=` link opens maximized) and while no chart is maximized, so a maximize is built at the window's height instead of being rebuilt when a delayed measurement lands; debounced 100 ms while one is, so a window drag settles before the maximized chart follows. Mounted through the js_bridge registry so an unmounted layout never leaves an observer and its timer alive.
 const MAXIMIZE_RESIZE_JS: &str = r#"(()=>{
-const el=document.querySelector('.main-wrap');if(!el)return;
+const el=document.querySelector('.main-wrap');
 let last=-1,t=0;
 function send(){
   const style=getComputedStyle(el);
-  // Match .maximize-overlay padding and .metric-rect's padding + 1lh title.
+  // Match .maximize-overlay padding and .metric-rect's padding + 1lh title; .main-wrap already excludes the navbar and any notice bar.
   const chrome=2*parseFloat(style.getPropertyValue('--spacing-md'))
     +2*parseFloat(style.getPropertyValue('--spacing-xs'))+parseFloat(style.lineHeight);
   const h=Math.max(0,Math.floor(el.clientHeight-chrome));
   // A NaN frame (e.g. a stylesheet that failed to load) would close the Rust u32 receiver.
   if(!Number.isFinite(h)||h===last)return;last=h;dioxus.send(h);
 }
-const ro=new ResizeObserver(()=>{clearTimeout(t);if(last<0)send();else t=setTimeout(send,100);});
+const ro=new ResizeObserver(()=>{clearTimeout(t);if(last<0||!document.getElementById(__MAXIMIZE_OVERLAY_ID__))send();else t=setTimeout(send,100);});
 window.__kymo_bridges.mount(__BRIDGE_NAME__,__BRIDGE_OWNER__,()=>{clearTimeout(t);ro.disconnect();});
 ro.observe(el);
 })()"#;
@@ -643,7 +643,9 @@ pub fn DashboardLayout(project_id: String) -> Element {
         div {
             class: "app-shell",
             onmounted: move |_| {
-                let js = maximize_bridge.script(MAXIMIZE_RESIZE_JS);
+                let js = maximize_bridge
+                    .script(MAXIMIZE_RESIZE_JS)
+                    .replace("__MAXIMIZE_OVERLAY_ID__", &js_string(MAXIMIZE_OVERLAY_ID));
                 spawn(async move {
                     let mut eval = document::eval(&js);
                     while let Ok(height) = eval.recv::<u32>().await {
@@ -720,7 +722,6 @@ fn MaximizeOverlay() -> Element {
     };
     let rect_id = rect_config.id.clone();
 
-    // The content area already excludes the navbar and any notice bar.
     let chart_height = *MAXIMIZED_CHART_HEIGHT.read();
 
     rsx! {

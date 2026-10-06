@@ -524,35 +524,6 @@ def record_scroll_restores(element: ElementHandle) -> None:
     )
 
 
-def await_tall_request(
-    page: Page, fixture: Fixture, element: ElementHandle, since: int
-):
-    """Return the first request planned at the tall height; the overlay can mount at its old height before the debounced maximize bridge resizes it."""
-
-    def planned():
-        height, line_height = element.evaluate(
-            "element => [element.offsetHeight, parseFloat(getComputedStyle(element).getPropertyValue('--kymo-text-line-height'))]"
-        )
-        if height <= VIEWPORT["height"]:
-            return None
-        limit = math.ceil(height / line_height) + 3 * BAND
-        return next(
-            (
-                query
-                for query in fixture.primary_queries(since, RUNS[0])
-                if query.line_limit == limit
-            ),
-            None,
-        )
-
-    wait_until(
-        page,
-        lambda: planned() is not None,
-        "the maximized log never planned for the taller viewport",
-    )
-    return planned()
-
-
 def tall_tail_restore(page: Page, fixture: Fixture, maximized: dict) -> None:
     page.locator(GRID).get_by_title("Maximize", exact=True).click()
     expect_position(page, body(page, OVERLAY), maximized)
@@ -565,18 +536,22 @@ def tall_tail_restore(page: Page, fixture: Fixture, maximized: dict) -> None:
         with fixture.holding():
             page.locator(GRID).get_by_title("Maximize", exact=True).click()
             element = body(page, OVERLAY).element_handle()
-            saved_band = await_tall_request(page, fixture, element, since)
-            start = next(
-                index
-                for index, query in enumerate(fixture.queries)
-                if query is saved_band
+            await_pending(page, fixture, 1)
+            saved_band = fixture.primary_queries(since, RUNS[0])[0]
+            height, line_height = element.evaluate(
+                "element => [element.offsetHeight, parseFloat(getComputedStyle(element).getPropertyValue('--kymo-text-line-height'))]"
             )
+            # A maximize right after a window resize mounts at the new height, so its first request already plans for the taller viewport.
+            assert (
+                height > VIEWPORT["height"]
+                and saved_band.line_limit == math.ceil(height / line_height) + 3 * BAND
+            ), (height, bands([saved_band]))
             record_scroll_restores(element)
             observed.append(element)
             fixture.release()
             fixture.hold = True
             await_pending(page, fixture, 1)
-            correction = fixture.primary_queries(start, RUNS[0])[-1]
+            correction = fixture.primary_queries(since, RUNS[0])[-1]
             assert (
                 correction.line_limit == saved_band.line_limit
                 and correction.line_offset < saved_band.line_offset
@@ -618,7 +593,7 @@ def tall_tail_restore(page: Page, fixture: Fixture, maximized: dict) -> None:
                 3 * BAND,
             )
             assert position(body(page, OVERLAY))["count"] <= max_rows
-            queries = fixture.primary_queries(start, RUNS[0])
+            queries = fixture.primary_queries(since, RUNS[0])
             assert 1 < len(queries) <= 4, bands(queries)
     finally:
         for element in observed:

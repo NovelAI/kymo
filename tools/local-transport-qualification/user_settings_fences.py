@@ -555,13 +555,21 @@ def run_fences(page: Page, *, dashboard_path: str | None = None) -> None:
             raise AssertionError(f"narrow options panel is misplaced: {laid}")
         close_panel(page, panel, defaults, "Escape")
 
+        # A maximize right after a window resize builds its chart once, at the new height, and one already maximized follows the window. A chart built at a stale height fits only once built again (its container doesn't size it), which drops the readout under the pointer, so the first instance must be the one that fits.
+        page.set_viewport_size({"width": 640, "height": 1_100})
         page.locator('.metric-rect button[title="Maximize"]').first.click()
-        for height in (900, 700):
-            page.set_viewport_size({"width": 640, "height": height})
-            assert_maximized_chart_fits(page)
+        built = page.wait_for_function(
+            "() => Object.values(window.__kymo_charts).find(chart => chart.root.closest('.maximize-content'))"
+        )
+        assert_maximized_chart_fits(page)
+        # uPlot's destroy() removes the root it built.
+        assert built.evaluate("chart => chart.root.isConnected"), (
+            "the maximized chart was rebuilt after the window resize"
+        )
+        page.set_viewport_size({"width": 640, "height": 900})
+        assert_maximized_chart_fits(page)
         page.keyboard.press("Escape")
         page.locator(".maximize-overlay").wait_for(state="detached")
-        page.set_viewport_size({"width": 640, "height": 900})
         assert_large_log_geometry(page)
         page.goto(origin + "trash", wait_until="domcontentloaded")
         wait_font(page, 24)
