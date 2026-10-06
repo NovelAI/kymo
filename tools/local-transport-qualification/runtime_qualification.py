@@ -231,6 +231,12 @@ def offline_browser():
         web_socket.on("framesent", lambda _: frame_proven.add(web_socket))
         web_socket.on("framereceived", lambda _: frame_proven.add(web_socket))
 
+    # Routes go on each tab, not its context: a fence's own page route falling back into a context route breaks the page (Playwright 1.60).
+    def watch_tab(tab):
+        tab.on("request", lambda request: requests.append(request.url))
+        tab.on("websocket", record_web_socket)
+        tab.route("**/*", route_request)
+
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
         page = browser.new_page()
@@ -249,9 +255,7 @@ def offline_browser():
             urllib.parse.urlsplit(endpoints["dashboard_origin"]).port,
             urllib.parse.urlsplit(endpoints["cdn_origin"]).port,
         }
-        page.route("**/*", route_request)
-        page.on("request", lambda request: requests.append(request.url))
-        page.on("websocket", record_web_socket)
+        watch_tab(page)
         page.goto(
             endpoints["dashboard_origin"] + "/browser-e2e/browser-e2e",
             wait_until="domcontentloaded",
@@ -271,10 +275,10 @@ def offline_browser():
 
         # Isolated fence pages preserve this primary frontend socket. Failures are deferred until the network, idle-stop and process-leak audits finish.
         def run_fence_page(path, runner, success, *, viewport=None):
-            page = browser.new_page(viewport=viewport, device_scale_factor=1)
-            page.route("**/*", route_request)
-            page.on("request", lambda request: requests.append(request.url))
-            page.on("websocket", record_web_socket)
+            # A context of its own, so a fence can open a second tab (Playwright refuses one in a page's own context); every tab is watched.
+            context = browser.new_context(viewport=viewport, device_scale_factor=1)
+            context.on("page", watch_tab)
+            page = context.new_page()
             try:
                 page.goto(
                     endpoints["dashboard_origin"] + path, wait_until="domcontentloaded"
@@ -284,7 +288,7 @@ def offline_browser():
             except Exception as error:
                 fence_errors.append(error)
             finally:
-                page.close()
+                context.close()
 
         run_fence_page(
             "/browser-e2e",

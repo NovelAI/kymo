@@ -13,7 +13,7 @@ use crate::components::uplot_chart::ZoomBridge;
 use crate::grpc::proto::{MetricInfo, RunLifecycleState};
 use crate::route::{focus_chart, Route};
 use crate::state::app_state::{request_refresh, ExplicitRunKey, ExplicitRunMetadata};
-use crate::state::layout_config::{resolve_rect_locally, RunRef};
+use crate::state::layout_config::RunRef;
 use crate::state::push::PushBridge;
 use crate::state::visibility::{
     is_terminal_run_status, retry_visible, retry_visible_run, visible_attempt,
@@ -24,7 +24,8 @@ use crate::state::{
     PanelTarget,
 };
 use crate::util::{
-    focus_on_mount, js_bridge::js_string, primary, MAXIMIZE_OVERLAY_ID, TOP_LAYER_SELECTOR,
+    focus_is_within, focus_on_mount, js_bridge::js_string, primary, MAXIMIZE_OVERLAY_ID,
+    OPTIONS_PANEL_ID, TOP_LAYER_SELECTOR,
 };
 
 const EXPLICIT_METADATA_CONCURRENCY: usize = 16;
@@ -356,7 +357,6 @@ pub fn DashboardLayout(project_id: String) -> Element {
 
     // URL → overlay: `?chart=<rect id>` is the maximize overlay's source of truth — chart links open focused, and every dismissal goes through `focus_chart`, which rewrites the param and lands back here.
     use_effect(use_reactive((&route.chart_param(),), move |(param,)| {
-        let layout = state.layout_config.read().clone();
         let mut maximized = state.maximized;
         match param {
             None => {
@@ -375,29 +375,26 @@ pub fn DashboardLayout(project_id: String) -> Element {
                     _ => {}
                 }
             }
-            // The loaded layout is the authority, but a chart link must not wait for its metrics sweep (tens of seconds on big projects), so until it holds the rect this falls back to `resolve_rect_locally`.
+            // The loaded layout is the authority, but a chart link must not wait for its metrics sweep (tens of seconds on big projects), so until it holds the rect this falls back to `DashboardState::fresh_rect`'s local resolve.
             // Once open, the overlay is left alone: it re-resolves against the live layout each render, upgrading a fallback config when the sweep lands.
             Some(id) => {
                 if maximized.peek().as_ref().is_some_and(|m| m.id == id) {
                     return;
                 }
-                let resolved = layout
-                    .as_ref()
-                    .and_then(|l| l.find_rect(&id).cloned())
-                    .or_else(|| resolve_rect_locally(&state.peek_diff(), &id));
+                // Peeks (see `fresh_rect`): only the param drives this. A layout change while a dismissal's history pop is pending would otherwise maximize the chart again for a render.
+                let resolved = state.fresh_rect(&id);
                 if let Some(config) = resolved {
-                    // The maximize moved to another chart (←/→), and a chart panel follows it there.
+                    // The maximize moved to another chart (←/→), and a chart panel follows it there, taking focus only if the one still showing holds it.
                     let mut panel = state.options_panel;
-                    let follower = panel.peek().clone().filter(|p| {
-                        p.target == PanelTarget::Chart
-                            && !p.follows_chart
-                            && maximized.peek().is_some()
-                    });
+                    let follower = panel
+                        .peek()
+                        .clone()
+                        .filter(|p| p.target == PanelTarget::Chart && maximized.peek().is_some());
                     if let Some(p) = follower {
-                        panel.set(Some(OpenPanel {
-                            follows_chart: true,
-                            ..p
-                        }));
+                        let take_focus = focus_is_within(OPTIONS_PANEL_ID);
+                        if p.take_focus != take_focus {
+                            panel.set(Some(OpenPanel { take_focus, ..p }));
+                        }
                     }
                     maximized.set(Some(config));
                 }
@@ -684,12 +681,7 @@ pub fn DashboardLayout(project_id: String) -> Element {
     }
 }
 
-/// Overlay beside `<main>` that fills its column while the sidebar stays visible.
-/// `DashboardState::maximized` holds a snapshot for fallback, but the rect
-/// is re-resolved against the live layout each render, so edits land
-/// against current values rather than the (possibly drifted) snapshot
-/// taken when the overlay opened; edits route through
-/// `DashboardState::edit_maximized_rect`.
+/// Overlay beside `<main>` that fills its column while the sidebar stays visible, showing [`DashboardState::maximized_rect`].
 #[component]
 fn MaximizeOverlay() -> Element {
     let state = use_context::<DashboardState>();
@@ -723,17 +715,10 @@ fn MaximizeOverlay() -> Element {
         }
     });
 
-    let Some(snapshot) = maximized_signal.read().clone() else {
+    let Some((rect_config, _)) = state.maximized_rect() else {
         return rsx! {};
     };
-
-    let rect_id = snapshot.id.clone();
-    let rect_config = state
-        .layout_config
-        .read()
-        .as_ref()
-        .and_then(|l| l.find_rect(&rect_id).cloned())
-        .unwrap_or(snapshot);
+    let rect_id = rect_config.id.clone();
 
     // The content area already excludes the navbar and any notice bar.
     let chart_height = *MAXIMIZED_CHART_HEIGHT.read();
@@ -757,7 +742,10 @@ fn MaximizeOverlay() -> Element {
                 }
             },
             // Dismiss on click (mouseup) can be annoying if you drag the x-axis and release in the border.
-            onmousedown: primary(move |_| focus_chart(None)),
+            onmousedown: primary(move |_| {
+                crate::util::panel_moved();
+                focus_chart(None)
+            }),
             div {
                 class: "maximize-content",
                 onmousedown: move |e| e.stop_propagation(),
@@ -768,19 +756,6 @@ fn MaximizeOverlay() -> Element {
                         config: rect_config.clone(),
                         chart_height: chart_height,
                         is_maximized: true,
-                        on_rename: {
-                            let id = id.clone();
-                            move |label: String| {
-                                state.edit_maximized_rect(&id, |diff, base| {
-                                    diff.edit_rect(base, &id, |r| r.label = label)
-                                })
-                            }
-                        },
-                        on_delete: move |_| {
-                            state.delete_rect(&id);
-                            focus_chart(None);
-                        },
-                        on_resize: move |_| {},
                     }
                 }
             }

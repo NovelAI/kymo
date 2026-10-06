@@ -14,7 +14,6 @@ from playwright.sync_api import Page, expect, sync_playwright
 from fences_common import drag_handle
 from user_settings_fences import (
     VIEWPORT,
-    close_settings,
     open_settings,
     set_font_size,
     wait_font,
@@ -170,12 +169,11 @@ def run_fences(page: Page, origin: str) -> None:
     wait_font(page, 20)
     open_settings(page)
     set_font_size(page, 18)
-    close_settings(page)
     config = json.loads(
         migrated("kymo_user_config_v1", "mkdb2_user_config_v1")["kymo_user_config_v1"]
     )
     assert config.get("font_size") == 18 and config.get("show_nearest_point") is True, (
-        f"the first settings save dropped legacy fields: {config}"
+        f"the first saved change dropped legacy fields: {config}"
     )
 
     # The color was only read, so its legacy key must survive untouched.

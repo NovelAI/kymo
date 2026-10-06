@@ -23,6 +23,11 @@ def options_panel(page: Page, name: str) -> Locator:
     return page.get_by_role("complementary", name=name, exact=True)
 
 
+def panel_body(panel: Locator) -> Locator:
+    """The panel's scrolling body, which takes the panel's focus so the keyboard scrolls it."""
+    return panel.locator(".options-panel-body")
+
+
 def open_editor(
     page: Page, trigger: Locator, name: str, *, key: str | None = None
 ) -> Locator:
@@ -32,7 +37,7 @@ def open_editor(
         trigger.press(key)
     panel = options_panel(page, name)
     expect(panel).to_be_visible()
-    expect(panel).to_be_focused()
+    expect(panel_body(panel)).to_be_focused()
     return panel
 
 
@@ -48,6 +53,27 @@ def close_panel(page: Page, panel: Locator, trigger: Locator, how: str) -> None:
         panel.get_by_role("button", name="Close", exact=True).click()
     expect(panel).to_have_count(0)
     expect(trigger).to_be_focused()
+
+
+def count_presses(page: Page) -> None:
+    """Zero `window.__kymo_presses`, the count of presses that reach the page wherever they land, counting from the first call."""
+    page.evaluate(
+        """() => {
+            if (window.__kymo_presses === undefined)
+                document.addEventListener('mousedown', () => window.__kymo_presses++);
+            window.__kymo_presses = 0;
+        }"""
+    )
+
+
+def double_click_acts_once(page: Page, target: Locator) -> None:
+    """Double-click `target`'s middle: only the first press may reach the page (util/panel_presses.js swallows the rest of a press that moved the panel)."""
+    box = target.bounding_box()
+    assert box is not None
+    count_presses(page)
+    page.mouse.dblclick(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+    page.wait_for_timeout(300)
+    assert page.evaluate("window.__kymo_presses") == 1, "both presses reached the page"
 
 
 def expect_stored(page: Page, expected: dict | None) -> None:
@@ -276,6 +302,17 @@ def run_fences(page: Page, *, dashboard_path: str | None = None) -> None:
     expect(panel).to_have_count(0)
     expect(trigger).to_be_focused()
     expect(trigger).to_have_attribute("aria-expanded", "false")
+    # The panel docks and undocks under the pointer, so a double-click on Settings or on its panel's Close acts once: the rest of it goes nowhere.
+    stored = f"localStorage.getItem({STORAGE_KEY!r})"
+    before, url = page.evaluate(stored), page.url
+    double_click_acts_once(page, trigger)
+    panel = options_panel(page, "Settings")
+    expect(panel).to_be_visible()
+    double_click_acts_once(page, panel.get_by_role("button", name="Close", exact=True))
+    expect(panel).to_have_count(0)
+    assert page.evaluate(stored) == before and page.url == url, (
+        "a double-click pressed what the panel moved under the pointer"
+    )
     panel = open_settings(page, key="Enter")
     expect(
         page.get_by_role("checkbox", name="Single-click to exit chart zoom")
@@ -312,12 +349,14 @@ def run_fences(page: Page, *, dashboard_path: str | None = None) -> None:
     wait_font(page, 18)
     expect_stored(page, {"font_size": 18})
     panel = open_settings(page)
+    # The panel docks beside the page's main landmark, not inside it.
+    expect(page.locator("main .options-panel")).to_have_count(0)
     page.get_by_role("checkbox", name="Single-click to exit chart zoom").uncheck()
     expect_single_click(page, False)
     close_panel(page, panel, trigger, "Close")
     expect_stored(page, {"font_size": 18, "single_click_unzoom": False})
 
-    # Leaving the page with the panel open keeps what was saved: nothing is a preview.
+    # Leaving the page with the panel open keeps what was saved.
     open_settings(page)
     page.locator("#kymo-show-nearest-point").check()
     page.evaluate("document.querySelector('.trash-nav-link').click()")
@@ -328,8 +367,26 @@ def run_fences(page: Page, *, dashboard_path: str | None = None) -> None:
         {"font_size": 18, "single_click_unzoom": False, "show_nearest_point": True},
     )
 
-    # A refused write applies nothing and says so; the next accepted change clears the alert.
+    # Another tab's change to a setting this panel leaves alone survives its edits and Revert.
     page.goto(origin, wait_until="domcontentloaded")
+    reset(page)
+    panel = open_settings(page)
+    other = page.context.new_page()
+    try:
+        other.goto(origin, wait_until="domcontentloaded")
+        other.locator(".project-row").first.wait_for(timeout=20_000)
+        open_settings(other)
+        other.get_by_role("checkbox", name="Single-click to exit chart zoom").uncheck()
+        close_settings(other)
+    finally:
+        other.close()
+    page.locator("#kymo-show-nearest-point").check()
+    expect_stored(page, {"single_click_unzoom": False, "show_nearest_point": True})
+    panel.get_by_role("button", name="Revert", exact=True).click()
+    expect_stored(page, {"single_click_unzoom": False})
+    close_panel(page, panel, trigger, "Close")
+
+    # A refused write applies nothing and says so; the next accepted change clears the alert.
     reset(page)
     page.evaluate(
         """() => {
@@ -471,7 +528,7 @@ def run_fences(page: Page, *, dashboard_path: str | None = None) -> None:
         )
         assert_finite_geometry(laid)
         if laid["page_overflow"] > 0 or laid["body_overflow"] > 0:
-            raise AssertionError(f"{pixels}px options panel overflowed: {laid}")
+            raise AssertionError(f"options panel overflowed: {laid}")
         if (
             laid["under_floor"] > 0.5
             or laid["over_charts"] > 0.5
@@ -507,7 +564,8 @@ def main() -> None:
 
     with sync_playwright() as playwright:
         browser = getattr(playwright, args.browser).launch(headless=True)
-        page = browser.new_page(viewport=VIEWPORT, device_scale_factor=1)
+        # A context, so the cross-tab check can open a second page sharing its storage.
+        page = browser.new_context(viewport=VIEWPORT, device_scale_factor=1).new_page()
         try:
             page.goto(args.url, wait_until="domcontentloaded")
             run_fences(page, dashboard_path=args.dashboard_path)

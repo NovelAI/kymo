@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use dioxus::prelude::*;
 
+use crate::components::metric_rect::rect_title;
 use crate::components::options_editor::{
     AxisFields, EditorSection, SmoothingFields, OPTIONS_ID_PREFIX,
 };
@@ -9,10 +10,10 @@ use crate::components::options_panel::OptionsPanel;
 use crate::components::sidebar::{sidebar_needs_run_ordinals, sidebar_run_label};
 use crate::grpc::proto::{metric_info::MetricType, MetricInfo, RunInfo};
 use crate::state::layout_config::{
-    run_ref_ids, CdnDisplayMode, DisplayType, MetricBinding, ProjectRef, RectOptions, RunRef,
-    ViewContext,
+    run_ref_ids, CdnDisplayMode, DisplayType, MetricBinding, ProjectRef, RectConfig, RectOptions,
+    RunRef, ViewContext, XAxisMode,
 };
-use crate::util::{is_app_escape, primary, use_live_apply};
+use crate::util::{editor_trigger_id, is_app_escape, primary, use_live_apply};
 
 type XMetricSource = (String, String);
 type XMetricResult = (Option<XMetricSource>, Vec<String>);
@@ -147,6 +148,13 @@ type MetricCatalog = Vec<(String, DisplayType)>;
 /// By row id, so each row can gate on its siblings' chosen types.
 type RowCatalogs = HashMap<u64, MetricCatalog>;
 
+type CatalogKey = (String, Vec<String>, u64);
+const CACHED_CATALOGS: usize = 4;
+thread_local! {
+    /// Catalogs the dashboard's project's sources fetched, by (project, its discovery runs, the `versions_key` of their metric versions); the runs themselves are part of the key, since the hash alone can collide. The editor remounts for each chart the panel follows (←/→), and those charts' sources mostly share a run set, which in a big project names thousands of runs; a few entries cover the charts around the one shown. Another project's run versions aren't tracked, so a kept catalog of it could go stale: those are fetched each time.
+    static CATALOGS: std::cell::RefCell<Vec<(CatalogKey, MetricCatalog)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 const KIND_ORDER: [DisplayType; 3] = [
     DisplayType::Numeric,
     DisplayType::Cdn,
@@ -258,12 +266,11 @@ fn matching_project_runs<'a>(
 /// An empty specific-run list discovers across the project so metrics stay pickable.
 fn metric_discovery_run_ids(
     binding_runs: &RunRef,
-    effective_project: &str,
-    fetched_runs: Option<&(String, Vec<RunInfo>)>,
+    project_runs: Option<&[RunInfo]>,
 ) -> Vec<String> {
     match binding_runs {
         RunRef::Specific(run_ids) if !run_ids.is_empty() => run_ids.clone(),
-        _ => matching_project_runs(effective_project, fetched_runs)
+        _ => project_runs
             .unwrap_or_default()
             .iter()
             .map(|run| run.run_id.clone())
@@ -286,40 +293,35 @@ fn matching_metric_catalog<'a>(
 #[component]
 pub fn BindingEditor(
     return_focus_id: String,
-    /// The grid copy's Configure, for focus when the maximized one went with the panel.
-    fallback_focus_id: String,
     /// See `OptionsPanel`.
     take_focus: bool,
-    /// The maximized chart the panel edits.
-    rect_id: String,
-    /// The chart's title, naming what the panel edits.
-    target: String,
-    bindings: Vec<MetricBinding>,
-    display_type: DisplayType,
-    /// The gallery's resolved CDN sub-type ("image_gallery", "metadata", "file_list" or "mixed"); None until its manifest loads.
-    cdn_class: Option<String>,
+    /// The maximized chart the panel edits, as the layout holds it.
+    rect: RectConfig,
     /// Section's max columns — clamps the Width input.
     max_columns: u32,
-    on_close: EventHandler<()>,
 ) -> Element {
     let state = use_context::<crate::state::DashboardState>();
+    // The gallery's resolved CDN sub-type ("image_gallery", "metadata", "file_list" or "mixed"), None until its manifest loads, and the type the chart resolved to.
+    let (cdn_class, display_type) = state.chart_facts(&rect);
+    let display_type = display_type.unwrap_or(rect.display_type);
+    let rect_id = rect.id.clone();
     let is_numeric = matches!(display_type, DisplayType::Numeric);
     let is_cdn = matches!(display_type, DisplayType::Cdn);
     let (class_has_gallery_panel, class_has_metadata_panel) =
         cdn_option_panels(cdn_class.as_deref());
     let show_gallery_panel = is_cdn && class_has_gallery_panel;
     let show_metadata_panel = is_cdn && class_has_metadata_panel;
-    // The chart's options level as stored: its own patch over what it inherits from its section and the project, which draft fields differing from it (chart-level overrides) are highlighted against.
+    // The chart's options level as stored: its own patch over what it inherits from its section and the project. A draft field differing from what it inherits is a chart-level override, and is highlighted.
     let baseline = use_hook(|| state.rect_options_baseline(&rect_id));
-    // One draft of the whole struct, so options without a control here pass through untouched, the saved width included: only the Width control clamps it to the section's columns, as rendering does.
-    let initial = use_hook(|| (bindings.clone(), baseline.opened.clone()));
+    // The draft keeps the saved width: only the Width control clamps it to the section's columns, as rendering does.
+    let initial = use_hook(|| (rect.bindings.clone(), baseline.opened.clone()));
     // Each source with an id of its own, which keeps row-local state with its source across removals.
     let mut sources = use_signal(|| {
         (0..)
             .zip(initial.0.clone())
             .collect::<Vec<(u64, MetricBinding)>>()
     });
-    let mut next_row_id = use_signal(|| bindings.len() as u64);
+    let mut next_row_id = use_signal(|| initial.0.len() as u64);
     let mut draft_opts = use_signal(|| initial.1.clone());
 
     let draft = move || {
@@ -335,13 +337,14 @@ pub fn BindingEditor(
     use_live_apply(current_config, {
         let baseline = baseline.clone();
         move |previous: &(Vec<MetricBinding>, RectOptions), (bindings, options)| {
-            state.edit_maximized_rect(&rect_id, |diff, base| {
-                (bindings == previous.0
-                    || diff.edit_rect(base, &rect_id, |rect| rect.bindings = bindings))
-                    && (options == previous.1
-                        || diff.edit_rect_options(base, &rect_id, |stored| {
-                            baseline.write_fields(stored, &previous.1, &options)
-                        }))
+            // Options first: the sources edit can take the chart out of the layout (a Specific source was what kept it there), leaving an options edit after it nothing to edit.
+            state.edit_rect(&rect_id, |diff, base| {
+                (options == previous.1
+                    || diff.edit_rect_options(base, &rect_id, |stored| {
+                        baseline.write_fields(stored, &previous.1, &options)
+                    }))
+                    && (bindings == previous.0
+                        || diff.edit_rect(base, &rect_id, |rect| rect.bindings = bindings))
             });
         }
     });
@@ -407,13 +410,13 @@ pub fn BindingEditor(
     rsx! {
         OptionsPanel {
             title: "Configure Metric",
-            target,
-            return_focus_id,
-            fallback_focus_id,
+            target: rect_title(&rect),
+            // The opener, then the maximized chart's own Configure (shown again as the panel goes), then its grid copy's (once closing un-maximizes the chart).
+            return_focus_ids: vec![return_focus_id, editor_trigger_id("rect-max", &rect.id), editor_trigger_id("rect-grid", &rect.id)],
             take_focus,
             revert_disabled: unchanged,
             on_revert: revert,
-            on_close,
+            on_close: move |_| state.close_options_panel(),
 
             // --- Bindings section ---
             div { class: "editor-section-label", "Data Sources" }
@@ -464,7 +467,6 @@ pub fn BindingEditor(
                         div { class: "binding-field",
                             label { r#for: "{OPTIONS_ID_PREFIX}-x-axis", "X axis" }
                             {
-                                use crate::state::layout_config::XAxisMode;
                                 let mode_val = match &draft_opts.read().x_axis_mode {
                                     XAxisMode::Step => "step",
                                     XAxisMode::RelativeTime => "relative",
@@ -489,7 +491,7 @@ pub fn BindingEditor(
                                 }
                             }
                         }
-                        if matches!(draft_opts.read().x_axis_mode, crate::state::layout_config::XAxisMode::Step) {
+                        if matches!(draft_opts.read().x_axis_mode, XAxisMode::Step) {
                             div { class: "binding-field",
                                 label { r#for: "{OPTIONS_ID_PREFIX}-x-metric", "X metric" }
                                 {
@@ -681,27 +683,23 @@ mod tests {
             ],
         );
 
+        let a = matching_project_runs("project-a", Some(&fetched));
+        let b = matching_project_runs("project-b", Some(&fetched));
         assert_eq!(
-            metric_discovery_run_ids(&RunRef::Selected, "project-a", Some(&fetched)),
+            metric_discovery_run_ids(&RunRef::Selected, a),
             ["run-a", "run-b"]
         );
         assert_eq!(
-            metric_discovery_run_ids(&RunRef::All, "project-a", Some(&fetched)),
+            metric_discovery_run_ids(&RunRef::All, a),
             ["run-a", "run-b"]
         );
-        assert!(
-            metric_discovery_run_ids(&RunRef::Selected, "project-b", Some(&fetched)).is_empty()
-        );
+        assert!(metric_discovery_run_ids(&RunRef::Selected, b).is_empty());
         assert_eq!(
-            metric_discovery_run_ids(
-                &RunRef::Specific(vec!["saved-run".into()]),
-                "project-b",
-                None,
-            ),
+            metric_discovery_run_ids(&RunRef::Specific(vec!["saved-run".into()]), None),
             ["saved-run"]
         );
         assert_eq!(
-            metric_discovery_run_ids(&RunRef::Specific(Vec::new()), "project-a", Some(&fetched)),
+            metric_discovery_run_ids(&RunRef::Specific(Vec::new()), a),
             ["run-a", "run-b"]
         );
     }
@@ -1092,33 +1090,67 @@ fn BindingRow(
         .read()
         .get(&effective_project)
         .copied();
-    let runs = use_resource(use_reactive(
-        (&effective_project, &runs_version),
-        move |(project, _version)| {
+    // The current project's runs are the dashboard's own list (the same ListRuns reply, 1.2 MB on an 11k-run project), read in place once it has loaded; a source never fetches it, so a run page's held first list goes out once. Another project's are fetched each time the editor mounts: nothing tracks its versions, so a kept list could go stale.
+    let own_project = effective_project == *state.project_id.read();
+    let fetched_runs = use_resource(use_reactive(
+        (&effective_project, &runs_version, &own_project),
+        move |(project, _version, own)| {
             let grpc = state.grpc.read().clone();
             async move {
+                if own {
+                    return None;
+                }
                 let fetched = crate::state::visibility::retry_visible("binding runs", async || {
                     grpc.list_runs(&project).await
                 })
                 .await
                 .runs;
-                (project, fetched)
+                Some((project, fetched))
             }
         },
     ));
+    let own_list = (own_project && *state.runs_loaded.read()).then(|| state.runs.read());
+    let fetched_list = fetched_runs.read();
+    let project_runs = match &own_list {
+        Some(list) => Some(list.as_slice()),
+        None => matching_project_runs(
+            &effective_project,
+            fetched_list.as_ref().and_then(Option::as_ref),
+        ),
+    };
 
-    let discovery_run_ids =
-        metric_discovery_run_ids(&binding.runs, &effective_project, runs.read().as_ref());
+    let discovery_run_ids = metric_discovery_run_ids(&binding.runs, project_runs);
     let metric_version = crate::state::versions_key(
         *state.resync_gen.read(),
         discovery_run_ids.iter().map(String::as_str),
         &state.metrics_gen.read(),
     );
     let metrics = use_resource(use_reactive(
-        (&effective_project, &discovery_run_ids, &metric_version),
-        move |(project, discovery_run_ids, _version)| {
+        (
+            &effective_project,
+            &discovery_run_ids,
+            &metric_version,
+            &own_project,
+        ),
+        move |(project, discovery_run_ids, version, own)| {
             let grpc = state.grpc.read().clone();
             async move {
+                let key = (project.clone(), discovery_run_ids.clone(), version);
+                // Only the dashboard's project is kept, and the cache outlives a visit: another dashboard's entry for this project could be stale.
+                let cached = own
+                    .then(|| {
+                        CATALOGS.with_borrow(|catalogs| {
+                            catalogs
+                                .iter()
+                                .find(|(k, _)| *k == key)
+                                .map(|(_, c)| c.clone())
+                        })
+                    })
+                    .flatten();
+                if let Some(catalog) = cached {
+                    row_catalogs.write().insert(row_id, catalog.clone());
+                    return (project, discovery_run_ids, catalog);
+                }
                 // Invalidate sibling type gating while this source refreshes.
                 if row_catalogs.peek().contains_key(&row_id) {
                     row_catalogs.write().remove(&row_id);
@@ -1148,6 +1180,13 @@ fn BindingRow(
                     }
                 };
                 let catalog = metric_catalog(metrics);
+                if own {
+                    CATALOGS.with_borrow_mut(|catalogs| {
+                        catalogs.retain(|(k, _)| *k != key);
+                        catalogs.insert(0, (key, catalog.clone()));
+                        catalogs.truncate(CACHED_CATALOGS);
+                    });
+                }
                 row_catalogs.write().insert(row_id, catalog.clone());
                 (project, discovery_run_ids, catalog)
             }
@@ -1245,8 +1284,6 @@ fn BindingRow(
                 if runs_value == SPECIFIC_RUNS_VALUE {
                     {
                         let checked = checked_run_ids(&binding.runs);
-                        let runs_read = runs.read();
-                        let project_runs = matching_project_runs(&effective_project, runs_read.as_ref());
                         let choices = project_runs.map_or_else(Vec::new, |catalog| specific_run_choices(checked, catalog));
                         let no_runs = project_runs.is_some() && choices.is_empty();
                         rsx! {

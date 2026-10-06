@@ -62,17 +62,17 @@ fn pretty_option_value(field: &str, v: &Value) -> String {
 }
 
 /// The finer-level pins a defaults editor lists under its fields, and the record of those it has cleared, which its Revert puts back.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct OverrideChips {
-    pins: Vec<OptionOverride>,
+    pins: Memo<Vec<OptionOverride>>,
     cleared: Signal<Vec<OptionOverride>>,
 }
 
-/// Clears finer-level pins so they inherit this field again.
+/// The chips listing `field`'s finer-level pins; clicking one clears it so the field inherits again.
 fn override_chips(
     state: DashboardState,
     field: &'static str,
-    chips: Option<&OverrideChips>,
+    chips: Option<OverrideChips>,
 ) -> Element {
     let Some(chips) = chips else {
         return rsx! {};
@@ -80,6 +80,7 @@ fn override_chips(
     let mut cleared = chips.cleared;
     let hits: Vec<OptionOverride> = chips
         .pins
+        .read()
         .iter()
         .filter(|o| o.field == field)
         .cloned()
@@ -118,7 +119,7 @@ fn override_chips(
 
 /// Edits project chart defaults live, as a sparse patch over the library defaults, written field by field (`OptionsBaseline::write_fields`).
 #[component]
-pub fn ProjectDefaultsEditor(return_focus_id: String, on_close: EventHandler<()>) -> Element {
+pub fn ProjectDefaultsEditor(return_focus_id: String) -> Element {
     let state = use_context::<DashboardState>();
     let baseline = use_hook(|| state.chart_defaults_baseline(None));
     let mut draft = use_signal(|| baseline.opened.clone());
@@ -136,7 +137,7 @@ pub fn ProjectDefaultsEditor(return_focus_id: String, on_close: EventHandler<()>
     rsx! {
         OptionsPanel {
             title: "Project settings",
-            return_focus_id,
+            return_focus_ids: vec![return_focus_id],
             revert_disabled: unchanged,
             on_revert: {
                 let opened = baseline.opened.clone();
@@ -145,7 +146,7 @@ pub fn ProjectDefaultsEditor(return_focus_id: String, on_close: EventHandler<()>
                     state.restore_overrides(&std::mem::take(&mut *cleared.write()));
                 }
             },
-            on_close,
+            on_close: move |_| state.close_options_panel(),
 
             div { class: "editor-options",
                 ChartOptionsForm { draft, anchor: baseline.anchor.clone(), cleared }
@@ -192,7 +193,7 @@ pub fn SmoothingFields(
     #[props(default)] chips: Option<OverrideChips>,
 ) -> Element {
     let state = use_context::<DashboardState>();
-    let chips = |field| override_chips(state, field, chips.as_ref());
+    let chips_for = |field| override_chips(state, field, chips);
     let o = draft.read().clone();
     let smoothing_value = match &o.smoothing {
         SmoothingAlgorithm::None => "none",
@@ -218,7 +219,7 @@ pub fn SmoothingFields(
     let poly_order = o.smoothing_poly_order;
     // The UI edits the e-folding time constant, while the draft stores alpha.
     let tc_display = ema_time_constant(o.smoothing_alpha).round() as u32;
-    let inherited_smoothing = anchor.smoothing.clone();
+    let inherited_smoothing = anchor.smoothing;
     let inherited_order = anchor.smoothing_poly_order;
     let inherited_window = anchor.smoothing_window;
     let inherited_alpha = anchor.smoothing_alpha;
@@ -236,7 +237,7 @@ pub fn SmoothingFields(
 
     rsx! {
         div { class: field_class(o.smoothing != anchor.smoothing),
-            ResetDot { show: o.smoothing != anchor.smoothing, onreset: move |_| draft.write().smoothing = inherited_smoothing.clone() }
+            ResetDot { show: o.smoothing != anchor.smoothing, onreset: move |_| draft.write().smoothing = inherited_smoothing }
             label { r#for: "{OPTIONS_ID_PREFIX}-smoothing", "Smoothing" }
             select {
                 id: "{OPTIONS_ID_PREFIX}-smoothing",
@@ -262,7 +263,7 @@ pub fn SmoothingFields(
                 option { value: "savgol", "(1−x²)² polyfit" }
             }
         }
-        {chips("smoothing")}
+        {chips_for("smoothing")}
         if is_polyfit {
             div { class: field_class(o.smoothing_poly_order != anchor.smoothing_poly_order),
                 ResetDot { show: o.smoothing_poly_order != anchor.smoothing_poly_order, onreset: move |_| draft.write().smoothing_poly_order = inherited_order }
@@ -280,7 +281,7 @@ pub fn SmoothingFields(
                     option { value: "2", "2 — quadratic" }
                 }
             }
-            {chips("smoothing_poly_order")}
+            {chips_for("smoothing_poly_order")}
         }
         if needs_window {
             div { class: field_class(o.smoothing_window != anchor.smoothing_window),
@@ -306,7 +307,7 @@ pub fn SmoothingFields(
                     }
                 }
             }
-            {chips("smoothing_window")}
+            {chips_for("smoothing_window")}
         }
         if is_ema {
             div { class: field_class(o.smoothing_alpha != anchor.smoothing_alpha),
@@ -332,10 +333,10 @@ pub fn SmoothingFields(
                     }
                 }
             }
-            {chips("smoothing_alpha")}
+            {chips_for("smoothing_alpha")}
         }
         if let Some(hint) = hint {
-            p { class: "editor-hint smoothing-hover-hint", "{hint}" }
+            p { class: "smoothing-hover-hint", "{hint}" }
         }
     }
 }
@@ -348,7 +349,7 @@ pub fn AxisFields(
     #[props(default)] chips: Option<OverrideChips>,
 ) -> Element {
     let state = use_context::<DashboardState>();
-    let chips = |field| override_chips(state, field, chips.as_ref());
+    let chips_for = |field| override_chips(state, field, chips);
     let o = draft.read().clone();
     let inherited_max_runs = anchor.max_runs;
     let log_field = |axis: &str, value: bool, inherited: bool, set: fn(&mut RectOptions, bool)| {
@@ -374,9 +375,9 @@ pub fn AxisFields(
 
     rsx! {
         {log_field("X", o.log_x, anchor.log_x, |options, value| options.log_x = value)}
-        {chips("log_x")}
+        {chips_for("log_x")}
         {log_field("Y", o.log_y, anchor.log_y, |options, value| options.log_y = value)}
-        {chips("log_y")}
+        {chips_for("log_y")}
         div { class: field_class(o.max_runs != anchor.max_runs),
             ResetDot { show: o.max_runs != anchor.max_runs, onreset: move |_| draft.write().max_runs = inherited_max_runs }
             label { r#for: "{OPTIONS_ID_PREFIX}-max-runs", "Max runs" }
@@ -393,7 +394,7 @@ pub fn AxisFields(
                 },
             }
         }
-        {chips("max_runs")}
+        {chips_for("max_runs")}
     }
 }
 
@@ -416,15 +417,11 @@ pub fn ChartOptionsForm(
         finer_overrides(&state.peek_diff(), shown, section.as_deref())
     });
     let chips = OverrideChips {
-        pins: overrides(),
+        pins: overrides,
         cleared,
     };
     rsx! {
-        SmoothingFields {
-            draft,
-            anchor: anchor.clone(),
-            chips: chips.clone(),
-        }
+        SmoothingFields { draft, anchor: anchor.clone(), chips }
         AxisFields { draft, anchor, chips }
     }
 }

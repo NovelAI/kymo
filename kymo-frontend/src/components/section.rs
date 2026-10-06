@@ -3,7 +3,7 @@ use dioxus::prelude::*;
 use crate::components::icons::{
     CaretLeftIcon, CaretRightIcon, CloseIcon, GearIcon, GripIcon, PlusIcon,
 };
-use crate::components::metric_rect::{MetricRect, ResizeResult};
+use crate::components::metric_rect::MetricRect;
 use crate::components::section_drag::SectionDrag;
 use crate::state::layout_config::{MetricBinding, ProjectRef, RectOptions, RunRef};
 use crate::state::{
@@ -55,7 +55,7 @@ pub fn Section(
 ) -> Element {
     // Immutable id — keys rect ids; the label is what the user sees.
     let section_id = config.name.clone();
-    let editor_trigger_id = editor_trigger_id("section", &section_id);
+    let trigger_id = editor_trigger_id("section", &section_id);
     let section_label = config.display_name().to_string();
     let state = use_context::<DashboardState>();
     let mut panel_filter = state.panel_filter;
@@ -181,13 +181,12 @@ pub fn Section(
                     PlusIcon {}
                 }
                 button {
-                    id: "{editor_trigger_id}",
+                    id: "{trigger_id}",
                     class: "section-action icon-button",
                     title: "Configure",
                     aria_expanded: options_target(),
                     onmousedown: primary({
                         let section_id = section_id.clone();
-                        let trigger_id = editor_trigger_id.clone();
                         move |e: Event<MouseData>| {
                             e.stop_propagation();
                             state.open_options_panel(
@@ -279,12 +278,7 @@ pub fn Section(
                     for i in visible_indices.iter().copied() {
                         {
                             let rect = display_rects[i].clone();
-                            let rect_id_for_delete = rect.id.clone();
-                            let rect_id_for_resize = rect.id.clone();
-                            let section_for_resize = section_id.clone();
-                            let chart_h = config.chart_height;
-                            let max_cols = config.max_columns.max(1);
-                            let span = rect.options.column_span.clamp(1, max_cols);
+                            let span = rect.options.column_span.clamp(1, config.max_columns.max(1));
                             let span_style = format!("grid-column: span {};", span);
                             rsx! {
                                 div {
@@ -292,24 +286,7 @@ pub fn Section(
                                     style: "{span_style}",
                                     MetricRect {
                                         config: rect.clone(),
-                                        chart_height: chart_h,
-                                        on_rename: {
-                                            let id = rect.id.clone();
-                                            move |label: String| {
-                                                state.edit_rect(&id, |r| r.label = label);
-                                            }
-                                        },
-                                        on_delete: move |_| state.delete_rect(&rect_id_for_delete),
-                                        // One gesture, two intents: the height belongs to the section, the span to the rect. Fires once per drag (mouseup), so the split costs nothing per tick.
-                                        on_resize: move |r: ResizeResult| {
-                                            if r.height_delta != 0 {
-                                                let new_h = (chart_h as i32 + r.height_delta).clamp(100, 800) as u32;
-                                                state.edit_section_settings(&section_for_resize, |s| s.chart_height = new_h);
-                                            }
-                                            if let Some(new_span) = r.new_column_span {
-                                                state.edit_rect(&rect_id_for_resize, |r| r.options.column_span = new_span.clamp(1, max_cols));
-                                            }
-                                        },
+                                        chart_height: config.chart_height,
                                     }
                                 }
                             }

@@ -96,8 +96,9 @@ pub fn ProjectsPage() -> Element {
         // Restore the default title (document.title persists across SPA
         // navigation, so coming back from a dashboard would keep its name).
         document::Title { "kymo — Metrics Dashboard" }
-        main { class: "projects-page",
-            div { class: "projects-page-inner",
+        // The Settings panel docks beside the main landmark, not inside it.
+        div { class: "projects-page",
+            main { class: "projects-page-inner",
                 div { class: "projects-title-row",
                     h1 { "kymo" }
                     div { class: "projects-page-actions",

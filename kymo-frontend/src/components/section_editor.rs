@@ -29,17 +29,13 @@ fn stored_display_name(typed: &str, name: &str) -> String {
 /// Chart defaults start at the section's resolved options and are stored as a sparse patch over the project level (`OptionsBaseline::write_fields`).
 /// Each change writes just the settings and chart-default fields it changed, Revert's restore included, so a collapse or chart-height drag beside the panel, or another tab's edit to anything else, survives.
 #[component]
-pub fn SectionEditor(
-    return_focus_id: String,
-    config: SectionConfig,
-    on_close: EventHandler<()>,
-) -> Element {
+pub fn SectionEditor(return_focus_id: String, config: SectionConfig) -> Element {
     let state = use_context::<DashboardState>();
     // Resolved once: nothing else in this tab edits the project's or this section's defaults while the panel is open.
     let chart_baseline = use_hook(|| state.chart_defaults_baseline(Some(&config.name)));
     let initial = use_hook(|| SectionDraft {
         display_name: stored_display_name(&config.display_name, &config.name),
-        max_columns: config.max_columns.max(1),
+        max_columns: config.max_columns.clamp(1, MAX_SECTION_COLUMNS),
         rows_per_page: config.rows_per_page,
         chart_opts: chart_baseline.opened.clone(),
     });
@@ -86,8 +82,9 @@ pub fn SectionEditor(
     rsx! {
         OptionsPanel {
             title: "Configure section",
-            target: config.display_name().to_string(),
-            return_focus_id,
+            // The catch-all section of unprefixed metrics has no name to show.
+            target: Some(config.display_name()).filter(|name| !name.is_empty()).map(str::to_string),
+            return_focus_ids: vec![return_focus_id],
             revert_disabled: unchanged,
             on_revert: {
                 let initial = initial.clone();
@@ -99,7 +96,7 @@ pub fn SectionEditor(
                     state.restore_overrides(&std::mem::take(&mut *cleared.write()));
                 }
             },
-            on_close,
+            on_close: move |_| state.close_options_panel(),
 
             div { class: "editor-options",
                 div { class: "binding-field",

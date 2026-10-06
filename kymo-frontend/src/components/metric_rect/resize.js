@@ -12,8 +12,6 @@ let gap=parseFloat(getComputedStyle(grid).gap)||8;
 let totalCols=getComputedStyle(grid).gridTemplateColumns.split(' ').length;
 let colW=(gb.width-(totalCols-1)*gap)/totalCols;
 let lastPageY=sy;
-// Snap to every integer column count from 1..=totalCols
-let targets=Array.from({length:totalCols},(_,i)=>i+1);
 let ov=document.getElementById('resize-drag-overlay');
 if(!ov){ov=document.createElement('div');ov.id='resize-drag-overlay';document.body.appendChild(ov);}
 let pv=document.getElementById('resize-drag-preview');
@@ -23,17 +21,11 @@ pv.style.cssText='position:fixed;z-index:9999;pointer-events:none;border:2px sol
 // Rects are auto-placed, so this rect's left edge is wherever the row
 // packer put it — measure the drag from mb.left, not gb.left, or every
 // rect after the first in its row snaps as if it spanned from column 1.
-let snapCols=Math.max(1,Math.round((mb.width+gap)/(colW+gap)));
+// A span of c columns ends c*(colW+gap)-gap right of mb.left, so the nearest span rounds this.
 function snap(mx){
-  let rel=mx-mb.left;
-  let best=targets[0],bestDist=1e9;
-  for(let c of targets){
-    let rightEdge=c*colW+(c-1)*gap;
-    let dist=Math.abs(rel-rightEdge);
-    if(dist<bestDist){bestDist=dist;best=c;}
-  }
-  return best;
+  return Math.max(1,Math.min(totalCols,Math.round((mx-mb.left+gap)/(colW+gap))));
 }
+let startCols=snap(mb.right),snapCols=startCols;
 function updatePreview(mx,my){
   snapCols=snap(mx);
   let pw=snapCols*colW+(snapCols-1)*gap;
@@ -66,7 +58,8 @@ function onUp(e){
   document.removeEventListener('mousemove',onMove);
   document.removeEventListener('mouseup',onUp);
   window.removeEventListener('blur',onUp);
-  try{dioxus.send({span:snapCols,dy:pageY-sy});}catch(_){}
+  // A span the drag didn't change stays as saved, even one wider than the section shows.
+  try{dioxus.send({span:snapCols===startCols?null:snapCols,dy:pageY-sy});}catch(_){}
 }
 document.addEventListener('mousemove',onMove);
 document.addEventListener('mouseup',onUp);

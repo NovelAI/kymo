@@ -115,9 +115,18 @@ pub fn unique_id(prefix: &str) -> String {
     format!("{prefix}-{ms}-{rand:08x}")
 }
 
-/// Browser-console warning.
+/// A press just opened, closed or switched the options panel: the rest of its double-click goes nowhere (`panel_presses.js`).
+pub fn panel_moved() {
+    #[cfg(target_arch = "wasm32")]
+    let _ = js_sys::eval("window.__kymo_panel_moved?.()");
+}
+
+/// Browser-console warning (stderr in host tests).
 pub fn warn(msg: &str) {
+    #[cfg(target_arch = "wasm32")]
     web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(msg));
+    #[cfg(not(target_arch = "wasm32"))]
+    eprintln!("{msg}");
 }
 
 /// Stable, collision-free DOM identity for the control that opens an editor.
@@ -131,7 +140,7 @@ pub fn editor_trigger_id(kind: &str, identity: &str) -> String {
     id
 }
 
-/// Once the DOM has updated, focus the first of these ids that can take it (one inside an inert grid can't). With `only_if_lost`, only when focus has fallen back to the page, as when a closing panel takes it along; focus the user moved elsewhere stays put. Spawned at the root, since the caller's scope is often the one ending.
+/// On the next animation frame, focus the first of these ids that can take it (one in an inert grid can't), without scrolling the page. With `only_if_lost`, only when focus fell back to the page (a closing panel took it along); focus the user moved stays put. A later call supersedes one still waiting (WebKit can hold a frame while nothing changes).
 pub fn focus_later(ids: &[&str], only_if_lost: bool) {
     let ids = ids
         .iter()
@@ -139,11 +148,9 @@ pub fn focus_later(ids: &[&str], only_if_lost: bool) {
         .collect::<Vec<_>>()
         .join(",");
     let js = format!(
-        "requestAnimationFrame(()=>{{const a=document.activeElement;if({only_if_lost}&&a&&a!==document.body)return;for(const id of [{ids}]){{const e=document.getElementById(id);if(e){{e.focus();if(document.activeElement===e)break;}}}}}});"
+        "const n=window.__kymo_focus_seq=(window.__kymo_focus_seq||0)+1;requestAnimationFrame(()=>{{if(n!==window.__kymo_focus_seq)return;const a=document.activeElement;if({only_if_lost}&&a&&a!==document.body)return;for(const id of [{ids}]){{const e=document.getElementById(id);if(e){{e.focus({{preventScroll:true}});if(document.activeElement===e)break;}}}}}});"
     );
-    dioxus::core::spawn_forever(async move {
-        let _ = dioxus::prelude::document::eval(&js).await;
-    });
+    let _ = js_sys::eval(&js);
 }
 
 /// Whether focus is on the element `id` or inside it.

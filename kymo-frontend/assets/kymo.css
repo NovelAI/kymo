@@ -317,7 +317,7 @@ input[type="checkbox"]:checked::before {
     min-height: 0;
     overflow-y: auto;
     position: relative;
-    /* Own stacking context: in-grid z-indexes (actions 55, title pop 60, tips 70) resolve locally, so nothing in the grid can hit-test or paint above the sibling maximize overlay (50). The options panel (60) paints above both; the image preview uses the browser top layer. */
+    /* Own stacking context: in-grid z-indexes (actions 55, title pop 60) resolve locally, so nothing in the grid can hit-test or paint above the sibling maximize overlay (50). The options panel (60) paints above both; chart hover readouts (70) sit outside, under <body> (create.js), and the image preview uses the browser top layer. */
     isolation: isolate;
 }
 /* While the maximize overlay is up, freeze the underlying scrollbar so the
@@ -569,8 +569,8 @@ input[type="checkbox"]:checked::before {
     width: max-content;
     background: var(--row-bg, var(--bg2));
     pointer-events: none;
-    /* above the maximize overlay (50) like the color picker */
-    z-index: 60;
+    /* above the maximize overlay (50) like the color picker, and the docked options panel (60) a long name can reach */
+    z-index: 61;
 }
 
 /* === Projects Page === */
@@ -1175,21 +1175,19 @@ input[type="checkbox"]:checked::before {
 }
 
 /* === Options panel === */
-/* Docks as the last flex item of its host (the dashboard's .content-row, the projects page's main), so the content beside it narrows while it is open, at any window width. Its default 30rem grows with the user font like the forms inside it; a dragged width is a share of the window, like the run list's. */
+/* Docks as the last flex item of its host (.content-row on the dashboard, .projects-page on the projects page), so the content beside it narrows while it is open, at any window width. Its default 30rem grows with the user font like the forms inside it; a dragged width is a share of the window, like the run list's. */
 .options-panel {
-    /* Above the main column and the maximize overlay (50): a chart's fixed hover tip near its right edge passes under the panel, and the smoothing hint beside it stays over a maximized chart. */
+    /* Above the main column and the maximize overlay (50), so the smoothing hint beside it stays over a maximized chart; chart hover readouts (70, under <body>) paint over it (create.js). */
     position: relative;
     z-index: 60;
     /* In a row too narrow for everything at its width, the panel gives way first (its shrink weight dwarfs the others'), down to 14rem, where its forms stop fitting at a 12px font; then what's beside it (the run list, and the charts or project list, counted as 20rem) shrink together in proportion. It never lies over them. */
     flex: 0 1000 var(--kymo-options-w);
     min-width: 14rem;
-    min-height: 0;
     display: flex;
     flex-direction: column;
     background: var(--bg1);
     border-left: 1px solid var(--bg3);
 }
-.options-panel:focus { outline: none; }
 .options-panel-header {
     flex: none;
     display: flex;
@@ -1207,13 +1205,13 @@ input[type="checkbox"]:checked::before {
 .options-panel-close { font-size: var(--font-size-16); padding: 2px 4px; }
 .options-panel-body {
     flex: 1;
-    min-height: 0;
     overflow-y: auto;
     padding: var(--spacing-lg);
 }
+.options-panel-body:focus { outline: none; }
 
-/* The panel's host is a query container, so the smoothing hint can place itself by the host's width in rem (media queries ignore the user font). Fixed-position descendants (chart tips, the smoothing hint at a narrow window's foot) still position against the viewport inside it, as checked in Chromium and WebKit; `contain: layout` would capture them, so don't add it here. */
-.content-row, .projects-page { container: options-host / inline-size; }
+/* The dashboard's panel host is a query container, so the smoothing hint can place itself by the host's width in rem (media queries ignore the user font). Fixed-position descendants (the run list's name hovers, the smoothing hint at a narrow window's foot) still position against the viewport inside it, as checked in Chromium and WebKit; `contain: layout` would capture them, so don't add it here. */
+.content-row { container: options-host / inline-size; }
 /* The projects page scrolls the document, so its panel sticks to the viewport beside the list, as tall as its content: a full viewport would push the document past a notice bar. */
 .projects-page {
     display: flex;
@@ -1283,7 +1281,7 @@ input[type="checkbox"]:checked::before {
     visibility: visible;
 }
 
-/* With no room beside the panel the help spans the window's foot; the panel body scrolls, so it can cover a select hovered down there. */
+/* In a row under 54rem the help spans the window's foot instead; the panel body scrolls, so it can cover a select hovered down there. */
 @container options-host (width < 54rem) {
     .smoothing-hover-hint {
         position: fixed;

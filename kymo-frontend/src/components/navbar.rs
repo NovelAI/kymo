@@ -4,7 +4,10 @@ use crate::components::icons::{CloseIcon, CollapseAllIcon, ExpandAllIcon, GearIc
 use crate::components::theme_toggle::ThemeToggle;
 use crate::route::Route;
 use crate::state::{DashboardState, DirectRunLoad, PanelTarget, SectionConfig, UserConfigState};
-use crate::util::{editor_trigger_id, is_app_escape, primary, unique_id};
+use crate::util::{is_app_escape, primary, unique_id};
+
+/// The Project settings button's id, which focus returns to when its panel closes.
+const PROJECT_SETTINGS_TRIGGER_ID: &str = "kymo-project-settings-trigger";
 
 #[component]
 pub fn Navbar() -> Element {
@@ -14,7 +17,6 @@ pub fn Navbar() -> Element {
     let current_run = state.current_run.read().clone();
     // The breadcrumb carries the focused chart along (like the sidebar's run links), so the overlay follows dashboard navigation. Hook, so it must run unconditionally up here.
     let chart_focus = use_route::<Route>().chart_param();
-    let defaults_trigger_id = editor_trigger_id("project-defaults", "");
 
     let mut panel_filter = state.panel_filter;
     let filter_value = panel_filter.read().clone();
@@ -145,14 +147,11 @@ pub fn Navbar() -> Element {
                 "+ Section"
             }
             button {
-                id: "{defaults_trigger_id}",
+                id: PROJECT_SETTINGS_TRIGGER_ID,
                 class: "navbar-action icon-button",
                 title: "Project settings",
                 aria_expanded: state.options_panel.read().as_ref().is_some_and(|p| p.target == PanelTarget::ProjectDefaults),
-                onmousedown: primary({
-                    let trigger_id = defaults_trigger_id.clone();
-                    move |_| state.open_options_panel(PanelTarget::ProjectDefaults, trigger_id.clone())
-                }),
+                onmousedown: primary(move |_| state.open_options_panel(PanelTarget::ProjectDefaults, PROJECT_SETTINGS_TRIGGER_ID.to_string())),
                 GearIcon {}
             }
             button {

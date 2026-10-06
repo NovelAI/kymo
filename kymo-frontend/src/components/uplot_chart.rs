@@ -118,6 +118,7 @@ if(window.__kymo_charts&&window.__kymo_charts['{id}']){{
   delete window.__kymo_charts['{id}'];
 }}
 if(window.__kymo_hoversrc==='{id}')window.__kymo_hoversrc=null;
+document.getElementById('{id}-tip')?.remove();
 if(window.__kymo_cfghash) delete window.__kymo_cfghash['{id}'];
 if(window.__kymo_data) delete window.__kymo_data['{id}'];
 }})();"#,
@@ -571,6 +572,8 @@ mod tests {
                 "destroy is missing the create.js-owned {registry} registry"
             );
         }
+        // The readout lives outside the chart, under <body> (create.js), so teardown removes it by id.
+        assert!(destroy.contains("document.getElementById('__KYMO_ID__-tip')?.remove();"));
         // Data is populated through Reflect in Rust rather than an assignment in create.js, so it remains an explicit part of the teardown contract.
         assert!(destroy.contains("delete window.__kymo_data['__KYMO_ID__']"));
         assert!(destroy.contains("window.__kymo_zg.srcId==='__KYMO_ID__'"));

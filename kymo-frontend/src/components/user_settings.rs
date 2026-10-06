@@ -3,24 +3,26 @@ use dioxus::prelude::*;
 use crate::components::icons::GearIcon;
 use crate::components::options_panel::OptionsPanel;
 use crate::state::{FontSize, UserConfig, UserConfigState};
-use crate::util::{editor_trigger_id, focus_later, primary};
+use crate::util::{focus_later, primary};
 
 /// The Settings button's id, which focus returns to when the panel closes.
-pub fn user_settings_trigger_id() -> String {
-    editor_trigger_id("user-settings", "global")
-}
+const TRIGGER_ID: &str = "kymo-user-settings-trigger";
 
 #[component]
 pub fn UserSettingsButton(mut open: Signal<bool>) -> Element {
     rsx! {
         button {
-            id: "{user_settings_trigger_id()}",
-            class: "page-user-settings-trigger page-action",
+            id: TRIGGER_ID,
+            class: "page-action",
             r#type: "button",
             title: "User settings",
             // Shown pressed while the panel is open, and closes it.
             aria_expanded: *open.read(),
-            onmousedown: primary(move |_| open.toggle()),
+            onmousedown: primary(move |_| {
+                // The docked panel narrows the page under the pointer as it opens and closes.
+                crate::util::panel_moved();
+                open.toggle()
+            }),
             GearIcon {}
             span { "Settings" }
         }
@@ -57,7 +59,7 @@ const TOGGLES: [(&str, &str, Toggle); 4] = [
 #[component]
 pub fn UserSettingsPanel(mut open: Signal<bool>) -> Element {
     let state = use_context::<UserConfigState>();
-    let initial = use_hook(|| state.current());
+    let initial = use_hook(|| state.peek_config());
     let mut save_failed = use_signal(|| false);
     // A refused change must not stay on screen: the controls remount from the stored settings (a controlled input's DOM state survives a render whose value didn't change).
     let mut refusals = use_signal(|| 0u32);
@@ -84,13 +86,16 @@ pub fn UserSettingsPanel(mut open: Signal<bool>) -> Element {
         OptionsPanel {
             title: "Settings",
             target: "Saved in this browser.",
-            return_focus_id: user_settings_trigger_id(),
+            return_focus_ids: vec![TRIGGER_ID.to_string()],
             revert_disabled: current == initial,
             on_revert: move |_| save(initial),
-            on_close: move |_| open.set(false),
+            on_close: move |_| {
+                crate::util::panel_moved();
+                open.set(false)
+            },
 
             for r in [*refusals.read()] {
-                div { key: "{r}", class: "user-settings-controls",
+                div { key: "{r}",
                     div { class: "user-settings-field",
                         label { r#for: "kymo-user-font-size", "Font size" }
                         div { class: "user-settings-font-control",
@@ -104,7 +109,7 @@ pub fn UserSettingsPanel(mut open: Signal<bool>) -> Element {
                                 aria_valuetext: "{font_size.pixels()} pixels",
                                 oninput: move |event: Event<FormData>| {
                                     if let Some(font_size) = event.value().parse().ok().and_then(FontSize::new) {
-                                        save(UserConfig { font_size, ..state.current() });
+                                        save(UserConfig { font_size, ..state.peek_config() });
                                     }
                                 }
                             }
@@ -119,7 +124,7 @@ pub fn UserSettingsPanel(mut open: Signal<bool>) -> Element {
                                 r#type: "checkbox",
                                 checked: *field(&mut current),
                                 onchange: move |event: Event<FormData>| {
-                                    let mut next = state.current();
+                                    let mut next = state.peek_config();
                                     *field(&mut next) = event.checked();
                                     save(next);
                                 },

@@ -4,7 +4,7 @@ This standalone harness gates the transport assumptions in the AI-1433 local-dep
 
 The ClickHouse version and hashes come from `../../shared/local-runtime-artifacts.json`, and its configuration from `../../local-runtime/core`, so the harness and launcher cannot silently drift to different release inputs or laptop profiles.
 
-The browser fixtures share `fences_common.py` for the frozen WebSocket envelope and a two-animation-frame barrier. It has no protobuf or Playwright imports: each fixture owns its generated messages, response behavior, and RPC waiting rules. New fixtures should reuse this module rather than introducing another framing implementation. Run its golden wire vectors with `python -m unittest -v test_fences_common`.
+The browser fixtures share `fences_common.py` for the frozen WebSocket envelope, a two-animation-frame barrier and a handle drag. It has no protobuf or Playwright imports: each fixture owns its generated messages, response behavior, and RPC waiting rules. New fixtures should reuse this module rather than introducing another framing implementation. Run its golden wire vectors with `python -m unittest -v test_fences_common`.
 
 ## Frozen inputs
 
@@ -46,7 +46,7 @@ The options panel checks run locally with Playwright against the `browser-e2e` f
 python options_panel_fences.py <dashboard-project-url>
 ```
 
-Run them after editor, focus, or panel changes. They cover docking and target switching, dismissal and focus return, edits kept by Esc and Close, Revert, a collapse made beside an open section panel, label activation, option inheritance and persistence, and smoothing hints at wide and narrow widths. They are excluded from CI to keep its runtime down. Run `user_settings_fences.py <dashboard-origin> --dashboard-path /<project>` as well when changing the shared panel or focus helpers; without `--dashboard-path` it skips the dashboard docking check. In Playwright WebKit on macOS the field checks stop at the first label click, which doesn't focus the checkbox there.
+Run them after editor, focus, or panel changes; they are excluded from CI to keep its runtime down. Run `user_settings_fences.py <dashboard-origin> --dashboard-path /<project>` as well when changing the shared panel or focus helpers; without `--dashboard-path` it skips its dashboard checks. They pass in Chromium, WebKit and Firefox (Firefox needs `CFFIXED_USER_HOME` set to a writable directory on macOS); in WebKit a label click doesn't focus a checkbox and Tab skips buttons, as in Safari, so those two checks adapt there.
 
 ## Target status
 

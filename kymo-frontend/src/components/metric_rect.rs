@@ -9,6 +9,7 @@ use crate::components::icons::{CloseIcon, GearIcon, MaximizeIcon, SpinnerIcon};
 use crate::components::text_stream::TextStreamViewer;
 use crate::grpc::proto::{CdnSeries, RunStatus, SeriesRef};
 use crate::route::focus_chart;
+use crate::state::app_state::set_chart_facts;
 use crate::state::chart_sync::ChartCacheEntry;
 use crate::state::layout_config::{CdnDisplayMode, MetricBinding, RectOptions, RunRef};
 use crate::state::panel_cache::{panel_key, Store};
@@ -27,10 +28,9 @@ pub(crate) fn rect_title(config: &RectConfig) -> String {
         .iter()
         .map(|b| {
             // Strip prefix before last '/' (same as section grouping)
-            match b.metric_name.rfind('/') {
-                Some(pos) => &b.metric_name[pos + 1..],
-                None => b.metric_name.as_str(),
-            }
+            b.metric_name
+                .rsplit_once('/')
+                .map_or(b.metric_name.as_str(), |(_, name)| name)
         })
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
@@ -228,12 +228,6 @@ fn refs_known(bindings: &[MetricBinding], current_run: Option<&str>, runs_loaded
     })
 }
 
-#[derive(Clone, Debug)]
-pub struct ResizeResult {
-    pub new_column_span: Option<u32>,
-    pub height_delta: i32,
-}
-
 /// The always-mounted slot: one fixed-min-height card div, one zone signal, one registry entry. Everything else — header, hooks, eval channels, fetches, the chart — lives in MetricRectBody, mounted only while the slot is inside the prefetch band. At thousands of panels the Far slots are the only per-panel cost; their data survives in the module-level caches above.
 #[component]
 pub fn MetricRect(
@@ -243,10 +237,6 @@ pub fn MetricRect(
     /// hides the maximize button and disables the resize handle.
     #[props(default = false)]
     is_maximized: bool,
-    /// Fired with the new label when a title rename commits.
-    on_rename: EventHandler<String>,
-    on_delete: EventHandler<()>,
-    on_resize: EventHandler<ResizeResult>,
 ) -> Element {
     // Zone from the shared observers (state/zones.rs), which attach via the .metric-slot class — no per-rect observers or channels. The maximize overlay is pinned Visible and stays out of the registry.
     let zone = use_signal(|| {
@@ -295,9 +285,6 @@ pub fn MetricRect(
                     is_maximized: is_maximized,
                     zone: zone,
                     renaming: renaming,
-                    on_rename: on_rename,
-                    on_delete: on_delete,
-                    on_resize: on_resize,
                 }
             }
         }
@@ -311,12 +298,9 @@ fn MetricRectBody(
     is_maximized: bool,
     zone: Signal<Zone>,
     mut renaming: Signal<bool>,
-    on_rename: EventHandler<String>,
-    on_delete: EventHandler<()>,
-    on_resize: EventHandler<ResizeResult>,
 ) -> Element {
     let initial_label = config.label.clone();
-    let editor_trigger_id = editor_trigger_id(
+    let trigger_id = editor_trigger_id(
         if is_maximized {
             "rect-max"
         } else {
@@ -332,9 +316,9 @@ fn MetricRectBody(
 
     // Sub-type of a CDN metric, learned from the manifest's `class` field as
     // the gallery resolves. None until known; "image_gallery", "metadata",
-    // or "file_list" once a manifest has been parsed. Used by BindingEditor
-    // to show only panels that actually apply (e.g. hide Image Gallery mode
-    // for metadata trees).
+    // or "file_list" once a manifest has been parsed. Reported in the chart
+    // facts so the chart panel shows only modes that apply (e.g. hides Image
+    // Gallery mode for metadata trees).
     let cdn_class = use_signal(|| Option::<String>::None);
     // AutoContent may need a registry probe when a saved Specific rect has
     // outlived its discovery metric. Keep that observed type ephemeral: the
@@ -350,13 +334,40 @@ fn MetricRectBody(
     // The options panel edits the maximized chart from outside this body, so the maximized copy reports what it learns about its content; what the grid copy handed over (Configure, below) fills in what it hasn't learned yet.
     use_effect(use_reactive((&config,), move |(config,)| {
         if is_maximized {
-            state.report_chart_facts(
+            set_chart_facts(
+                state.reported_chart_facts,
                 &config,
                 cdn_class.read().clone(),
                 *resolved_display_type.read(),
             );
         }
     }));
+    // What a maximized body learned holds only while it is up: a later maximize relearns the chart rather than trust what its content used to be.
+    use_drop({
+        let id = config.id.clone();
+        move || {
+            if is_maximized {
+                let mut facts = state.reported_chart_facts;
+                if facts.peek().as_ref().is_some_and(|f| f.rect_id == id) {
+                    facts.set(None);
+                }
+            }
+        }
+    });
+    // A maximized chart the loaded layout doesn't hold (its runs hidden, deleted in another tab, or taken out by its own sources edit) can take no edit, so it offers neither Configure nor a rename; Configure is also gone with its settings open beside it. Only the maximized copy reads these, so grid charts don't re-render as they change.
+    let out_of_layout = is_maximized
+        && state
+            .layout_config
+            .read()
+            .as_ref()
+            .is_some_and(|l| l.find_rect(&config.id).is_none());
+    let configure_hidden = out_of_layout
+        || (is_maximized
+            && state
+                .options_panel
+                .read()
+                .as_ref()
+                .is_some_and(|p| p.target == PanelTarget::Chart));
     let color_ver = *state.color_version.read();
     let options = config.options.clone();
     // Key into the module-level caches. The overlay copy gets its own entries — its width (and so its chart request) differs from the grid rect's, and the two must not evict each other per open/close.
@@ -389,9 +400,11 @@ fn MetricRectBody(
             div { class: "rect-header",
                 if *renaming.read() {
                     {
+                        let id = config.id.clone();
                         let mut commit_rename = move || {
                             renaming.set(false);
-                            on_rename.call(normalize_rect_label(rename_value.read().clone()));
+                            let label = normalize_rect_label(rename_value.read().clone());
+                            state.edit_rect(&id, |diff, base| diff.edit_rect(base, &id, |r| r.label = label));
                         };
                         rsx! {
                             input {
@@ -403,13 +416,16 @@ fn MetricRectBody(
                                 oninput: move |e: Event<FormData>| {
                                     rename_value.set(e.value());
                                 },
-                                onkeydown: move |e: Event<KeyboardData>| {
-                                    if e.key() == Key::Enter && !e.is_composing() {
-                                        commit_rename();
-                                    } else if is_app_escape(&e) {
-                                        // Consume the key so cancelling a rename inside a maximized chart doesn't also close the overlay.
-                                        e.prevent_default();
-                                        renaming.set(false);
+                                onkeydown: {
+                                    let mut commit_rename = commit_rename.clone();
+                                    move |e: Event<KeyboardData>| {
+                                        if e.key() == Key::Enter && !e.is_composing() {
+                                            commit_rename();
+                                        } else if is_app_escape(&e) {
+                                            // Consume the key so cancelling a rename inside a maximized chart doesn't also close the overlay.
+                                            e.prevent_default();
+                                            renaming.set(false);
+                                        }
                                     }
                                 },
                                 onblur: move |_| commit_rename(),
@@ -423,8 +439,10 @@ fn MetricRectBody(
                             div {
                                 class: "rect-title",
                                 ondoubleclick: move |_| {
-                                    rename_value.set(label_for_click.clone());
-                                    renaming.set(true);
+                                    if !out_of_layout {
+                                        rename_value.set(label_for_click.clone());
+                                        renaming.set(true);
+                                    }
                                 },
                                 // Inner span is the hover reveal (.rect-title-pop in kymo.css).
                                 span { class: "rect-title-text fade-overflow",
@@ -450,21 +468,19 @@ fn MetricRectBody(
                             }
                         }
                     }
-                    // A maximized chart with its settings open beside it has no use for the button; only the maximized copy reads the panel, so grid charts don't re-render as it opens and closes.
-                    if !(is_maximized && state.options_panel.read().as_ref().is_some_and(|p| p.target == PanelTarget::Chart)) {
+                    if !configure_hidden {
                         {
                             let rect = config.clone();
-                            let trigger_id = editor_trigger_id.clone();
                             rsx! {
                                 button {
-                                    id: "{editor_trigger_id}",
+                                    id: "{trigger_id}",
                                     class: "rect-action icon-button",
                                     title: "Configure",
                                     onmousedown: primary(move |_| {
                                         state.open_options_panel(PanelTarget::Chart, trigger_id.clone());
                                         if !is_maximized {
                                             // Configure edits beside the maximized chart: maximize a grid chart, handing the maximized copy what this one already knows so the editor opens on the right sections.
-                                            state.hand_over_chart_facts(&rect, cdn_class.peek().clone(), *resolved_display_type.peek());
+                                            set_chart_facts(state.handed_over_chart_facts, &rect, cdn_class.peek().clone(), *resolved_display_type.peek());
                                             focus_chart(Some(rect.id.clone()));
                                         }
                                     }),
@@ -478,6 +494,8 @@ fn MetricRectBody(
                             class: "rect-action icon-button",
                             title: "Close",
                             onmousedown: primary(move |_| {
+                                // Closing the chart takes a chart panel along, undocking it under the pointer.
+                                crate::util::panel_moved();
                                 focus_chart(None);
                             }),
                             CloseIcon {}
@@ -485,6 +503,7 @@ fn MetricRectBody(
                     } else {
                         {
                             let display_title_for_delete = display_title.clone();
+                            let id = config.id.clone();
                             rsx! {
                                 button {
                                     class: "rect-action rect-action-delete icon-button",
@@ -493,7 +512,7 @@ fn MetricRectBody(
                                         if let Some(window) = web_sys::window() {
                                             let msg = format!("Delete chart \"{}\"?", display_title_for_delete);
                                             if window.confirm_with_message(&msg).unwrap_or(false) {
-                                                on_delete.call(());
+                                                state.delete_rect(&id);
                                             }
                                         }
                                     }),
@@ -522,7 +541,7 @@ fn MetricRectBody(
                         onmousedown: primary({
                             let rect_id = config.id.clone();
                             move |e: Event<MouseData>| {
-                                // The default mousedown action anchors a text selection that the drag then extends; the resize JS attaches too late (async eval) to stop it, so kill it here like the sidebar handle's inline preventDefault.
+                                // The default mousedown action anchors a text selection that the drag then extends; the resize JS attaches too late (async eval) to stop it, so kill it here, as width_drag.js does for the width handles.
                                 e.prevent_default();
                                 let start_y = e.page_coordinates().y;
                                 let rid = rect_id.clone();
@@ -532,11 +551,19 @@ fn MetricRectBody(
                                     match eval.recv::<serde_json::Value>().await {
                                         Ok(val) => {
                                             let dy = val["dy"].as_f64().unwrap_or(0.0) as i32;
-                                            let new_column_span = val["span"]
-                                                .as_u64()
-                                                .map(|v| v as u32)
-                                                .filter(|&v| v >= 1);
-                                            on_resize.call(ResizeResult { new_column_span, height_delta: dy });
+                                            // One gesture, two edits: the height belongs to the section, the span to the rect.
+                                            if dy != 0 {
+                                                let section = state.layout_config.peek().as_ref().and_then(|l| l.section_of_rect(&rid).map(str::to_string));
+                                                if let Some(section) = section {
+                                                    let height = (chart_height as i32 + dy).clamp(100, 800) as u32;
+                                                    state.edit_section_settings(&section, |s| s.chart_height = height);
+                                                } else {
+                                                    crate::util::warn(&format!("[resize] {rid} is no longer in the layout; its height drag was dropped"));
+                                                }
+                                            }
+                                            if let Some(span) = val["span"].as_u64().map(|v| v as u32) {
+                                                state.edit_rect(&rid, |diff, base| diff.edit_rect(base, &rid, |r| r.options.column_span = span));
+                                            }
                                         }
                                         Err(e) => crate::util::warn(&format!("[resize] bridge channel lost: {e:?}")),
                                     }
@@ -675,7 +702,7 @@ fn AutoContent(
         )
     });
 
-    // Zone gate + cache, like the data fetches: an out-of-band rect (only reachable here mid-rename, which keeps the body mounted) must not turn a registry event into list_metrics traffic, and a Near/Visible re-detection defers to visible fetches. The cache keys on (metrics-gen hash, bound metric NAMES) — a binding edit that keeps the same runs but swaps metrics must not serve the old types. All-terminal passes never enter it. It lives in TYPE_CACHE so a body remounting after a scroll-away skips re-detection.
+    // Zone gate + cache, like the data fetches: an out-of-band rect (mounted only mid-rename) must not turn a registry event into list_metrics traffic, and a Near/Visible re-detection defers to visible fetches. The cache keys on (metrics-gen hash, bound metric NAMES) — a binding edit that keeps the same runs but swaps metrics must not serve the old types. All-terminal passes never enter it. It lives in TYPE_CACHE so a body remounting after a scroll-away skips re-detection.
     let type_allowed = use_memo(move || *zone.read() != Zone::Far);
 
     enum TypeFetch {

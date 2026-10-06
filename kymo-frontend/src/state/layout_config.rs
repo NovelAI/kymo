@@ -494,7 +494,7 @@ pub enum XAxisMode {
 }
 
 /// Smoothing algorithm selection (mirrors proto SmoothingConfig.Algorithm).
-#[derive(Clone, Debug, Serialize, PartialEq, Default)]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Default)]
 pub enum SmoothingAlgorithm {
     None,
     TriangularPolyfit,
@@ -775,16 +775,9 @@ pub enum LoadResult {
     Corrupt(String),
 }
 
-/// Resolve a rect id without waiting for the metrics sweep (tens of seconds on big projects), so a `?chart=` link's maximize overlay opens immediately.
+/// The bases, in order, that rect `id` resolves against without waiting for the metrics sweep (tens of seconds on big projects), so a `?chart=` link's maximize overlay opens immediately.
 /// No new construction path: user rect creation bases and their sparse edits come from the saved diff applied to an empty base, and anything else gets the rect the pipeline would auto-generate for this id-as-metric-name, with the same diff apply. The bases are tried separately so a user rect is never shadowed by a same-id synthetic.
 /// Only the sweep knows metric types, so the synthetic assumes Numeric; the overlay re-resolves against the real layout each render, so the type corrects itself when the sweep lands, and a rect that turns out not to exist shows an empty chart.
-pub fn resolve_rect_locally(diff: &LayoutDiff, id: &str) -> Option<RectConfig> {
-    local_bases(id)
-        .iter()
-        .find_map(|base| diff.apply(base).find_rect(id).cloned())
-}
-
-/// The bases [`resolve_rect_locally`] tries, in order.
 pub fn local_bases(id: &str) -> [LayoutConfig; 2] {
     let synthetic = MetricInfo {
         metric_name: id.to_string(),
@@ -809,7 +802,7 @@ const LAYOUT_DIFF_FORMAT_VERSION: u8 = 2;
 /// # Updated by intent
 ///
 /// Settings and chart gestures upsert or remove entries for their own
-/// elements ([`Self::upsert_section_settings`], [`Self::delete_rect`],
+/// elements ([`Self::edit_section_settings`], [`Self::delete_rect`],
 /// ...), against a store re-read from localStorage per edit. Section ordering
 /// may re-derive visible placements, while protecting hidden entries and
 /// anchors; it never rewrites chart or section settings. Entries for
@@ -918,7 +911,7 @@ fn parse_layout_diff(json: &str) -> Result<LayoutDiff, String> {
 /// Objects diff recursively; arrays and scalars replace wholesale (an edit
 /// to `bindings` stores the whole list). Patch keys for since-removed
 /// properties are ignored by serde on deserialize; a patch value that no
-/// longer fits the schema is dropped key-by-key (with a console warning),
+/// longer fits the schema is dropped leaf by leaf (with a console warning),
 /// keeping the element's still-valid customizations rather than reverting
 /// it wholesale to its auto-generated form.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -929,73 +922,6 @@ pub struct ConfigPatch {
 }
 
 impl ConfigPatch {
-    /// The properties of `cur` that differ from `base`; `None` if none do.
-    fn between<T: Serialize + PartialEq>(key: &str, base: &T, cur: &T) -> Option<Self> {
-        // Fast path, and load-bearing for non-object T: `merge_diff` on two
-        // equal scalars returns `cur.clone()` (a non-empty patch), not an
-        // empty map, so equality must short-circuit here.
-        if base == cur {
-            return None;
-        }
-        Self::between_values(
-            key,
-            &serde_json::to_value(base).ok()?,
-            &serde_json::to_value(cur).ok()?,
-        )
-    }
-
-    fn between_values(key: &str, base: &Value, cur: &Value) -> Option<Self> {
-        let patch = merge_diff(base, cur);
-        match &patch {
-            Value::Object(map) if map.is_empty() => None,
-            _ => Some(Self {
-                key: key.to_string(),
-                patch,
-            }),
-        }
-    }
-
-    fn apply_to<T: Serialize + DeserializeOwned>(&self, target: &mut T) {
-        let Ok(base_value) = serde_json::to_value(&*target) else {
-            return;
-        };
-        let mut value = base_value.clone();
-        merge_apply(&mut value, &self.patch);
-        match serde_json::from_value::<T>(value) {
-            Ok(merged) => {
-                *target = merged;
-                return;
-            }
-            Err(e) => warn(&format!("[layout] stale override for {}: {e}", self.key)),
-        }
-        // Salvage key-by-key: dropping only the keys that no longer fit the
-        // schema keeps the element's other customizations alive — on screen
-        // and in storage, since the next edit recomputes this entry from the
-        // displayed element (a wholesale revert here would make that
-        // recompute silently erase them).
-        let Value::Object(patch) = &self.patch else {
-            return;
-        };
-        let mut current = base_value;
-        for (key, patch_value) in patch {
-            let mut candidate = current.clone();
-            let single =
-                Value::Object(std::iter::once((key.clone(), patch_value.clone())).collect());
-            merge_apply(&mut candidate, &single);
-            if serde_json::from_value::<T>(candidate.clone()).is_ok() {
-                current = candidate;
-            } else {
-                warn(&format!(
-                    "[layout] dropped stale key {key:?} of override {}",
-                    self.key
-                ));
-            }
-        }
-        if let Ok(merged) = serde_json::from_value::<T>(current) {
-            *target = merged;
-        }
-    }
-
     /// A base-owned chart can disappear from discovery while one of its
     /// saved bindings still names a specific run (notably while that run is
     /// in Trash). Arrays replace wholesale in a merge patch, so a binding
@@ -1021,6 +947,11 @@ fn section_anchor(base: &LayoutConfig, name: &str) -> SectionConfig {
         .unwrap_or_else(|| SectionConfig::auto(name.to_string(), Vec::new()))
 }
 
+fn rect_json(rect: &RectConfig) -> Value {
+    // Infallible, as for `section_settings`.
+    serde_json::to_value(rect).expect("RectConfig serializes to JSON")
+}
+
 /// A section's settings as a JSON object, minus `rects` — those diff
 /// separately, by rect id.
 fn section_settings(s: &SectionConfig) -> Value {
@@ -1032,35 +963,7 @@ fn section_settings(s: &SectionConfig) -> Value {
     value
 }
 
-/// JSON merge patch turning `base` into `cur`: objects diff recursively to
-/// just their changed keys, everything else replaces wholesale.
-fn merge_diff(base: &Value, cur: &Value) -> Value {
-    match (base, cur) {
-        (Value::Object(base), Value::Object(cur)) => {
-            let mut patch = serde_json::Map::new();
-            for (key, cur_value) in cur {
-                match base.get(key) {
-                    Some(base_value) if base_value == cur_value => {}
-                    Some(base_value) => {
-                        patch.insert(key.clone(), merge_diff(base_value, cur_value));
-                    }
-                    None => {
-                        patch.insert(key.clone(), cur_value.clone());
-                    }
-                }
-            }
-            for key in base.keys() {
-                if !cur.contains_key(key) {
-                    patch.insert(key.clone(), Value::Null);
-                }
-            }
-            Value::Object(patch)
-        }
-        _ => cur.clone(),
-    }
-}
-
-/// Apply a merge patch produced by `merge_diff` (null = remove key).
+/// Apply a JSON merge patch (null = remove key).
 fn merge_apply(target: &mut Value, patch: &Value) {
     let Value::Object(patch) = patch else {
         *target = patch.clone();
@@ -1094,15 +997,34 @@ fn edit_object(value: &mut Value, edit: impl FnOnce(&mut serde_json::Map<String,
     }
 }
 
-/// Rewrite stored merge patch `patch` for one edit, `before` → `after` (both resolved over `anchor`, as JSON): a leaf the edit changed is pinned at its new value, or dropped when that equals the anchor's so it inherits again; a stored leaf that reads back as something else (a legacy alias, or a value the schema no longer takes) is stored as it reads back, the same rule; every other leaf stays as stored, pins at the inherited value included.
+/// Store `patch` as `key`'s one entry among `entries`, dropping any others for it (an older or foreign writer's), and the entry itself when `patch` is `Null`.
+fn store_patch(entries: &mut Vec<ConfigPatch>, key: &str, patch: Value) {
+    entries.retain(|ov| ov.key != key);
+    if !patch.is_null() {
+        entries.push(ConfigPatch {
+            key: key.to_string(),
+            patch,
+        });
+    }
+}
+
+/// Rewrite stored merge patch `patch` for one edit, `before` → `after` (both resolved over `anchor`, as JSON; a key one lacks is `Null` there): a leaf the edit changed is pinned at its new value, or dropped when that equals the anchor's so it inherits again; every other leaf stays as stored, as `OptionsBaseline::write_fields` leaves them. With `before` the anchor itself and an empty `patch`, it leaves the merge patch from `anchor` to `after`.
 fn rewrite_patch(patch: &mut Value, anchor: &Value, before: &Value, after: &Value) {
     let Value::Object(after) = after else {
         return;
     };
+    let removed = before
+        .as_object()
+        .into_iter()
+        .flat_map(|before| before.keys())
+        .filter(|key| !after.contains_key(*key));
     edit_object(patch, |map| {
-        map.retain(|key, _| after.contains_key(key));
-        for (key, after_value) in after {
+        for key in after.keys().chain(removed) {
             let before_value = before.get(key).unwrap_or(&Value::Null);
+            let after_value = after.get(key).unwrap_or(&Value::Null);
+            if before_value == after_value {
+                continue;
+            }
             let anchor_value = anchor.get(key).unwrap_or(&Value::Null);
             if after_value.is_object() && before_value.is_object() {
                 let mut nested = map.remove(key).unwrap_or(Value::Null);
@@ -1110,45 +1032,84 @@ fn rewrite_patch(patch: &mut Value, anchor: &Value, before: &Value, after: &Valu
                 if !nested.is_null() {
                     map.insert(key.clone(), nested);
                 }
-            } else if before_value != after_value
-                || map.get(key).is_some_and(|stored| stored != before_value)
-            {
-                if anchor_value == after_value {
-                    map.remove(key);
-                } else {
-                    map.insert(key.clone(), after_value.clone());
-                }
+            } else if anchor_value == after_value {
+                map.remove(key);
+            } else {
+                map.insert(key.clone(), after_value.clone());
             }
         }
     });
 }
 
-/// Resolve the chart-options cascade up to some level: `base` with each
-/// level's merge patch applied in coarse → fine order. An absent key at a
-/// level means "inherit from the level above"; a non-object patch (`Null`)
-/// means nothing is set at that level. The rect's own sparse override
-/// patch applies after these via [`ConfigPatch::apply_to`], like any other
-/// rect edit — the finest level always wins.
-pub fn cascade_options(base: &RectOptions, patches: &[&Value]) -> RectOptions {
+thread_local! {
+    /// The unreadable-value warnings printed so far, each printed once.
+    static WARNED: std::cell::RefCell<std::collections::HashSet<String>> = std::cell::RefCell::default();
+}
+
+/// `base` with the object patches among `patches` merged in, in order. When the result doesn't read back as a `T`, they merge leaf by leaf, leaving out (with a console warning naming `what`) each leaf after which it no longer does: a value a newer build wrote, kept since edits write only the fields they change, or one the schema dropped. Objects a patch and the value share are descended into; anything else is one leaf.
+fn merge_readable<T: Clone + Serialize + DeserializeOwned>(
+    base: &T,
+    patches: &[&Value],
+    what: &str,
+) -> T {
     // Nothing to merge: skip the serde round trip, which would return `base` unchanged (`apply` runs this for every rect on every edit).
     if !patches.iter().any(|patch| patch.is_object()) {
         return base.clone();
     }
-    let Ok(mut value) = serde_json::to_value(base) else {
+    fn leaves(
+        patch: &Value,
+        target: Option<&Value>,
+        path: &mut Vec<String>,
+        out: &mut Vec<(Vec<String>, Value)>,
+    ) {
+        match (patch, target) {
+            (Value::Object(patch), Some(Value::Object(target))) => {
+                for (key, value) in patch {
+                    path.push(key.clone());
+                    leaves(value, target.get(key), path, out);
+                    path.pop();
+                }
+            }
+            _ => out.push((path.clone(), patch.clone())),
+        }
+    }
+    let patches = patches.iter().filter(|patch| patch.is_object());
+    let Ok(start) = serde_json::to_value(base) else {
         return base.clone();
     };
+    let mut value = start.clone();
+    for patch in patches.clone() {
+        merge_apply(&mut value, patch);
+    }
+    if let Ok(merged) = serde_json::from_value(value) {
+        return merged;
+    }
+    let mut value = start;
     for patch in patches {
-        if patch.is_object() {
-            merge_apply(&mut value, patch);
+        let mut found = Vec::new();
+        leaves(patch, Some(&value), &mut Vec::new(), &mut found);
+        for (path, leaf) in found {
+            let single = path.iter().rev().fold(leaf, |inner, key| {
+                Value::Object(std::iter::once((key.clone(), inner)).collect())
+            });
+            let mut candidate = value.clone();
+            merge_apply(&mut candidate, &single);
+            match serde_json::from_value::<T>(candidate.clone()) {
+                Ok(_) => value = candidate,
+                Err(e) => {
+                    // Every layout write reads the stored value again: say so once.
+                    let message = format!(
+                        "[layout] dropped unreadable {} of {what}: {e}",
+                        path.join(".")
+                    );
+                    if WARNED.with_borrow_mut(|warned| warned.insert(message.clone())) {
+                        warn(&message);
+                    }
+                }
+            }
         }
     }
-    match serde_json::from_value(value) {
-        Ok(resolved) => resolved,
-        Err(e) => {
-            warn(&format!("[layout] stale chart-defaults patch ignored: {e}"));
-            base.clone()
-        }
-    }
+    serde_json::from_value(value).unwrap_or_else(|_| base.clone())
 }
 
 fn options_object(options: &RectOptions) -> serde_json::Map<String, Value> {
@@ -1158,7 +1119,7 @@ fn options_object(options: &RectOptions) -> serde_json::Map<String, Value> {
     }
 }
 
-/// What a chart-options level (the project's or a section's defaults, or one chart's own options) held when its editor opened: the options the level above resolves to, the level's own patch, and the two resolved.
+/// What a chart-options level (the project's or a section's defaults, or one chart's own options) held when its editor opened: `anchor`, the options the level above resolves to; `patch`, the level's own; `opened`, the two resolved.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OptionsBaseline {
     pub anchor: RectOptions,
@@ -1168,7 +1129,7 @@ pub struct OptionsBaseline {
 
 impl OptionsBaseline {
     pub fn new(anchor: RectOptions, patch: Value) -> Self {
-        let opened = cascade_options(&anchor, &[&patch]);
+        let opened = merge_readable(&anchor, &[&patch], "chart options");
         Self {
             anchor,
             patch,
@@ -1176,7 +1137,7 @@ impl OptionsBaseline {
         }
     }
 
-    /// Write the fields `draft` changed since `previous` into `stored`, the level's patch as storage holds it now, leaving its other keys as they are (another tab may have set them). A field back at the value it opened with takes its open-time entry again, so a pin at the inherited value survives a Revert; one at the level above's value inherits it; any other is pinned.
+    /// Write the fields `draft` changed since `previous` into `stored`, the level's patch as storage holds it now, leaving its other keys as they are (another tab may have set them). A field back at the value it opened with takes its open-time entry again, so a pin at the inherited value survives a Revert; one at the level above's value inherits it; any other is pinned. The level above is `anchor`, as the editor opened on it: the editor shows that value as inherited and its Reset sets it, so comparing against what another tab set since would make a Reset pin.
     pub fn write_fields(&self, stored: &mut Value, previous: &RectOptions, draft: &RectOptions) {
         let (previous, opened, anchor) = (
             options_object(previous),
@@ -1410,6 +1371,35 @@ mod cascade_tests {
         layout.find_rect(id).expect("rect").options.clone()
     }
 
+    /// A value this build can't read (a newer build's, left in storage after a rollback) drops alone: the other fields at its level still apply, chart defaults and a chart's own options alike.
+    #[test]
+    fn an_unreadable_option_drops_alone() {
+        let base = base_with_one_rect();
+        let mut diff = LayoutDiff {
+            project_chart_defaults: serde_json::json!({ "x_axis_mode": "FutureMode", "log_x": true }),
+            ..Default::default()
+        };
+        let options = opts_of(&diff.apply(&base), "train/loss");
+        assert!(options.log_x, "the readable default still applies");
+        assert_eq!(options.x_axis_mode, XAxisMode::default());
+
+        diff.rect_overrides.push(ConfigPatch {
+            key: "train/loss".to_string(),
+            patch: serde_json::json!({ "label": "kept", "options": { "smoothing_window": 9, "x_axis_mode": "FutureMode" } }),
+        });
+        let rect = diff
+            .apply(&base)
+            .find_rect("train/loss")
+            .expect("rect")
+            .clone();
+        assert_eq!(rect.label, "kept");
+        assert_eq!(
+            rect.options.smoothing_window, 9,
+            "the chart's other options survive"
+        );
+        assert!(rect.options.log_x);
+    }
+
     #[test]
     fn finest_level_wins_and_absent_inherits() {
         let base = base_with_one_rect();
@@ -1565,25 +1555,78 @@ mod cascade_tests {
         );
     }
 
-    /// The options panel stays open beside the grid, so a collapse and a chart-height drag can land between its edits; an edit must keep them.
+    /// A section edit rewrites only the settings it changed, as a rect's does: a collapse or chart-height drag made beside the open panel stays, so does a setting or value this build can't read (a newer build's), and a chart default the edit clears goes alone.
     #[test]
-    fn section_settings_edit_keeps_settings_it_does_not_touch() {
+    fn section_edits_keep_untouched_settings() {
         let base = base_with_one_rect();
         let mut diff = LayoutDiff::default();
-
-        let mut beside = diff.apply(&base).sections[0].clone();
-        beside.collapsed = Some(true);
-        beside.chart_height = 400;
-        diff.upsert_section_settings(&base, &beside);
-
-        diff.edit_section_settings(&base, "train", |section| {
-            section.display_name = "Training".to_string();
+        let stored = serde_json::json!({
+            "collapsed": true,
+            "chart_height": 400,
+            "future_setting": { "wrap": true },
+            "max_columns": "wide",
+            "chart_defaults": { "log_y": true, "smoothing": "FutureAlgorithm" }
+        });
+        diff.section_overrides.push(ConfigPatch {
+            key: "train".to_string(),
+            patch: stored.clone(),
         });
 
-        let shown = &diff.apply(&base).sections[0];
-        assert_eq!(shown.display_name, "Training");
-        assert_eq!(shown.collapsed, Some(true));
-        assert_eq!(shown.chart_height, 400);
+        assert!(diff.edit_section_settings(&base, "train", |s| {
+            s.display_name = "Training".to_string();
+        }));
+        let mut expected = stored;
+        expected["display_name"] = serde_json::json!("Training");
+        assert_eq!(diff.section_overrides[0].patch, expected);
+
+        assert!(diff.edit_section_settings(&base, "train", |s| {
+            s.chart_defaults.as_object_mut().unwrap().remove("log_y");
+        }));
+        expected["chart_defaults"] = serde_json::json!({ "smoothing": "FutureAlgorithm" });
+        assert_eq!(diff.section_overrides[0].patch, expected);
+    }
+
+    /// Several entries stored under one key are read as their reader reads them: a section's in order, so an edit folds them into one; a chart's first wins, so an edit keeps the first and drops the rest it never showed.
+    #[test]
+    fn an_edit_folds_entries_stored_under_one_key() {
+        let base = base_with_one_rect();
+        let mut diff = LayoutDiff::default();
+        for patch in [
+            serde_json::json!({ "display_name": "AA", "chart_height": 300 }),
+            serde_json::json!({ "chart_height": 400, "collapsed": false }),
+        ] {
+            diff.section_overrides.push(ConfigPatch {
+                key: "train".to_string(),
+                patch,
+            });
+        }
+        assert_eq!(diff.apply(&base).sections[0].chart_height, 400);
+
+        assert!(diff.edit_section_settings(&base, "train", |s| {
+            s.display_name = "WW".to_string();
+        }));
+        assert_eq!(diff.section_overrides.len(), 1);
+        assert_eq!(
+            diff.section_overrides[0].patch,
+            serde_json::json!({ "display_name": "WW", "chart_height": 400, "collapsed": false })
+        );
+
+        for patch in [
+            serde_json::json!({ "label": "A" }),
+            serde_json::json!({ "label": "B", "options": { "log_y": true } }),
+        ] {
+            diff.rect_overrides.push(ConfigPatch {
+                key: "train/loss".to_string(),
+                patch,
+            });
+        }
+        assert!(!opts_of(&diff.apply(&base), "train/loss").log_y);
+        assert!(diff.edit_rect(&base, "train/loss", |r| r.options.max_runs = 3));
+        assert_eq!(diff.rect_overrides.len(), 1);
+        assert_eq!(
+            diff.rect_overrides[0].patch,
+            serde_json::json!({ "label": "A", "options": { "max_runs": 3 } })
+        );
     }
 
     /// A settings payload built from an earlier snapshot of the section (as
@@ -1772,20 +1815,6 @@ mod cascade_tests {
     /// An editor writes only what it changed onto the stored state, so another tab's edits since it opened survive.
     #[test]
     fn editors_write_only_the_fields_they_change() {
-        let base = base_with_one_rect();
-        let mut diff = LayoutDiff::default();
-
-        // Rect: another tab sets the smoothing; this one changes Log Y.
-        let mut theirs = diff.apply(&base).find_rect("train/loss").unwrap().clone();
-        theirs.options.smoothing = SmoothingAlgorithm::EmaPolyfit;
-        diff.update_rect(&base, &theirs);
-        diff.edit_rect(&base, "train/loss", |r| r.options.log_y = true);
-        let o = opts_of(&diff.apply(&base), "train/loss");
-        assert_eq!(
-            (o.smoothing, o.log_y),
-            (SmoothingAlgorithm::EmaPolyfit, true)
-        );
-
         // Defaults level opened with Log Y pinned, and Max runs pinned at the value it inherits.
         let baseline = OptionsBaseline::new(
             RectOptions::default(),
@@ -1827,7 +1856,7 @@ mod cascade_tests {
         assert!(stored.is_null(), "an emptied level is Null, never {{}}");
     }
 
-    /// A rect edit rewrites only the keys it changed: pins it leaves alone stay, even at their inherited value, stale keys are stored as they read back, and a deleted rect stays deleted.
+    /// A rect edit rewrites only the keys it changed: pins it leaves alone stay, even at their inherited value or unreadable here, and a deleted rect stays deleted.
     #[test]
     fn rect_edits_keep_untouched_pins_and_deletions() {
         let base = base_with_one_rect();
@@ -1853,17 +1882,17 @@ mod cascade_tests {
         set_project_defaults(&mut diff, &RectOptions::default());
         assert!(opts_of(&diff.apply(&base), "train/loss").log_y);
 
-        // The next edit drops a removed field and stores a value as it reads back: a removed smoothing ("RunningAverage") reads as None, which the chart keeps showing.
-        diff.rect_overrides[0].patch = serde_json::json!({
+        // A value this build reads as something else (a smoothing it doesn't know reads as None) or not at all stays for the build that wrote it.
+        let stored = serde_json::json!({
             "label": "kept",
             "removed_field": 1,
-            "options": { "smoothing": "RunningAverage" }
+            "options": { "smoothing": "FutureAlgorithm", "x_axis_mode": "FutureMode" }
         });
+        diff.rect_overrides[0].patch = stored.clone();
         assert!(diff.edit_rect(&base, "train/loss", |r| r.options.log_x = true));
-        assert_eq!(
-            diff.rect_overrides[0].patch,
-            serde_json::json!({ "label": "kept", "options": { "log_x": true, "smoothing": "None" } })
-        );
+        let mut expected = stored;
+        expected["options"]["log_x"] = serde_json::json!(true);
+        assert_eq!(diff.rect_overrides[0].patch, expected);
 
         // An edit to a rect deleted meanwhile (another tab's delete) records nothing and keeps the deletion.
         diff.delete_rect(&base, "train/loss");
@@ -2123,7 +2152,7 @@ mod user_section_tests {
         assert_eq!(s.display_name(), "New Section");
         assert!(!s.is_collapsed(false));
 
-        // A settings save built from the displayed merged section (navbar collapse-all) — AI-1359's trigger — must not copy base rects into the store.
+        // A settings save built from the merged section (every section-settings edit starts from one) — AI-1359's trigger — must not copy base rects into the store.
         let mut payload = s.clone();
         payload.display_name = "Mine".to_string();
         diff.upsert_section_settings(&base, &payload);
@@ -2540,20 +2569,16 @@ impl LayoutDiff {
             let mut anchor = add.rect.clone();
             anchor.options =
                 self.inherited_options(&empty_base, &add.section, &RectOptions::default());
-            let legacy_patch = ConfigPatch::between(&add.rect.id, &anchor, &add.rect);
+            let anchor = rect_json(&anchor);
+            let mut patch = Value::Null;
+            rewrite_patch(&mut patch, &anchor, &anchor, &rect_json(&add.rect));
 
             self.added_rects[i].rect.options = RectOptions::default();
-            if let Some(mut legacy_patch) = legacy_patch {
-                if let Some(pos) = self
-                    .rect_overrides
-                    .iter()
-                    .position(|ov| ov.key == add.rect.id)
-                {
-                    let existing = self.rect_overrides.remove(pos);
-                    merge_apply(&mut legacy_patch.patch, &existing.patch);
-                }
-                self.rect_overrides.push(legacy_patch);
+            // A stored entry for the rect (the first, as reads take it) applies over the migrated patch.
+            if let Some(existing) = self.rect_overrides.iter().find(|ov| ov.key == add.rect.id) {
+                merge_apply(&mut patch, &existing.patch);
             }
+            store_patch(&mut self.rect_overrides, &add.rect.id, patch);
         }
         self.format_version = 1;
     }
@@ -2594,21 +2619,13 @@ impl LayoutDiff {
         self.rect_edit_anchor(base, id).map(|rect| rect.options)
     }
 
-    /// Record the user's settings for one section — one path for base-derived and user-created alike. Recomputes that single entry; removing it when the settings match the anchor keeps reverts self-cleaning. `section_settings` strips `rects`, so a payload built from displayed state (which for a prefix-collided user section carries base rects) can never store rect content, only settings.
+    /// Set section `section.name`'s settings to `section`'s: an edit changing every setting that differs.
+    #[cfg(test)]
     pub fn upsert_section_settings(&mut self, base: &LayoutConfig, section: &SectionConfig) {
-        let anchor = section_anchor(base, &section.name);
-        let patch = ConfigPatch::between_values(
-            &section.name,
-            &section_settings(&anchor),
-            &section_settings(section),
-        );
-        self.section_overrides.retain(|ov| ov.key != section.name);
-        if let Some(patch) = patch {
-            self.section_overrides.push(patch);
-        }
+        self.edit_section_settings(base, &section.name, |s| *s = section.clone());
     }
 
-    /// Record an edit to some of `name`'s settings, made on the section as this diff resolves it so that settings `edit` doesn't touch keep their stored values.
+    /// Record an edit to some of `name`'s settings, made on the section as this diff resolves it: what `edit` changes is written into the section's patch against its anchor, and the rest of the patch stays as stored, values this build can't read included.
     /// Returns false, recording nothing, when this diff doesn't show the section: gone from discovery, or deleted, perhaps in another tab.
     pub fn edit_section_settings(
         &mut self,
@@ -2616,7 +2633,7 @@ impl LayoutDiff {
         name: &str,
         edit: impl FnOnce(&mut SectionConfig),
     ) -> bool {
-        let Some(mut section) = self
+        let Some(before) = self
             .materialized_sections(base)
             .sections
             .into_iter()
@@ -2624,9 +2641,35 @@ impl LayoutDiff {
         else {
             return false;
         };
+        let mut section = before.clone();
         edit(&mut section);
-        self.upsert_section_settings(base, &section);
+        self.write_section_settings(base, &before, &section);
         true
+    }
+
+    /// Rewrite section `after.name`'s stored patch for one edit, `before` → `after`, dropping the entry once nothing differs from the anchor, so reverts clean up. `section_settings` strips `rects`, so a payload built from displayed state (which for a prefix-collided user section carries base rects) can never store rect content, only settings.
+    fn write_section_settings(
+        &mut self,
+        base: &LayoutConfig,
+        before: &SectionConfig,
+        after: &SectionConfig,
+    ) {
+        // Several entries under one name apply in order when read, so they fold into the one written.
+        let mut patch = Value::Null;
+        for ov in self
+            .section_overrides
+            .iter()
+            .filter(|ov| ov.key == after.name)
+        {
+            merge_apply(&mut patch, &ov.patch);
+        }
+        rewrite_patch(
+            &mut patch,
+            &section_settings(&section_anchor(base, &after.name)),
+            &section_settings(before),
+            &section_settings(after),
+        );
+        store_patch(&mut self.section_overrides, &after.name, patch);
     }
 
     /// Set the named sections to `collapsed`, recording each one that changes as its header toggle would; one already there keeps its override, and names gone from the layout are skipped. Returns whether anything changed.
@@ -2638,11 +2681,11 @@ impl LayoutDiff {
         sections_visible: bool,
     ) -> bool {
         let mut changed = false;
-        for mut section in self.materialized_sections(base).sections {
-            if names.contains(&section.name) && section.is_collapsed(sections_visible) != collapsed
-            {
+        for before in self.materialized_sections(base).sections {
+            if names.contains(&before.name) && before.is_collapsed(sections_visible) != collapsed {
+                let mut section = before.clone();
                 section.set_collapsed(collapsed, sections_visible);
-                self.upsert_section_settings(base, &section);
+                self.write_section_settings(base, &before, &section);
                 changed = true;
             }
         }
@@ -2699,7 +2742,7 @@ impl LayoutDiff {
         for rect in &section.rects {
             self.add_rect(base, &section.name, rect);
         }
-        self.upsert_section_settings(base, section);
+        self.edit_section_settings(base, &section.name, |s| *s = section.clone());
     }
 
     /// Record an edit to rect `id`, made on the rect as this diff resolves it: what `edit` changes is written into the rect's own patch against its inherited project/section resolution, and the rest of the patch stays as stored.
@@ -2713,20 +2756,26 @@ impl LayoutDiff {
         let Some(anchor) = self.rect_edit_anchor(base, id) else {
             return false;
         };
-        let stored = self.rect_overrides.iter().find(|ov| ov.key == id);
-        let mut before = anchor.clone();
-        if let Some(ov) = stored {
-            ov.apply_to(&mut before);
-        }
-        let mut patch = stored.map_or(Value::Null, |ov| ov.patch.clone());
+        let mut patch = self.rect_patch(id);
+        let before = merge_readable(&anchor, &[&patch], id);
         let mut after = before.clone();
         edit(&mut after);
-        // Infallible, as for `section_settings`.
-        let json =
-            |rect: &RectConfig| serde_json::to_value(rect).expect("RectConfig serializes to JSON");
-        rewrite_patch(&mut patch, &json(&anchor), &json(&before), &json(&after));
-        self.store_rect_patch(id, patch);
+        rewrite_patch(
+            &mut patch,
+            &rect_json(&anchor),
+            &rect_json(&before),
+            &rect_json(&after),
+        );
+        store_patch(&mut self.rect_overrides, id, patch);
         true
+    }
+
+    /// Rect `id`'s own patch as reads apply it: the first entry stored for it (`Null` without one).
+    pub(crate) fn rect_patch(&self, id: &str) -> Value {
+        self.rect_overrides
+            .iter()
+            .find(|ov| ov.key == id)
+            .map_or(Value::Null, |ov| ov.patch.clone())
     }
 
     /// Record an edit to rect `id`'s own options patch as stored, which the chart editor writes as the defaults editors write theirs ([`OptionsBaseline::write_fields`]). Returns false, recording nothing, for a rect this diff doesn't show, as [`Self::edit_rect`] does.
@@ -2739,10 +2788,7 @@ impl LayoutDiff {
         if self.rect_edit_anchor(base, id).is_none() {
             return false;
         }
-        let mut patch = match self.rect_overrides.iter().find(|ov| ov.key == id) {
-            Some(ov) => ov.patch.clone(),
-            None => Value::Null,
-        };
+        let mut patch = self.rect_patch(id);
         edit_object(&mut patch, |map| {
             let mut options = map.remove("options").unwrap_or(Value::Null);
             edit(&mut options);
@@ -2750,19 +2796,8 @@ impl LayoutDiff {
                 map.insert("options".to_string(), options);
             }
         });
-        self.store_rect_patch(id, patch);
+        store_patch(&mut self.rect_overrides, id, patch);
         true
-    }
-
-    /// Store `patch` as rect `id`'s own, dropping the entry when it is `Null`.
-    fn store_rect_patch(&mut self, id: &str, patch: Value) {
-        self.rect_overrides.retain(|ov| ov.key != id);
-        if !patch.is_null() {
-            self.rect_overrides.push(ConfigPatch {
-                key: id.to_string(),
-                patch,
-            });
-        }
     }
 
     /// Set rect `rect.id` to `rect`: an edit changing everything that differs.
@@ -2821,7 +2856,7 @@ impl LayoutDiff {
     fn resolved_section(&self, base: &LayoutConfig, name: &str) -> SectionConfig {
         let mut sec = section_anchor(base, name);
         for ov in self.section_overrides.iter().filter(|o| o.key == name) {
-            ov.apply_to(&mut sec);
+            sec = merge_readable(&sec, &[&ov.patch], name);
         }
         sec
     }
@@ -2836,18 +2871,19 @@ impl LayoutDiff {
     /// editors diff against this, so values a chart merely inherits never
     /// freeze into its own override patch — later section/project changes
     /// keep flowing through to it.
-    pub fn inherited_options(
+    fn inherited_options(
         &self,
         base: &LayoutConfig,
         section: &str,
         rect_base: &RectOptions,
     ) -> RectOptions {
-        cascade_options(
+        merge_readable(
             rect_base,
             &[
                 &self.project_chart_defaults,
                 &self.section_chart_defaults(base, section),
             ],
+            "chart defaults",
         )
     }
 
@@ -2898,7 +2934,7 @@ impl LayoutDiff {
         }
         for ov in &self.section_overrides {
             if let Some(s) = layout.find_section_mut(&ov.key) {
-                ov.apply_to(s);
+                *s = merge_readable(s, &[&ov.patch], &ov.key);
             }
         }
         layout
@@ -2934,12 +2970,13 @@ impl LayoutDiff {
                 // Project → section → rect cascade: the coarse defaults
                 // slide in under the rect's own sparse override patch, which
                 // applies last and wins.
-                r.options = cascade_options(
+                r.options = merge_readable(
                     &r.options,
                     &[&self.project_chart_defaults, &section_defaults],
+                    "chart defaults",
                 );
                 if let Some(ov) = rect_overrides.get(r.id.as_str()) {
-                    ov.apply_to(r);
+                    *r = merge_readable(r, &[&ov.patch], &ov.key);
                 }
             }
         }

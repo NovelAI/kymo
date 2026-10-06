@@ -278,7 +278,8 @@ impl UserConfigState {
         signal.set(light);
     }
 
-    pub fn current(&self) -> UserConfig {
+    /// The current settings, without subscribing the caller.
+    pub fn peek_config(&self) -> UserConfig {
         *self.config.peek()
     }
 

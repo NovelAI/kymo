@@ -8,7 +8,7 @@ use crate::grpc::GrpcClient;
 use crate::route::Route;
 use crate::state::layout_config::{
     local_bases, DisplayType, LayoutDiff, LoadResult, MetricBinding, OptionOverride,
-    OptionsBaseline, RectConfig, RectOptions, SectionConfig, ViewContext,
+    OptionsBaseline, RectConfig, RectOptions, SectionConfig, ViewContext, MAX_SECTION_COLUMNS,
 };
 use crate::state::section_order::SectionGap;
 use crate::state::LayoutConfig;
@@ -72,11 +72,11 @@ pub struct OpenPanel {
     pub return_focus_id: String,
     /// Configure on a grid chart maximized the chart now shown, so closing the panel un-maximizes it.
     pub unmaximize_on_close: bool,
-    /// The maximize has moved to another chart (←/→) since the panel opened, and a chart panel followed it there: such a remount takes focus only from the panel it replaced, not from where the user put it.
-    pub follows_chart: bool,
+    /// Whether the editor takes focus as it mounts: an opened panel does; a chart panel following the maximize to another chart (←/→) does only if the panel it replaces held focus, so keys pressed on the maximized chart stay with it.
+    pub take_focus: bool,
 }
 
-/// What a chart body learned about a chart's content, for the chart panel's editor (a body's own signals die with it). Facts belong to one set of data sources.
+/// What a chart body learned about a chart's content, for the chart panel's editor (a body's own signals die with it), from the data sources it was learned from.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChartFacts {
     pub rect_id: String,
@@ -85,7 +85,8 @@ pub struct ChartFacts {
     pub display_type: Option<DisplayType>,
 }
 
-fn set_chart_facts(
+/// Record what a chart body knows of `rect`'s content in `facts` (`DashboardState::reported_chart_facts` or `handed_over_chart_facts`), replacing what it held.
+pub fn set_chart_facts(
     mut facts: Signal<Option<ChartFacts>>,
     rect: &RectConfig,
     cdn_class: Option<String>,
@@ -279,7 +280,7 @@ pub struct DashboardState {
     pub base_layout: Signal<Option<LayoutConfig>>,
     pub layout_generation: Signal<u64>,
     pub color_version: Signal<u64>,
-    /// The maximized chart as it was when maximized. The overlay and the chart panel read the live layout's copy, so this only shows while the layout doesn't hold the rect: a `?chart=` link that lands ahead of the metrics sweep, or a chart that left the layout while maximized (its panel then closes).
+    /// The maximized chart as of its maximize or its latest applied edit ([`Self::edit_rect`]). The overlay and the chart panel read the live layout's copy, so this only shows while the layout doesn't hold the rect: a `?chart=` link that lands ahead of the metrics sweep, or a chart that left the layout while maximized (its panel then closes).
     pub maximized: Signal<Option<RectConfig>>,
     /// The open options panel, docked beside the main column.
     pub options_panel: Signal<Option<OpenPanel>>,
@@ -476,57 +477,65 @@ impl DashboardState {
         });
     }
 
-    /// Returns whether `f` changed the diff, which is then saved; false when there is no diff to edit.
+    /// Saves the diff when `f` returns true (it made the edit), and returns that; false also when the stored diff can't be read. `f` must leave the diff as it found it when it returns false, since the layout shown is refreshed from the diff either way.
     fn record_edit_if_changed(
         &self,
         f: impl FnOnce(&mut LayoutDiff, &LayoutConfig) -> bool,
     ) -> bool {
         let project_id = self.project_id.peek().clone();
         let base = self.base_layout.peek().clone();
-        let Some(base) = base else {
-            // base/layout are set together on load, so this is unreachable
-            // today — but an edit silently not persisting must be
-            // diagnosable if a future code path shows a layout without one.
-            warn(&format!(
-                "[layout] no base layout for {project_id}; edit dropped"
-            ));
-            return false;
-        };
         // Mid-session corruption (another tab running a different build?):
         // drop this one edit and surface the recovery page.
         let Some(mut diff) = load_diff_or_route(&project_id, "edit dropped") else {
             return false;
         };
-        let changed = f(&mut diff, &base);
+        // Ahead of the metrics sweep (a panel opened early), an edit goes against the empty base: one needing a discovered chart finds nothing to edit, the rest saves, and the sweep's layout, which reads the diff after it, shows it.
+        let changed = match &base {
+            Some(base) => f(&mut diff, base),
+            None => f(&mut diff, &LayoutConfig::auto_generate(&[])),
+        };
         if changed {
             diff.save(&project_id);
         }
-        let shown = diff.apply(&base);
-        let mut layout_signal = self.layout_config;
-        layout_signal.set(Some(shown));
+        if let Some(base) = base {
+            let mut layout_signal = self.layout_config;
+            layout_signal.set(Some(diff.apply(&base)));
+        }
         changed
     }
 
     /// Edit some of `name`'s settings on the section as stored, leaving the others as they are: the options panel stays open beside the grid, so a collapse or chart-height drag made meanwhile must survive its edits. A section the stored layout no longer shows (deleted, perhaps in another tab) records nothing, and the refreshed layout drops it.
     pub fn edit_section_settings(&self, name: &str, edit: impl FnOnce(&mut SectionConfig)) {
-        self.record_edit_if_changed(|diff, base| {
-            let applied = diff.edit_section_settings(base, name, edit);
-            if !applied {
-                warn(&format!(
-                    "[layout] section {name} no longer in layout; edit not saved"
-                ));
-            }
-            applied
+        self.record_element_edit(&format!("section {name}"), |diff, base| {
+            diff.edit_section_settings(base, name, edit)
         });
     }
 
-    /// Open the options panel on `target`, opened by the control `return_focus_id`, replacing whatever it showed. The open target's own trigger, shown pressed meanwhile, closes it instead, except a chart panel with nothing maximized behind it (a Configure whose maximize never landed), which opens again.
+    /// [`Self::record_edit_if_changed`] for an edit to the one layout element `what` names, which returns false, recording nothing, once the stored layout no longer shows it; that also warns in the console.
+    fn record_element_edit(
+        &self,
+        what: &str,
+        edit: impl FnOnce(&mut LayoutDiff, &LayoutConfig) -> bool,
+    ) -> bool {
+        self.record_edit_if_changed(|diff, base| {
+            let applied = edit(diff, base);
+            if !applied {
+                warn(&format!(
+                    "[layout] {what} no longer in layout; edit not saved"
+                ));
+            }
+            applied
+        })
+    }
+
+    /// Open the options panel on `target`, opened by the control `return_focus_id`, replacing whatever it showed. The open target's own trigger, shown pressed meanwhile, closes it instead; a chart panel's never shows while it is open (hidden on the maximized chart, inert in the grid beneath), so a Configure pressed again before its maximize lands opens it again.
     /// A chart panel opened with nothing maximized comes from Configure on a grid chart, which maximizes the chart next; closing the panel un-maximizes it again, whichever target the panel shows by then.
     pub fn open_options_panel(&self, target: PanelTarget, return_focus_id: String) {
+        crate::util::panel_moved();
         let mut open = self.options_panel;
         let current = open.peek().clone();
-        let shown = current.as_ref().is_some_and(|p| p.target == target)
-            && (target != PanelTarget::Chart || self.maximized.peek().is_some());
+        let shown =
+            target != PanelTarget::Chart && current.as_ref().is_some_and(|p| p.target == target);
         if shown {
             self.close_options_panel();
             return;
@@ -537,7 +546,7 @@ impl DashboardState {
             target,
             return_focus_id,
             unmaximize_on_close,
-            follows_chart: false,
+            take_focus: true,
         }));
     }
 
@@ -547,6 +556,7 @@ impl DashboardState {
         let Some(panel) = open.peek().clone() else {
             return;
         };
+        crate::util::panel_moved();
         open.set(None);
         if panel.unmaximize_on_close {
             let mut maximized = self.maximized;
@@ -555,48 +565,32 @@ impl DashboardState {
         }
     }
 
-    /// The maximized chart body's report on `rect`'s content, replacing its last one.
-    pub fn report_chart_facts(
-        &self,
-        rect: &RectConfig,
-        cdn_class: Option<String>,
-        display_type: Option<DisplayType>,
-    ) {
-        set_chart_facts(self.reported_chart_facts, rect, cdn_class, display_type);
+    /// The maximized chart as the loaded layout holds it, with its section's columns (which bound the chart panel's Width), or, while the layout doesn't hold it, its snapshot ([`Self::maximized`]) with the most columns a section can have. Subscribes the caller.
+    pub fn maximized_rect(&self) -> Option<(RectConfig, u32)> {
+        let snapshot = self.maximized.read().clone()?;
+        let resolved = self
+            .layout_config
+            .read()
+            .as_ref()
+            .and_then(|layout| layout.resolve_rect(&snapshot.id));
+        Some(resolved.unwrap_or((snapshot, MAX_SECTION_COLUMNS)))
     }
 
-    /// What the grid copy of `rect` knows about its content as Configure maximizes it, so the editor opens on the right sections before the maximized copy has learned them.
-    pub fn hand_over_chart_facts(
-        &self,
-        rect: &RectConfig,
-        cdn_class: Option<String>,
-        display_type: Option<DisplayType>,
-    ) {
-        set_chart_facts(self.handed_over_chart_facts, rect, cdn_class, display_type);
-    }
-
-    /// What is known about `rect`'s content as (CDN class, display type): the maximized body's report, with what the grid copy handed over filling in what it hasn't learned yet; facts for other sources don't count. Subscribes the caller.
+    /// What is known about `rect`'s content as (CDN class, display type): the maximized body's report, with what the grid copy handed over for these sources filling in what it hasn't learned yet. The report holds through a source edit, since the body re-reports right after it with what it knew then, so the editor's sections don't flip for a render in between. Subscribes the caller.
     pub fn chart_facts(&self, rect: &RectConfig) -> (Option<String>, Option<DisplayType>) {
-        let known: Vec<ChartFacts> = [self.reported_chart_facts, self.handed_over_chart_facts]
-            .into_iter()
-            .filter_map(|facts| facts.read().clone())
-            .filter(|f| f.rect_id == rect.id && f.bindings == rect.bindings)
-            .collect();
+        let reported = self.reported_chart_facts.read();
+        let handed_over = self.handed_over_chart_facts.read();
+        let known = [
+            reported.as_ref().filter(|f| f.rect_id == rect.id),
+            handed_over
+                .as_ref()
+                .filter(|f| f.rect_id == rect.id && f.bindings == rect.bindings),
+        ];
+        let known = known.iter().flatten();
         (
-            known.iter().find_map(|f| f.cdn_class.clone()),
-            known.iter().find_map(|f| f.display_type),
+            known.clone().find_map(|f| f.cdn_class.clone()),
+            known.clone().find_map(|f| f.display_type),
         )
-    }
-
-    /// Edit the maximized chart: `edit` makes its edits to rect `id` on the stored diff as one ([`LayoutDiff::edit_rect`], [`LayoutDiff::edit_rect_options`]), false when the diff doesn't show the rect. One the layout doesn't hold (it dropped out of a regenerated layout) can't take the edit, so the overlay closes instead of pretending it applied.
-    pub fn edit_maximized_rect(
-        &self,
-        id: &str,
-        edit: impl FnOnce(&mut LayoutDiff, &LayoutConfig) -> bool,
-    ) {
-        if !self.edit_stored_rect(id, edit) {
-            crate::route::focus_chart(None);
-        }
     }
 
     /// Collapse or expand the named sections as one edit (see [`LayoutDiff::set_sections_collapsed`]).
@@ -629,26 +623,36 @@ impl DashboardState {
         self.record_edit_if_changed(|_, _| false);
     }
 
-    /// Edit rect `id` on the rect as stored, leaving what `edit` doesn't change as it is, so another tab's edit to the same chart survives.
-    /// Records nothing when the stored layout no longer shows the rect: its metric left a regenerated base, or it was deleted, perhaps in another tab.
-    pub fn edit_rect(&self, id: &str, edit: impl FnOnce(&mut RectConfig)) {
-        self.edit_stored_rect(id, |diff, base| diff.edit_rect(base, id, edit));
+    /// Record `edit`'s [`LayoutDiff::edit_rect`]/[`LayoutDiff::edit_rect_options`] calls on rect `id` as one edit; `edit` returns what they return, false once the diff no longer shows the rect. A maximized chart that can't take the edit closes instead of pretending it applied; one that took it has its snapshot follow, which the overlay shows while the layout doesn't hold the chart (ahead of the sweep, or its runs hidden).
+    pub fn edit_rect(&self, id: &str, edit: impl FnOnce(&mut LayoutDiff, &LayoutConfig) -> bool) {
+        let applied = self.record_element_edit(&format!("rect {id}"), edit);
+        let mut maximized = self.maximized;
+        if !maximized.peek().as_ref().is_some_and(|m| m.id == id) {
+            return;
+        }
+        if !applied {
+            crate::route::focus_chart(None);
+            return;
+        }
+        // An edit can take the chart out of the layout (a sources edit, when a Specific source was what kept it there): the saved diff then resolves it as a chart link ahead of the sweep does.
+        let fresh = self.fresh_rect(id);
+        if fresh.is_some() && *maximized.peek() != fresh {
+            maximized.set(fresh);
+        }
     }
 
-    fn edit_stored_rect(
-        &self,
-        id: &str,
-        edit: impl FnOnce(&mut LayoutDiff, &LayoutConfig) -> bool,
-    ) -> bool {
-        self.record_edit_if_changed(|diff, base| {
-            let applied = edit(diff, base);
-            if !applied {
-                warn(&format!(
-                    "[layout] rect {id} no longer in layout; edit not saved"
-                ));
-            }
-            applied
-        })
+    /// The freshest picture of rect `id`: the loaded layout's, else the saved diff's local resolve without one (ahead of the metrics sweep). Peeks: callers re-resolve on their own triggers (an edit, a `?chart=` change), never per layout write.
+    pub fn fresh_rect(&self, id: &str) -> Option<RectConfig> {
+        self.layout_config
+            .peek()
+            .as_ref()
+            .and_then(|layout| layout.find_rect(id).cloned())
+            .or_else(|| {
+                let diff = self.peek_diff();
+                local_bases(id)
+                    .iter()
+                    .find_map(|base| diff.apply(base).find_rect(id).cloned())
+            })
     }
 
     /// Record a user-added chart in `section`. Like every rect intent, adds
@@ -715,11 +719,10 @@ impl DashboardState {
         }
         .unwrap_or_default();
         let own = diff
-            .rect_overrides
-            .iter()
-            .find(|ov| ov.key == id)
-            .and_then(|ov| ov.patch.get("options").cloned())
-            .unwrap_or(serde_json::Value::Null);
+            .rect_patch(id)
+            .get("options")
+            .cloned()
+            .unwrap_or_default();
         OptionsBaseline::new(inherited, own)
     }
 

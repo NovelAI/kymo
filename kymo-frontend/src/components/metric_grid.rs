@@ -51,7 +51,6 @@ pub fn MetricGrid() -> Element {
                         filter: needle.clone(),
                     }
                 }
-
             }
             }
         }

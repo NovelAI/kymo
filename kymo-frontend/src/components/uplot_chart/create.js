@@ -68,11 +68,11 @@ let zoomRefetch=__KYMO_ZOOM_REFETCH__;
 let isTimeAxis=__KYMO_IS_TIME__;
 let isWallTime=__KYMO_IS_WALL__;
 // Tooltip
-let tip=el.querySelector('.kymo-tip');
-if(!tip){tip=document.createElement('div');tip.className='kymo-tip';el.appendChild(tip);}
+// Readouts live under <body>, outside the charts' stacking contexts, so they paint over the docked options panel (z-index 70 against its 60) and a section's move never takes them along. The chart's teardown removes its readout.
+let tip=document.getElementById('__KYMO_ID__-tip');
+if(!tip){tip=document.createElement('div');tip.id='__KYMO_ID__-tip';tip.className='kymo-tip';document.body.appendChild(tip);}
 // Hidden until this instance's hover hook shows it on the next move or synced update, so a failed rebuild leaves no stale tooltip.
 tip.style.display='none';
-el.style.position='relative';
 let xShift=__KYMO_X_SHIFT__;
 let readoutXShift=__KYMO_READOUT_X_SHIFT__;
 // Value formatter for Y and step X. Zero is just "0": fixed-precision formatting rendered step 0 as "0.00" (AI-1385).

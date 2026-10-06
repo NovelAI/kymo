@@ -49,6 +49,7 @@ const CHART_HIGHLIGHT_JS: &str = include_str!("components/uplot_chart/highlight.
 const CHART_HOVER_JS: &str = include_str!("components/uplot_chart/hover_points.js");
 const OVERFLOW_FADE_JS: &str = include_str!("util/overflow_fade.js");
 const WIDTH_DRAG_JS: &str = include_str!("util/width_drag.js");
+const PANEL_PRESSES_JS: &str = include_str!("util/panel_presses.js");
 
 const VISIBILITY_BRIDGE_JS: &str = r#"(()=>{
 function send(){try{dioxus.send(document.hidden)}catch(_){td();}}
@@ -151,6 +152,7 @@ fn main() {
     js_sys::eval(CHART_HOVER_JS).expect("failed to install chart hover lookup");
     js_sys::eval(OVERFLOW_FADE_JS).expect("failed to install the overflow fade observer");
     js_sys::eval(WIDTH_DRAG_JS).expect("failed to install the width drags");
+    js_sys::eval(PANEL_PRESSES_JS).expect("failed to install the panel press guard");
     js_sys::eval(util::js_bridge::LIFECYCLE_JS)
         .expect("failed to install the JavaScript bridge registry");
     dioxus::launch(Root);
