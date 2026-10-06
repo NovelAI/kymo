@@ -4,7 +4,7 @@ use crate::components::icons::{CloseIcon, CollapseAllIcon, ExpandAllIcon, GearIc
 use crate::components::theme_toggle::ThemeToggle;
 use crate::route::Route;
 use crate::state::{DashboardState, DirectRunLoad, PanelTarget, SectionConfig, UserConfigState};
-use crate::util::{is_app_escape, primary, unique_id};
+use crate::util::{confirm, is_app_escape, primary, unique_id};
 
 /// The Project settings button's id, which focus returns to when its panel closes.
 const PROJECT_SETTINGS_TRIGGER_ID: &str = "kymo-project-settings-trigger";
@@ -158,12 +158,10 @@ pub fn Navbar() -> Element {
                 class: "navbar-action icon-button",
                 title: "Reset layout to auto-generated",
                 onmousedown: primary(move |_| {
-                    if let Some(window) = web_sys::window() {
-                        if window.confirm_with_message("Reset layout? This will discard all customizations and regenerate from discovered metrics.").unwrap_or(false) {
-                            state.reset_layout();
-                            // A maximized chart may be one of the discarded customizations; its bindings would no longer be planned for name lookups, so it could never become ready.
-                            crate::route::focus_chart(None);
-                        }
+                    if confirm("Reset layout? This will discard all customizations and regenerate from discovered metrics.") {
+                        state.reset_layout();
+                        // A maximized chart may be one of the discarded customizations; its bindings would no longer be planned for name lookups, so it could never become ready.
+                        crate::route::focus_chart(None);
                     }
                 }),
                 ResetIcon {}

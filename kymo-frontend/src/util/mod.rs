@@ -41,6 +41,11 @@ pub(crate) fn is_app_escape(e: &Event<KeyboardData>) -> bool {
             .is_none()
 }
 
+/// The browser's confirm dialog: true only when the user accepts it.
+pub(crate) fn confirm(message: &str) -> bool {
+    web_sys::window().is_some_and(|window| window.confirm_with_message(message).unwrap_or(false))
+}
+
 /// Compare two strings "naturally": maximal runs of ASCII digits compare by
 /// numeric value, everything else byte-for-byte (which, for UTF-8, equals
 /// Unicode scalar order). So `block_2` sorts before `block_10`, where plain

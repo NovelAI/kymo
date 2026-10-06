@@ -58,17 +58,17 @@ pub fn SpinnerIcon() -> Element {
     )
 }
 
-/// Material Icons "settings_backup_restore"; deliberately not the undo glyph "↺": the dot marks the default being returned to. Its viewBox is the square around the drawn glyph (x 0–21, y 3–21), so it fills the em box like its navbar neighbours; its 2-unit ring (2/21 em) already matches the thickened icons' 1.5/16 em lines.
+/// Material Icons "settings_backup_restore"; deliberately not the undo glyph "↺": the dot marks the default being returned to. The glyph is drawn x 0–21, y 3–21; the viewBox is the 21-unit square around it, so it fills the em box like its navbar neighbours; its 2-unit ring (2/21 em) already matches the thickened icons' 1.5/16 em lines.
 #[component]
 pub fn ResetIcon() -> Element {
     path_icon("0 1.5 21 21", "M14 12c0-1.1-.9-2-2-2s-2 .9-2 2 .9 2 2 2 2-.9 2-2zm-2-9c-4.97 0-9 4.03-9 9H0l4 4 4-4H5c0-3.87 3.13-7 7-7s7 3.13 7 7-3.13 7-7 7c-1.51 0-2.91-.49-4.06-1.3l-1.42 1.44C8.04 20.3 9.94 21 12 21c4.97 0 9-4.03 9-9s-4.03-9-9-9z", false)
 }
 
-/// Material Icons "delete".
+/// Material Icons "delete". The can is drawn x 5–19, y 3–21; the viewBox is the 18-unit square around it, so the can is as tall as the full-em gear and maximize icons, and its 2-unit walls (2/18 em) come out 18.5% heavier than the thickened icons' 1.5/16 em lines.
 #[component]
 pub fn TrashIcon() -> Element {
     path_icon(
-        "0 0 24 24",
+        "3 3 18 18",
         "M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM8 9h8v10H8V9zm7.5-5-1-1h-5l-1 1H5v2h14V4z",
         false,
     )

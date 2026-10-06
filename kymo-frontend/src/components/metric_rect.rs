@@ -5,7 +5,7 @@ use std::rc::Rc;
 use dioxus::prelude::*;
 
 use crate::components::cdn_gallery::CdnGallery;
-use crate::components::icons::{CloseIcon, GearIcon, MaximizeIcon, SpinnerIcon};
+use crate::components::icons::{CloseIcon, GearIcon, MaximizeIcon, SpinnerIcon, TrashIcon};
 use crate::components::text_stream::TextStreamViewer;
 use crate::grpc::proto::{CdnSeries, RunStatus, SeriesRef};
 use crate::route::focus_chart;
@@ -16,7 +16,7 @@ use crate::state::panel_cache::{panel_key, Store};
 use crate::state::visibility::{self, Zone};
 use crate::state::zones::ZoneRegistry;
 use crate::state::{resolve_capped_bindings, DashboardState, DisplayType, PanelTarget, RectConfig};
-use crate::util::{editor_trigger_id, focus_on_mount, is_app_escape, primary};
+use crate::util::{confirm, editor_trigger_id, focus_on_mount, is_app_escape, primary};
 
 /// A chart's title: its label, else its metrics' names without their section prefix.
 pub(crate) fn rect_title(config: &RectConfig) -> String {
@@ -454,39 +454,33 @@ fn MetricRectBody(
                 }
                 div { class: "rect-actions",
                     if !is_maximized {
-                        {
-                            let rect_id_for_max = config.id.clone();
-                            rsx! {
-                                button {
-                                    class: "rect-action icon-button",
-                                    title: "Maximize",
-                                    onmousedown: primary(move |_| {
-                                        focus_chart(Some(rect_id_for_max.clone()));
-                                    }),
-                                    MaximizeIcon {}
-                                }
-                            }
+                        button {
+                            class: "rect-action icon-button",
+                            title: "Maximize",
+                            onmousedown: primary({
+                                let id = config.id.clone();
+                                move |_| focus_chart(Some(id.clone()))
+                            }),
+                            MaximizeIcon {}
                         }
                     }
                     if !configure_hidden {
-                        {
-                            let rect = config.clone();
-                            rsx! {
-                                button {
-                                    id: "{trigger_id}",
-                                    class: "rect-action icon-button",
-                                    title: "Configure",
-                                    onmousedown: primary(move |_| {
-                                        state.open_options_panel(PanelTarget::Chart, trigger_id.clone());
-                                        if !is_maximized {
-                                            // Configure edits beside the maximized chart: maximize a grid chart, handing the maximized copy what this one already knows so the editor opens on the right sections.
-                                            set_chart_facts(state.handed_over_chart_facts, &rect, cdn_class.peek().clone(), *resolved_display_type.peek());
-                                            focus_chart(Some(rect.id.clone()));
-                                        }
-                                    }),
-                                    GearIcon {}
+                        button {
+                            id: "{trigger_id}",
+                            class: "rect-action icon-button",
+                            title: "Configure",
+                            onmousedown: primary({
+                                let rect = config.clone();
+                                move |_| {
+                                    state.open_options_panel(PanelTarget::Chart, trigger_id.clone());
+                                    if !is_maximized {
+                                        // Configure edits beside the maximized chart: maximize a grid chart, handing the maximized copy what this one already knows so the editor opens on the right sections.
+                                        set_chart_facts(state.handed_over_chart_facts, &rect, cdn_class.peek().clone(), *resolved_display_type.peek());
+                                        focus_chart(Some(rect.id.clone()));
+                                    }
                                 }
-                            }
+                            }),
+                            GearIcon {}
                         }
                     }
                     if is_maximized {
@@ -501,24 +495,19 @@ fn MetricRectBody(
                             CloseIcon {}
                         }
                     } else {
-                        {
-                            let display_title_for_delete = display_title.clone();
-                            let id = config.id.clone();
-                            rsx! {
-                                button {
-                                    class: "rect-action rect-action-delete icon-button",
-                                    title: "Delete",
-                                    onmousedown: primary(move |_| {
-                                        if let Some(window) = web_sys::window() {
-                                            let msg = format!("Delete chart \"{}\"?", display_title_for_delete);
-                                            if window.confirm_with_message(&msg).unwrap_or(false) {
-                                                state.delete_rect(&id);
-                                            }
-                                        }
-                                    }),
-                                    CloseIcon {}
+                        button {
+                            class: "rect-action delete-action icon-button",
+                            title: "Delete chart",
+                            onmousedown: primary({
+                                let display_title = display_title.clone();
+                                let id = config.id.clone();
+                                move |_| {
+                                    if confirm(&format!("Delete chart \"{display_title}\"?")) {
+                                        state.delete_rect(&id);
+                                    }
                                 }
-                            }
+                            }),
+                            TrashIcon {}
                         }
                     }
                 }

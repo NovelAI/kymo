@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 
 use crate::components::icons::{
-    CaretLeftIcon, CaretRightIcon, CloseIcon, GearIcon, GripIcon, PlusIcon,
+    CaretLeftIcon, CaretRightIcon, GearIcon, GripIcon, PlusIcon, TrashIcon,
 };
 use crate::components::metric_rect::MetricRect;
 use crate::components::section_drag::SectionDrag;
@@ -9,7 +9,7 @@ use crate::state::layout_config::{MetricBinding, ProjectRef, RectOptions, RunRef
 use crate::state::{
     DashboardState, DisplayType, PanelTarget, RectConfig, SectionConfig, UserConfigState,
 };
-use crate::util::{editor_trigger_id, primary};
+use crate::util::{confirm, editor_trigger_id, primary};
 
 /// Greedy row-pack: each rect consumes its `column_span` units of the current
 /// row; overflow wraps to the next row; `rows_per_page` rows = one page.
@@ -198,22 +198,19 @@ pub fn Section(
                     GearIcon {}
                 }
                 button {
-                    class: "section-action section-action-danger icon-button",
+                    class: "section-action delete-action icon-button",
                     title: "Delete section",
                     onmousedown: primary({
                         let section_label = section_label.clone();
                         let section_id = section_id.clone();
                         move |e| {
                             e.stop_propagation();
-                            if let Some(window) = web_sys::window() {
-                                let msg = format!("Delete section \"{}\"?", section_label);
-                                if window.confirm_with_message(&msg).unwrap_or(false) {
-                                    state.delete_section(&section_id);
-                                }
+                            if confirm(&format!("Delete section \"{section_label}\"?")) {
+                                state.delete_section(&section_id);
                             }
                         }
                     }),
-                    CloseIcon {}
+                    TrashIcon {}
                 }
                 // Pagination only makes sense for content you can see.
                 if show_pagination && !collapsed {

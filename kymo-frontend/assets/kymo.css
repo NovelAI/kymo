@@ -140,6 +140,7 @@ input[type="range"]:focus::-moz-range-thumb {
     transition: color var(--transition);
 }
 .navbar-action:hover, .section-action:hover, .rect-action:hover, .navbar-search-clear:hover, .options-panel-close:hover { color: var(--text-headings); }
+.delete-action:hover { color: var(--warning); }
 /* A panel trigger whose panel is open shows pressed, and closes it. */
 .navbar-action[aria-expanded="true"], .section-action[aria-expanded="true"] {
     color: var(--text-headings);
@@ -958,7 +959,6 @@ input[type="checkbox"]:checked::before {
     transition: opacity var(--transition), color var(--transition);
     padding: 2px 4px;
 }
-.section-action-danger:hover { color: var(--warning); }
 
 .section-grid {
     display: grid;
@@ -1136,7 +1136,6 @@ input[type="checkbox"]:checked::before {
     font-size: var(--font-size-16);
     padding: 4px 6px;
 }
-.rect-action-delete:hover { color: var(--warning); }
 
 .rect-error { height: 120px; color: var(--warning); }
 

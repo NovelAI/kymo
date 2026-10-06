@@ -1480,7 +1480,7 @@ def other_tab_edit_survives(
         twin = other.locator(f".metric-rect[data-slot-id={json.dumps(slot)}]")
         twin.hover()
         other.once("dialog", lambda dialog: dialog.accept())
-        saving(other, storage_key, twin.locator('button[title="Delete"]').click)
+        saving(other, storage_key, twin.locator('button[title="Delete chart"]').click)
         # This tab learns of the delete at its next edit, which records nothing and closes the panel with the chart.
         log_y_control(panel).click()
         expect(panel).to_have_count(0)
@@ -1545,7 +1545,7 @@ def media_sections_open(page: Page) -> None:
         dismiss(page, panel, trigger, "Escape")
     neighbours.last.hover()
     page.once("dialog", lambda dialog: dialog.accept())
-    neighbours.last.get_by_title("Delete", exact=True).click()
+    neighbours.last.get_by_title("Delete chart", exact=True).click()
     expect(neighbours).to_have_count(1)
 
 
