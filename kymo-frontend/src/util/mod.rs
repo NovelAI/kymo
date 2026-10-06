@@ -140,15 +140,11 @@ pub fn editor_trigger_id(kind: &str, identity: &str) -> String {
     id
 }
 
-/// On the next animation frame, focus the first of these ids that can take it (one in an inert grid can't), without scrolling the page. With `only_if_lost`, only when focus fell back to the page (a closing panel took it along); focus the user moved stays put. A later call supersedes one still waiting (WebKit can hold a frame while nothing changes).
-pub fn focus_later(ids: &[&str], only_if_lost: bool) {
-    let ids = ids
-        .iter()
-        .map(|id| js_bridge::js_string(id))
-        .collect::<Vec<_>>()
-        .join(",");
+/// On the next animation frame, focus the first of these ids that can take it (one in an inert grid can't), without scrolling the page, if focus was lost by then: fell back to the page (a closing panel or a remount took it along) or left on a disabled control (WebKit keeps it on a button that disables itself). Focus moved to another element stays put, so a control picked before the frame keeps the next key. A later call supersedes one still waiting (WebKit can hold a frame while nothing changes).
+pub fn focus_later(ids: &[&str]) {
+    let ids = serde_json::to_string(ids).expect("serializing strings cannot fail");
     let js = format!(
-        "const n=window.__kymo_focus_seq=(window.__kymo_focus_seq||0)+1;requestAnimationFrame(()=>{{if(n!==window.__kymo_focus_seq)return;const a=document.activeElement;if({only_if_lost}&&a&&a!==document.body)return;for(const id of [{ids}]){{const e=document.getElementById(id);if(e){{e.focus({{preventScroll:true}});if(document.activeElement===e)break;}}}}}});"
+        "const n=window.__kymo_focus_seq=(window.__kymo_focus_seq||0)+1;requestAnimationFrame(()=>{{if(n!==window.__kymo_focus_seq||!document.activeElement.matches('body,:disabled'))return;for(const id of {ids}){{const e=document.getElementById(id);if(e){{e.focus({{preventScroll:true}});if(document.activeElement===e)break;}}}}}});"
     );
     let _ = js_sys::eval(&js);
 }

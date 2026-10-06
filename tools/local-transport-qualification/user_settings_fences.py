@@ -334,9 +334,25 @@ def run_fences(page: Page, *, dashboard_path: str | None = None) -> None:
         {"font_size": 18, "show_nearest_point": True, "highlight_same_name": True},
     )
 
-    # Revert puts back the values the panel opened with and keeps it open.
+    # Revert puts back the values the panel opened with and keeps it open. Its focus return waits for a frame, held here until the slider is focused: a control focused before that frame keeps focus, so the next key reaches it.
     expect(revert).to_be_enabled()
+    page.evaluate(
+        """() => {
+            const held = [], raf = window.requestAnimationFrame;
+            window.requestAnimationFrame = cb => held.push(cb);
+            window.__kymo_release_frames = () => {
+                window.requestAnimationFrame = raf;
+                held.forEach(cb => cb(performance.now()));
+                return held.length;
+            };
+        }"""
+    )
     revert.press("Space")
+    slider = page.get_by_role("slider", name="Font size")
+    slider.focus()
+    held = page.evaluate("() => window.__kymo_release_frames()")
+    assert held, "Revert deferred no focus return"
+    expect(slider).to_be_focused()
     wait_font(page, 16)
     expect_hover_settings(page)
     expect_stored(page, None)
@@ -404,6 +420,8 @@ def run_fences(page: Page, *, dashboard_path: str | None = None) -> None:
     slider = page.get_by_role("slider", name="Font size")
     slider.press("ArrowRight")
     expect(slider).to_have_value("16")
+    # The refused change remounted the controls; focus is back on the one it was on.
+    expect(slider).to_be_focused()
     wait_font(page, 16)
     expect_hover_settings(page)
     expect_stored(page, None)

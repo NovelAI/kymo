@@ -35,7 +35,7 @@ pub fn OptionsPanel(
             .map(String::as_str)
             .chain([MAXIMIZE_OVERLAY_ID])
             .collect();
-        focus_later(&ids, true);
+        focus_later(&ids);
     });
     let has_target = target.is_some();
     rsx! {
@@ -69,8 +69,8 @@ pub fn OptionsPanel(
                     title: "Put back the values this panel opened with",
                     onmousedown: primary(move |_| {
                         on_revert.call(());
-                        // Revert disables itself, which drops keyboard focus on the page (Chromium) or strands it on the disabled button (WebKit).
-                        focus_later(&[OPTIONS_PANEL_BODY_ID], false);
+                        // Revert disables itself, losing keyboard focus (see `focus_later`); the panel body takes it.
+                        focus_later(&[OPTIONS_PANEL_BODY_ID]);
                     }),
                     "Revert"
                 }

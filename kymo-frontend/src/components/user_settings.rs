@@ -75,7 +75,7 @@ pub fn UserSettingsPanel(mut open: Signal<bool>) -> Element {
                 .map(|e| e.id())
                 .filter(|id| !id.is_empty())
             {
-                focus_later(&[&id], false);
+                focus_later(&[&id]);
             }
         }
     };
