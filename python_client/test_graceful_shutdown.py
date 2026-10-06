@@ -321,6 +321,10 @@ class _CdnHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+# The stop() of every fake server still running, so main() can stop them after a failed scenario.
+_RUNNING_SERVERS: list = []
+
+
 def start_fake_server(
     call_delay: float = 0.0,
     per_point_delay: float = 0.0,
@@ -343,11 +347,16 @@ def start_fake_server(
     threading.Thread(target=cdn.serve_forever, daemon=True).start()
 
     def stop():
+        if stop not in _RUNNING_SERVERS:
+            return
+        _RUNNING_SERVERS.remove(stop)
         stopped = server.stop(grace=0)
         servicer.stop_event.set()
         stopped.wait(timeout=5)
         cdn.shutdown()
         cdn.server_close()
+
+    _RUNNING_SERVERS.append(stop)
 
     return (
         servicer,
@@ -1062,6 +1071,9 @@ def scenario_ram_cap_catches_up_before_live_suffix(spool_dir):
         assert not spool_files(spool_dir, run_id), (
             f"automatic catch-up left a pending spool\n{out}"
         )
+        assert not spool_files(spool_dir, run_id, ".sent"), (
+            f"the worker kept a .sent copy of a segment it delivered\n{out}"
+        )
         expected = expected_train_point_keys(steps, metrics)
         expected.add(("train/tail0", steps, ""))
         assert servicer.train_point_keys() == expected, (
@@ -1180,26 +1192,18 @@ def scenario_rotated_segments_are_reported(spool_dir):
         return stdout.read()
 
     try:
-        # Count distinct worker segment identities across pending and replayed
-        # names. Scan .sent first so a concurrent rename can only undercount for
-        # one poll; normalization also prevents one segment from counting twice.
+        # Count distinct worker segment names across polls: the worker deletes a segment once it is delivered, so remember every name seen.
         # Requiring a pending worker segment ensures shutdown must report a
         # rotated path that the owner did not create itself.
         deadline = time.monotonic() + 60
+        worker_segments = set()
         while True:
-            sent_workers = [
-                path
-                for path in spool_files(spool_dir, run_id, ".sent")
-                if "__worker_" in os.path.basename(path)
-            ]
             pending_workers = [
                 path
                 for path in spool_files(spool_dir, run_id)
                 if "__worker_" in os.path.basename(path)
             ]
-            worker_segments = {
-                path.removesuffix(".sent") for path in (*sent_workers, *pending_workers)
-            }
+            worker_segments.update(pending_workers)
             if pending_workers and len(worker_segments) >= 2:
                 break
             assert proc.poll() is None, (
@@ -1239,19 +1243,24 @@ def scenario_rotated_segments_are_reported(spool_dir):
 def main():
     with tempfile.TemporaryDirectory(prefix="kymo-spool-test-") as spool_dir:
         os.environ["KYMO_SPOOL_DIR"] = spool_dir
-        scenario_fast_server(spool_dir)
-        files, run_id, spooled = scenario_slow_server(spool_dir)
-        scenario_replay(spool_dir, files, run_id, spooled)
-        scenario_sigterm(spool_dir)
-        scenario_hung_server(spool_dir)
-        scenario_large_pipelined(spool_dir)
-        scenario_stream_break(spool_dir)
-        scenario_ack_watchdog(spool_dir)
-        scenario_malformed_ack(spool_dir)
-        scenario_watchdog_recovers_blackholed_attempt(spool_dir)
-        scenario_ram_cap_catches_up_before_live_suffix(spool_dir)
-        scenario_finish_during_replay(spool_dir)
-        scenario_rotated_segments_are_reported(spool_dir)
+        try:
+            scenario_fast_server(spool_dir)
+            files, run_id, spooled = scenario_slow_server(spool_dir)
+            scenario_replay(spool_dir, files, run_id, spooled)
+            scenario_sigterm(spool_dir)
+            scenario_hung_server(spool_dir)
+            scenario_large_pipelined(spool_dir)
+            scenario_stream_break(spool_dir)
+            scenario_ack_watchdog(spool_dir)
+            scenario_malformed_ack(spool_dir)
+            scenario_watchdog_recovers_blackholed_attempt(spool_dir)
+            scenario_ram_cap_catches_up_before_live_suffix(spool_dir)
+            scenario_finish_during_replay(spool_dir)
+            scenario_rotated_segments_are_reported(spool_dir)
+        finally:
+            # A failed scenario never reaches its own stop(), and a handler parked in a long call_delay would hold the interpreter's exit until it ends.
+            for stop in list(_RUNNING_SERVERS):
+                stop()
     print("ALL SCENARIOS PASSED")
 
 

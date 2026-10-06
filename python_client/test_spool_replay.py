@@ -228,6 +228,17 @@ class FrameValidationTests(unittest.TestCase):
                 (1 << 32) | 1,
             )
 
+    def test_a_gallery_the_encoder_reduced_spools_under_its_reserved_version(self):
+        version = (3 << 32) | 7
+        gallery = [Image(object()), client_module.Resource(b"x", "item.bin")]
+        point = ("cdn_batch_mutation", "gallery", 4, gallery, 1, version, version + 1)
+        with self.assertLogs("kymo", level="WARNING"):
+            record = client_module._spool_record(point)
+        # The reduced gallery is a different mutation, so it takes the reserved successor, which leaves no reserve.
+        self.assertEqual(record[0], "cdn_batch_encoded_mutation")
+        self.assertEqual(record[5], version + 1)
+        self.assertEqual(len(record[3]), 1)
+
     def test_reduced_versioned_manifest_gets_a_fresh_mutation_identity(self):
         original_version = (3 << 32) | 7
         replacement_version = original_version + 1
@@ -500,6 +511,38 @@ class FrameValidationTests(unittest.TestCase):
                 )
             )
 
+    def test_a_live_gallery_that_lost_an_item_publishes_its_reduced_version(self):
+        encoded = client_module._encode_cdn_items(
+            "gallery", 7, [client_module.Resource(b"payload", "payload.bin")]
+        )
+        with (
+            mock.patch.object(
+                client_module,
+                "_upload_to_cdn",
+                side_effect=["payload.bin", "manifest.json"],
+            ),
+            mock.patch.object(
+                client_module, "_publish_rich_mutation", return_value=True
+            ) as publish,
+        ):
+            self.assertTrue(
+                client_module._process_cdn_batch(
+                    mock.Mock(),
+                    object(),
+                    "unused",
+                    "project",
+                    "run",
+                    "gallery",
+                    7,
+                    client_module._EncodedItems(encoded.entries, dropped=True),
+                    send_placeholder=False,
+                    timestamp_ms=1,
+                    mutation_version=10,
+                    reduced_mutation_version=11,
+                )
+            )
+        self.assertEqual(publish.call_args.args[-1], 11)
+
     def test_sync_connect_closes_a_channel_that_never_becomes_ready(self):
         channel = mock.Mock()
         ready = mock.Mock()
@@ -665,6 +708,10 @@ class LaneFailoverTests(unittest.TestCase):
         return item
 
     @staticmethod
+    def _metadata(value: int) -> tuple:
+        return ("metadata_batch", "info/run_info", 0, Metadata({"v": value}))
+
+    @staticmethod
     def _upload_recorder(uploads: list):
         def upload(http_client, cdn_url, data, ext):
             uploads.append(ext)
@@ -687,9 +734,6 @@ class LaneFailoverTests(unittest.TestCase):
         self.assert_wait_reports_spooled(lane.status, lane.spooled)
 
     def test_a_failed_spill_keeps_the_records_already_flushed_replayable(self):
-        def metadata(value: int) -> tuple:
-            return ("metadata_batch", "info/run_info", 0, Metadata({"v": value}))
-
         env = {"KYMO_MAX_RICH_BUFFER_BYTES": "1"}
         with tempfile.TemporaryDirectory() as spool_dir:
             with (
@@ -701,7 +745,7 @@ class LaneFailoverTests(unittest.TestCase):
                     expected_failure=client_module._WORKER_EXIT_SPOOL_FAILED,
                 ) as lane,
             ):
-                lane.put([metadata(1), metadata(2)])
+                lane.put([self._metadata(1), self._metadata(2)])
                 # The two entries spill separately: wait until both are on disk.
                 deadline = time.monotonic() + 5
                 while lane.status.value and time.monotonic() < deadline:
@@ -709,7 +753,7 @@ class LaneFailoverTests(unittest.TestCase):
                 self.assertEqual(lane.status.value, 0)
                 # The disk fills: the next spill's flush tears its record.
                 failing.set()
-                lane.put([metadata(3)])
+                lane.put([self._metadata(3)])
             _, records = read_spool(lane.path)
             self.assertEqual([record[3]["v"] for record in records], [1, 2])
 
@@ -952,6 +996,73 @@ class LaneFailoverTests(unittest.TestCase):
                 finally:
                     gates[2].set()
 
+    def test_a_live_metadata_conflict_is_data_loss_not_a_retry(self):
+        version = (1 << 32) | 1
+        (item,) = client_module._snapshot_rich_queue_items(
+            [
+                (
+                    "metadata_batch_mutation",
+                    "info/run_info",
+                    0,
+                    Metadata({"v": 1}),
+                    1,
+                    version,
+                )
+            ]
+        )
+        with tempfile.TemporaryDirectory() as spool_dir:
+            with (
+                self.assertLogs("kymo", level="ERROR"),
+                self._lane_worker(
+                    spool_dir,
+                    {},
+                    self._upload_recorder([]),
+                    expected_failure=client_module._WORKER_EXIT_DATA_LOSS,
+                ) as lane,
+            ):
+                lane.publish.side_effect = client_module._RichMutationDataLoss(
+                    "different content"
+                )
+                lane.put(item)
+                self.assertTrue(self._wait_for(lambda: lane.failure.value != 0))
+        # The server's conflict answer is final: the entry goes to the spool for replay to quarantine, not back to the publish.
+        self.assertEqual(lane.publish.call_count, 1)
+
+    def test_a_failover_after_the_lane_went_live_needs_a_new_proof_to_drain(self):
+        gates = [threading.Event(), threading.Event()]
+        calls = []
+
+        def replay(path, quarantined_files, **kwargs):
+            gate = gates[min(len(calls), 1)]
+            calls.append(path)
+            gate.wait(timeout=5)
+            return True
+
+        with tempfile.TemporaryDirectory() as spool_dir:
+            with (
+                self.assertLogs("kymo", level="WARNING"),
+                self._lane_worker(
+                    spool_dir,
+                    self._RICH_CAP_1K,
+                    self._upload_recorder([]),
+                    replay=replay,
+                ) as lane,
+            ):
+                try:
+                    lane.put(self._overflowing(1))
+                    self.assertTrue(self._wait_for(lambda: len(calls) == 1))
+                    gates[0].set()
+                    # The delivered replay proves the circuit, and the empty prefix lets the lane go live.
+                    self.assertTrue(self._wait_for(lambda: lane.on_disk.value == 0))
+                    lane.put(self._overflowing(2))
+                    self.assertTrue(self._wait_for(lambda: len(calls) == 2))
+                    # The failover from live voided that proof, so the second replay does not drain the lane: its new work still goes to disk.
+                    self.assertFalse(
+                        self._wait_for(lambda: lane.on_disk.value == 0, timeout=0.3)
+                    )
+                finally:
+                    gates[1].set()
+
     def test_shutdown_after_a_quarantine_ends_the_drain_goes_live(self):
         gates = [threading.Event(), threading.Event()]
         calls = []
@@ -991,6 +1102,66 @@ class LaneFailoverTests(unittest.TestCase):
                     gates[1].set()
         # The quarantine left no prefix, so shutdown went live and uploaded the drained gallery.
         self.assertEqual([call.args[4] for call in lane.publish.call_args_list], [3])
+
+    def test_no_upload_starts_while_one_a_failover_abandoned_still_runs(self):
+        released = threading.Event()
+        uploads = []
+
+        def upload(_http_client, _cdn_url, data, ext):
+            uploads.append(ext)
+            if len(uploads) == 1:
+                # The first upload hangs, as against a stalled CDN, until the test releases it.
+                released.wait(timeout=5)
+            return content_id(data, ext)
+
+        def replay(path, **kwargs):
+            replay.calls += 1
+            return True
+
+        replay.calls = 0
+        with tempfile.TemporaryDirectory() as spool_dir:
+            with (
+                self.assertLogs("kymo", level="WARNING"),
+                self._lane_worker(
+                    spool_dir, self._RICH_CAP_1K, upload, replay=replay
+                ) as lane,
+            ):
+                try:
+                    lane.put(self._small(1))
+                    self.assertTrue(self._wait_for(lambda: uploads))
+                    # The cap trips behind the hung upload: the failover abandons it, and the replay brings the lane back live.
+                    lane.put(self._overflowing(2))
+                    self.assertTrue(self._wait_for(lambda: replay.calls))
+                    self.assertTrue(self._wait_for(lambda: lane.on_disk.value == 0))
+                    lane.put(self._small(3))
+                    time.sleep(0.2)
+                    self.assertEqual(len(uploads), 1)
+                finally:
+                    released.set()
+                # Once the abandoned upload ends, the live gallery uploads.
+                published = lane.publish.call_args_list
+                self.assertTrue(
+                    self._wait_for(lambda: 3 in [call.args[4] for call in published])
+                )
+
+    def test_a_fork_childs_gallery_is_charged_whole_and_never_released(self):
+        # A fork child of the initializing process snapshots these galleries.
+        with mock.patch.object(client_module, "_init_pid", os.getpid() + 1):
+            small = self._small(1)
+            large = self._versioned_gallery(2, [Image(PILImage.new("RGB", (32, 32)))])
+        with tempfile.TemporaryDirectory() as spool_dir:
+            with (
+                self.assertLogs("kymo", level="WARNING"),
+                self._lane_worker(spool_dir, self._RICH_CAP_1K) as lane,
+            ):
+                lane.put(small)
+                self.assertTrue(self._wait_for(lambda: lane.encode.called))
+                # Its raw pixels sit in the worker until encoded, so its 3 KiB arrays trip the 1 KiB cap on arrival.
+                lane.put(large)
+                self.assertTrue(lane.first_spill.wait(timeout=2))
+                self.assertTrue(self._wait_for(lambda: lane.status.value == 0))
+        # The parent never counted them, so neither the encode nor the spill releases them.
+        self.assertEqual(lane.released.value, 0)
 
     def test_rich_lane_recovers_after_a_cdn_outage(self):
         outage = threading.Event()
@@ -1137,15 +1308,12 @@ class LaneFailoverTests(unittest.TestCase):
                 self.assertEqual(seal.call_count, 1)
 
     def test_rich_byte_cap_spools_whole_lane_and_future_entries_in_order(self):
-        def metadata(value: int) -> tuple:
-            return ("metadata_batch", "info/run_info", 0, Metadata({"v": value}))
-
         env = {"KYMO_MAX_RICH_BUFFER_BYTES": "1"}
         with tempfile.TemporaryDirectory() as spool_dir:
             with self._lane_worker(spool_dir, env) as lane:
-                lane.put([metadata(1), metadata(2)])
+                lane.put([self._metadata(1), self._metadata(2)])
                 self.assertTrue(lane.first_spill.wait(timeout=1))
-                lane.put([metadata(3)])
+                lane.put([self._metadata(3)])
             _, records = read_spool(lane.path)
             self.assertEqual([record[3]["v"] for record in records], [1, 2, 3])
         self.assertEqual(lane.spooled.value, 1)
@@ -1189,9 +1357,6 @@ class LaneFailoverTests(unittest.TestCase):
         self.assertEqual(lane.encode.call_count, 4)
 
     def test_a_gallery_the_spool_cannot_encode_loses_only_itself(self):
-        def metadata(value: int) -> tuple:
-            return ("metadata_batch", "info/run_info", 0, Metadata({"v": value}))
-
         env = {"KYMO_MAX_RICH_BUFFER_BYTES": str(1 << 20)}
         with tempfile.TemporaryDirectory() as spool_dir:
             with (
@@ -1205,9 +1370,9 @@ class LaneFailoverTests(unittest.TestCase):
             ):
                 # The encoder gives up on the gallery and fails the lane over; the spool cannot encode it either.
                 lane.put(self._gallery(1, [Image(PILImage.new("RGB", (8, 8)))]))
-                lane.put([metadata(1)])
+                lane.put([self._metadata(1)])
                 self.assertTrue(lane.first_spill.wait(timeout=5))
-                lane.put([metadata(2)])
+                lane.put([self._metadata(2)])
             records = list(read_spool(lane.path)[1])
         self.assertEqual([record[3]["v"] for record in records], [1, 2])
         self.assertEqual(lane.spooled.value, 1)
@@ -1492,8 +1657,15 @@ class SpoolDurabilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as spool_dir:
             path = os.path.join(spool_dir, "long.mkspool")
             spool = SpoolWriter(path, header={})
+            # A small-block file system's buffer, so records reach the file long before 8192 ends pile up.
+            with mock.patch.object(
+                spool_module.os,
+                "fstat",
+                return_value=types.SimpleNamespace(st_blksize=4096),
+            ):
+                spool.write(numeric(1.0, step=0))
             # Write until the list is pruned, then fail at once: the pruned list must still hold the end of the last record on disk.
-            step = 0
+            step = 1
             pruned = False
             while not pruned:
                 before = len(spool._record_ends)
@@ -1531,8 +1703,28 @@ class SpoolDurabilityTests(unittest.TestCase):
             self.assertEqual(spool.count, 1)
             with self.assertRaisesRegex(OSError, "torn record"):
                 spool.write(numeric(3.0, step=3))
+            # It still seals, so replay can quarantine it and the worker go on to newer segments.
+            spool.seal()
             with self.assertRaisesRegex(OSError, "torn record"):
                 spool.close()
+
+    def test_the_write_buffer_takes_the_file_system_block_size(self):
+        with tempfile.TemporaryDirectory() as spool_dir:
+            path = os.path.join(spool_dir, "blocks.mkspool")
+            spool = SpoolWriter(path, header={})
+            with mock.patch.object(
+                spool_module.os,
+                "fstat",
+                return_value=types.SimpleNamespace(st_blksize=4 << 20),
+            ):
+                spool.write(numeric(0.0, step=0))
+            opened = os.path.getsize(path)
+            for step in range(1, 5000):
+                spool.write(numeric(float(step), step=step))
+            # Hundreds of KiB of records still fit the 4 MiB buffer of a large-block file system.
+            self.assertEqual(os.path.getsize(path), opened)
+            spool.close()
+            self.assertGreater(os.path.getsize(path), opened)
 
     def test_replay_command_round_trips_arbitrary_posix_paths(self):
         paths = [
@@ -1661,7 +1853,7 @@ class SpoolDurabilityTests(unittest.TestCase):
             writer = SpoolWriter(path, spool_header())
             writer.write(point)
 
-            self.assertEqual(writer.seal(), path)
+            writer.seal()
             self.assertTrue(sync_module._writer_active(path))
             with self.assertRaisesRegex(RuntimeError, "sealed spool"):
                 writer.write(numeric(2.0))
@@ -2293,6 +2485,20 @@ class ReplayTests(unittest.TestCase):
             self.assertEqual(quarantined, {paths[2] + ".rejected"})
             self.assertTrue(os.path.exists(paths[0] + ".rejected"))
             self.assertTrue(os.path.exists(paths[1] + ".sent"))
+
+    def test_delete_removes_a_replayed_file_instead_of_keeping_it_sent(self):
+        with tempfile.TemporaryDirectory() as spool_dir:
+            path = os.path.join(spool_dir, "delivered.mkspool")
+            self._write(path, [numeric(1.0)])
+            with (
+                mock.patch.object(
+                    sync_module, "_connect", return_value=(_Channel(), object())
+                ),
+                mock.patch.object(sync_module, "_send_tuples", return_value=True),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertTrue(sync_module.replay_file(path, delete=True))
+            self.assertEqual(os.listdir(spool_dir), [])
 
     def test_malformed_header_is_quarantined_by_directory_sync(self):
         with tempfile.TemporaryDirectory() as spool_dir:

@@ -39,6 +39,15 @@ class _RichMutationDataLoss(RuntimeError):
     """A versioned rich mutation conflicts with authoritative server state."""
 
 
+def _reduced_mutation_version(reduced_mutation_version: Optional[int]) -> int:
+    """The version a gallery that lost an item publishes under: the successor its writer reserved for that case."""
+    if reduced_mutation_version is None:
+        raise _RichMutationDataLoss(
+            "reduced gallery has no causally reserved mutation identity"
+        )
+    return reduced_mutation_version
+
+
 def _is_terminal_run_error(error: BaseException) -> bool:
     """Return whether queued data must never be retried for this run."""
     code = error.code() if hasattr(error, "code") else None

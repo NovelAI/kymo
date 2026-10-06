@@ -60,6 +60,7 @@ from kymo._wire import (
     _MAX_RICH_RESOURCE_ID_BYTES,
     _RichMutationDataLoss,
     _chunk_tuples,
+    _reduced_mutation_version,
     _estimate_tuple_bytes,
     _is_permanent_upload_error,
     _is_terminal_run_error,
@@ -194,7 +195,7 @@ def _spool_run_key(path: str, server_override: str = "") -> tuple[str, str, str]
 
 
 def _quarantine_if_unchanged(
-    path: str, size_before: int, reason: str, quarantined_files: set[str] | None
+    path: str, size_before: int, reason: str, quarantined_files: set[str]
 ) -> bool:
     """Quarantine static bad input, recording it so later spools stay eligible; retain a file that may still be growing."""
     if os.stat(path).st_size != size_before:
@@ -202,8 +203,7 @@ def _quarantine_if_unchanged(
         return False
     print(f"    permanently invalid — quarantined: {reason}")
     rejected_path = quarantine_spool(path)
-    if quarantined_files is not None:
-        quarantined_files.add(rejected_path)
+    quarantined_files.add(rejected_path)
     print(
         f"    source quarantined as {os.path.basename(rejected_path)} "
         "without sending any records"
@@ -211,21 +211,23 @@ def _quarantine_if_unchanged(
     return False
 
 
-def _quarantine_after_data_loss(path: str, size_before: int, reason: str) -> str | None:
-    """Quarantine one static spool after an authoritative mutation conflict."""
+def _quarantine_after_data_loss(
+    path: str, size_before: int, reason: str, quarantined_files: set[str]
+) -> None:
+    """Quarantine one static spool after an authoritative mutation conflict, recording it so later spools stay eligible."""
     if os.stat(path).st_size != size_before:
         print(
             f"    DATA_LOSS ({reason}), but file grew — kept and blocked "
             "(stop its writer before investigating)"
         )
-        return None
+        return
     rejected_path = quarantine_spool(path)
+    quarantined_files.add(rejected_path)
     print(f"    DATA_LOSS — quarantined as {os.path.basename(rejected_path)}: {reason}")
     print(
         "    earlier records may already be delivered; the remainder of this "
         "file needs investigation, while later spool files remain eligible"
     )
-    return rejected_path
 
 
 def _retire_deleted(path: str, size_before: int, reason: str) -> bool:
@@ -322,9 +324,13 @@ def _replay_cdn_record(
 ) -> bool:
     kind, name, step = record[0], record[1], record[2]
     versioned = kind in _VERSIONED_RICH_KINDS
-    if kind == "cdn_key_mutation":
-        _, _, _, resource_id, timestamp_ms, mutation_version = record
-        try:
+    storage_key = (project_id, run_id, name, step)
+    # Legacy records lack logical versions, so retain their conservative
+    # server-wins guard and its known recency limitation. Versioned records
+    # bypass both probes below and let the authoritative server CAS decide.
+    try:
+        if kind == "cdn_key_mutation":
+            _, _, _, resource_id, timestamp_ms, mutation_version = record
             return _publish_rich_mutation(
                 stub,
                 project_id,
@@ -335,26 +341,6 @@ def _replay_cdn_record(
                 timestamp_ms,
                 mutation_version,
             )
-        except (_TerminalRunError, _RichMutationDataLoss):
-            raise
-        except grpc.RpcError as error:
-            if _is_terminal_run_error(error):
-                raise _terminal_run_error(error) from error
-            _log.error(
-                "failed to replay rich mutation %s step %s: %s", name, step, error
-            )
-            return False
-        except Exception as error:
-            _log.error(
-                "failed to replay rich mutation %s step %s: %s", name, step, error
-            )
-            return False
-
-    storage_key = (project_id, run_id, name, step)
-    # Legacy records lack logical versions, so retain their conservative
-    # server-wins guard and its known recency limitation. Versioned records
-    # bypass both probes below and let the authoritative server CAS decide.
-    try:
         if kind in ("metadata_json", "metadata_json_mutation"):
             prospective_bytes = metadata_manifest(record[3])
             expected_resources = []
@@ -432,14 +418,9 @@ def _replay_cdn_record(
         if versioned:
             timestamp_ms, mutation_version = record[4], record[5]
             if manifest_changed:
-                reduced_mutation_version = (
+                mutation_version = _reduced_mutation_version(
                     record[6] if kind == "cdn_batch_encoded_mutation_reserved" else None
                 )
-                if reduced_mutation_version is None:
-                    raise _RichMutationDataLoss(
-                        "reduced gallery has no causally reserved mutation identity"
-                    )
-                mutation_version = reduced_mutation_version
             return _publish_rich_mutation(
                 stub,
                 project_id,
@@ -625,6 +606,8 @@ def replay_file(
     processes see the file as active while this replay safely reads its immutable
     contents.
     """
+    if quarantined_files is None:
+        quarantined_files = set()
     # A run's worker keeps its spool open (and appends to it) for the run's whole lifetime. Replaying to the current EOF and renaming to .sent would strand every later append in the .sent inode where no sync looks — skip live files entirely.
     if not _writer_lock_held and _writer_active(path):
         print(
@@ -885,9 +868,9 @@ def replay_file(
         return _retire_deleted(path, size_before, terminal_error)
 
     if data_loss_error is not None:
-        rejected_path = _quarantine_after_data_loss(path, size_before, data_loss_error)
-        if rejected_path is not None and quarantined_files is not None:
-            quarantined_files.add(rejected_path)
+        _quarantine_after_data_loss(
+            path, size_before, data_loss_error, quarantined_files
+        )
         return False
 
     print(

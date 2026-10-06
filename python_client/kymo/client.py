@@ -65,13 +65,14 @@ from kymo._wire import (
     _SEND_CALL_TIMEOUT,
     _SEND_MAX_DELAY,
     _RichMutationDataLoss as _RichMutationDataLoss,
-    _TerminalRunError,
+    _TerminalRunError as _TerminalRunError,
     _chunk_tuples,
     _estimate_tuple_bytes,
     _is_permanent_upload_error,
     _is_terminal_run_error,
     _normalize_numeric_value,
     _publish_rich_mutation,
+    _reduced_mutation_version,
     _send_tuples as _send_tuples,
     _terminal_run_error,
     _upload_to_cdn,
@@ -91,6 +92,7 @@ from kymo.spool import (
     writer_active,
 )
 from kymo.types import Image, Metadata, Resource
+from kymo._worker import _upload_worker
 
 _MAX_RUN_NAME_BYTES = 2048
 # Client-side mirror of ALLOWED_EXTENSIONS in kymo-server/src/cdn.rs (keep in sync): the server 400s any other extension and the item would be dropped as a permanent upload error, so unsupported extensions are coerced to "bin" (stored/served as octet-stream; the manifest keeps the real filename).
@@ -268,11 +270,11 @@ _upload_terminal: Optional[multiprocessing.Value] = None
 # Monotonic deadline for the upload worker, 0.0 = none. Once passed, the worker
 # stops sending and spools the rest — bounded shutdown.
 _shutdown_deadline: Optional[multiprocessing.Value] = None
-# Galleries the worker no longer holds as raw pixels (encoded, spooled or dropped), and whether either upload lane writes new work to disk; _await_encoder paces gallery calls by them.
+# _await_encoder paces gallery calls by these: the galleries the worker no longer holds as raw pixels (encoded, spooled or dropped), and whether either upload lane writes new work to disk.
 _galleries_released = None  # multiprocessing.RawValue("q")
 _lanes_on_disk = None  # multiprocessing.RawValue("i")
-# Galleries published by this process and its fork children, whose galleries the worker releases too.
-_galleries_published = None  # multiprocessing.RawValue("q")
+# Galleries this process published; only the initializing process waits on it. The worker never releases a fork child's galleries against it (see _ChildGalleryItems): a child's queue puts can be lost (a raw os.fork() child has no feeder thread, and a killed child loses what its feeder held), and a count the worker never released would hold every later gallery call. Unlocked between the direct and the pending path: an increment lost to a race only lets a later call wait less.
+_galleries_published = 0
 # How many this process's latest gallery-publishing call published: the depth left raw without waiting.
 _previous_galleries = 0
 # Set when shutdown begins, so a log() waiting for the encoder lets it proceed.
@@ -323,7 +325,9 @@ _rich_mutation_seq = None  # multiprocessing.Value("I") when versioning is negot
 _pending: collections.deque = collections.deque()
 # Reentrant: the shutdown signal handler runs on the main thread, possibly inside log().
 _pending_lock = threading.RLock()
-# What log() holds instead when it publishes no gallery.
+# Held by a log() call that publishes galleries directly, from its encoder check to its publication, so concurrent callers cannot all pass one check. It is never held while taking _pending_lock, which other threads' writes need while such a call waits; reentrant for a signal handler that logs inside log().
+_gallery_lock = threading.RLock()
+# What log() holds instead when it publishes no gallery directly.
 _NO_LOCK = contextlib.nullcontext()
 # Set when a value was dropped after its log() returned; wait_for_upload() and finish() then report incomplete delivery.
 _pending_incomplete = False
@@ -367,10 +371,11 @@ def _forget_pending() -> None:
 
 
 def _forget_pending_in_child() -> None:
-    """A fork child cannot use the parent's CUDA context, so it never publishes the parent's pending calls."""
-    global _pending_lock
+    """A fork child cannot use the parent's CUDA context, so it never publishes the parent's pending calls. It gets fresh locks, since a parent thread may have held one at the fork."""
+    global _pending_lock, _gallery_lock
     _forget_pending()
     _pending_lock = threading.RLock()
+    _gallery_lock = threading.RLock()
 
 
 if hasattr(os, "register_at_fork"):
@@ -573,8 +578,7 @@ def init(
     _shutdown_deadline = multiprocessing.Value("d", 0.0)
     _galleries_released = multiprocessing.RawValue("q", 0)
     _lanes_on_disk = multiprocessing.RawValue("i", 0)
-    # Unlocked: an increment a fork child loses to a race only lets a later call wait less.
-    _galleries_published = multiprocessing.RawValue("q", 0)
+    _galleries_published = 0
     _previous_galleries = 0
     _finishing = False
     _spool_dir = spool_dir
@@ -589,10 +593,8 @@ def init(
 
     # daemon=True: graceful drain is atexit's job; the daemon flag is the
     # backstop so the interpreter never waits on this process.
-    from kymo._worker import _upload_worker as worker_target
-
     _upload_process = multiprocessing.Process(
-        target=worker_target,
+        target=_upload_worker,
         args=(
             server_address,
             project_id,
@@ -819,10 +821,10 @@ def log(metrics: dict, step: int) -> None:
                 ("numeric_ts", name, step, _normalize_numeric_value(value), now_ms)
             )
 
-    # Held from the encoder check to the publication, so concurrent callers cannot all pass one check.
-    with _pending_lock if galleries else _NO_LOCK:
-        pending = bool(gpu_scalars or gpu_batches or _pending)
-        if galleries and not pending:
+    pending = bool(gpu_scalars or gpu_batches or _pending)
+    paced = galleries and not pending
+    with _gallery_lock if paced else _NO_LOCK:
+        if paced:
             # Before the snapshot, so a waiting call holds no copy of its images yet.
             _await_encoder()
         # Freeze public rich work before draining captured text: Queue.put() returns
@@ -926,10 +928,17 @@ class _HostTensorPickler(pickle.Pickler):
         return pickle.loads, (pickle.dumps(host, protocol=pickle.HIGHEST_PROTOCOL),)
 
 
+class _ChildGalleryItems(list):
+    """A fork child's unpaced gallery: the worker charges it whole until encoded and never releases it against the parent's gallery count."""
+
+
 def _snapshot_rich_queue_items(cdn_batches: list[tuple]) -> list[tuple]:
     """Return queue-safe immutable snapshots of public rich metric batches."""
     snapshots = []
+    in_child = _init_pid is not None and os.getpid() != _init_pid
     for batch in cdn_batches:
+        if in_child and batch[0] in ("cdn_batch", "cdn_batch_mutation"):
+            batch = (*batch[:3], _ChildGalleryItems(batch[3]), *batch[4:])
         if batch[0] in ("metadata_batch", "metadata_batch_mutation"):
             try:
                 manifest = metadata_manifest(batch[3].data)
@@ -1002,11 +1011,13 @@ def _decode_queue_item(item):
     return decoded
 
 
+def _raw_shared(shared):
+    """The object behind a synchronized value, read or written without its lock; a plain stand-in is its own."""
+    return shared.get_obj() if hasattr(shared, "get_obj") else shared
+
+
 def _raw_shared_value(shared, default=0):
-    if shared is None:
-        return default
-    raw = shared.get_obj() if hasattr(shared, "get_obj") else shared
-    return raw.value
+    return default if shared is None else _raw_shared(shared).value
 
 
 def _change_shared_value(shared, delta: int, *, timeout: float) -> None:
@@ -1015,8 +1026,7 @@ def _change_shared_value(shared, delta: int, *, timeout: float) -> None:
     if not lock.acquire(timeout=max(0.0, timeout)):
         raise RuntimeError("kymo upload accounting lock is unavailable")
     try:
-        raw = shared.get_obj() if hasattr(shared, "get_obj") else shared
-        raw.value += delta
+        _raw_shared(shared).value += delta
     finally:
         lock.release()
 
@@ -1046,7 +1056,7 @@ def _publish_queue_items(
     group immediately.  If a later put fails synchronously, retain ownership of
     groups whose puts returned and roll back only the unpublished suffix.
     """
-    global _previous_galleries
+    global _previous_galleries, _galleries_published
     total = sum(_queue_item_size(item) for item in items)
     if total == 0:
         return
@@ -1072,8 +1082,8 @@ def _publish_queue_items(
         except Exception as accounting_error:
             _log.error("failed to roll back upload accounting: %s", accounting_error)
         raise
-    if galleries and _galleries_published is not None:
-        _galleries_published.value += galleries
+    if galleries:
+        _galleries_published += galleries
         _previous_galleries = galleries
 
 
@@ -1089,7 +1099,7 @@ def _await_encoder() -> None:
     if _galleries_released is None or os.getpid() != _init_pid:
         return
     while (
-        _galleries_published.value - _galleries_released.value > _previous_galleries
+        _galleries_published - _galleries_released.value > _previous_galleries
         and not _lanes_on_disk.value
         and not _raw_shared_value(_upload_terminal)
         and not _finishing
@@ -1901,8 +1911,7 @@ def _read_shutdown_status(status) -> Optional[int]:
     if status is None:
         return 0
     try:
-        raw = status.get_obj() if hasattr(status, "get_obj") else status
-        return int(raw.value)
+        return int(_raw_shared(status).value)
     except Exception as error:
         _log.error("shutdown accounting could not be read: %s", error)
         return None
@@ -1911,8 +1920,7 @@ def _read_shutdown_status(status) -> Optional[int]:
 def _set_shutdown_deadline(deadline, value: float) -> None:
     """Publish the worker deadline without waiting on a shared-value lock."""
     try:
-        raw = deadline.get_obj() if hasattr(deadline, "get_obj") else deadline
-        raw.value = value
+        _raw_shared(deadline).value = value
     except Exception as error:
         # The parent's process deadline still force-stops the worker.
         _log.error("worker shutdown deadline could not be published: %s", error)
@@ -1961,6 +1969,8 @@ def _drain_queue_until(
         if is_fence(item):
             return True
         consume(item)
+        # The next wait may last seconds; it must not keep a large serialized gallery alive.
+        item = None
 
 
 def _drain_worker_queue(metric_queue, consume, *, input_closed: bool) -> bool:
@@ -2016,6 +2026,7 @@ def _drain_queue_to_spool(
                 _spill_tuple(spool, point_tuple)
             except Exception as e:
                 # A failed write is normally disk-wide, and the writer has cut its record off, with any earlier records that had not reached the file: stop writing, but keep draining to the fence.
+                # Lost: the failed point and the rest of its group, plus any counted records the cut removed.
                 dropped += len(point_tuples) - index + held - spool.count
                 _log.warning(
                     "failed to spool during salvage; dropping the rest of the queue: %s",
@@ -2040,9 +2051,7 @@ def _drain_queue_to_spool(
 
 
 def _report_spool(paths: list[str]) -> bool:
-    # The session-scoped listdir is the delivery evidence. Restatting here would
-    # make a vanished name ambiguous: sync may have delivered it as .sent, but it
-    # may instead have quarantined/retired it or an operator may have removed it.
+    # The session-scoped listdir is the delivery evidence. Do not restat: disappearance cannot distinguish delivery (the worker deletes what it delivers, sync renames it .sent) from quarantine, retirement, or manual removal.
     # Conservatively report the listed path rather than infer delivery.
     if not paths:
         return False
@@ -2356,11 +2365,11 @@ def _drain_and_shutdown(flush_timeout: Optional[float] = None) -> bool:
     # Raw os.fork() children (NOT multiprocessing children — those skip atexit) inherit this module's state and hooks; see _init_pid. Only the initializing process may shut the shared worker down.
     if _init_pid is not None and os.getpid() != _init_pid:
         return True
-    _finishing = True
 
     if flush_timeout is None:
         flush_timeout = _default_flush_timeout()
     flush_timeout = _normalize_timeout_budget(flush_timeout, "flush")
+    _finishing = True
     hard_deadline = time.monotonic() + flush_timeout
 
     poller_quiesced = True
@@ -2697,6 +2706,37 @@ def _encode_cdn_items(name: str, step: int, items: list) -> _EncodedItems:
     return _EncodedItems(entries, dropped=len(entries) < len(items))
 
 
+def _publish_manifest_point(
+    stub,
+    project_id: str,
+    run_id: str,
+    metric_name: str,
+    step: int,
+    cdn_key: str,
+    timestamp_ms: Optional[int],
+    mutation_version: Optional[int],
+) -> bool:
+    """Publish a rich record's manifest key: as its versioned mutation, or to an old server as a point stamped at publication."""
+    if mutation_version is not None:
+        return _publish_rich_mutation(
+            stub,
+            project_id,
+            run_id,
+            metric_name,
+            step,
+            cdn_key,
+            timestamp_ms,
+            mutation_version,
+        )
+    point = kymo_pb2.MetricPoint(
+        metric_name=metric_name,
+        step=step,
+        cdn_key=cdn_key,
+        timestamp_ms=int(time.time() * 1000),
+    )
+    return _send_unary_point(stub, project_id, run_id, point)
+
+
 def _send_unary_point(stub, project_id: str, run_id: str, point) -> bool:
     batch = kymo_pb2.MetricsBatch(project_id=project_id, run_id=run_id, points=[point])
     try:
@@ -2750,8 +2790,6 @@ def _process_cdn_batch(
             _send_unary_point(stub, project_id, run_id, placeholder_point)
         except grpc.RpcError as e:
             _log.error("failed to send placeholder: %s", e.details())
-        except _TerminalRunError:
-            raise
 
     # 2. Upload the encoded items. A CDN rejection drops its item, like an encode failure; any other upload failure is transient and fails the whole batch for retry — committing a manifest missing the failed items would silently thin the gallery. A retry re-uploads the already-uploaded prefix (the CDN dedups by content hash). Past the deadline the caller spools the batch, so finishing uploads here is pure shutdown latency against the parent's kill grace.
     manifest_items = []
@@ -2799,46 +2837,22 @@ def _process_cdn_batch(
     if mutation_version is not None:
         assert timestamp_ms is not None
         if manifest_changed:
-            if reduced_mutation_version is None:
-                raise _RichMutationDataLoss(
-                    "reduced gallery has no causally reserved mutation identity"
-                )
-            mutation_version = reduced_mutation_version
-        try:
-            if not _publish_rich_mutation(
-                stub,
-                project_id,
-                run_id,
-                metric_name,
-                step,
-                manifest_id,
-                timestamp_ms,
-                mutation_version,
-            ):
-                return False
-            _log.info(
-                "CDN %s step=%d → %s (%d items)",
-                metric_name,
-                step,
-                manifest_id,
-                len(manifest_items),
-            )
-            return True
-        except grpc.RpcError as e:
-            _log.error("failed to publish rich mutation: %s", e.details())
-            return False
-        except _TerminalRunError:
-            raise
-
-    real_point = kymo_pb2.MetricPoint(
-        metric_name=metric_name,
-        step=step,
-        cdn_key=manifest_id,
-        timestamp_ms=int(time.time() * 1000),
-    )
+            mutation_version = _reduced_mutation_version(reduced_mutation_version)
     try:
-        if not _send_unary_point(stub, project_id, run_id, real_point):
-            return False
+        published = _publish_manifest_point(
+            stub,
+            project_id,
+            run_id,
+            metric_name,
+            step,
+            manifest_id,
+            timestamp_ms,
+            mutation_version,
+        )
+    except grpc.RpcError as e:
+        _log.error("failed to publish manifest %s: %s", manifest_id, e.details())
+        return False
+    if published:
         _log.info(
             "CDN %s step=%d → %s (%d items)",
             metric_name,
@@ -2846,12 +2860,7 @@ def _process_cdn_batch(
             manifest_id,
             len(manifest_items),
         )
-        return True
-    except grpc.RpcError as e:
-        _log.error("failed to send real cdn_key: %s", e.details())
-        return False
-    except _TerminalRunError:
-        raise
+    return published
 
 
 _CONNECT_INITIAL_DELAY = 0.5
@@ -2872,7 +2881,7 @@ _WORKER_EXIT_DRAIN_INCOMPLETE = 3
 # The identity is deleted/purged. Retrying or spooling would create an
 # immortal backlog, so the worker rejects queued points and reports failure.
 _WORKER_EXIT_RUN_DELETED = 4
-# The server answered DATA_LOSS for a rich mutation: its spool segment was quarantined as *.rejected and later data kept flowing.
+# A spool segment was quarantined as *.rejected (the server answered DATA_LOSS for a rich mutation in it, or it held records that can never be delivered), and later data kept flowing.
 _WORKER_EXIT_DATA_LOSS = 5
 # Loss evidence outranks other failures, and an outright spool failure outranks a quarantine.
 _FAILURE_RANK = {_WORKER_EXIT_DATA_LOSS: 1, _WORKER_EXIT_SPOOL_FAILED: 2}
@@ -2908,9 +2917,11 @@ _DEFAULT_MAX_BUFFER_POINTS = 2_000_000
 _DEFAULT_MAX_BUFFER_BYTES = 256 * 1024 * 1024
 _RECOVERY_MAX_BUFFER_POINTS = _MAX_UNACKED_POINTS
 _RECOVERY_MAX_BUFFER_BYTES = 32 * 1024 * 1024
+# A live numeric lane that holds points and gets no ACK for this long fails over to disk, so an outage's points do not sit only in RAM until the cap.
+_NUMERIC_OUTAGE_FAILOVER = 180.0
 # Bound ordered CDN entries; retain_queue_item in _upload_worker says what a queued gallery is charged.
 _MAX_CDN_QUEUE = 1_000
-_MAX_CDN_QUEUE_BYTES = 2 * 1024 * 1024 * 1024
+_DEFAULT_MAX_RICH_BUFFER_BYTES = 2 * 1024 * 1024 * 1024
 _ORDERED_CDN_KINDS = (
     "cdn_batch",
     "metadata_batch",
@@ -2931,9 +2942,6 @@ class _RetainedLane:
         self.items: list[tuple] = []
         self.sizes: list[int] = []
         self.total_bytes = 0
-
-    def __bool__(self) -> bool:
-        return bool(self.items)
 
     def __len__(self) -> int:
         return len(self.items)
@@ -3032,7 +3040,7 @@ def _equal_jitter_delay(base: float, rng: random.Random) -> float:
 def _recovery_retry_delay(failures: int, rng: random.Random) -> float:
     """Equal-jitter exponential backoff for outage recovery.
 
-    The random half prevents a fleet of workers that crossed the RAM cap at
+    The random half prevents a fleet of workers that failed over to disk at
     roughly the same time from all probing a restarted backend together. Keep
     the whole interval below the cap rather than clamping randomized values to
     it: clamping would create a large point mass at exactly 60 seconds.
@@ -3085,67 +3093,40 @@ def _spool_record(point_tuple: tuple) -> tuple:
     """The spool record for one queue tuple, encoding CDN payloads not yet encoded so the file is self-contained."""
     kind = point_tuple[0]
     if kind in ("metadata_batch", "metadata_batch_mutation"):
-        import json
-
-        if kind == "metadata_batch_mutation":
-            _, name, step, metadata_obj, timestamp_ms, mutation_version = point_tuple
-        else:
-            _, name, step, metadata_obj = point_tuple
+        _, name, step, metadata_obj, *versions = point_tuple
         data = json.loads(json.dumps(metadata_obj.data, default=str, allow_nan=False))
-        if kind == "metadata_batch_mutation":
-            return (
-                "metadata_json_mutation",
-                name,
-                step,
-                data,
-                timestamp_ms,
-                mutation_version,
-            )
-        return ("metadata_json", name, step, data)
+        record_kind = "metadata_json_mutation" if versions else "metadata_json"
+        return (record_kind, name, step, data, *versions)
     if kind not in ("cdn_batch", "cdn_batch_mutation"):
         return point_tuple
-    if kind == "cdn_batch_mutation":
-        (
-            _,
-            name,
-            step,
-            items,
-            timestamp_ms,
-            mutation_version,
-            reduced_mutation_version,
-        ) = point_tuple
-    else:
-        _, name, step, items = point_tuple
+    _, name, step, items, *versions = point_tuple
     # The worker's encoder may already have encoded this gallery.
     if not isinstance(items, _EncodedItems):
         items = _encode_cdn_items(name, step, items)
     # Recorded even when every item failed to encode. Legacy batches may
     # need an empty manifest to clear their pending:* placeholder;
     # versioned batches still represent a real empty-gallery mutation.
-    if kind == "cdn_batch":
+    if not versions:
         return ("cdn_batch_encoded", name, step, items.entries)
+    timestamp_ms, mutation_version, reduced_mutation_version = versions
     if items.dropped:
-        mutation_version = reduced_mutation_version
-        reduced_mutation_version = None
-    if reduced_mutation_version is None:
-        return (
-            "cdn_batch_encoded_mutation",
-            name,
-            step,
-            items.entries,
-            timestamp_ms,
-            mutation_version,
-        )
-    # A distinct kind makes the extra field forward-safe: older
-    # replay tools preserve unknown records instead of rejecting a
-    # valid newer tuple as malformed.
-    return (
-        "cdn_batch_encoded_mutation_reserved",
+        mutation_version, reduced_mutation_version = reduced_mutation_version, None
+    record = (
+        "cdn_batch_encoded_mutation",
         name,
         step,
         items.entries,
         timestamp_ms,
         mutation_version,
+    )
+    if reduced_mutation_version is None:
+        return record
+    # A distinct kind makes the extra field forward-safe: older
+    # replay tools preserve unknown records instead of rejecting a
+    # valid newer tuple as malformed.
+    return (
+        "cdn_batch_encoded_mutation_reserved",
+        *record[1:],
         reduced_mutation_version,
     )
 
@@ -3293,13 +3274,6 @@ class _BidiStream:
             self._call.cancel()
         except Exception:
             pass
-
-
-def _upload_worker(*args, **kwargs):
-    """Compatibility shim for tests and callers of this private helper."""
-    from kymo._worker import _upload_worker as worker_target
-
-    return worker_target(*args, **kwargs)
 
 
 def _connect(

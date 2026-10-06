@@ -166,7 +166,7 @@ def make_spool_path(
 
 
 def writer_active(path: str) -> bool:
-    """True if a live SpoolWriter still holds its advisory lock on the file (see SpoolWriter._open). Errs toward False where flock is unsupported or node-local — replay_file's size-growth check backs this up for active writers, but an idle live writer on such a mount goes undetected (accepted residual, see SpoolWriter._open)."""
+    """True if a live SpoolWriter still holds its advisory lock on the file (see SpoolWriter.open). Errs toward False where flock is unsupported or node-local — replay_file's size-growth check backs this up for active writers, but an idle live writer on such a mount goes undetected (accepted residual, see SpoolWriter.open)."""
     try:
         import errno
         import fcntl
@@ -299,7 +299,7 @@ class _SpoolFile(io.FileIO):
 
 class SpoolWriter:
     """Append-only spool writer. Opens the file (and writes the header) lazily
-    on the first record, so no file appears on runs that flush cleanly.
+    on the first record or at open(), so no file appears on runs that flush cleanly.
 
     A failed write or flush cuts the file back to its last whole record, since a reader rejects a file whose last record is torn. ``count`` is the records written, less any a cut removed; those still buffered reach the file at the next flush."""
 
@@ -320,7 +320,10 @@ class SpoolWriter:
     def path(self) -> str:
         return self._path
 
-    def _open(self):
+    def open(self) -> None:
+        """Create the file and write its header, unless already open: the first record does this, and a caller can do it earlier to learn whether the spool can be written."""
+        if self._fh is not None:
+            return
         spool_dir = os.path.dirname(self._path)
         os.makedirs(spool_dir, mode=0o700, exist_ok=True)
         # Replay often runs as another uid (e.g. --container-remap-root jobs), so mirror the directory's group/other read bits; writes remain owner-only. The default 0700 directory widens nothing.
@@ -331,6 +334,10 @@ class SpoolWriter:
             fchmod = getattr(os, "fchmod", None)
             if fchmod is not None:
                 fchmod(fd, mode)
+            # Sized as Python 3.14's open() sizes it: a file system's block size can be megabytes, where a fixed small buffer would split large spills into far more writes.
+            buffer_size = max(
+                io.DEFAULT_BUFFER_SIZE, min(os.fstat(fd).st_blksize, 8 << 20)
+            )
             raw = _SpoolFile(fd, "a")
         except BaseException:
             try:
@@ -338,7 +345,7 @@ class SpoolWriter:
             except OSError:
                 pass
             raise
-        self._fh = io.BufferedWriter(raw)
+        self._fh = io.BufferedWriter(raw, buffer_size)
         # Advisory writer lock, held while the file is open: sync renames replayed files to .sent, and renaming a file a live writer still appends to would strand every later record in the .sent inode. Best-effort — where flock is unsupported or node-local (NFSv3/nolock mounts) sync's only backstop is its size-growth check during the replay, so an IDLE live writer there can still be renamed out from under; accepted residual.
         try:
             import fcntl
@@ -346,9 +353,10 @@ class SpoolWriter:
             fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except (ImportError, OSError):
             pass
-        self._record_ends = [self._fh.tell()]
+        size = self._fh.tell()
+        self._record_ends = [size]
         self._unsynced = True
-        if self._fh.tell() == 0:
+        if size == 0:
             try:
                 pickle.dump(self._header, self._fh, protocol=pickle.HIGHEST_PROTOCOL)
                 # On disk at once, so a failed first record cannot take the header with it.
@@ -367,8 +375,7 @@ class SpoolWriter:
         if self._sealed:
             raise RuntimeError(f"cannot append to sealed spool {self._path}")
         self._raise_if_torn()
-        if self._fh is None:
-            self._open()
+        self.open()
         try:
             pickle.dump(record, self._fh, protocol=pickle.HIGHEST_PROTOCOL)
         except BaseException:
@@ -379,11 +386,13 @@ class SpoolWriter:
                 self._discard()
             raise
         self._record_ends.append(self._fh.tell())
+        # Records already wholly on disk survive any cut, so only the last of their ends is needed; ends still in a large buffer stay until they reach the file.
         if len(self._record_ends) > 8192:
-            # Records already wholly on disk survive any cut, so only the last of their ends is needed.
-            del self._record_ends[
-                : bisect.bisect_right(self._record_ends, self._fh.raw.tell()) - 1
-            ]
+            written = self._fh.raw.tell()
+            if self._record_ends[1] <= written:
+                del self._record_ends[
+                    : bisect.bisect_right(self._record_ends, written) - 1
+                ]
         self._unsynced = True
         self.count += 1
 
@@ -434,7 +443,7 @@ class SpoolWriter:
         self._record_ends = [size]
         self._unsynced = True
 
-    def seal(self) -> Optional[str]:
+    def seal(self) -> None:
         """Make a nonempty spool immutable while retaining its writer lock.
 
         The live upload worker hands sealed segments to its replay helper. The
@@ -446,14 +455,10 @@ class SpoolWriter:
         thread, and a stalled spool mount must not stop the queue draining.
         ``sync()`` performs the durability barrier from the replay helper.
         """
-        if self._sealed:
-            return self._path if self.count else None
-        if self._fh is None:
-            self._sealed = True
-            return None
-        self.flush()
+        # A torn writer has already dropped its buffer: sealing it hands the file to replay, which quarantines the torn tail, instead of failing every attempt.
+        if not (self._sealed or self._torn):
+            self.flush()
         self._sealed = True
-        return self._path if self.count else None
 
     def sync(self) -> None:
         """Make the written records durable. Safe to call from the thread that

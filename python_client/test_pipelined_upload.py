@@ -1914,7 +1914,6 @@ def _patch_log_client(case, *extra) -> mock.Mock:
 def _patch_encoder_pacing(case) -> types.SimpleNamespace:
     """Pace gallery calls by a fake worker for one test: set released.value as it encodes, on_disk.value while a lane is on disk."""
     pacing = types.SimpleNamespace(
-        published=types.SimpleNamespace(value=0),
         released=types.SimpleNamespace(value=0),
         on_disk=types.SimpleNamespace(value=0),
         process=mock.Mock(),
@@ -1925,7 +1924,7 @@ def _patch_encoder_pacing(case) -> types.SimpleNamespace:
         mock.patch.object(client_module, "_lanes_on_disk", pacing.on_disk),
         mock.patch.object(client_module, "_upload_terminal", _QueueStatus()),
         mock.patch.object(client_module, "_upload_process", pacing.process),
-        mock.patch.object(client_module, "_galleries_published", pacing.published),
+        mock.patch.object(client_module, "_galleries_published", 0),
         mock.patch.object(client_module, "_previous_galleries", 0),
         mock.patch.object(client_module, "_finishing", False),
     ):
@@ -2383,8 +2382,8 @@ class PendingGpuLogTests(unittest.TestCase):
         self.assertEqual([group[0][1] for group in self.published()], ["gpu", "later"])
 
     def test_a_call_whose_gpu_copies_failed_does_not_wait_for_the_encoder(self):
-        pacing = _patch_encoder_pacing(self)
-        pacing.published.value = 2
+        _patch_encoder_pacing(self)
+        client_module._galleries_published = 2
         pixels = np.zeros((2, 2, 3), dtype=np.uint8)
         _log_promptly(self, ({"gpu": [Image(_GpuImage(pixels))]}, 1))
         self.reads[0].error = RuntimeError("CUDA error: an illegal memory access")
@@ -2550,16 +2549,26 @@ class EncoderPacingTests(unittest.TestCase):
             ]
             time.sleep(0.3)
             # Two calls' galleries may be raw; the other six wait.
-            self.assertEqual(self.pacing.published.value, 2)
+            self.assertEqual(client_module._galleries_published, 2)
             self.pacing.released.value = 8
             self.assertTrue(all(event.wait(timeout=2) for event in done))
-        self.assertEqual(self.pacing.published.value, 8)
+        self.assertEqual(client_module._galleries_published, 8)
 
-    def test_a_fork_child_counts_the_galleries_it_publishes(self):
-        # The worker releases them along with the parent's, so the parent must count them too.
-        with mock.patch.object(client_module, "_init_pid", os.getpid() + 1):
-            _log_promptly(self, ({"samples": self.gallery()}, 1))
-        self.assertEqual(self.pacing.published.value, 1)
+    def test_a_waiting_gallery_call_does_not_hold_other_threads_writes(self):
+        _log_promptly(
+            self, ({"first": self.gallery()}, 1), ({"second": self.gallery()}, 2)
+        )
+        waiting = _in_thread(
+            lambda: client_module.log({"third": self.gallery()}, step=3)
+        )
+        self.assertFalse(waiting.wait(timeout=0.1))
+        # Another thread's write that takes the pending-call lock goes through while that call waits for the encoder.
+        written = _in_thread(lambda: client_module.log_cdn({"key": "abc"}, step=4))
+        self.assertTrue(written.wait(timeout=1))
+        self.assertIn("key", self.published_names())
+        self.assertFalse(waiting.is_set())
+        self.pacing.released.value = 2
+        self.assertTrue(waiting.wait(timeout=1))
 
     def test_a_call_without_galleries_never_waits(self):
         _log_promptly(
@@ -3345,6 +3354,12 @@ class ShutdownProofTests(unittest.TestCase):
             self.assertLess(time.monotonic() - started, 0.5)
         waiter.join(timeout=1)
         self.assertFalse(waiter.is_alive())
+
+    def test_a_shutdown_refused_its_flush_timeout_keeps_the_encoder_wait(self):
+        with mock.patch.object(client_module, "_finishing", False):
+            with self.assertRaises(ValueError):
+                self._run_shutdown(flush_timeout="invalid")
+            self.assertFalse(client_module._finishing)
 
     def test_shutdown_publishes_captured_tail_before_the_sentinel(self):
         status = _QueueStatus()
@@ -5158,7 +5173,7 @@ class WorkerResponsivenessTests(unittest.TestCase):
                 first_replay_started.set()
                 self.assertTrue(release_first_replay.wait(timeout=1))
                 return False
-            os.rename(path, path + ".sent")
+            os.remove(path)
             return True
 
         def observe_live(batch):
@@ -5243,7 +5258,7 @@ class WorkerResponsivenessTests(unittest.TestCase):
 
     @staticmethod
     def _replay_stand_in(gates=(), outcomes=(), delay=0.0):
-        """A kymo.sync.replay_file stand-in: call n waits for gates[n] and returns outcomes[n], if given, else True; a successful one records its steps in .numeric and .rich and renames the segment .sent, and "quarantine" quarantines it as authoritative DATA_LOSS would."""
+        """A kymo.sync.replay_file stand-in: call n waits for gates[n] and returns outcomes[n], if given, else True; a successful one records its steps in .numeric and .rich and deletes the segment, "quarantine" quarantines it as authoritative DATA_LOSS would, "terminal" reports the run deleted and then fails to retire the file, and "vanish" removes it as another process might."""
 
         def replay(path, **kwargs):
             index = len(replay.calls)
@@ -5252,6 +5267,12 @@ class WorkerResponsivenessTests(unittest.TestCase):
                 gates[index].wait(timeout=5)
             time.sleep(delay)
             succeeded = outcomes[index] if index < len(outcomes) else True
+            if succeeded == "terminal":
+                kwargs["terminal_runs"].add(("unused", "p", "r"))
+                raise PermissionError(13, "Permission denied", path)
+            if succeeded == "vanish":
+                os.remove(path)
+                raise FileNotFoundError(2, "No such file or directory", path)
             if succeeded == "quarantine":
                 os.rename(path, path + ".rejected")
                 kwargs["quarantined_files"].add(path + ".rejected")
@@ -5263,7 +5284,8 @@ class WorkerResponsivenessTests(unittest.TestCase):
                         replay.rich if record[0].startswith("cdn") else replay.numeric
                     )
                     lane.append(record[2])
-                os.rename(path, path + ".sent")
+                assert kwargs["delete"], "the worker keeps no .sent copy"
+                os.remove(path)
             return succeeded
 
         replay.calls, replay.numeric, replay.rich, replay.gates = [], [], [], gates
@@ -5279,10 +5301,12 @@ class WorkerResponsivenessTests(unittest.TestCase):
         connect=None,
         retry_delay=None,
         ensure=None,
+        jitter=0.01,
+        limit=None,
     ):
-        """Run the worker through a numeric outage: connects fail until lane.server_up is set (then connect(lane) makes them, if given), and a 200-point cap fails the lane over. With an ensure_local_endpoint stand-in, the worker runs against a local endpoint and lane.ensure is that mock.
+        """Run the worker through a numeric outage: connects fail until lane.server_up is set (then connect(lane) makes them, if given), and a 200-point cap, or limit seconds without an ACK if given, fails the lane over. With an ensure_local_endpoint stand-in, the worker runs against a local endpoint and lane.ensure is that mock; jitter is every jittered backoff (stream breaks, local ensures).
 
-        Yields a namespace with put(step), put_item(item), shut_down(), the live steps, the opens event, on_disk, status and spool_dir; on exit it shuts the worker down and checks that it left.
+        Yields a namespace with put(step), put_item(item), shut_down(), the live steps, the opens event, on_disk, status, spooled and spool_dir; on exit it shuts the worker down and checks that it left.
         """
         lane = types.SimpleNamespace(
             server_up=threading.Event(),
@@ -5290,6 +5314,7 @@ class WorkerResponsivenessTests(unittest.TestCase):
             opens=threading.Event(),
             on_disk=types.SimpleNamespace(value=0),
             status=_QueueStatus(),
+            spooled=_QueueStatus(),
             source=queue.Queue(),
         )
 
@@ -5326,12 +5351,20 @@ class WorkerResponsivenessTests(unittest.TestCase):
                 side_effect=retry_delay,
                 return_value=0,
             ),
-            mock.patch.object(client_module, "_equal_jitter_delay", return_value=0.01),
+            mock.patch.object(
+                client_module, "_equal_jitter_delay", return_value=jitter
+            ),
             mock.patch.object(sync_module, "replay_file", side_effect=replay),
             mock.patch.dict(
                 os.environ, {"KYMO_MAX_BUFFER_POINTS": "200", **(env or {})}
             ),
+            # Short loop turns: a worker waiting on nothing still notices a recovery, a limit or a deadline at once.
+            mock.patch.object(client_module, "_IDLE_POLL_TIMEOUT", 0.02),
         )
+        if limit is not None:
+            patches += (
+                mock.patch.object(client_module, "_NUMERIC_OUTAGE_FAILOVER", limit),
+            )
         local = {}
         if ensure is not None:
             local["local_endpoint_config"] = local_endpoint_config()
@@ -5355,6 +5388,7 @@ class WorkerResponsivenessTests(unittest.TestCase):
                     "shutdown_deadline": _DeadlineValue(),
                     "spool_path": os.path.join(spool_dir, "numeric.mkspool"),
                     "lanes_on_disk": lane.on_disk,
+                    "upload_spooled": lane.spooled,
                     **local,
                 },
                 daemon=True,
@@ -5404,31 +5438,28 @@ class WorkerResponsivenessTests(unittest.TestCase):
         self.assertTrue(self._wait_for(lambda: lane.on_disk.value == 0))
 
     @staticmethod
-    def _resource_gallery(step, data) -> tuple:
-        """A versioned one-resource gallery, charged len(data) bytes on arrival."""
+    def _gallery(step, items) -> tuple:
+        """A versioned gallery as log() queues it, with the step as its version's sequence."""
         version = (1 << 32) | step
         (item,) = client_module._snapshot_rich_queue_items(
-            [
-                (
-                    "cdn_batch_mutation",
-                    "samples",
-                    step,
-                    [client_module.Resource(data, "item.bin")],
-                    step,
-                    version,
-                    version + 1,
-                )
-            ]
+            [("cdn_batch_mutation", "samples", step, items, step, version, version + 1)]
         )
         return item
 
+    @classmethod
+    def _resource_gallery(cls, step, data) -> tuple:
+        """A versioned one-resource gallery, charged len(data) bytes on arrival."""
+        return cls._gallery(step, [client_module.Resource(data, "item.bin")])
+
     @staticmethod
     def _steps_on_disk(spool_dir) -> list:
-        """The steps of every record in spool_dir's pending (not yet .sent) spool files."""
+        """The steps of every record in spool_dir's pending (not yet replayed) spool files."""
         steps = []
         for name in sorted(os.listdir(spool_dir)):
-            if name.endswith(".mkspool"):
-                _header, records = read_spool(os.path.join(spool_dir, name))
+            path = os.path.join(spool_dir, name)
+            # A segment the worker is creating stays empty until its header is flushed.
+            if name.endswith(".mkspool") and os.path.getsize(path):
+                _header, records = read_spool(path)
                 steps.extend(record[2] for record in records)
         return steps
 
@@ -5456,6 +5487,456 @@ class WorkerResponsivenessTests(unittest.TestCase):
         ):
             stack.enter_context(patch)
         return stack
+
+    def test_a_segment_that_vanishes_before_its_replay_is_skipped(self):
+        replay = self._replay_stand_in(outcomes=("vanish",))
+        with (
+            self.assertLogs("kymo", level="WARNING") as logs,
+            self._numeric_outage(replay) as lane,
+        ):
+            for step in range(1, 202):
+                lane.put(step)
+            self.assertTrue(self._wait_for(lambda: lane.status.value == 0))
+            # Another process takes the sealed segment, so the lane goes on past it and live.
+            lane.server_up.set()
+            self.assertTrue(lane.opens.wait(timeout=2))
+            lane.put(202)
+            self.assertTrue(self._wait_for(lambda: lane.live == [202]))
+        self.assertEqual(len(replay.calls), 1)
+        self.assertTrue(
+            any("disappeared before its replay" in line for line in logs.output)
+        )
+        # Whether another process delivered it is unknown, so the run still reports spooled data.
+        self.assertEqual(lane.spooled.value, 1)
+
+    def test_a_later_replay_does_not_clear_the_report_of_a_vanished_segment(self):
+        replay = self._replay_stand_in(gates=(threading.Event(),), outcomes=("vanish",))
+        with (
+            self.assertLogs("kymo", level="WARNING"),
+            self._numeric_outage(replay) as lane,
+        ):
+            try:
+                for step in range(1, 202):
+                    lane.put(step)
+                self.assertTrue(self._wait_for(lambda: lane.status.value == 0))
+                lane.server_up.set()
+                self.assertTrue(self._wait_for(lambda: replay.calls))
+                # Spooled behind the segment that vanishes, then delivered by the next replay.
+                lane.put(202)
+                time.sleep(0.05)
+            finally:
+                replay.gates[0].set()
+            self.assertTrue(lane.opens.wait(timeout=2))
+            self.assertEqual(replay.numeric, [202])
+            # The vanished segment's delivery is still unknown while the run goes on.
+            self.assertEqual(lane.spooled.value, 1)
+
+    def _break_once_stream(self):
+        """A live stream double that records each stream it opens in .opened, and breaks once, the first time it is fed step 999, recording that in .breaks."""
+
+        class BreakOnce(self._immediate_stream_class(lambda _batch: None)):
+            opened, breaks = [], []
+
+            def __init__(self, stub, feed_cap):
+                super().__init__(stub, feed_cap)
+                BreakOnce.opened.append(time.monotonic())
+
+            def feed(self, batch):
+                if not BreakOnce.breaks and any(
+                    point.step == 999 for point in batch.points
+                ):
+                    BreakOnce.breaks.append(time.monotonic())
+                    self.events.put(("error", RuntimeError("stream broke")))
+                    return True
+                return super().feed(batch)
+
+        return BreakOnce
+
+    def test_a_delivered_rich_replay_keeps_a_live_stream_backing_off(self):
+        replay = self._replay_stand_in(gates=(threading.Event(),))
+        stream = self._break_once_stream()
+        opened, breaks = stream.opened, stream.breaks
+        env = {"KYMO_MAX_RICH_BUFFER_BYTES": "1024"}
+        with self._numeric_outage(replay, env=env, stream=stream, jitter=1.0) as lane:
+            try:
+                lane.server_up.set()
+                self.assertTrue(lane.opens.wait(timeout=2))
+                # The rich lane fails over and replays while numeric stays live.
+                lane.put_item(self._resource_gallery(1001, b"x" * 2048))
+                self.assertTrue(self._wait_for(lambda: replay.calls))
+                # The live stream breaks, and backs off for a second once the worker has seen the break.
+                lane.put(999)
+                self.assertTrue(self._wait_for(lambda: breaks))
+                time.sleep(0.2)
+                streams = len(opened)
+            finally:
+                replay.gates[0].set()
+            self.assertTrue(self._wait_for(lambda: lane.on_disk.value == 0))
+            time.sleep(0.3)
+            # The rich circuit's success does not cut the numeric backoff short.
+            self.assertEqual(len(opened), streams)
+
+    def test_a_terminal_answer_stands_when_retiring_the_segment_fails(self):
+        replay = self._replay_stand_in(outcomes=("terminal",))
+        with (
+            self.assertLogs("kymo", level="ERROR"),
+            self._numeric_outage(replay) as lane,
+        ):
+            for step in range(1, 202):
+                lane.put(step)
+            self.assertTrue(self._wait_for(lambda: lane.status.value == 0))
+            lane.server_up.set()
+            self.assertTrue(self._wait_for(lambda: replay.calls))
+            time.sleep(0.2)
+            # The run is gone: the segment is not replayed again, and a later point is rejected, neither sent nor spooled.
+            lane.put(202)
+            self.assertTrue(self._wait_for(lambda: lane.status.value == 0))
+            time.sleep(0.1)
+            self.assertEqual(len(replay.calls), 1)
+            self.assertNotIn(202, lane.live)
+            self.assertNotIn(202, self._steps_on_disk(lane.spool_dir))
+
+    def test_points_with_no_ack_for_the_outage_limit_go_to_disk(self):
+        replay = self._replay_stand_in()
+        with (
+            self.assertLogs("kymo", level="WARNING") as logs,
+            self._numeric_outage(replay, limit=0.3) as lane,
+        ):
+            for step in range(1, 6):
+                lane.put(step)
+            # Far below the 200-point cap: only the outage limit moves them to disk.
+            self.assertTrue(self._wait_for(lambda: lane.status.value == 0))
+            self.assertEqual(self._steps_on_disk(lane.spool_dir), [1, 2, 3, 4, 5])
+            lane.server_up.set()
+            self.assertTrue(lane.opens.wait(timeout=2))
+            lane.put(6)
+            self.assertTrue(self._wait_for(lambda: lane.live == [6]))
+        self.assertEqual(replay.numeric, [1, 2, 3, 4, 5])
+        self.assertTrue(any("no numeric ACK for 0.3s" in line for line in logs.output))
+
+    def _slow_ack_stream(self, delay):
+        """A live stream double that ACKs each batch, in order, delay seconds after it is fed, records the fed steps in .fed, holds its ACKs while .muted is set, and closes once a half-close has every ACK."""
+
+        class SlowAcks(
+            self._immediate_stream_class(
+                lambda batch: SlowAcks.fed.extend(point.step for point in batch.points)
+            )
+        ):
+            fed = []
+            muted = threading.Event()
+
+            def __init__(self, stub, feed_cap):
+                super().__init__(stub, feed_cap)
+                self.unacked = deque()
+
+            def feed(self, batch):
+                if not super().feed(batch):
+                    return False
+                # Hold back the ACK the parent queued until it is due.
+                self.unacked.append(
+                    (time.monotonic() + delay, self.events.get_nowait())
+                )
+                return True
+
+            def poll_acks(self):
+                acks = []
+                while (
+                    self.unacked
+                    and self.unacked[0][0] <= time.monotonic()
+                    and not SlowAcks.muted.is_set()
+                ):
+                    acks.append(self.unacked.popleft()[1])
+                # A half-close's EOF waits in the parent's queue until every ACK is out.
+                return acks + ([] if self.unacked else super().poll_acks())
+
+        return SlowAcks
+
+    def test_acks_slower_than_logging_keep_the_lane_live(self):
+        SlowAcks = self._slow_ack_stream(0.1)
+        replay = self._replay_stand_in()
+        with (
+            self.assertLogs("kymo", level="WARNING"),
+            # A cap the backlog cannot reach, even if the loop stalls under load.
+            self._numeric_outage(
+                replay,
+                limit=0.5,
+                env={"KYMO_MAX_BUFFER_POINTS": "1000000"},
+                stream=SlowAcks,
+            ) as lane,
+        ):
+            lane.server_up.set()
+            self.assertTrue(lane.opens.wait(timeout=2))
+            # Points always wait for an ACK, but each ACK restarts the clock.
+            with self._logging_points(lane):
+                time.sleep(1.5)
+            self.assertTrue(
+                self._wait_for(lambda: SlowAcks.fed[-1:] == [lane.last_step])
+            )
+            self.assertEqual(replay.calls, [])
+            self.assertEqual(SlowAcks.fed, list(range(1, lane.last_step + 1)))
+            # Then the open stream stops acknowledging, and the lane fails over.
+            SlowAcks.muted.set()
+            lane.put(lane.last_step + 1)
+            self.assertTrue(
+                self._wait_for(lambda: lane.last_step + 1 in replay.numeric)
+            )
+
+    def test_silent_streams_the_ack_watchdog_breaks_do_not_restart_the_clock(self):
+        class Silent(self._immediate_stream_class(lambda _batch: None)):
+            opened = []
+
+            def __init__(self, stub, feed_cap):
+                super().__init__(stub, feed_cap)
+                Silent.opened.append(self)
+
+            def feed(self, batch):
+                # Accepted and never acknowledged.
+                return not self.half_closed
+
+        replay = self._replay_stand_in()
+        with (
+            self.assertLogs("kymo", level="WARNING"),
+            self._numeric_outage(
+                replay,
+                limit=0.6,
+                env={"KYMO_ACK_PROGRESS_TIMEOUT": "0.1"},
+                stream=Silent,
+            ) as lane,
+        ):
+            lane.server_up.set()
+            for step in range(1, 6):
+                lane.put(step)
+            # The watchdog breaks each silent stream and the worker opens another, while the clock runs on across them.
+            self.assertTrue(self._wait_for(lambda: replay.numeric == [1, 2, 3, 4, 5]))
+            self.assertGreater(len(Silent.opened), 3)
+
+    def test_a_live_lane_with_nothing_pending_does_not_fail_over(self):
+        replay = self._replay_stand_in()
+        with self._numeric_outage(replay, limit=0.1) as lane:
+            lane.server_up.set()
+            lane.put(1)
+            self.assertTrue(self._wait_for(lambda: lane.live == [1]))
+            # Acked and idle, the lane has nothing waiting, so no clock runs.
+            with self.assertNoLogs("kymo", level="WARNING"):
+                time.sleep(0.5)
+
+    def test_after_a_spool_failure_the_limit_leaves_points_in_ram(self):
+        disk_full = threading.Event()
+        real_spill = client_module._spill_tuple
+
+        def spill(spool, point):
+            if disk_full.is_set():
+                raise OSError(28, "No space left on device")
+            return real_spill(spool, point)
+
+        SlowAcks = self._slow_ack_stream(0.0)
+        replay = self._replay_stand_in()
+        with (
+            mock.patch.object(client_module, "_spill_tuple", side_effect=spill),
+            self.assertLogs("kymo", level="WARNING"),
+            self._numeric_outage(replay, limit=0.3, stream=SlowAcks) as lane,
+        ):
+            # A first outage finds the disk full, and its point is lost.
+            disk_full.set()
+            lane.put(1)
+            self.assertTrue(self._wait_for(lambda: lane.status.value == 0))
+            disk_full.clear()
+            lane.server_up.set()
+            self.assertTrue(lane.opens.wait(timeout=2))
+            # The failed spool would lose a later outage's points too, so they wait in RAM for the server instead.
+            SlowAcks.muted.set()
+            for step in range(2, 6):
+                lane.put(step)
+            time.sleep(1.0)
+            self.assertEqual(lane.status.value, 4)
+            SlowAcks.muted.clear()
+            self.assertTrue(self._wait_for(lambda: lane.status.value == 0))
+        self.assertEqual(SlowAcks.fed, [2, 3, 4, 5])
+        self.assertEqual(replay.calls, [])
+
+    def test_a_draining_lane_waits_out_a_slow_replay_in_ram(self):
+        replay = self._replay_stand_in(gates=(threading.Event(), threading.Event()))
+        with self._numeric_outage(replay, limit=0.3) as lane:
+            try:
+                self._drain_behind_second_replay(lane, replay)
+                # Behind a replay slower than the limit, the drained point stays in RAM, so the catch-up still converges.
+                lane.put(203)
+                time.sleep(0.6)
+                self.assertNotIn(203, self._steps_on_disk(lane.spool_dir))
+            finally:
+                replay.gates[1].set()
+            self.assertTrue(self._wait_for(lambda: lane.live == [203]))
+        self.assertEqual(len(replay.calls), 2)
+
+    def test_a_gallery_is_charged_whole_while_numeric_writes_to_disk(self):
+        gallery = self._gallery(1001, [Image(np.zeros((512, 512, 3), np.uint8))])
+        replay = self._replay_stand_in()
+        with (
+            self.assertLogs("kymo", level="WARNING"),
+            self._numeric_outage(
+                replay, env={"KYMO_MAX_RICH_BUFFER_BYTES": str(512 * 1024)}
+            ) as lane,
+        ):
+            # The numeric lane trips its cap and writes to disk, so log() no longer paces galleries.
+            for step in range(1, 202):
+                lane.put(step)
+            self.assertTrue(self._wait_for(lambda: lane.on_disk.value == 1))
+            # Its 768 KiB of raw pixels count against the 512 KiB rich cap at once, before any encode could shrink them.
+            lane.put_item(gallery)
+            self.assertTrue(
+                self._wait_for(lambda: 1001 in self._steps_on_disk(lane.spool_dir))
+            )
+
+    def test_points_go_to_disk_while_the_local_stack_stays_down(self):
+        replay = self._replay_stand_in()
+        endpoint = endpoint_from_worker_config(local_endpoint_config())
+        stack_down = threading.Event()
+        stack_down.set()
+
+        def ensure(**_kwargs):
+            if stack_down.is_set():
+                raise RuntimeError("the local stack does not start")
+            return endpoint
+
+        with (
+            self.assertLogs("kymo", level="WARNING"),
+            self._local_cdn(stack_down),
+            self._numeric_outage(replay, limit=0.3, ensure=ensure) as lane,
+        ):
+            # Connects fail and every endpoint refresh fails with them, so the points wait for the limit.
+            for step in range(1, 6):
+                lane.put(step)
+            self.assertTrue(
+                self._wait_for(
+                    lambda: self._steps_on_disk(lane.spool_dir) == [1, 2, 3, 4, 5]
+                )
+            )
+            stack_down.clear()
+            lane.server_up.set()
+            self.assertTrue(self._wait_for(lambda: replay.numeric == [1, 2, 3, 4, 5]))
+
+    def test_a_spool_that_cannot_be_opened_leaves_points_in_ram(self):
+        broken = threading.Event()
+        broken.set()
+        fed = []
+
+        class BreakingStream(
+            self._immediate_stream_class(
+                lambda batch: fed.extend(point.step for point in batch.points)
+            )
+        ):
+            def feed(self, batch):
+                if broken.is_set():
+                    self.events.put(("error", RuntimeError("ingest is broken")))
+                    return True
+                return super().feed(batch)
+
+        def read_only(_writer):
+            raise OSError(30, "Read-only file system")
+
+        replay = self._replay_stand_in()
+        with (
+            mock.patch.object(spool_module.SpoolWriter, "open", read_only),
+            self.assertLogs("kymo", level="WARNING") as logs,
+            self._numeric_outage(replay, limit=0.3, stream=BreakingStream) as lane,
+        ):
+            lane.server_up.set()
+            for step in range(1, 6):
+                lane.put(step)
+            # The spool could only lose the points, so they wait in RAM, and the streams' own break warnings do not hide why.
+            self.assertTrue(
+                self._wait_for(
+                    lambda: any("cannot be opened" in line for line in logs.output)
+                )
+            )
+            self.assertEqual(lane.status.value, 5)
+            broken.clear()
+            self.assertTrue(self._wait_for(lambda: lane.status.value == 0))
+        self.assertEqual(fed, [1, 2, 3, 4, 5])
+        self.assertEqual(replay.calls, [])
+
+    def test_points_the_limit_spooled_are_reported_once_at_exit(self):
+        replay = self._replay_stand_in()
+        with (
+            self.assertLogs("kymo", level="WARNING") as logs,
+            self._numeric_outage(replay, limit=0.3) as lane,
+        ):
+            for step in range(1, 6):
+                lane.put(step)
+            self.assertTrue(self._wait_for(lambda: lane.status.value == 0))
+        # The server never came back, so the worker exits with them on disk.
+        self.assertTrue(any("0 points sent, 5 spooled" in line for line in logs.output))
+
+    def test_a_shutdown_waits_for_the_server_without_the_outage_limit(self):
+        replay = self._replay_stand_in()
+        with self._numeric_outage(replay, limit=0.1) as lane:
+            for step in range(1, 6):
+                lane.put(step)
+            lane.shut_down()
+            # The shutdown deadline, not the outage limit, bounds how long a finishing run holds its points.
+            time.sleep(0.6)
+            self.assertEqual(self._steps_on_disk(lane.spool_dir), [])
+            lane.server_up.set()
+            self.assertTrue(self._wait_for(lambda: lane.live == [1, 2, 3, 4, 5]))
+
+    def test_a_fork_childs_galleries_are_marked_for_the_worker(self):
+        gallery = ("cdn_batch", "samples", 1, [Image(np.zeros((2, 2, 3), np.uint8))])
+        with mock.patch.object(client_module, "_init_pid", os.getpid()):
+            (owner,) = client_module._snapshot_rich_queue_items([gallery])
+        with mock.patch.object(client_module, "_init_pid", os.getpid() + 1):
+            (child,) = client_module._snapshot_rich_queue_items([gallery])
+        marked = client_module._ChildGalleryItems
+        self.assertNotIsInstance(client_module._decode_queue_item(owner)[0][3], marked)
+        self.assertIsInstance(client_module._decode_queue_item(child)[0][3], marked)
+
+    def test_a_spooling_lane_reconnects_only_at_its_recovery_deadline(self):
+        replay = self._replay_stand_in()
+        with self._numeric_outage(replay, retry_delay=lambda failed, rng: 5.0) as lane:
+            for step in range(1, 202):
+                lane.put(step)
+            self.assertTrue(self._wait_for(lambda: lane.on_disk.value == 1))
+            # The server is back, but the circuit's backoff has not run out: no replay starts within several idle polls.
+            lane.server_up.set()
+            self.assertFalse(self._wait_for(lambda: replay.calls, timeout=1.5))
+
+    def test_a_live_rich_failover_backs_off_a_draining_numeric_lane(self):
+        replay = self._replay_stand_in(gates=(threading.Event(), threading.Event()))
+        slow = threading.Event()
+        env = {"KYMO_MAX_RICH_BUFFER_BYTES": "1024"}
+        with self._numeric_outage(
+            replay, env=env, retry_delay=lambda failed, rng: 5.0 if slow.is_set() else 0
+        ) as lane:
+            try:
+                self._drain_behind_second_replay(lane, replay)
+                # The live rich lane trips its cap while numeric drains: evidence against the circuit, so it backs off.
+                slow.set()
+                lane.put_item(self._resource_gallery(1001, b"x" * 2048))
+                self.assertTrue(
+                    self._wait_for(lambda: 1001 in self._steps_on_disk(lane.spool_dir))
+                )
+                replay.gates[1].set()
+                self.assertFalse(
+                    self._wait_for(lambda: len(replay.calls) > 2, timeout=1.5)
+                )
+            finally:
+                replay.gates[1].set()
+
+    def test_a_failover_clears_a_live_streams_break_backoff(self):
+        replay = self._replay_stand_in()
+        stream = self._break_once_stream()
+        with self._numeric_outage(replay, stream=stream, jitter=2.0) as lane:
+            lane.server_up.set()
+            self.assertTrue(lane.opens.wait(timeout=5))
+            # The live stream breaks and backs off for two seconds, then the lane trips its cap and fails over.
+            lane.put(999)
+            self.assertTrue(self._wait_for(lambda: stream.breaks))
+            time.sleep(0.1)
+            lane.put_item([numeric(step) for step in range(1, 202)])
+            self.assertTrue(self._wait_for(lambda: replay.numeric))
+            # The first stream after recovery opens at once, not when the old backoff ends.
+            self.assertTrue(
+                self._wait_for(lambda: len(stream.opened) >= 2, timeout=1.0)
+            )
 
     def test_a_lane_whose_replay_empties_the_disk_goes_live_and_sends_live(self):
         replay = self._replay_stand_in()
@@ -5496,7 +5977,7 @@ class WorkerResponsivenessTests(unittest.TestCase):
         replay = self._replay_stand_in(delay=0.02)
 
         class DeadStream(self._immediate_stream_class(lambda _batch: None)):
-            # Unary replays work, but every bidi stream breaks before an ACK (an old server, or a broken ingest path).
+            # Unary replays work, but every bidi stream breaks before an ACK (a broken ingest path).
             def feed(self, batch):
                 self.events.put(("error", RuntimeError("bidi ingest is broken")))
                 return True
@@ -5849,27 +6330,16 @@ class WorkerResponsivenessTests(unittest.TestCase):
         def replay(path, **kwargs):
             replaying.set()
             self.assertTrue(release.wait(timeout=5))
-            os.rename(path, path + ".sent")
+            os.remove(path)
             return True
 
         def observe_live(batch):
             live_steps.extend(point.step for point in batch.points)
             live_point.set()
 
-        version = (1 << 32) | 1
         # Its 2 KiB resource is charged on arrival, over the 1 KiB cap, so the rich lane fails over and its replay holds before the first connect.
-        (gallery,) = client_module._snapshot_rich_queue_items(
-            [
-                (
-                    "cdn_batch_mutation",
-                    "samples",
-                    1,
-                    [client_module.Resource(b"x" * 2048, "overflow.bin")],
-                    1,
-                    version,
-                    version + 1,
-                )
-            ]
+        gallery = self._gallery(
+            1, [client_module.Resource(b"x" * 2048, "overflow.bin")]
         )
         source = queue.Queue()
         source.put(gallery)
@@ -5934,7 +6404,7 @@ class WorkerResponsivenessTests(unittest.TestCase):
             replayed_endpoints.append(kwargs["_local_endpoint"])
             if len(replayed_endpoints) == 1:
                 return False
-            os.rename(path, path + ".sent")
+            os.remove(path)
             replay_done.set()
             return True
 
@@ -5985,7 +6455,7 @@ class WorkerResponsivenessTests(unittest.TestCase):
         def quarantine_replay(path, **kwargs):
             replay_calls.append(path)
             if len(replay_calls) > 1:
-                os.rename(path, path + ".sent")
+                os.remove(path)
                 replayed_later.set()
                 return True
             rejected = path + ".rejected"
@@ -6062,7 +6532,7 @@ class WorkerResponsivenessTests(unittest.TestCase):
         def replay(path, **_kwargs):
             replay_started.set()
             self.assertTrue(release_replay.wait(timeout=5))
-            os.rename(path, path + ".sent")
+            os.remove(path)
             return True
 
         source = queue.Queue()
@@ -6208,7 +6678,7 @@ class WorkerResponsivenessTests(unittest.TestCase):
             return real_fsync(fd)
 
         def replay(path, **_kwargs):
-            os.rename(path, path + ".sent")
+            os.remove(path)
             replay_done.set()
             return True
 
@@ -6264,7 +6734,7 @@ class WorkerResponsivenessTests(unittest.TestCase):
 
         def replay(path, **_kwargs):
             replayed.append(path)
-            os.rename(path, path + ".sent")
+            os.remove(path)
             replay_done.set()
             return True
 

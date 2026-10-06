@@ -14,7 +14,7 @@ import grpc
 from kymo._cdn import metadata_manifest
 from kymo._env import integer as _env_integer
 from kymo._env import number as _env_number
-from kymo._generated import kymo_pb2, kymo_pb2_grpc
+from kymo._generated import kymo_pb2_grpc
 from kymo._log import logger as _log
 from kymo.spool import replay_command
 
@@ -25,6 +25,26 @@ class _ReplayQuarantined(RuntimeError):
     def __init__(self, path: str):
         super().__init__(f"quarantined {path}")
         self.path = path
+
+
+class _SegmentGone(RuntimeError):
+    """A sealed spool vanished before its replay: another process took it (a kymo.sync where flock does not work, or an operator)."""
+
+    def __init__(self, path: str):
+        super().__init__(f"sealed upload spool {path} disappeared before its replay")
+        self.path = path
+
+
+def _encoded_entry(entry: tuple, items) -> tuple:
+    """The queued gallery entry with its items replaced by their encoded form."""
+    return (*entry[:3], items, *entry[4:])
+
+
+# An upload lane is live, or spooling while its recovery circuit is open.
+# A spooling lane writes its new work to disk until a replay starts on a proven circuit.
+# It then drains: new work waits in RAM behind the sealed prefix instead of growing it, so the catch-up converges under sustained logging.
+# It goes live only once the prefix is gone.
+_LIVE, _TO_DISK, _DRAINING = "live", "to disk", "draining"
 
 
 def _upload_worker(
@@ -55,9 +75,10 @@ def _upload_worker(
     Degradation ladder when the server can't keep up:
     1. in-flight window — ≤ _MAX_UNACKED_POINTS fed-but-unacked; feeding stops
        there and the buffer absorbs the rest;
-    2. RAM cap — the overflowing ordered lane fails over to disk; sealed spool
-       segments replay FIFO while producers append to a newer segment, and a
-       lane resumes live only after the disk prefix is empty;
+    2. RAM cap or ACK wait — the overflowing ordered lane fails over to disk, as
+       does a live numeric lane that holds points and gets no ACK for 3 minutes;
+       sealed spool segments replay FIFO while producers append to a newer
+       segment, and a lane resumes live only after the disk prefix is empty;
     3. shutdown deadline — past it, the stream is cancelled and everything
        undelivered spills, bounding exit latency;
     4. orphan watch — a parent that dies without draining us becomes a shutdown
@@ -71,6 +92,7 @@ def _upload_worker(
         _ACTIVE_POLL_TIMEOUT,
         _BidiStream,
         _CDN_MAX_ATTEMPTS,
+        _ChildGalleryItems,
         _CONNECT_INITIAL_DELAY,
         _CONNECT_PENDING,
         _CONNECT_POLL_TIMEOUT,
@@ -82,8 +104,9 @@ def _upload_worker(
         _FEED_Q_CAP,
         _IDLE_POLL_TIMEOUT,
         _MAX_CDN_QUEUE,
-        _MAX_CDN_QUEUE_BYTES,
+        _DEFAULT_MAX_RICH_BUFFER_BYTES,
         _MAX_UNACKED_POINTS,
+        _NUMERIC_OUTAGE_FAILOVER,
         _ORDERED_CDN_KINDS,
         _PermanentPointError,
         _RECOVERY_MAX_BUFFER_BYTES,
@@ -110,11 +133,12 @@ def _upload_worker(
         _next_batch,
         _next_connect_retry_delay,
         _process_cdn_batch,
+        _publish_manifest_point,
         _publish_rich_mutation,
         _queue_item_size,
+        _raw_shared,
         _recovery_retry_delay,
         _retire_rejected_worker_spools,
-        _send_unary_point,
         _spill_tuple,
         _spool_header,
         _terminal_run_error,
@@ -141,37 +165,33 @@ def _upload_worker(
         local_endpoint = None
         local_installation_uuid = ""
 
-    max_buffer_points = _DEFAULT_MAX_BUFFER_POINTS
     max_buffer_points = max(
         0,
         _env_integer(
-            "KYMO_MAX_BUFFER_POINTS", "MKDB2_MAX_BUFFER_POINTS", max_buffer_points
+            "KYMO_MAX_BUFFER_POINTS",
+            "MKDB2_MAX_BUFFER_POINTS",
+            _DEFAULT_MAX_BUFFER_POINTS,
         ),
     )
-    max_buffer_bytes = _DEFAULT_MAX_BUFFER_BYTES
     max_buffer_bytes = max(
         0,
         _env_integer(
-            "KYMO_MAX_BUFFER_BYTES", "MKDB2_MAX_BUFFER_BYTES", max_buffer_bytes
+            "KYMO_MAX_BUFFER_BYTES", "MKDB2_MAX_BUFFER_BYTES", _DEFAULT_MAX_BUFFER_BYTES
         ),
     )
-    max_rich_buffer_bytes = _MAX_CDN_QUEUE_BYTES
     max_rich_buffer_bytes = max(
         0,
         _env_integer(
             "KYMO_MAX_RICH_BUFFER_BYTES",
             "MKDB2_MAX_RICH_BUFFER_BYTES",
-            max_rich_buffer_bytes,
+            _DEFAULT_MAX_RICH_BUFFER_BYTES,
         ),
     )
-    ack_progress_timeout = _ACK_PROGRESS_TIMEOUT
     configured = _env_number(
-        "KYMO_ACK_PROGRESS_TIMEOUT",
-        "MKDB2_ACK_PROGRESS_TIMEOUT",
-        ack_progress_timeout,
+        "KYMO_ACK_PROGRESS_TIMEOUT", "MKDB2_ACK_PROGRESS_TIMEOUT", _ACK_PROGRESS_TIMEOUT
     )
-    if configured > 0:
-        ack_progress_timeout = configured
+    # A non-positive setting is ignored, so a typo cannot turn the watchdog off.
+    ack_progress_timeout = configured if configured > 0 else _ACK_PROGRESS_TIMEOUT
 
     spool = SpoolWriter(
         spool_path or make_spool_path(project_id, run_id, "worker", session=session),
@@ -240,24 +260,26 @@ def _upload_worker(
     # string again. Rich sizes reflect retained serialized memory.
     buffer = _RetainedLane()
     cdn_queue = _RetainedLane()
-    numeric_spooling = False
-    # The (points, bytes) RAM caps of the half-open numeric lane, None outside it. A fresh channel became ready after numeric disk failover, but no positive ACK has proved the ingest path yet, so it is bounded more tightly than ordinary connected operation; a drained lane's caps count on top of the RAM backlog it held as it went live, which they must not fail over again.
+    numeric_lane = rich_lane = _LIVE
+    # The (points, bytes) RAM caps of the half-open numeric lane, None outside it.
+    # A fresh channel became ready after numeric disk failover, but no positive ACK has proved the ingest path yet, so the lane is bounded more tightly than ordinary connected operation.
+    # A drained lane's caps count on top of the RAM backlog it held as it went live, so going live does not fail it over again.
     numeric_probe_caps: Optional[tuple[int, int]] = None
     # Consecutive failed catch-ups of whichever circuit owns the disk FIFO.
     recovery_failures = 0
     replay_segment: Optional[SpoolWriter] = None
     replay_attempt: Optional[_ThreadAttempt] = None
-    # The newest disk-circuit event was a delivered sealed-segment replay: set then, cleared by a failed replay or numeric reconnect and by a lane failing over from live (a broken live circuit is not proof). Lanes drain only while it holds, and shutdown, which may not open connects, keeps replaying the disk FIFO on it, so a tail spilled behind an in-flight replay still goes out.
+    # The newest disk-circuit event was a delivered sealed-segment replay: set then, cleared by a failed replay or numeric reconnect and by a lane failing over from live (a broken live circuit is not proof).
+    # Lanes drain only while it holds, and the shutdown tail replays only on it.
     replay_proved_circuit = False
     # Whether the replay in flight may set that proof: a lane failing over from live while it runs is newer evidence.
     replay_can_prove = False
     replayed_cdn_keys: dict[tuple, str] = {}
     quarantined_spool_paths: list[str] = []
-    rich_spooling = False
-    # Whether a spooling lane writes its new work to disk. It stops once a replay starts on a proven circuit, having sealed the last records on disk: the lane then drains, its new work waiting in RAM behind them instead of growing the disk prefix, so the catch-up converges under sustained logging. It is still not live until the prefix is gone.
-    numeric_to_disk = rich_to_disk = False
-    # Rich-only failover replays the spool while numeric stays live, no earlier than this; stream_retry_at also times live stream reopens, so the rich catch-up keeps its own deadline.
-    rich_retry_at = 0.0
+    # Sealed segments another process took before their replay: whether they were delivered is unknown, so they keep the owner reporting spooled data.
+    vanished_spool_paths: list[str] = []
+    # The disk circuit's next catch-up, whichever lane owns it; stream_retry_at times only the live numeric stream's reopens.
+    recovery_retry_at = 0.0
     # Rich records without logical versions (an old server) keep rich-only failover one-way: their replay guard cannot tell a predecessor delivered live from a newer write, so it would skip the newer record and report it delivered.
     unversioned_rich = False
     shutdown = False
@@ -279,6 +301,8 @@ def _upload_worker(
     stream: Optional[_BidiStream] = None
     connect_attempt: Optional[_ConnectionAttempt] = None
     cdn_attempt: Optional[_ThreadAttempt] = None
+    # An upload a rich failover left running still holds its gallery, so no other upload starts until it ends: repeated outages cannot pile abandoned galleries up past the rich cap.
+    abandoned_upload: Optional[_ThreadAttempt] = None
     # Encodes the oldest queued gallery that is still Image/Resource objects, so the rich cap counts encoded bytes.
     encode_attempt: Optional[_ThreadAttempt] = None
     # Consecutive failures encoding that gallery, and the earliest time to retry it, as for the CDN head.
@@ -287,13 +311,15 @@ def _upload_worker(
     inflight_n = 0  # points fed to the current stream, unacked (== buffer[:inflight_n])
     last_acked_cum = 0  # last cumulative points_acked seen on the current stream
     ack_progress_at: Optional[float] = None
+    # Since when the live numeric lane has held points without an ACK advancing it; None while no limit applies.
+    numeric_waiting_since: Optional[float] = None
     half_closed = False  # feed sentinel sent (shutdown half-close)
     # Earliest time to reopen after a break; backoff runs on the loop cadence.
     stream_retry_at = 0.0
     connect_retry_delay = _CONNECT_INITIAL_DELAY
     # Rebuild the channel after this many consecutive breaks.
     stream_breaks = 0
-    last_break_warn = 0.0  # throttle the retry/version-mismatch logging
+    last_warned_at = 0.0  # throttle the retry logging
     accounting_bypass_warned = False
     local_refresh_required = False
     local_ensure_attempt: Optional[_ThreadAttempt] = None
@@ -313,15 +339,14 @@ def _upload_worker(
     def publish_lanes_on_disk() -> None:
         """Tell log() whether either lane writes new work to disk; it then never waits for the encoder, since disk writes would set the pace."""
         if lanes_on_disk is not None:
-            lanes_on_disk.value = int(numeric_to_disk or rich_to_disk)
+            lanes_on_disk.value = int(_TO_DISK in (numeric_lane, rich_lane))
 
-    def spool_draining_lanes() -> int:
+    def spool_draining_lanes() -> None:
         """Send the draining lanes' RAM work to disk behind the prefix, leaving the retry and the circuit proof as they are."""
-        # failover_* do nothing for a lane that already writes to disk.
-        count = failover_numeric() if numeric_spooling else 0
-        if rich_spooling:
-            count += failover_rich()
-        return count
+        if numeric_lane == _DRAINING:
+            failover_numeric()
+        if rich_lane == _DRAINING:
+            failover_rich()
 
     def has_pending_delivery() -> bool:
         """One local wake predicate: anything retained or spooled. In-flight points stay in buffer, an upload attempt's head in cdn_queue, and a replay's segment in replay_segment."""
@@ -337,30 +362,43 @@ def _upload_worker(
             and local_ensure_attempt is None
         )
 
-    def install_local_endpoint(endpoint) -> None:
-        nonlocal local_endpoint
-        nonlocal server_address, cdn_url, channel, stub, stream, connect_attempt
+    def close_numeric_channel() -> None:
+        """Close the bidi channel, so the next stream needs a fresh connect."""
+        nonlocal channel, stub
+        if channel is not None:
+            channel.close()
+        channel = stub = None
+
+    def drop_numeric_transport() -> None:
+        """Cancel the stream and any connect, close the bidi channel, and forget the in-flight window."""
+        nonlocal stream, connect_attempt
         nonlocal inflight_n, last_acked_cum, ack_progress_at, half_closed
+        # Cancel before releasing the in-flight prefix's accounting. A racing
+        # commit may duplicate on replay, but cannot ACK and decrement twice.
+        if stream is not None:
+            stream.cancel()
+            stream = None
+        if connect_attempt is not None:
+            connect_attempt.cancel()
+            connect_attempt = None
+        # A channel can remain READY briefly while its dead HTTP/2 transport is
+        # being torn down. Recovery must not immediately reuse that stale
+        # channel and declare the circuit half-open without a real reconnect.
+        close_numeric_channel()
+        inflight_n = 0
+        last_acked_cum = 0
+        ack_progress_at = None
+        half_closed = False
+
+    def install_local_endpoint(endpoint) -> None:
+        nonlocal local_endpoint, server_address, cdn_url
         generation_changed = (
             local_endpoint is None
             or endpoint.endpoint_generation != local_endpoint.endpoint_generation
         )
         if generation_changed:
-            if stream is not None:
-                stream.cancel()
-                stream = None
-            if connect_attempt is not None:
-                connect_attempt.cancel()
-                connect_attempt = None
-            if channel is not None:
-                channel.close()
-                channel = None
-                stub = None
+            drop_numeric_transport()
             close_rich_transport()
-            inflight_n = 0
-            last_acked_cum = 0
-            ack_progress_at = None
-            half_closed = False
         local_endpoint = endpoint
         server_address = endpoint.grpc_target
         cdn_url = endpoint.upload_origin
@@ -393,32 +431,13 @@ def _upload_worker(
                 )
         try:
             if spooled is not None and upload_spooled is not None:
-                raw_spooled = (
-                    upload_spooled.get_obj()
-                    if hasattr(upload_spooled, "get_obj")
-                    else upload_spooled
-                )
-                raw_spooled.value = int(spooled)
+                _raw_shared(upload_spooled).value = int(spooled)
             if failure and upload_failure is not None:
-                raw_failure = (
-                    upload_failure.get_obj()
-                    if hasattr(upload_failure, "get_obj")
-                    else upload_failure
-                )
+                raw_failure = _raw_shared(upload_failure)
                 raw_failure.value = _merged_worker_failure(raw_failure.value, failure)
             if terminal and upload_terminal is not None:
-                raw_terminal = (
-                    upload_terminal.get_obj()
-                    if hasattr(upload_terminal, "get_obj")
-                    else upload_terminal
-                )
-                raw_terminal.value = 1
-            raw_status = (
-                queue_status.get_obj()
-                if hasattr(queue_status, "get_obj")
-                else queue_status
-            )
-            raw_status.value -= n
+                _raw_shared(upload_terminal).value = 1
+            _raw_shared(queue_status).value -= n
         finally:
             if acquired:
                 lock.release()
@@ -450,11 +469,11 @@ def _upload_worker(
         cdn_stub = None
 
     def spill(tuples: list[tuple]) -> int:
-        nonlocal spool_failed, unencodable
+        nonlocal spilled, spool_failed, unencodable
         if not tuples:
             return 0
-        # Written, unencodable or lost, none of them stays raw in this worker.
-        raw_galleries = sum(map(awaits_encoding, tuples))
+        # Written, unencodable or lost: none of them stays raw in this worker.
+        raw_galleries = sum(map(counted_raw, tuples))
         spooled_now = 0
         if spool_failed:
             spool_failed += len(tuples)
@@ -490,6 +509,7 @@ def _upload_worker(
             failure=_WORKER_EXIT_SPOOL_FAILED if spool_failed or unencodable else 0,
         )
         release_raw_galleries(raw_galleries)
+        spilled += spooled_now
         # Only points written: callers log it as spooled, and losses are counted apart.
         return spooled_now
 
@@ -512,7 +532,7 @@ def _upload_worker(
         False means nothing started: delivery may not start (see may_start_transport), nothing is spooled, or sealing failed and the next attempt waits out a backoff.
         """
         nonlocal spool, replay_segment, replay_attempt, replay_can_prove
-        nonlocal numeric_to_disk, rich_to_disk
+        nonlocal numeric_lane, rich_lane
         if not may_start_transport():
             return False
         if replay_segment is None:
@@ -564,14 +584,31 @@ def _upload_worker(
                 )
             terminal_runs: set[tuple[str, str, str]] = set()
             quarantined_files: set[str] = set()
-            delivered = replay_file(
-                segment.path,
-                replayed_keys=replayed_cdn_keys,
-                terminal_runs=terminal_runs,
-                quarantined_files=quarantined_files,
-                _writer_lock_held=True,
-                _local_endpoint=local_endpoint,
-            )
+            try:
+                # Delete consumed segments: their records were delivered, superseded, or on an old server skipped as older than the server's.
+                delivered = replay_file(
+                    segment.path,
+                    delete=True,
+                    replayed_keys=replayed_cdn_keys,
+                    terminal_runs=terminal_runs,
+                    quarantined_files=quarantined_files,
+                    _writer_lock_held=True,
+                    _local_endpoint=local_endpoint,
+                )
+            except Exception as error:
+                # The server's terminal answer stands even if retiring the segment then failed.
+                if terminal_runs:
+                    delivered = False
+                elif isinstance(error, FileNotFoundError) and not os.path.exists(
+                    segment.path
+                ):
+                    segment.release()
+                    raise _SegmentGone(segment.path) from None
+                else:
+                    raise
+            if delivered or terminal_runs or quarantined_files:
+                # Done with a segment whose path is gone or renamed: release it without a barrier, since persisting it buys nothing, and here, since closing a deleted file frees its blocks (milliseconds per GiB) and the queue-consumer thread should not pay that.
+                segment.release()
             if terminal_runs:
                 raise _TerminalRunError("run is no longer writable during spool replay")
             if quarantined_files:
@@ -582,7 +619,10 @@ def _upload_worker(
         replay_can_prove = True
         if replay_proved_circuit:
             # A proven circuit retains no failed segment, so this replay sealed every record left on disk: the spooling lanes drain, their new work waiting in RAM behind it.
-            numeric_to_disk = rich_to_disk = False
+            if numeric_lane == _TO_DISK:
+                numeric_lane = _DRAINING
+            if rich_lane == _TO_DISK:
+                rich_lane = _DRAINING
             publish_lanes_on_disk()
         return True
 
@@ -591,12 +631,16 @@ def _upload_worker(
             entry[3], _EncodedItems
         )
 
-    def enforce_rich_caps() -> int:
+    def counted_raw(entry: tuple) -> bool:
+        """A gallery still raw that the initializing process counted: one log()'s encoder wait waits on, unlike a fork child's."""
+        return awaits_encoding(entry) and not isinstance(entry[3], _ChildGalleryItems)
+
+    def enforce_rich_caps() -> None:
         if (
             len(cdn_queue) <= _MAX_CDN_QUEUE
             and cdn_queue.total_bytes <= max_rich_buffer_bytes
         ):
-            return 0
+            return
         count = failover_rich()
         _log.warning(
             "rich upload backlog exceeded its %d-entry/%d-byte cap "
@@ -606,11 +650,10 @@ def _upload_worker(
             count,
             spool.path,
         )
-        return count
 
     def poll_encoder() -> None:
         """Apply a finished encode, then start one on the oldest gallery still awaiting it."""
-        nonlocal encode_attempt, encode_fails, encode_backoff_until, spilled
+        nonlocal encode_attempt, encode_fails, encode_backoff_until
         if encode_attempt is not None:
             try:
                 succeeded, result = encode_attempt.events.get_nowait()
@@ -621,11 +664,11 @@ def _upload_worker(
             if succeeded:
                 encode_fails = 0
                 index = next(i for i, e in enumerate(cdn_queue.items) if e is entry)
-                encoded = (*entry[:3], result, *entry[4:])
+                encoded = _encoded_entry(entry, result)
                 cdn_queue.replace(
                     index, encoded, _estimate_tuple_bytes(encoded) + result.nbytes
                 )
-                spilled += enforce_rich_caps()
+                enforce_rich_caps()
             else:
                 # Items that fail to encode are dropped inside the encode, so this is a MemoryError or a bug: retry it like a failed CDN attempt.
                 _log.warning(
@@ -646,23 +689,24 @@ def _upload_worker(
                         entry[2],
                         encode_fails,
                     )
-                    spilled += failover_rich()
+                    failover_rich()
         if time.monotonic() < encode_backoff_until:
             return
         # A rejected rich lane, or one writing to disk, is empty, so it has nothing to encode; a draining one holds new work for it.
         entry = next((e for e in cdn_queue.items if awaits_encoding(e)), None)
         if entry is not None:
+            counted = counted_raw(entry)
 
             def encode():
                 result = _encode_cdn_items(entry[1], entry[2], entry[3])
                 # Its arrays are gone, so a waiting log() need not wait for this loop to wake and apply the result: the loop wakes when that log() publishes.
-                release_raw_galleries(1)
+                release_raw_galleries(int(counted))
                 return result
 
             encode_attempt = _ThreadAttempt(entry, encode, name="kymo-cdn-encode")
 
     def retain_queue_item(item) -> None:
-        nonlocal spilled, undecodable, unversioned_rich
+        nonlocal undecodable, unversioned_rich
         if terminal_rejected:
             resolve_points(
                 _queue_item_size(item),
@@ -682,10 +726,11 @@ def _upload_worker(
                 )
             undecodable += count
             resolve_points(count, failure=_WORKER_EXIT_SPOOL_FAILED)
-            # Only a rich snapshot can fail to decode, and only a gallery's can hold a tensor.
+            # Only a rich snapshot can fail to decode, and only a gallery's can hold a tensor. If it was metadata or a fork child's gallery, this release was never counted, which only lets a later log() wait less.
             release_raw_galleries(1)
             return
         pending_spill: list[tuple] = []
+        # A serialized envelope holds exactly one rich point, which is charged its size.
         serialized_bytes = (
             len(item[2])
             if isinstance(item, tuple)
@@ -693,20 +738,21 @@ def _upload_worker(
             and item[0] == _SERIALIZED_RICH_QUEUE_ITEM
             else 0
         )
-        per_point_serialized = (
-            max(1, serialized_bytes // len(point_tuples))
-            if serialized_bytes and point_tuples
-            else 0
-        )
         for point_tuple in point_tuples:
             is_rich = point_tuple[0] in _ORDERED_CDN_KINDS
             unversioned_rich |= point_tuple[0] in ("cdn_batch", "metadata_batch")
-            if rich_to_disk if is_rich else numeric_to_disk:
+            if (rich_lane if is_rich else numeric_lane) == _TO_DISK:
                 pending_spill.append(point_tuple)
                 continue
             if is_rich:
-                # A gallery waiting for the encoder is charged only its bytes-backed items; its arrays are charged their encoded bytes once encoded. While encodes are failing (memory pressure), nothing will shrink it soon, so it is charged whole.
-                if not encode_fails and awaits_encoding(point_tuple):
+                # A gallery waiting for the encoder is charged only its bytes-backed items, since log()'s encoder wait bounds how many do; its arrays are charged their encoded bytes once encoded.
+                # A gallery no log() paced is charged whole until then: a fork child's, or any while the numeric lane writes to disk.
+                # So is any gallery while encodes are failing (memory pressure), when nothing will shrink it soon.
+                if (
+                    not encode_fails
+                    and numeric_lane != _TO_DISK
+                    and counted_raw(point_tuple)
+                ):
                     retained_bytes = sum(
                         len(element.data)
                         for element in point_tuple[3]
@@ -714,11 +760,11 @@ def _upload_worker(
                     )
                 else:
                     # Galleries and metadata arrive in one serialized envelope; direct versioned CDN keys use raw tuples and must retain their actual string bytes or large keys bypass the rich RAM cap.
-                    retained_bytes = per_point_serialized or _estimate_tuple_bytes(
+                    retained_bytes = serialized_bytes or _estimate_tuple_bytes(
                         point_tuple
                     )
                 cdn_queue.append(point_tuple, retained_bytes)
-                spilled += enforce_rich_caps()
+                enforce_rich_caps()
             else:
                 retained_bytes = _estimate_tuple_bytes(point_tuple)
                 buffer.append(point_tuple, retained_bytes)
@@ -728,7 +774,6 @@ def _upload_worker(
                 )
                 if len(buffer) > point_cap or buffer.total_bytes > byte_cap:
                     count = failover_numeric()
-                    spilled += count
                     _log.warning(
                         "numeric upload backlog exceeded its %d-point/%d-byte "
                         "cap — failed over %d point(s) to %s",
@@ -741,39 +786,27 @@ def _upload_worker(
         # their order but flush/account them as one group rather than issuing a
         # file-buffer flush for every point during a prolonged outage.
         if pending_spill:
-            spilled += spill(pending_spill)
+            spill(pending_spill)
 
     def process_cdn_entry(entry: tuple, *, first_attempt: bool) -> bool:
         """Complete one CDN head entry; the owner loop applies its result."""
-        kind = entry[0]
+        kind, name, step, payload, *versions = entry
+        # Legacy entries carry no versions; a direct key and metadata carry no reduced one.
+        timestamp_ms, mutation_version, reduced_mutation_version = (
+            versions + [None] * 3
+        )[:3]
         if kind == "cdn_key_mutation":
-            _, name, step, resource_id, timestamp_ms, mutation_version = entry
             return _publish_rich_mutation(
                 cdn_stub,
                 project_id,
                 run_id,
                 name,
                 step,
-                resource_id,
+                payload,
                 timestamp_ms,
                 mutation_version,
             )
         if kind in ("cdn_batch", "cdn_batch_mutation"):
-            if kind == "cdn_batch_mutation":
-                (
-                    _,
-                    name,
-                    step,
-                    items_,
-                    timestamp_ms,
-                    mutation_version,
-                    reduced_mutation_version,
-                ) = entry
-            else:
-                _, name, step, items_ = entry
-                timestamp_ms = None
-                mutation_version = None
-                reduced_mutation_version = None
             return _process_cdn_batch(
                 cdn_stub,
                 http_client,
@@ -782,33 +815,17 @@ def _upload_worker(
                 run_id,
                 name,
                 step,
-                items_,
+                payload,
                 deadline_fn=past_deadline,
                 send_placeholder=first_attempt,
                 timestamp_ms=timestamp_ms,
                 mutation_version=mutation_version,
                 reduced_mutation_version=reduced_mutation_version,
             )
-
-        if kind == "metadata_batch_mutation":
-            _, name, step, metadata_obj, timestamp_ms, mutation_version = entry
-        else:
-            _, name, step, metadata_obj = entry
-            timestamp_ms = int(time.time() * 1000)
-            mutation_version = None
         try:
-            encoded_manifest = metadata_manifest(metadata_obj.data)
+            encoded_manifest = metadata_manifest(payload.data)
             resource_id = _upload_to_cdn(http_client, cdn_url, encoded_manifest, "json")
-            if mutation_version is None:
-                point = kymo_pb2.MetricPoint(
-                    metric_name=name,
-                    step=step,
-                    cdn_key=resource_id,
-                    timestamp_ms=timestamp_ms,
-                )
-                if not _send_unary_point(cdn_stub, project_id, run_id, point):
-                    return False
-            elif not _publish_rich_mutation(
+            if not _publish_manifest_point(
                 cdn_stub,
                 project_id,
                 run_id,
@@ -821,7 +838,7 @@ def _upload_worker(
                 return False
             _log.info("metadata %s step=%d → %s", name, step, resource_id)
             return True
-        except _TerminalRunError:
+        except (_TerminalRunError, _RichMutationDataLoss):
             raise
         except Exception as error:
             _log.warning("failed to upload metadata: %s", error)
@@ -829,10 +846,7 @@ def _upload_worker(
 
     def reject_deleted_run(error: BaseException) -> None:
         """Stop every transport and fail queued work without creating a spool."""
-        nonlocal terminal_rejected, terminal_reason
-        nonlocal stream, inflight_n, last_acked_cum, ack_progress_at, half_closed
-        nonlocal connect_attempt, cdn_attempt, encode_attempt
-        nonlocal channel, stub, cdn_channel, cdn_stub
+        nonlocal terminal_rejected, terminal_reason, cdn_attempt, encode_attempt
         if terminal_rejected:
             return
         terminal_rejected = True
@@ -842,28 +856,12 @@ def _upload_worker(
         # reaches its force-kill deadline, and parent salvage must already know
         # that every remaining queue item is permanently inadmissible.
         resolve_points(0, failure=_WORKER_EXIT_RUN_DELETED, terminal=True)
-        if stream is not None:
-            stream.cancel()
-            stream = None
-        if connect_attempt is not None:
-            connect_attempt.cancel()
-            connect_attempt = None
-        # Closing the unary channel cancels a concurrent rich publication. It
+        drop_numeric_transport()
+        # Closing the rich transport cancels a concurrent rich publication. It
         # may have uploaded content-addressed bytes, but cannot publish a row.
-        if cdn_channel is not None:
-            cdn_channel.close()
-            cdn_channel = None
-            cdn_stub = None
+        close_rich_transport()
         cdn_attempt = None
         encode_attempt = None
-        if channel is not None:
-            channel.close()
-            channel = None
-            stub = None
-        inflight_n = 0
-        last_acked_cum = 0
-        ack_progress_at = None
-        half_closed = False
         rejected = len(buffer) + len(cdn_queue)
         buffer.clear()
         cdn_queue.clear()
@@ -877,28 +875,38 @@ def _upload_worker(
         )
 
     def schedule_recovery_retry() -> float:
-        """Advance and publish the jittered retry deadline of the circuit that owns the disk FIFO: numeric while it spools, else the rich-only catch-up."""
-        nonlocal recovery_failures, stream_retry_at, rich_retry_at
+        """Advance and publish the disk circuit's jittered retry deadline."""
+        nonlocal recovery_failures, recovery_retry_at
         recovery_failures += 1
         delay = _recovery_retry_delay(recovery_failures, recovery_rng)
-        if numeric_spooling:
-            stream_retry_at = time.monotonic() + delay
-        else:
-            rich_retry_at = time.monotonic() + delay
+        recovery_retry_at = time.monotonic() + delay
         return delay
+
+    def warn_throttled(message: str, *args) -> None:
+        """Warn at most every 30 s: these warnings repeat at a broken server's retry cadence."""
+        nonlocal last_warned_at
+        now = time.monotonic()
+        if now - last_warned_at > 30.0:
+            last_warned_at = now
+            _log.warning(message, *args)
 
     def handle_break(err) -> None:
         """The stream ended other than by our clean half-close (an RpcError, or —
         `err is None` — a server close we didn't ask for). Unacked points stay in
         buffer[:inflight_n]; reset the fed cursor and re-feed from the front next
         attempt. Back off on loop cadence (no time.sleep); rebuild the channel after
-        _SEND_MAX_RETRIES consecutive breaks (it may be wedged). Logging throttled."""
-        nonlocal stream, inflight_n, ack_progress_at, half_closed, spilled
+        _SEND_MAX_RETRIES consecutive breaks (it may be wedged), and after every break
+        on a local endpoint, behind a refresh. Logging throttled."""
+        nonlocal stream, inflight_n, ack_progress_at, half_closed
         nonlocal stream_breaks, stream_retry_at
-        nonlocal channel, stub, last_break_warn
         if err is not None and _is_terminal_run_error(err):
             reject_deleted_run(_terminal_run_error(err))
             return
+        detail = (
+            "server closed the stream"
+            if err is None
+            else (err.details() if hasattr(err, "details") else str(err))
+        )
         if numeric_probe_caps is not None:
             # Half-open means exactly one transport attempt: if it ends before
             # proving progress, put its retained probe suffix back on disk and
@@ -906,21 +914,12 @@ def _upload_worker(
             # endpoint with a broken ingest path from accumulating the normal
             # 2M-point window or spinning on a stale channel.
             count = failover_numeric()
-            spilled += count
-            now = time.monotonic()
-            if now - last_break_warn > 30.0:
-                last_break_warn = now
-                detail = (
-                    "server closed the stream"
-                    if err is None
-                    else (err.details() if hasattr(err, "details") else str(err))
-                )
-                _log.warning(
-                    "numeric ingest recovery probe failed (%s) — spooled %d "
-                    "point(s); retrying on a fresh channel",
-                    detail,
-                    count,
-                )
+            warn_throttled(
+                "numeric ingest recovery probe failed (%s) — spooled %d "
+                "point(s); retrying on a fresh channel",
+                detail,
+                count,
+            )
             return
         if stream is not None:
             stream.cancel()
@@ -935,38 +934,17 @@ def _upload_worker(
         stream_retry_at = time.monotonic() + _equal_jitter_delay(
             retry_base, recovery_rng
         )
-        now = time.monotonic()
-        if now - last_break_warn > 30.0:
-            last_break_warn = now
-            code = err.code() if hasattr(err, "code") else None
-            if code == grpc.StatusCode.UNIMPLEMENTED:
-                # A version mismatch must degrade like an outage, never masquerade as a flake.
-                _log.error(
-                    "the kymo server does not implement IngestMetricsBidi — it predates the "
-                    "pipelined-ingest server revision. Upgrade the server. Until then points "
-                    "accumulate and spool at shutdown (replay: python -m kymo.sync). No data is lost."
-                )
-            else:
-                detail = (
-                    "server closed the stream"
-                    if err is None
-                    else (err.details() if hasattr(err, "details") else str(err))
-                )
-                _log.warning("ingest stream broke (%s) — retrying", detail)
-        # After enough consecutive breaks the channel itself may be dead — rebuild it.
-        if stream_breaks >= _SEND_MAX_RETRIES:
-            if channel:
-                channel.close()
-            channel = None
-            stub = None
-            stream_breaks = 0
-        if local_endpoint is not None:
-            if channel is not None:
-                channel.close()
-            channel = None
-            stub = None
+        warn_throttled("ingest stream broke (%s) — retrying", detail)
+        if stream_breaks >= _SEND_MAX_RETRIES or local_endpoint is not None:
+            close_numeric_channel()
             stream_breaks = 0
             mark_local_transport_stale()
+
+    def void_circuit_proof() -> None:
+        """Only a lane failing over from live is evidence against the circuit: it voids the proof (and a running replay's claim to it) and backs off. A draining lane returning to disk leaves both as they are."""
+        nonlocal replay_proved_circuit, replay_can_prove
+        replay_proved_circuit = replay_can_prove = False
+        schedule_recovery_retry()
 
     def failover_numeric() -> int:
         """Move the retained numeric lane behind an ordered disk prefix.
@@ -976,61 +954,39 @@ def _upload_worker(
         until every older segment has committed, so offline replay can never
         overwrite a newer live suffix from this worker.
         """
-        nonlocal numeric_spooling, numeric_to_disk, numeric_probe_caps
-        nonlocal replay_proved_circuit, replay_can_prove
-        nonlocal stream, inflight_n, last_acked_cum
-        nonlocal ack_progress_at, half_closed, connect_attempt
-        nonlocal channel, stub, connect_retry_delay
-        if numeric_to_disk:
+        nonlocal numeric_lane, numeric_probe_caps
+        nonlocal connect_retry_delay, stream_retry_at
+        if numeric_lane == _TO_DISK:
             return 0
-        opens_circuit = not numeric_spooling
-        numeric_spooling = numeric_to_disk = True
+        opens_circuit = numeric_lane == _LIVE
+        numeric_lane = _TO_DISK
         publish_lanes_on_disk()
         numeric_probe_caps = None
-        # Only a lane failing over from live is evidence against the circuit: it voids the proof (and a running replay's claim to it), backs off, and marks a local transport stale. A draining lane returning to disk leaves all three as they are.
         if opens_circuit:
-            replay_proved_circuit = replay_can_prove = False
-            schedule_recovery_retry()
+            void_circuit_proof()
             mark_local_transport_stale()
-        # Cancel before releasing the in-flight prefix's accounting. A racing
-        # commit may duplicate on replay, but cannot ACK and decrement twice.
-        if stream is not None:
-            stream.cancel()
-            stream = None
-        if connect_attempt is not None:
-            connect_attempt.cancel()
-            connect_attempt = None
-        # A channel can remain READY briefly while its dead HTTP/2 transport is
-        # being torn down. Recovery must not immediately reuse that stale
-        # channel and declare the circuit half-open without a real reconnect.
-        if channel is not None:
-            channel.close()
-            channel = None
-            stub = None
-        inflight_n = 0
-        last_acked_cum = 0
-        ack_progress_at = None
-        half_closed = False
+        drop_numeric_transport()
         connect_retry_delay = _CONNECT_INITIAL_DELAY
+        # A live stream's break backoff ends with the live lane: the first stream after recovery opens at once.
+        stream_retry_at = 0.0
         count = spill(buffer.items)
         buffer.clear()
         return count
 
     def failover_rich() -> int:
         """Move the whole ordered rich lane to disk; versioned records return to live delivery once the disk FIFO has been replayed."""
-        nonlocal rich_spooling, rich_to_disk, cdn_attempt, cdn_fails, cdn_backoff_until
+        nonlocal rich_lane, cdn_attempt, cdn_fails, cdn_backoff_until
+        nonlocal abandoned_upload
         nonlocal encode_attempt, encode_fails, encode_backoff_until
-        nonlocal replay_proved_circuit, replay_can_prove
-        if rich_to_disk:
+        if rich_lane == _TO_DISK:
             return 0
-        # As in failover_numeric, only a lane failing over from live voids the proof and backs off.
-        if not rich_spooling:
-            replay_proved_circuit = replay_can_prove = False
-            if not numeric_spooling:
-                schedule_recovery_retry()
-        rich_spooling = rich_to_disk = True
+        if rich_lane == _LIVE:
+            void_circuit_proof()
+        rich_lane = _TO_DISK
         publish_lanes_on_disk()
-        # The daemon helper owns no accounting; ignore a late result once its head is on disk. Its publish may still land after a replay's, and the server rejects it as older (unversioned lanes never replay).
+        # The daemon helper owns no accounting; ignore a late result once its head is on disk. Its publish may still land after a replay's: a versioned server rejects it as older, but an old server keeps arrival order, so there it can replace a newer record that a numeric-circuit replay delivered first.
+        if cdn_attempt is not None:
+            abandoned_upload = cdn_attempt
         cdn_attempt = None
         cdn_fails = 0
         cdn_backoff_until = 0.0
@@ -1049,7 +1005,7 @@ def _upload_worker(
                 succeeded, result = encode_attempt.events.get()
                 # Its helper counted it as no longer raw, so spill the encoded form, which spill does not count again. With a failed spool it is not waited for, and its helper's late count is a second one: a later log() only waits less.
                 if succeeded:
-                    remaining[0] = (*remaining[0][:3], result, *remaining[0][4:])
+                    remaining[0] = _encoded_entry(remaining[0], result)
             encode_attempt = None
             count += spill(remaining)
         cdn_queue.clear()
@@ -1059,14 +1015,14 @@ def _upload_worker(
         error: BaseException, *, quarantined_path: str = ""
     ) -> None:
         """Quarantine one bad segment and keep later delivery eligible."""
-        nonlocal spilled
         if quarantined_path:
             quarantined_spool_paths.append(quarantined_path)
         else:
             # A live rich head has no spool to rename yet. Move both lanes into
             # the existing FIFO circuit; replay will quarantine the segment
             # containing this head, then advance to newer segments.
-            spilled += failover_numeric() + failover_rich()
+            failover_numeric()
+            failover_rich()
             close_rich_transport()
         resolve_points(0, failure=_WORKER_EXIT_DATA_LOSS)
         if quarantined_path:
@@ -1082,22 +1038,32 @@ def _upload_worker(
                 error,
             )
 
-    def accept_queue_item(item) -> None:
+    def accept_next(timeout: float) -> bool:
+        """Accept one queue item, waiting up to timeout seconds (0: not at all); False if none came. Only this frame holds the item, so a quiet queue keeps no large serialized gallery alive."""
         nonlocal shutdown, input_closed
+        try:
+            item = (
+                metric_queue.get(timeout=timeout)
+                if timeout
+                else metric_queue.get_nowait()
+            )
+        except queue.Empty:
+            return False
         if item is None:
-            shutdown = True
-            input_closed = True
+            shutdown = input_closed = True
         else:
             retain_queue_item(item)
+        return True
 
     def drain_to_spool_after_deadline() -> None:
         """Move owned work to disk, then drain every new queue item there."""
-        nonlocal spilled, drain_incomplete
+        nonlocal drain_incomplete
         # Put both lanes into their one-way spool mode before touching the
         # producer queue. Each subsequently dequeued group is flushed before
         # its accounting is released, minimizing worker-private state that
         # owner-fenced salvage cannot reach.
-        spilled += failover_numeric() + failover_rich()
+        failover_numeric()
+        failover_rich()
         saw_parent_close = _drain_worker_queue(
             metric_queue, retain_queue_item, input_closed=input_closed
         )
@@ -1131,31 +1097,25 @@ def _upload_worker(
             poll_timeout = _ACTIVE_POLL_TIMEOUT if buffer else _CONNECT_POLL_TIMEOUT
         else:
             poll_timeout = _IDLE_POLL_TIMEOUT
-        try:
-            item = metric_queue.get(timeout=poll_timeout)
-        except queue.Empty:
-            drained_to_empty = True
-        else:
-            accept_queue_item(item)
+        if accept_next(poll_timeout):
             drained_items = 1
+        else:
+            drained_to_empty = True
         if past_deadline():
             drain_to_spool_after_deadline()
             break
         while drained_items < _DRAIN_MAX_ITEMS_PER_CYCLE and not past_deadline():
-            try:
-                item = metric_queue.get_nowait()
-            except queue.Empty:
+            if not accept_next(0.0):
                 drained_to_empty = True
                 break
-            accept_queue_item(item)
             drained_items += 1
         if past_deadline():
             drain_to_spool_after_deadline()
             break
 
         # A lane drains only while a proven circuit could take it live. Once the proof is gone, or shutdown has closed the connect gate while numeric owns the disk FIFO, its RAM work goes to disk rather than wait out an outage there; at shutdown the exit tail replays it on the proven circuit.
-        if not replay_proved_circuit or (shutdown and numeric_spooling):
-            spilled += spool_draining_lanes()
+        if not replay_proved_circuit or (shutdown and numeric_lane != _LIVE):
+            spool_draining_lanes()
 
         # ---- orphan watch: parent died without draining us ----
         if not orphan_deadline and not owner_alive():
@@ -1203,7 +1163,8 @@ def _upload_worker(
 
                     if isinstance(result, LocalInstallationMismatch):
                         local_identity_mismatch = str(result)
-                        spilled += failover_numeric() + failover_rich()
+                        failover_numeric()
+                        failover_rich()
                         local_refresh_required = False
                         _log.error(
                             "%s; retaining new points in the old installation's spool",
@@ -1211,17 +1172,14 @@ def _upload_worker(
                         )
                     else:
                         # Work held in RAM behind the prefix goes to disk rather than wait out a failing local stack there.
-                        spilled += spool_draining_lanes()
+                        spool_draining_lanes()
                         local_ensure_retry_at = time.monotonic() + _equal_jitter_delay(
                             local_ensure_retry_delay, recovery_rng
                         )
                         local_ensure_retry_delay = _next_connect_retry_delay(
                             local_ensure_retry_delay
                         )
-                        now = time.monotonic()
-                        if now - last_break_warn > 30.0:
-                            last_break_warn = now
-                            _log.warning("local runtime ensure failed: %s", result)
+                        warn_throttled("local runtime ensure failed: %s", result)
 
         # ---- ordered disk catch-up ----
         # A sealed segment retains its writer lock while the helper replays it;
@@ -1240,22 +1198,19 @@ def _upload_worker(
                     error = replay_result
                 elif not replay_result:
                     error = RuntimeError("spool replay did not complete")
+                # The helper has released a segment it finished with; only a failed replay keeps it for the retry.
                 if isinstance(error, _TerminalRunError):
-                    # Headed for retirement; durability would buy nothing.
-                    completed_segment.release()
                     replay_segment = None
                     reject_deleted_run(error)
                 elif error is None or isinstance(error, _ReplayQuarantined):
-                    # Delivered, or quarantined so that later segments stay eligible: release the descriptor, never re-attempt its barrier here. This loop is the queue's only consumer.
-                    completed_segment.release()
+                    # Delivered, or quarantined so that later segments stay eligible.
                     replay_segment = None
-                    # Go on at once, unless a lane failed over from live while this replay ran: that failover is newer evidence. Only a delivery proves the circuit, since a quarantine can come from a check that never reached the server.
+                    # The segment is done, so the backoff starts over, unless a lane failed over from live while this replay ran (newer evidence). Only a delivery proves the circuit: a quarantine can come from a check that never reached the server.
                     if replay_can_prove:
                         recovery_failures = 0
-                        stream_retry_at = rich_retry_at = time.monotonic()
-                    if error is None:
-                        if replay_can_prove:
+                        if error is None:
                             replay_proved_circuit = True
+                    if error is None:
                         _log.info(
                             "replayed sealed upload spool %s; checking for a newer segment",
                             completed_segment.path,
@@ -1266,8 +1221,13 @@ def _upload_worker(
                     # path below: a shutdown that arrives during this replay
                     # closes the connect gate, and the owner would otherwise
                     # report spooled data that has in fact been delivered.
-                    if spool.count == 0:
+                    if spool.count == 0 and not vanished_spool_paths:
                         resolve_points(0, spooled=False)
+                elif isinstance(error, _SegmentGone):
+                    # Nothing is left to replay, so go on to newer segments.
+                    replay_segment = None
+                    vanished_spool_paths.append(error.path)
+                    _log.warning("%s; going on to newer segments", error)
                 else:
                     replay_proved_circuit = False
                     if local_endpoint is not None:
@@ -1275,34 +1235,28 @@ def _upload_worker(
                         # rotates the bearer. A READY UDS channel therefore
                         # does not prove that replay authenticated; force an
                         # endpoint refresh before retrying this disk prefix.
-                        if channel is not None:
-                            channel.close()
-                        channel = None
-                        stub = None
+                        close_numeric_channel()
                         close_rich_transport()
                         mark_local_transport_stale()
                     delay = schedule_recovery_retry()
-                    now = time.monotonic()
-                    if now - last_break_warn > 30.0:
-                        last_break_warn = now
-                        _log.warning(
-                            "ordered spool replay failed (%s) — retrying in %.1fs",
-                            error,
-                            delay,
-                        )
+                    warn_throttled(
+                        "ordered spool replay failed (%s) — retrying in %.1fs",
+                        error,
+                        delay,
+                    )
 
         # ---- rich-only disk catch-up ----
         # With numeric live, the active spool holds only rich records. Replay it as the numeric circuit would, and resume live rich delivery once no disk prefix remains; until then new rich work waits behind it, so nothing overtakes an older record. Shutdown starts a replay only on a proven circuit, as the numeric tail does, but goes live on an empty prefix (a quarantine can leave one) regardless.
         if (
-            rich_spooling
-            and not numeric_spooling
+            rich_lane != _LIVE
+            and numeric_lane == _LIVE
             and not unversioned_rich
             and replay_attempt is None
-            and time.monotonic() >= rich_retry_at
+            and time.monotonic() >= recovery_retry_at
             and may_start_transport()
         ):
             if replay_segment is None and spool.count == 0:
-                rich_spooling = rich_to_disk = False
+                rich_lane = _LIVE
                 publish_lanes_on_disk()
                 recovery_failures = 0
                 _log.info("rich uploads are live again; the spool has been replayed")
@@ -1310,10 +1264,9 @@ def _upload_worker(
                 start_spool_replay()
 
         # ---- bidi ingest: (re)open a stream, then apply acks ----
-        # Reconnect a dead channel first so a stream can open. `stub` is None only
-        # after a channel rebuild failed (initial connect, or _SEND_MAX_RETRIES breaks).
+        # Reconnect when there is no channel, so a stream can open.
         if connect_attempt is not None and (
-            (shutdown and (numeric_spooling or not buffer))
+            (shutdown and (numeric_lane != _LIVE or not buffer))
             or (local_endpoint is not None and not has_pending_delivery())
         ):
             connect_attempt.cancel()
@@ -1322,13 +1275,14 @@ def _upload_worker(
             stub is None
             and connect_attempt is None
             # A replay in flight belongs to an open numeric circuit, or else to the rich-only catch-up, beside which the live numeric lane still reconnects.
-            and (replay_attempt is None or not numeric_spooling)
+            and (replay_attempt is None or numeric_lane == _LIVE)
             # An open numeric circuit still connects in the background while
             # an empty active spool proves there is no older disk prefix.
-            and (not shutdown or (not numeric_spooling and buffer))
+            and (not shutdown or (numeric_lane == _LIVE and buffer))
             and (local_endpoint is None or has_pending_delivery())
             and may_start_transport()
-            and time.monotonic() >= stream_retry_at
+            and time.monotonic()
+            >= (stream_retry_at if numeric_lane == _LIVE else recovery_retry_at)
         ):
             if local_endpoint is None:
                 # Preserve the hosted call contract exactly; local endpoint
@@ -1350,7 +1304,7 @@ def _upload_worker(
             channel, stub = connect_result
             if stub is None:
                 mark_local_transport_stale()
-                if numeric_spooling:
+                if numeric_lane != _LIVE:
                     replay_proved_circuit = False
                     schedule_recovery_retry()
                 else:
@@ -1360,15 +1314,13 @@ def _upload_worker(
                     connect_retry_delay = _next_connect_retry_delay(connect_retry_delay)
             else:
                 connect_retry_delay = _CONNECT_INITIAL_DELAY
-                if numeric_spooling:
+                if numeric_lane != _LIVE:
                     # Queue draining precedes this poll, so no sealed segment and
                     # an empty active spool together prove the disk prefix is
                     # gone. Anything else replays first — including a rotation
                     # that could not be sealed, which must not be stepped over.
                     if replay_segment is not None or spool.count:
-                        channel.close()
-                        channel = None
-                        stub = None
+                        close_numeric_channel()
                         start_spool_replay()
                     else:
                         numeric_probe_caps = (
@@ -1381,13 +1333,12 @@ def _upload_worker(
                                 buffer.total_bytes + _RECOVERY_MAX_BUFFER_BYTES,
                             ),
                         )
-                        numeric_spooling = numeric_to_disk = False
-                        rich_spooling = rich_to_disk = False
+                        numeric_lane = rich_lane = _LIVE
                         publish_lanes_on_disk()
                         recovery_failures = 0
         if (
             stream is None
-            and not numeric_spooling
+            and numeric_lane == _LIVE
             and stub is not None
             and (
                 (buffer or not shutdown)
@@ -1431,6 +1382,7 @@ def _upload_worker(
                         total_sent += delta
                         last_acked_cum = cumulative
                         stream_breaks = 0  # a live ack clears the break streak
+                        numeric_waiting_since = None
                         resolve_points(delta)
                         if numeric_probe_caps is not None:
                             numeric_probe_caps = None
@@ -1474,6 +1426,33 @@ def _upload_worker(
             and now - ack_progress_at >= ack_progress_timeout
         ):
             handle_break(RuntimeError(f"no ack progress for {ack_progress_timeout:g}s"))
+        # A live lane that holds points and gets no ACK for this long goes to disk, as over the RAM cap.
+        # A draining lane is exempt: its points wait for the replay ahead of them, so the catch-up converges.
+        # So are shutdown, which has its own deadline, and a failed spool, where spill() would only count the points lost.
+        if numeric_lane != _LIVE or shutdown or spool_failed or not buffer:
+            numeric_waiting_since = None
+        elif numeric_waiting_since is None:
+            numeric_waiting_since = now
+        elif now - numeric_waiting_since >= _NUMERIC_OUTAGE_FAILOVER:
+            try:
+                # A spool that cannot even be opened (a read-only or full home, say) would only lose the points: keep them in RAM and try again after another wait.
+                spool.open()
+            except OSError as error:
+                # Restarting the clock spaces this warning out, so a throttle shared with stream breaks must not hide it.
+                numeric_waiting_since = now
+                _log.warning(
+                    "no numeric ACK for %gs, but the spool cannot be opened (%s) — keeping the points in RAM",
+                    _NUMERIC_OUTAGE_FAILOVER,
+                    error,
+                )
+            else:
+                count = failover_numeric()
+                _log.warning(
+                    "no numeric ACK for %gs — failed over %d point(s) to %s",
+                    _NUMERIC_OUTAGE_FAILOVER,
+                    count,
+                    spool.path,
+                )
 
         # ---- shutdown deadline: spool everything undelivered and exit ----
         if past_deadline():
@@ -1487,7 +1466,7 @@ def _upload_worker(
         # and no 1-point spam. The server coalesces arrivals into efficient inserts.
         if (
             stream is not None
-            and not numeric_spooling
+            and numeric_lane == _LIVE
             and not half_closed
             and not past_deadline()
         ):
@@ -1512,10 +1491,10 @@ def _upload_worker(
                         "unencodable buffered point — spooling the numeric lane: %s",
                         error,
                     )
-                    spilled += failover_numeric()
+                    failover_numeric()
                     break
-                # n == 0 is a defensive no-op (a non-empty slice yields n≥1 or raises above); the live break reason is a full feed queue — retry next cycle.
-                if n == 0 or not stream.feed(batch):
+                # A full feed queue: retry next cycle.
+                if not stream.feed(batch):
                     break
                 if inflight_n == 0:
                     ack_progress_at = time.monotonic()
@@ -1552,7 +1531,8 @@ def _upload_worker(
             except queue.Empty:
                 pass
             else:
-                entry = cdn_attempt.item
+                # Its name and step only: holding the entry would keep the gallery alive after it leaves cdn_queue.
+                head_name, head_step = cdn_attempt.item[1:3]
                 cdn_attempt = None
                 if succeeded:
                     ok = bool(result)
@@ -1565,8 +1545,8 @@ def _upload_worker(
                         continue
                     _log.warning(
                         "CDN entry %s step %d failed: %s",
-                        entry[1],
-                        entry[2],
+                        head_name,
+                        head_step,
                         result,
                     )
                     ok = False
@@ -1589,15 +1569,18 @@ def _upload_worker(
                         _log.error(
                             "giving up on CDN entry %s step %d after %d attempts "
                             "— failing the rich lane over to the spool",
-                            entry[1],
-                            entry[2],
+                            head_name,
+                            head_step,
                             cdn_fails,
                         )
-                        spilled += failover_rich()
+                        failover_rich()
 
+        if abandoned_upload is not None and not abandoned_upload.events.empty():
+            abandoned_upload = None
         if (
             cdn_attempt is None
-            and not rich_spooling
+            and abandoned_upload is None
+            and rich_lane == _LIVE
             and cdn_queue
             and not awaits_encoding(cdn_queue.items[0])
             and cdn_url
@@ -1605,12 +1588,11 @@ def _upload_worker(
             and may_start_transport()
         ):
             ensure_rich_transport()
-            entry = cdn_queue.items[0]
-            first_attempt = cdn_fails == 0
+            # Bound only in the helper's arguments, so a delivered gallery is not kept alive by this frame.
             cdn_attempt = _ThreadAttempt(
-                entry,
-                lambda entry=entry, first_attempt=first_attempt: process_cdn_entry(
-                    entry, first_attempt=first_attempt
+                cdn_queue.items[0],
+                lambda entry=cdn_queue.items[0], first=cdn_fails == 0: (
+                    process_cdn_entry(entry, first_attempt=first)
                 ),
                 name="kymo-cdn-attempt",
             )
@@ -1625,21 +1607,14 @@ def _upload_worker(
             and stream is None
             and (input_closed or drained_to_empty)
         ):
-            # Shutdown closed the connect gate, so no connect probe can resume the disk FIFO for records spilled behind an in-flight replay (e.g. the owner's final captured-output flush). A replay the server just answered is the circuit proof instead: keep sealing and replaying the tail until the disk is empty, a replay fails, or delivery may not start (past the deadline, say, or with a local endpoint to refresh) — never exit stranding a deliverable tail as a fresh pending spool.
-            if numeric_spooling and replay_proved_circuit and start_spool_replay():
+            # Shutdown closed the connect gate, so no connect probe can resume the disk FIFO for records spilled behind an in-flight replay (e.g. the owner's final captured-output flush). A delivered replay is the circuit proof instead: keep sealing and replaying the tail until the disk is empty, a replay fails, or delivery may not start (past the deadline, say, or with a local endpoint to refresh) — never exit stranding a tail the proven circuit could deliver as a fresh pending spool.
+            if numeric_lane != _LIVE and replay_proved_circuit and start_spool_replay():
                 continue
             break
 
-    if stream is not None:
-        stream.cancel()  # idempotent; releases the gen/pump threads if we exited on a clean done
-    if connect_attempt is not None:
-        connect_attempt.cancel()
-    if http_client:
-        http_client.close()
-    if cdn_channel:
-        cdn_channel.close()
-    if channel:
-        channel.close()
+    # Close the bidi channel and anything else still open; a clean exit has already ended the stream.
+    drop_numeric_transport()
+    close_rich_transport()
     pending_spool_files = []
     spool_file = close_spool(spool)
     if spool_file:
@@ -1657,7 +1632,9 @@ def _upload_worker(
     try:
         resolve_points(
             0,
-            spooled=bool(pending_spool_files or quarantined_spool_paths),
+            spooled=bool(
+                pending_spool_files or quarantined_spool_paths or vanished_spool_paths
+            ),
         )
     except RuntimeError as error:
         _log.warning("failed to publish final spool state: %s", error)
@@ -1678,9 +1655,16 @@ def _upload_worker(
         _log.info("worker exiting, %d points sent total", total_sent)
     if quarantined_spool_paths:
         _log.error(
-            "worker quarantined spool segment(s) after DATA_LOSS while later "
-            "segments remained eligible for delivery: %s",
+            "worker quarantined spool segment(s) (authoritative DATA_LOSS, or "
+            "records that can never be delivered) while later segments "
+            "remained eligible for delivery: %s",
             ", ".join(quarantined_spool_paths),
+        )
+    if vanished_spool_paths:
+        _log.error(
+            "spool segment(s) disappeared before the worker replayed them, so "
+            "their delivery is unknown: %s",
+            ", ".join(vanished_spool_paths),
         )
     if spool_failed or undecodable or unencodable:
         _log.error(
