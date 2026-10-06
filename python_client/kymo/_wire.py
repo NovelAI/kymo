@@ -62,6 +62,21 @@ def _terminal_run_error(error: BaseException) -> _TerminalRunError:
     return _TerminalRunError(details or "run is no longer writable")
 
 
+def _send_unary_point(stub, project_id: str, run_id: str, point) -> bool:
+    """Ingest one point in one unary call, with no retry; False when the server accepts none."""
+    batch = kymo_pb2.MetricsBatch(project_id=project_id, run_id=run_id, points=[point])
+    try:
+        response = stub.IngestMetrics(iter([batch]), timeout=_CDN_RPC_TIMEOUT)
+    except grpc.RpcError as error:
+        if _is_terminal_run_error(error):
+            raise _terminal_run_error(error) from error
+        raise
+    if response.points_received != 1:
+        _log.warning("server accepted %d of 1 point", response.points_received)
+        return False
+    return True
+
+
 def _publish_rich_mutation(
     stub,
     project_id: str,

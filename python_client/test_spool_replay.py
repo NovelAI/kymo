@@ -1639,7 +1639,7 @@ class SpoolDurabilityTests(unittest.TestCase):
             _, records = read_spool(path)
             self.assertEqual([record[2] for record in records], [2])
 
-    def test_a_torn_header_leaves_an_empty_file_that_the_next_write_reopens(self):
+    def test_a_torn_header_leaves_no_file_and_the_next_write_creates_it_again(self):
         with tempfile.TemporaryDirectory() as spool_dir:
             path = os.path.join(spool_dir, "header.mkspool")
             spool = SpoolWriter(path, header={})
@@ -1647,7 +1647,8 @@ class SpoolDurabilityTests(unittest.TestCase):
                 failing.set()
                 with self.assertRaises(OSError):
                     spool.write(numeric(1.0, step=1))
-            self.assertEqual(os.path.getsize(path), 0)
+            # The run would report an empty file as pending, though nothing was spooled.
+            self.assertFalse(os.path.exists(path))
             spool.write(numeric(2.0, step=2))
             spool.close()
             _, records = read_spool(path)
@@ -1703,10 +1704,31 @@ class SpoolDurabilityTests(unittest.TestCase):
             self.assertEqual(spool.count, 1)
             with self.assertRaisesRegex(OSError, "torn record"):
                 spool.write(numeric(3.0, step=3))
+            # An early open, which tells the worker whether it may send points to disk, says so too.
+            with self.assertRaisesRegex(OSError, "torn record"):
+                spool.open()
             # It still seals, so replay can quarantine it and the worker go on to newer segments.
             spool.seal()
             with self.assertRaisesRegex(OSError, "torn record"):
                 spool.close()
+
+    def test_a_header_that_cannot_be_cut_off_leaves_a_writer_open_refuses(self):
+        with tempfile.TemporaryDirectory() as spool_dir:
+            path = os.path.join(spool_dir, "header.mkspool")
+            spool = SpoolWriter(path, header={})
+            with (
+                _failing_spool_writes() as failing,
+                mock.patch.object(
+                    spool_module.os, "ftruncate", side_effect=OSError(5, "EIO")
+                ),
+            ):
+                failing.set()
+                with self.assertRaises(OSError):
+                    spool.open()
+            # Half a header could not be cut off: the file goes, and the writer takes nothing more, so the outage limit keeps its points in RAM.
+            self.assertFalse(os.path.exists(path))
+            with self.assertRaisesRegex(OSError, "torn record"):
+                spool.open()
 
     def test_the_write_buffer_takes_the_file_system_block_size(self):
         with tempfile.TemporaryDirectory() as spool_dir:

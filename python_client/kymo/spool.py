@@ -26,6 +26,7 @@ Record kinds:
 """
 
 import bisect
+import contextlib
 import errno
 import hashlib
 import io
@@ -322,6 +323,8 @@ class SpoolWriter:
 
     def open(self) -> None:
         """Create the file and write its header, unless already open: the first record does this, and a caller can do it earlier to learn whether the spool can be written."""
+        # A torn writer can take no more records, open or not.
+        self._raise_if_torn()
         if self._fh is not None:
             return
         spool_dir = os.path.dirname(self._path)
@@ -363,18 +366,19 @@ class SpoolWriter:
                 self._fh.flush()
                 self._record_ends = [self._fh.tell()]
             except BaseException:
-                # Leave an empty file rather than a torn header; the next write opens it again.
+                # The file holds no records, so remove it rather than leave a torn header, or a file the run would report as pending; the next write creates it again.
                 try:
                     self._discard()
                 finally:
                     fh, self._fh = self._fh, None
                     fh.close()
+                    with contextlib.suppress(OSError):
+                        os.unlink(self._path)
                 raise
 
     def write(self, record: tuple) -> None:
         if self._sealed:
             raise RuntimeError(f"cannot append to sealed spool {self._path}")
-        self._raise_if_torn()
         self.open()
         try:
             pickle.dump(record, self._fh, protocol=pickle.HIGHEST_PROTOCOL)

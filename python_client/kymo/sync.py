@@ -68,6 +68,7 @@ from kymo._wire import (
     _terminal_run_error,
     _point_sort_key,
     _send_tuples,
+    _send_unary_point,
     _upload_to_cdn,
     _validate_ident,
     _validate_project_id,
@@ -325,9 +326,6 @@ def _replay_cdn_record(
     kind, name, step = record[0], record[1], record[2]
     versioned = kind in _VERSIONED_RICH_KINDS
     storage_key = (project_id, run_id, name, step)
-    # Legacy records lack logical versions, so retain their conservative
-    # server-wins guard and its known recency limitation. Versioned records
-    # bypass both probes below and let the authoritative server CAS decide.
     try:
         if kind == "cdn_key_mutation":
             _, _, _, resource_id, timestamp_ms, mutation_version = record
@@ -355,6 +353,9 @@ def _replay_cdn_record(
                 ]
             )
         prospective_id = content_id(prospective_bytes, "json")
+        # Legacy records lack logical versions, so retain their conservative
+        # server-wins guard and its known recency limitation. Versioned records
+        # bypass both probes below and let the authoritative server CAS decide.
         if not versioned:
             current = _current_cdn_key(stub, project_id, run_id, name, step)
             if current is None:
@@ -451,32 +452,15 @@ def _replay_cdn_record(
             cdn_key=manifest_id,
             timestamp_ms=int(time.time() * 1000),
         )
-        response = stub.IngestMetrics(
-            iter(
-                [
-                    kymo_pb2.MetricsBatch(
-                        project_id=project_id, run_id=run_id, points=[point]
-                    )
-                ]
-            ),
-            timeout=_CDN_RPC_TIMEOUT,
-        )
-        if response.points_received != 1:
-            _log.error(
-                "server accepted %d of 1 rich replay point; file kept",
-                response.points_received,
-            )
+        if not _send_unary_point(stub, project_id, run_id, point):
             return False
         replayed_keys[storage_key] = manifest_id
         return True
     except (_TerminalRunError, _RichMutationDataLoss):
         raise
-    except grpc.RpcError as e:
-        if _is_terminal_run_error(e):
-            raise _terminal_run_error(e) from e
-        _log.error("failed to replay CDN record %s step %s: %s", name, step, e)
-        return False
     except Exception as e:
+        if isinstance(e, grpc.RpcError) and _is_terminal_run_error(e):
+            raise _terminal_run_error(e) from e
         _log.error("failed to replay CDN record %s step %s: %s", name, step, e)
         return False
 

@@ -93,6 +93,7 @@ def _upload_worker(
         _BidiStream,
         _CDN_MAX_ATTEMPTS,
         _ChildGalleryItems,
+        _UnpacedGalleryItems,
         _CONNECT_INITIAL_DELAY,
         _CONNECT_PENDING,
         _CONNECT_POLL_TIMEOUT,
@@ -336,10 +337,10 @@ def _upload_worker(
             with release_lock:
                 galleries_released.value += count
 
-    def publish_lanes_on_disk() -> None:
-        """Tell log() whether either lane writes new work to disk; it then never waits for the encoder, since disk writes would set the pace."""
+    def publish_lanes_on_disk(writing: bool = False) -> None:
+        """Tell log() whether either lane writes new work to disk, or this loop is about to write (writing); it then never waits for the encoder, since disk writes would set the pace."""
         if lanes_on_disk is not None:
-            lanes_on_disk.value = int(_TO_DISK in (numeric_lane, rich_lane))
+            lanes_on_disk.value = int(writing or _TO_DISK in (numeric_lane, rich_lane))
 
     def spool_draining_lanes() -> None:
         """Send the draining lanes' RAM work to disk behind the prefix, leaving the retry and the circuit proof as they are."""
@@ -369,15 +370,24 @@ def _upload_worker(
             channel.close()
         channel = stub = None
 
-    def drop_numeric_transport() -> None:
-        """Cancel the stream and any connect, close the bidi channel, and forget the in-flight window."""
-        nonlocal stream, connect_attempt
-        nonlocal inflight_n, last_acked_cum, ack_progress_at, half_closed
-        # Cancel before releasing the in-flight prefix's accounting. A racing
-        # commit may duplicate on replay, but cannot ACK and decrement twice.
+    def end_stream() -> None:
+        """Cancel the stream, if any, and forget its in-flight window: its unacked points stay at the front of buffer for the next stream."""
+        nonlocal stream, inflight_n, last_acked_cum, ack_progress_at, half_closed
         if stream is not None:
             stream.cancel()
             stream = None
+        inflight_n = 0
+        # The server's cumulative counter restarts at 0 on every stream, so last_acked_cum MUST restart with it or the next stream's first delta is wild.
+        last_acked_cum = 0
+        ack_progress_at = None
+        half_closed = False
+
+    def drop_numeric_transport() -> None:
+        """End the stream, cancel any connect, and close the bidi channel."""
+        nonlocal connect_attempt
+        # Cancel before releasing the in-flight prefix's accounting. A racing
+        # commit may duplicate on replay, but cannot ACK and decrement twice.
+        end_stream()
         if connect_attempt is not None:
             connect_attempt.cancel()
             connect_attempt = None
@@ -385,10 +395,6 @@ def _upload_worker(
         # being torn down. Recovery must not immediately reuse that stale
         # channel and declare the circuit half-open without a real reconnect.
         close_numeric_channel()
-        inflight_n = 0
-        last_acked_cum = 0
-        ack_progress_at = None
-        half_closed = False
 
     def install_local_endpoint(endpoint) -> None:
         nonlocal local_endpoint, server_address, cdn_url
@@ -510,7 +516,7 @@ def _upload_worker(
         )
         release_raw_galleries(raw_galleries)
         spilled += spooled_now
-        # Only points written: callers log it as spooled, and losses are counted apart.
+        # Only points written, which spilled counts and the failover warnings report; losses are counted apart.
         return spooled_now
 
     def close_spool(writer: SpoolWriter) -> Optional[str]:
@@ -746,12 +752,11 @@ def _upload_worker(
                 continue
             if is_rich:
                 # A gallery waiting for the encoder is charged only its bytes-backed items, since log()'s encoder wait bounds how many do; its arrays are charged their encoded bytes once encoded.
-                # A gallery no log() paced is charged whole until then: a fork child's, or any while the numeric lane writes to disk.
-                # So is any gallery while encodes are failing (memory pressure), when nothing will shrink it soon.
+                # A gallery log() did not pace (marked _UnpacedGalleryItems: a fork child's, or one published while a lane wrote to disk) is charged whole until then, as is any while encodes are failing (memory pressure), when nothing will shrink it soon.
                 if (
                     not encode_fails
-                    and numeric_lane != _TO_DISK
-                    and counted_raw(point_tuple)
+                    and awaits_encoding(point_tuple)
+                    and not isinstance(point_tuple[3], _UnpacedGalleryItems)
                 ):
                     retained_bytes = sum(
                         len(element.data)
@@ -822,27 +827,22 @@ def _upload_worker(
                 mutation_version=mutation_version,
                 reduced_mutation_version=reduced_mutation_version,
             )
-        try:
-            encoded_manifest = metadata_manifest(payload.data)
-            resource_id = _upload_to_cdn(http_client, cdn_url, encoded_manifest, "json")
-            if not _publish_manifest_point(
-                cdn_stub,
-                project_id,
-                run_id,
-                name,
-                step,
-                resource_id,
-                timestamp_ms,
-                mutation_version,
-            ):
-                return False
-            _log.info("metadata %s step=%d → %s", name, step, resource_id)
-            return True
-        except (_TerminalRunError, _RichMutationDataLoss):
-            raise
-        except Exception as error:
-            _log.warning("failed to upload metadata: %s", error)
+        # The owner loop handles what this raises: a terminal answer, DATA_LOSS, or a failure it logs and retries.
+        encoded_manifest = metadata_manifest(payload.data)
+        resource_id = _upload_to_cdn(http_client, cdn_url, encoded_manifest, "json")
+        if not _publish_manifest_point(
+            cdn_stub,
+            project_id,
+            run_id,
+            name,
+            step,
+            resource_id,
+            timestamp_ms,
+            mutation_version,
+        ):
             return False
+        _log.info("metadata %s step=%d → %s", name, step, resource_id)
+        return True
 
     def reject_deleted_run(error: BaseException) -> None:
         """Stop every transport and fail queued work without creating a spool."""
@@ -897,7 +897,6 @@ def _upload_worker(
         attempt. Back off on loop cadence (no time.sleep); rebuild the channel after
         _SEND_MAX_RETRIES consecutive breaks (it may be wedged), and after every break
         on a local endpoint, behind a refresh. Logging throttled."""
-        nonlocal stream, inflight_n, ack_progress_at, half_closed
         nonlocal stream_breaks, stream_retry_at
         if err is not None and _is_terminal_run_error(err):
             reject_deleted_run(_terminal_run_error(err))
@@ -921,12 +920,7 @@ def _upload_worker(
                 count,
             )
             return
-        if stream is not None:
-            stream.cancel()
-        stream = None
-        inflight_n = 0
-        ack_progress_at = None
-        half_closed = False
+        end_stream()
         stream_breaks += 1
         retry_base = min(
             _SEND_INITIAL_DELAY * (2 ** (stream_breaks - 1)), _SEND_MAX_DELAY
@@ -992,7 +986,8 @@ def _upload_worker(
         cdn_backoff_until = 0.0
         encode_fails = 0
         encode_backoff_until = 0.0
-        # Every entry ahead of an encode in flight is encoded, so write those first. Then wait for the encoder rather than encode its gallery again on this thread (never longer than that encode), unless the spool has failed and would write nothing. The encoder encodes in place, so spilling that gallery only resumes an encode that raised.
+        # Spool the encoded entries ahead of an encode in flight, then wait for that encode rather than repeat it on this thread, unless the spool has failed and would write nothing.
+        # The encoder encodes in place, so spilling that gallery only resumes an encode that raised.
         if encode_attempt is None:
             count = spill(cdn_queue.items)
         else:
@@ -1348,6 +1343,7 @@ def _upload_worker(
             and not past_deadline()
             and time.monotonic() >= stream_retry_at
         ):
+            # Every stream that ended reset the in-flight window (end_stream), so this one starts fresh.
             try:
                 stream = _BidiStream(stub, _FEED_Q_CAP)
             except Exception as error:
@@ -1355,13 +1351,6 @@ def _upload_worker(
                 # channel, incompatible stub). Treat it like every other stream
                 # break so private buffered points remain retryable.
                 handle_break(error)
-            else:
-                # Fresh attempt: the server's cumulative counter restarts at 0, so
-                # last_acked_cum MUST restart with it or the first delta is wild.
-                inflight_n = 0
-                last_acked_cum = 0
-                ack_progress_at = None
-                half_closed = False
         if stream is not None:
             for kind, payload in stream.poll_acks():
                 if kind == "ack":
@@ -1402,8 +1391,7 @@ def _upload_worker(
                     # (error, or an unrequested "done" — a proxy, not our server) is
                     # an unexpected end → reconnect, re-feed from the front.
                     if kind == "done" and half_closed and inflight_n == 0:
-                        stream = None
-                        half_closed = False
+                        end_stream()
                     else:
                         if kind == "error":
                             error = payload
@@ -1434,6 +1422,8 @@ def _upload_worker(
         elif numeric_waiting_since is None:
             numeric_waiting_since = now
         elif now - numeric_waiting_since >= _NUMERIC_OUTAGE_FAILOVER:
+            # The open touches the disk, which may stall, so log() stops waiting for the encoder first.
+            publish_lanes_on_disk(writing=True)
             try:
                 # A spool that cannot even be opened (a read-only or full home, say) would only lose the points: keep them in RAM and try again after another wait.
                 spool.open()
@@ -1453,6 +1443,9 @@ def _upload_worker(
                     count,
                     spool.path,
                 )
+            finally:
+                # The lanes' own state again: still live after a failed open, on disk after a failover.
+                publish_lanes_on_disk()
 
         # ---- shutdown deadline: spool everything undelivered and exit ----
         if past_deadline():
@@ -1645,7 +1638,7 @@ def _upload_worker(
     if pending_spool_files:
         paths = ", ".join(pending_spool_files)
         _log.error(
-            "worker exiting: %d points sent, %d spooled to %s (replay with: %s)",
+            "worker exiting: %d points sent, %d spooled during the run; still on disk in %s (replay with: %s)",
             total_sent,
             spilled,
             paths,

@@ -5457,10 +5457,14 @@ class WorkerResponsivenessTests(unittest.TestCase):
         steps = []
         for name in sorted(os.listdir(spool_dir)):
             path = os.path.join(spool_dir, name)
-            # A segment the worker is creating stays empty until its header is flushed.
-            if name.endswith(".mkspool") and os.path.getsize(path):
-                _header, records = read_spool(path)
-                steps.extend(record[2] for record in records)
+            try:
+                # A segment the worker is creating stays empty until its header is flushed.
+                if name.endswith(".mkspool") and os.path.getsize(path):
+                    _header, records = read_spool(path)
+                    steps.extend(record[2] for record in records)
+            except FileNotFoundError:
+                # A replay delivered and deleted it meanwhile.
+                continue
         return steps
 
     def _local_cdn(self, stack_down):
@@ -5768,8 +5772,14 @@ class WorkerResponsivenessTests(unittest.TestCase):
             self.assertTrue(self._wait_for(lambda: lane.live == [203]))
         self.assertEqual(len(replay.calls), 2)
 
-    def test_a_gallery_is_charged_whole_while_numeric_writes_to_disk(self):
-        gallery = self._gallery(1001, [Image(np.zeros((512, 512, 3), np.uint8))])
+    def test_a_gallery_log_did_not_pace_is_charged_whole(self):
+        pixels = [Image(np.zeros((512, 512, 3), np.uint8))]
+        paced = self._gallery(1001, pixels)
+        # Published while a lane wrote to disk, so log() did not wait for the encoder.
+        with mock.patch.object(
+            client_module, "_lanes_on_disk", types.SimpleNamespace(value=1)
+        ):
+            unpaced = self._gallery(1002, pixels)
         replay = self._replay_stand_in()
         with (
             self.assertLogs("kymo", level="WARNING"),
@@ -5777,14 +5787,47 @@ class WorkerResponsivenessTests(unittest.TestCase):
                 replay, env={"KYMO_MAX_RICH_BUFFER_BYTES": str(512 * 1024)}
             ) as lane,
         ):
-            # The numeric lane trips its cap and writes to disk, so log() no longer paces galleries.
-            for step in range(1, 202):
-                lane.put(step)
-            self.assertTrue(self._wait_for(lambda: lane.on_disk.value == 1))
-            # Its 768 KiB of raw pixels count against the 512 KiB rich cap at once, before any encode could shrink them.
-            lane.put_item(gallery)
+            lane.server_up.set()
+            # A paced gallery's arrays are not charged before they are encoded.
+            lane.put_item(paced)
+            self.assertFalse(
+                self._wait_for(lambda: lane.on_disk.value == 1, timeout=0.5)
+            )
+            # The unpaced one's 768 KiB of raw pixels count against the 512 KiB rich cap at once, whatever the lanes do now, so the rich lane fails over (and the server being up, its catch-up replays it).
+            lane.put_item(unpaced)
             self.assertTrue(
-                self._wait_for(lambda: 1001 in self._steps_on_disk(lane.spool_dir))
+                self._wait_for(
+                    lambda: 1002 in self._steps_on_disk(lane.spool_dir) + replay.rich
+                )
+            )
+
+    def test_log_stops_pacing_galleries_before_the_limit_opens_the_spool(self):
+        opening, release = threading.Event(), threading.Event()
+        real_open = spool_module.SpoolWriter.open
+
+        def slow_open(writer):
+            opening.set()
+            release.wait(timeout=5)
+            real_open(writer)
+
+        replay = self._replay_stand_in()
+        with (
+            mock.patch.object(spool_module.SpoolWriter, "open", slow_open),
+            self.assertLogs("kymo", level="WARNING"),
+            self._numeric_outage(replay, limit=0.3) as lane,
+        ):
+            try:
+                for step in range(1, 6):
+                    lane.put(step)
+                self.assertTrue(opening.wait(timeout=5))
+                # The open may stall on a wedged mount, so log() has already stopped waiting for the encoder.
+                self.assertEqual(lane.on_disk.value, 1)
+            finally:
+                release.set()
+            self.assertTrue(
+                self._wait_for(
+                    lambda: self._steps_on_disk(lane.spool_dir) == [1, 2, 3, 4, 5]
+                )
             )
 
     def test_points_go_to_disk_while_the_local_stack_stays_down(self):
@@ -5850,6 +5893,8 @@ class WorkerResponsivenessTests(unittest.TestCase):
                 )
             )
             self.assertEqual(lane.status.value, 5)
+            # Nothing writes to disk after all, so log() paces galleries again.
+            self.assertEqual(lane.on_disk.value, 0)
             broken.clear()
             self.assertTrue(self._wait_for(lambda: lane.status.value == 0))
         self.assertEqual(fed, [1, 2, 3, 4, 5])
@@ -5879,15 +5924,31 @@ class WorkerResponsivenessTests(unittest.TestCase):
             lane.server_up.set()
             self.assertTrue(self._wait_for(lambda: lane.live == [1, 2, 3, 4, 5]))
 
-    def test_a_fork_childs_galleries_are_marked_for_the_worker(self):
+    def test_galleries_log_did_not_pace_are_marked_for_the_worker(self):
         gallery = ("cdn_batch", "samples", 1, [Image(np.zeros((2, 2, 3), np.uint8))])
-        with mock.patch.object(client_module, "_init_pid", os.getpid()):
-            (owner,) = client_module._snapshot_rich_queue_items([gallery])
-        with mock.patch.object(client_module, "_init_pid", os.getpid() + 1):
-            (child,) = client_module._snapshot_rich_queue_items([gallery])
-        marked = client_module._ChildGalleryItems
-        self.assertNotIsInstance(client_module._decode_queue_item(owner)[0][3], marked)
-        self.assertIsInstance(client_module._decode_queue_item(child)[0][3], marked)
+
+        def items(pid, lanes_on_disk):
+            with (
+                mock.patch.object(client_module, "_init_pid", pid),
+                mock.patch.object(
+                    client_module,
+                    "_lanes_on_disk",
+                    types.SimpleNamespace(value=lanes_on_disk),
+                ),
+            ):
+                (item,) = client_module._snapshot_rich_queue_items([gallery])
+            return client_module._decode_queue_item(item)[0][3]
+
+        unpaced, child = (
+            client_module._UnpacedGalleryItems,
+            client_module._ChildGalleryItems,
+        )
+        self.assertNotIsInstance(items(os.getpid(), 0), unpaced)
+        # Published while a lane writes to disk, when log() does not wait for the encoder.
+        self.assertIsInstance(items(os.getpid(), 1), unpaced)
+        self.assertNotIsInstance(items(os.getpid(), 1), child)
+        # A fork child's gallery is never paced, nor released against the parent's count.
+        self.assertIsInstance(items(os.getpid() + 1, 0), child)
 
     def test_a_spooling_lane_reconnects_only_at_its_recovery_deadline(self):
         replay = self._replay_stand_in()

@@ -54,7 +54,7 @@ from kymo._cdn import encoded_gallery_item, gallery_manifest, metadata_manifest
 from kymo._log import logger as _log
 from kymo.api import _check_fork_safe
 from kymo._wire import (
-    _CDN_RPC_TIMEOUT,
+    _CDN_RPC_TIMEOUT as _CDN_RPC_TIMEOUT,
     _F32_OVERFLOW,
     _MAX_ID_BYTES,
     _MAX_METRIC_NAME_BYTES,
@@ -69,12 +69,13 @@ from kymo._wire import (
     _chunk_tuples,
     _estimate_tuple_bytes,
     _is_permanent_upload_error,
-    _is_terminal_run_error,
+    _is_terminal_run_error as _is_terminal_run_error,
     _normalize_numeric_value,
     _publish_rich_mutation,
     _reduced_mutation_version,
     _send_tuples as _send_tuples,
-    _terminal_run_error,
+    _send_unary_point as _send_unary_point,
+    _terminal_run_error as _terminal_run_error,
     _upload_to_cdn,
     _validate_ident,
     _validate_project_id,
@@ -928,17 +929,24 @@ class _HostTensorPickler(pickle.Pickler):
         return pickle.loads, (pickle.dumps(host, protocol=pickle.HIGHEST_PROTOCOL),)
 
 
-class _ChildGalleryItems(list):
-    """A fork child's unpaced gallery: the worker charges it whole until encoded and never releases it against the parent's gallery count."""
+class _UnpacedGalleryItems(list):
+    """A gallery log() published without waiting for the encoder: the worker charges it whole until encoded, since no wait bounds how many there are."""
+
+
+class _ChildGalleryItems(_UnpacedGalleryItems):
+    """A fork child's gallery, which no log() paces: the worker also never releases it against the parent's gallery count."""
 
 
 def _snapshot_rich_queue_items(cdn_batches: list[tuple]) -> list[tuple]:
     """Return queue-safe immutable snapshots of public rich metric batches."""
     snapshots = []
     in_child = _init_pid is not None and os.getpid() != _init_pid
+    # While a lane writes to disk, log() does not wait for the encoder (see _await_encoder).
+    unpaced = in_child or bool(_lanes_on_disk is not None and _lanes_on_disk.value)
+    marker = _ChildGalleryItems if in_child else _UnpacedGalleryItems
     for batch in cdn_batches:
-        if in_child and batch[0] in ("cdn_batch", "cdn_batch_mutation"):
-            batch = (*batch[:3], _ChildGalleryItems(batch[3]), *batch[4:])
+        if unpaced and batch[0] in ("cdn_batch", "cdn_batch_mutation"):
+            batch = (*batch[:3], marker(batch[3]), *batch[4:])
         if batch[0] in ("metadata_batch", "metadata_batch_mutation"):
             try:
                 manifest = metadata_manifest(batch[3].data)
@@ -2551,10 +2559,6 @@ def _drain_and_shutdown(flush_timeout: Optional[float] = None) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Background worker
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
 # CDN helpers (run in worker process)
 # ---------------------------------------------------------------------------
 
@@ -2735,20 +2739,6 @@ def _publish_manifest_point(
         timestamp_ms=int(time.time() * 1000),
     )
     return _send_unary_point(stub, project_id, run_id, point)
-
-
-def _send_unary_point(stub, project_id: str, run_id: str, point) -> bool:
-    batch = kymo_pb2.MetricsBatch(project_id=project_id, run_id=run_id, points=[point])
-    try:
-        response = stub.IngestMetrics(iter([batch]), timeout=_CDN_RPC_TIMEOUT)
-    except grpc.RpcError as error:
-        if _is_terminal_run_error(error):
-            raise _terminal_run_error(error) from error
-        raise
-    if response.points_received != 1:
-        _log.warning("server accepted %d of 1 point", response.points_received)
-        return False
-    return True
 
 
 def _process_cdn_batch(
