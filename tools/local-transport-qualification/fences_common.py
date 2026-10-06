@@ -34,3 +34,15 @@ def render_turn(page) -> None:
     page.evaluate(
         "() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))"
     )
+
+
+def fitted_box(node) -> dict:
+    """`node`'s box once the chart around it has taken its container's width, which a chart does on its ResizeObserver's next frame after a layout change."""
+    chart_id = node.evaluate("n => n.closest('.chart-container').id")
+    node.page.wait_for_function(
+        "id => Math.abs(window.__kymo_charts[id].width - document.getElementById(id).getBoundingClientRect().width) <= 1",
+        arg=chart_id,
+    )
+    box = node.bounding_box()
+    assert box is not None
+    return box

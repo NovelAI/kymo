@@ -12,7 +12,7 @@ from urllib.parse import unquote, urlencode, urlsplit
 
 from playwright.sync_api import Locator, Page, expect, sync_playwright
 
-from fences_common import drag_handle, request_frame
+from fences_common import drag_handle, fitted_box, request_frame
 
 from user_settings_fences import (
     VIEWPORT,
@@ -1093,16 +1093,19 @@ def panel_keys_and_tips(page: Page, metric: Locator, section: Locator) -> None:
     )
     try:
         column = page.locator(".main-wrap").bounding_box()
-        box = plot.bounding_box()
-        assert column is not None and box is not None
+        assert column is not None
         assert column["width"] < shown["width"], (column, shown)
-        page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+        box = fitted_box(plot)
+        middle, right = box["x"] + box["width"] / 2, column["x"] + column["width"]
+        page.mouse.move(middle, box["y"] + box["height"] / 2)
         expect(tip).to_be_visible()
         narrow = tip.bounding_box()
         assert narrow is not None and abs(narrow["width"] - shown["width"]) < 0.5, (
             narrow,
             shown,
         )
+        # WebKit can keep the pre-resize readout showing, so check that this hover's readout sits beside the new pointer, inside the narrowed column.
+        assert middle < narrow["x"] < right, (middle, narrow, right)
         dismiss(page, panel, metric, "Escape")
 
         # Readouts don't live in their charts, so moving a section's node, as a reorder does, leaves them where they are: a moved chart's readout still paints over the panel. Moved out and straight back, the page stays as it was.
@@ -1114,8 +1117,7 @@ def panel_keys_and_tips(page: Page, metric: Locator, section: Locator) -> None:
         )
         panel = open_editor(page, section, "Configure section")
         rect.scroll_into_view_if_needed()
-        box = rect.locator(".u-over").first.bounding_box()
-        assert box is not None
+        box = fitted_box(rect.locator(".u-over").first)
         page.mouse.move(box["x"] + box["width"] * 0.95, box["y"] + box["height"] / 2)
         expect(tip).to_be_visible()
         shown, docked = tip.bounding_box(), panel.bounding_box()

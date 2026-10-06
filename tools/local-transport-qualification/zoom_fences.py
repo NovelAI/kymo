@@ -13,7 +13,7 @@ from typing import Any
 
 from playwright.sync_api import Page, sync_playwright
 
-from fences_common import render_turn as settle
+from fences_common import fitted_box, render_turn as settle
 
 
 SOURCE_TITLE = "zoom_a_source"
@@ -485,9 +485,8 @@ def real_resize_cancels(page: Page, source: dict[str, Any]) -> None:
     clear_events(page)
     start = (x_at_fraction(source, 0.25), y_mid(source))
     end = (x_at_fraction(source, 0.75), start[1])
-    original_style = page.evaluate(
-        "id => document.getElementById(id).style.width", source["id"]
-    )
+    container = page.locator(f"#{source['id']}")
+    original_style = container.evaluate("e => e.style.width")
 
     page.mouse.move(*start)
     page.mouse.down()
@@ -495,37 +494,15 @@ def real_resize_cancels(page: Page, source: dict[str, Any]) -> None:
         page.mouse.move(*end, steps=8)
         if not page.evaluate("!!window.__kymo_zg"):
             raise AssertionError("real-resize positive-control gesture never armed")
-        resized_width = page.evaluate(
-            """id => {
-                const element = document.getElementById(id);
-                const width = Math.max(100, element.getBoundingClientRect().width - 40);
-                element.style.width = `${width}px`;
-                return width;
-            }""",
-            source["id"],
+        container.evaluate(
+            "e => { e.style.width = `${Math.max(100, e.getBoundingClientRect().width - 40)}px`; }"
         )
-        page.wait_for_function(
-            """state => {
-                const chart = window.__kymo_charts[state.id];
-                return chart && Math.abs(chart.width - state.width) <= 1
-                    && window.__kymo_zg == null;
-            }""",
-            arg={"id": source["id"], "width": resized_width},
-        )
+        # The observer that resizes the chart cancels the gesture in the same callback.
+        page.wait_for_function("() => window.__kymo_zg == null")
     finally:
         page.mouse.up()
-        page.evaluate(
-            "state => { document.getElementById(state.id).style.width = state.width; }",
-            {"id": source["id"], "width": original_style},
-        )
-        page.wait_for_function(
-            """id => {
-                const chart = window.__kymo_charts[id];
-                const width = document.getElementById(id).getBoundingClientRect().width;
-                return chart && Math.abs(chart.width - width) <= 1;
-            }""",
-            arg=source["id"],
-        )
+        container.evaluate("(e, width) => { e.style.width = width; }", original_style)
+        fitted_box(container)
 
     settle(page)
     if events(page):

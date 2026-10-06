@@ -4,7 +4,7 @@ This standalone harness gates the transport assumptions in the AI-1433 local-dep
 
 The ClickHouse version and hashes come from `../../shared/local-runtime-artifacts.json`, and its configuration from `../../local-runtime/core`, so the harness and launcher cannot silently drift to different release inputs or laptop profiles.
 
-The browser fixtures share `fences_common.py` for the frozen WebSocket envelope, a two-animation-frame barrier and a handle drag. It has no protobuf or Playwright imports: each fixture owns its generated messages, response behavior, and RPC waiting rules. New fixtures should reuse this module rather than introducing another framing implementation. Run its golden wire vectors with `python -m unittest -v test_fences_common`.
+The browser fixtures share `fences_common.py` for the frozen WebSocket envelope, a two-animation-frame barrier, a handle drag and a wait for a chart to take its container's width. It has no protobuf or Playwright imports: each fixture owns its generated messages, response behavior, and RPC waiting rules. New fixtures should reuse this module rather than introducing another framing implementation. Run its golden wire vectors with `python -m unittest -v test_fences_common`.
 
 ## Frozen inputs
 
