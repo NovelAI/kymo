@@ -45,6 +45,7 @@ use futures::channel::{mpsc, oneshot};
 use futures::{select, FutureExt, SinkExt, StreamExt};
 use gloo_net::websocket::{futures::WebSocket, Message, State};
 use prost::Message as _;
+use tokio::sync::watch;
 use tonic::Status;
 
 /// A response that never arrives (server-side task panic, dropped frame)
@@ -55,124 +56,6 @@ const REQUEST_TIMEOUT_MS: u64 = 60_000;
 /// this covers the longest lifecycle RPC's roughly 120-second server budget;
 /// expiry never replays a queued or in-flight mutation.
 const MUTATION_RESPONSE_TIMEOUT_MS: u64 = 150_000;
-
-/// A versioned value with parked wakers — the handoff between the socket
-/// task (which runs outside the dioxus runtime and can't write signals)
-/// and async consumers. Backs the page-hidden, connection-state and reconnect-intent flags;
-/// push events use the subscriber hub below.
-#[derive(Default)]
-struct WatchState {
-    generation: u64,
-    value: bool,
-    next_waiter_id: u64,
-    waiters: HashMap<u64, std::task::Waker>,
-}
-
-#[derive(Default)]
-pub(super) struct Watch(std::sync::Mutex<WatchState>);
-
-pub(super) struct WatchChanged<'a> {
-    watch: &'a Watch,
-    seen: u64,
-    waiter_id: Option<u64>,
-}
-
-impl std::future::Future for WatchChanged<'_> {
-    type Output = (u64, bool);
-
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        let this = self.get_mut();
-        let mut state = this.watch.0.lock().unwrap();
-        if state.generation > this.seen {
-            if let Some(waiter_id) = this.waiter_id.take() {
-                state.waiters.remove(&waiter_id);
-            }
-            return std::task::Poll::Ready((state.generation, state.value));
-        }
-
-        let waiter_id = *this.waiter_id.get_or_insert_with(|| loop {
-            let candidate = state.next_waiter_id;
-            state.next_waiter_id = state.next_waiter_id.wrapping_add(1);
-            if !state.waiters.contains_key(&candidate) {
-                break candidate;
-            }
-        });
-        match state.waiters.entry(waiter_id) {
-            Entry::Occupied(mut entry) if !entry.get().will_wake(cx.waker()) => {
-                entry.insert(cx.waker().clone());
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(cx.waker().clone());
-            }
-            Entry::Occupied(_) => {}
-        }
-        std::task::Poll::Pending
-    }
-}
-
-impl Drop for WatchChanged<'_> {
-    fn drop(&mut self) {
-        if let Some(waiter_id) = self.waiter_id {
-            self.watch.0.lock().unwrap().waiters.remove(&waiter_id);
-        }
-    }
-}
-
-impl Watch {
-    /// Apply `f`; if it returns true, bump the generation and wake waiters.
-    pub(super) fn update(&self, f: impl FnOnce(&mut bool) -> bool) {
-        let wakers = {
-            let mut state = self.0.lock().unwrap();
-            if !f(&mut state.value) {
-                return;
-            }
-            state.generation += 1;
-            state
-                .waiters
-                .drain()
-                .map(|(_, waker)| waker)
-                .collect::<Vec<_>>()
-        };
-        for waker in wakers {
-            waker.wake();
-        }
-    }
-
-    /// Current (gen, value) without waiting.
-    pub(super) fn get(&self) -> (u64, bool) {
-        let state = self.0.lock().unwrap();
-        (state.generation, state.value)
-    }
-
-    /// Await the generation advancing past `seen`, returning (gen, value).
-    pub(super) fn changed(&self, seen: u64) -> WatchChanged<'_> {
-        WatchChanged {
-            watch: self,
-            seen,
-            waiter_id: None,
-        }
-    }
-
-    /// Await `pred(value)` holding (immediately if it already does).
-    /// Waiters woken by an update re-check and re-park if it doesn't.
-    async fn wait_for(&self, pred: impl Fn(bool) -> bool) {
-        loop {
-            let (generation, value) = self.get();
-            if pred(value) {
-                return;
-            }
-            self.changed(generation).await;
-        }
-    }
-
-    #[cfg(test)]
-    fn waiter_count(&self) -> usize {
-        self.0.lock().unwrap().waiters.len()
-    }
-}
 
 /// Cumulative server-pushed state used only to seed a new subscriber. Steady
 /// state is delivered as [`PushUpdate`] deltas, so an event touching one run
@@ -232,62 +115,11 @@ impl PushUpdate {
     /// the exact state a slow consumer needs without retaining a backlog.
     fn merge(&mut self, newer: Self) {
         self.initial |= newer.initial;
-        merge_optional_max(&mut self.resync_gen, newer.resync_gen);
+        self.resync_gen = self.resync_gen.max(newer.resync_gen);
         merge_versions(&mut self.runs, newer.runs);
         merge_versions(&mut self.projects, newer.projects);
-        merge_optional_max(&mut self.global, newer.global);
+        self.global = self.global.max(newer.global);
         merge_versions(&mut self.metrics_gen, newer.metrics_gen);
-    }
-}
-
-fn merge_optional_max(into: &mut Option<u64>, from: Option<u64>) {
-    if let Some(value) = from {
-        *into = Some(into.map_or(value, |current| current.max(value)));
-    }
-}
-
-#[derive(Default)]
-struct PushInboxState {
-    pending: Option<PushUpdate>,
-    waker: Option<std::task::Waker>,
-}
-
-#[derive(Default)]
-struct PushInbox(std::sync::Mutex<PushInboxState>);
-
-impl PushInbox {
-    /// Queue a seed/delta and return a parked waker for the hub to wake after releasing its own lock.
-    fn push(&self, update: &PushUpdate) -> Option<std::task::Waker> {
-        let mut state = self.0.lock().unwrap();
-        if let Some(pending) = &mut state.pending {
-            pending.merge(update.clone());
-        } else {
-            state.pending = Some(update.clone());
-        }
-        state.waker.take()
-    }
-
-    fn take(&self) -> Option<PushUpdate> {
-        self.0.lock().unwrap().pending.take()
-    }
-
-    async fn next(&self) -> PushUpdate {
-        std::future::poll_fn(|cx| {
-            let mut state = self.0.lock().unwrap();
-            if let Some(update) = state.pending.take() {
-                std::task::Poll::Ready(update)
-            } else {
-                let replace = state
-                    .waker
-                    .as_ref()
-                    .is_none_or(|waker| !waker.will_wake(cx.waker()));
-                if replace {
-                    state.waker = Some(cx.waker().clone());
-                }
-                std::task::Poll::Pending
-            }
-        })
-        .await
     }
 }
 
@@ -295,7 +127,7 @@ impl PushInbox {
 struct PushHubState {
     initialized: bool,
     snapshot: PushSnapshot,
-    subscribers: Vec<Weak<PushInbox>>,
+    subscribers: Vec<Weak<watch::Sender<PushUpdate>>>,
 }
 
 #[derive(Default)]
@@ -308,42 +140,32 @@ impl PushHub {
             .subscribers
             .retain(|subscriber| subscriber.strong_count() > 0);
         let pending = state.initialized.then(|| PushUpdate::seed(&state.snapshot));
-        let inbox = Arc::new(PushInbox(std::sync::Mutex::new(PushInboxState {
-            pending,
-            waker: None,
-        })));
+        let inbox = Arc::new(watch::Sender::new(pending.unwrap_or_default()));
         state.subscribers.push(Arc::downgrade(&inbox));
         PushSubscription { inbox }
     }
 
     fn publish(&self, apply: impl FnOnce(&mut PushSnapshot) -> PushUpdate) {
-        let mut wakes = Vec::new();
-        {
-            let mut state = self.0.lock().unwrap();
-            let was_initialized = state.initialized;
-            let delta = apply(&mut state.snapshot);
-            if delta.is_empty() {
-                return;
-            }
-            let update = if was_initialized {
-                delta
-            } else {
-                PushUpdate::seed(&state.snapshot)
+        let mut state = self.0.lock().unwrap();
+        let was_initialized = state.initialized;
+        let delta = apply(&mut state.snapshot);
+        if delta.is_empty() {
+            return;
+        }
+        let update = if was_initialized {
+            delta
+        } else {
+            PushUpdate::seed(&state.snapshot)
+        };
+        state.initialized = true;
+        // Wakes subscribers while holding the hub lock, which is safe because no waker takes that lock: on wasm a wake only queues the task.
+        state.subscribers.retain(|weak| {
+            let Some(inbox) = weak.upgrade() else {
+                return false;
             };
-            state.initialized = true;
-            state.subscribers.retain(|weak| {
-                let Some(inbox) = weak.upgrade() else {
-                    return false;
-                };
-                if let Some(waker) = inbox.push(&update) {
-                    wakes.push(waker);
-                }
-                true
-            });
-        }
-        for waker in wakes {
-            waker.wake();
-        }
+            inbox.send_modify(|pending| pending.merge(update.clone()));
+            true
+        });
     }
 
     /// Merge one server push event into the cumulative seed and publish only the
@@ -393,30 +215,36 @@ impl PushHub {
 /// coalescing inbox, so a slow or hidden page wakes once with the newest delta
 /// instead of draining an event queue.
 pub struct PushSubscription {
-    inbox: Arc<PushInbox>,
+    /// Unread seeds and deltas, merged (see `PushUpdate::merge`); empty means nothing is pending.
+    inbox: Arc<watch::Sender<PushUpdate>>,
 }
 
 impl PushSubscription {
     /// Await the next seed/delta while the page is visible. Updates arriving
     /// during the hidden wait are folded into the same delivery.
     pub async fn next_visible(&mut self) -> PushUpdate {
-        let mut update = self.inbox.next().await;
-        loop {
-            if page_hidden() {
-                wait_until_page_visible().await;
-                continue;
-            }
-            if let Some(next) = self.inbox.take() {
-                update.merge(next);
-            }
-            return update;
-        }
+        // Only this subscription empties its inbox, so it is still non-empty at the take.
+        let _ = self
+            .inbox
+            .subscribe()
+            .wait_for(|pending| !pending.is_empty())
+            .await;
+        wait_until_page_visible().await;
+        self.take()
+    }
+
+    /// The unread merged update, leaving the inbox empty.
+    fn take(&self) -> PushUpdate {
+        self.inbox.send_replace(PushUpdate::default())
     }
 }
 
 static PUSH: LazyLock<PushHub> = LazyLock::new(Default::default);
-static HIDDEN: LazyLock<Watch> = LazyLock::new(Default::default);
-static CONNECTED: LazyLock<Watch> = LazyLock::new(Default::default);
+/// `document.hidden`, set by the root's visibility bridge; the connection task mirrors it to the server.
+static HIDDEN: LazyLock<watch::Sender<bool>> = LazyLock::new(|| watch::Sender::new(false));
+/// Written by the connection task, which runs outside the dioxus runtime and can't write signals; read through `connection()`.
+static CONNECTED: LazyLock<watch::Sender<(u64, bool)>> =
+    LazyLock::new(|| watch::Sender::new((0, false)));
 /// Set when the server refuses this bundle's wire revision; the connection task has then stopped for good.
 static STALE: AtomicBool = AtomicBool::new(false);
 
@@ -426,7 +254,7 @@ pub fn subscribe_push() -> PushSubscription {
 
 /// `(generation, connected)`: the generation bumps on every connect and disconnect, so 0 means the socket has never connected.
 pub fn connection() -> (u64, bool) {
-    CONNECTED.get()
+    *CONNECTED.borrow()
 }
 
 /// Whether the server refused this bundle's wire revision, so the tab no longer connects.
@@ -436,7 +264,7 @@ pub fn is_stale() -> bool {
 
 /// Resolves on the first connect or disconnect after generation `seen`.
 pub async fn connection_changed(seen: u64) {
-    CONNECTED.changed(seen).await;
+    let _ = CONNECTED.subscribe().wait_for(|&(gen, _)| gen > seen).await;
 }
 
 /// Sleep `ms` of CONNECTED time: parked while the socket is down, restarted
@@ -444,15 +272,12 @@ pub async fn connection_changed(seen: u64) {
 /// — its response wasn't lost, it was never sent — while a live socket
 /// that stays silent for the full window still fails the caller.
 async fn live_deadline(ms: u64) {
+    let mut connection = CONNECTED.subscribe();
     loop {
-        let (gen, connected) = CONNECTED.get();
-        if !connected {
-            let _ = CONNECTED.changed(gen).await;
-            continue;
-        }
-        futures::select! {
-            _ = gloo_timers::future::sleep(std::time::Duration::from_millis(ms)).fuse() => return,
-            _ = CONNECTED.changed(gen).fuse() => {} // disconnected: park and restart
+        let _ = connection.wait_for(|&(_, connected)| connected).await;
+        select! {
+            _ = gloo_timers::future::sleep(Duration::from_millis(ms)).fuse() => return,
+            _ = connection.changed().fuse() => {} // disconnected: park and restart
         }
     }
 }
@@ -496,12 +321,12 @@ pub fn merge_versions(
 }
 
 pub(super) fn page_hidden() -> bool {
-    HIDDEN.get().1
+    *HIDDEN.borrow()
 }
 
 /// Resolves once the page is visible (immediately if it already is).
 pub async fn wait_until_page_visible() {
-    HIDDEN.wait_for(|h| !h).await
+    let _ = HIDDEN.subscribe().wait_for(|hidden| !hidden).await;
 }
 
 /// Record a visibility flip (from the root component's visibilitychange
@@ -511,11 +336,7 @@ pub async fn wait_until_page_visible() {
 /// could re-enqueue opposite flips in drop order, leaving the server quiet
 /// on a visible tab.
 pub fn set_page_visibility(hidden: bool) {
-    HIDDEN.update(|h| {
-        let changed = *h != hidden;
-        *h = hidden;
-        changed
-    });
+    HIDDEN.send_replace(hidden);
 }
 
 struct Pending {
@@ -598,12 +419,13 @@ impl WsClient {
         // absolute from enqueue through response: if it expires while queued,
         // dropping this receiver makes the connection task discard it without sending;
         // if already sent, reconciliation observes the outcome without replay.
-        let mut timeout = std::pin::pin!(if replay_on_disconnect {
-            futures::future::Either::Left(live_deadline(REQUEST_TIMEOUT_MS))
-        } else {
-            futures::future::Either::Right(gloo_timers::future::sleep(Duration::from_millis(
-                MUTATION_RESPONSE_TIMEOUT_MS,
-            )))
+        let mut timeout = std::pin::pin!(async {
+            if replay_on_disconnect {
+                live_deadline(REQUEST_TIMEOUT_MS).await;
+            } else {
+                gloo_timers::future::sleep(Duration::from_millis(MUTATION_RESPONSE_TIMEOUT_MS))
+                    .await;
+            }
         }
         .fuse());
         // A dropped oneshot is the only transport-loss signal — the socket
@@ -641,9 +463,6 @@ impl WsClient {
                         ));
                     }
                 },
-                // The connection task may retain this sender until a late response or
-                // disconnect. Its receiver is dropped, so it cannot replay or
-                // otherwise continue the caller's mutation workflow.
                 _ = timeout => {
                     // Exact on single-threaded wasm: the connection task can't dequeue the request between the `sent` check and the return that drops the receiver.
                     return Err(if replay_on_disconnect {
@@ -715,22 +534,18 @@ async fn connection_task(mut requests: mpsc::UnboundedReceiver<Pending>) {
         // consumers to resync. Also fires on the FIRST connect, seeding the
         // page's initial version fetch.
         PUSH.note_connected();
-        CONNECTED.update(|c| {
-            let changed = !*c;
-            *c = true;
-            changed
-        });
+        CONNECTED.send_modify(|(gen, connected)| (*gen, *connected) = (*gen + 1, true));
         let (mut sink, stream) = ws.split();
         let mut stream = stream.fuse();
         // Server-side quiet mirror, level-triggered: converge what this
         // CONNECTION last told the server (fresh connections start
-        // un-quieted) to the hidden flag — seen_vis_gen = 0 makes the
-        // visibility arm fire immediately if the flag ever flipped, and
-        // each later flip bumps its gen. Sending only the latest state (no
+        // un-quieted) to the hidden flag — the visibility arm fires whenever
+        // the flag differs from what was last sent, so a hidden tab's fresh
+        // connection sends at once. Sending only the latest state (no
         // queued per-flip messages) makes reordering impossible. Control
         // frames take an id but expect no reply (a refusing server still answers them).
         let mut sent_hidden = false;
-        let mut seen_vis_gen = 0u64;
+        let mut visibility = HIDDEN.subscribe();
         // Parked oneshots, by correlation id. Dropped wholesale on
         // disconnect. Read-only unary calls re-enqueue; no-replay mutation
         // calls surface the lost response for authoritative reconciliation.
@@ -758,18 +573,14 @@ async fn connection_task(mut requests: mpsc::UnboundedReceiver<Pending>) {
                     }
                     inflight.insert(next_id, p.resp);
                 }
-                vis = HIDDEN.changed(seen_vis_gen).fuse() => {
-                    let (gen, hidden) = vis;
-                    seen_vis_gen = gen;
-                    if hidden != sent_hidden {
-                        sent_hidden = hidden;
-                        next_id = next_id.wrapping_add(1).max(1);
-                        let body =
-                            super::proto::PushControlRequest { quiet: hidden }.encode_to_vec();
-                        let frame = encode_request(next_id, super::ws_rpc::PUSH_CONTROL, &body);
-                        if sink.send(Message::Bytes(frame)).await.is_err() {
-                            break;
-                        }
+                _ = visibility.wait_for(|&hidden| hidden != sent_hidden).map(drop).fuse() => {
+                    sent_hidden = *HIDDEN.borrow();
+                    next_id = next_id.wrapping_add(1).max(1);
+                    let body =
+                        super::proto::PushControlRequest { quiet: sent_hidden }.encode_to_vec();
+                    let frame = encode_request(next_id, super::ws_rpc::PUSH_CONTROL, &body);
+                    if sink.send(Message::Bytes(frame)).await.is_err() {
+                        break;
                     }
                 }
                 msg = stream.next() => {
@@ -806,12 +617,7 @@ async fn connection_task(mut requests: mpsc::UnboundedReceiver<Pending>) {
                 }
             }
         }
-        drop(inflight);
-        CONNECTED.update(|c| {
-            let changed = *c;
-            *c = false;
-            changed
-        });
+        CONNECTED.send_modify(|(gen, connected)| (*gen, *connected) = (*gen + 1, false));
         if is_stale() {
             // Stop for good, never reload by ourselves: dropping `requests` fails every waiting and later call at once, and the notice bar asks the user to reload.
             return;
@@ -864,91 +670,40 @@ mod push_tests {
     }
 
     #[test]
-    fn canceled_watch_waiters_unregister_without_a_state_change() {
-        let watch = Watch::default();
-        let (generation, _) = watch.get();
-        let canceled_counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
-        let canceled_waker = waker_ref(&canceled_counter);
-        let mut canceled_context = Context::from_waker(&canceled_waker);
-        let mut canceled = Box::pin(watch.changed(generation));
-        assert!(matches!(
-            canceled.as_mut().poll(&mut canceled_context),
-            Poll::Pending
-        ));
-        assert_eq!(watch.waiter_count(), 1);
-        drop(canceled);
-        assert_eq!(watch.waiter_count(), 0);
-
-        let live_counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
-        let live_waker = waker_ref(&live_counter);
-        let mut live_context = Context::from_waker(&live_waker);
-        let mut live = Box::pin(watch.changed(generation));
-        assert!(matches!(
-            live.as_mut().poll(&mut live_context),
-            Poll::Pending
-        ));
-        watch.update(|value| {
-            *value = true;
-            true
-        });
-        assert_eq!(canceled_counter.0.load(Ordering::SeqCst), 0);
-        assert_eq!(live_counter.0.load(Ordering::SeqCst), 1);
-        assert_eq!(watch.waiter_count(), 0);
-        assert!(matches!(
-            live.as_mut().poll(&mut live_context),
-            Poll::Ready((1, true))
-        ));
-    }
-
-    #[test]
-    fn canceled_watch_predicate_waits_unregister_too() {
-        let watch = Watch::default();
-        let counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
-        let waker = waker_ref(&counter);
-        let mut context = Context::from_waker(&waker);
-        let mut wait = Box::pin(watch.wait_for(|value| value));
-        assert!(matches!(wait.as_mut().poll(&mut context), Poll::Pending));
-        assert_eq!(watch.waiter_count(), 1);
-        drop(wait);
-        assert_eq!(watch.waiter_count(), 0);
-
-        let (generation, _) = watch.get();
-        watch.update(|value| {
-            *value = true;
-            true
-        });
-        let mut changed = Box::pin(watch.changed(generation));
-        assert!(matches!(
-            changed.as_mut().poll(&mut context),
-            Poll::Ready((1, true))
-        ));
-        assert_eq!(watch.waiter_count(), 0);
-    }
-
-    #[test]
     fn preconnect_subscriber_waits_and_first_delivery_is_the_full_seed() {
-        let hub = Arc::new(PushHub::default());
+        let hub = PushHub::default();
         let subscriber = hub.subscribe();
-        assert_eq!(subscriber.inbox.take(), None);
+        assert!(subscriber.take().is_empty());
 
         hub.note_connected();
-        let seed = subscriber.inbox.take().unwrap();
+        let seed = subscriber.take();
         assert!(seed.initial);
         assert_eq!(seed.resync_gen, Some(1));
         assert_eq!(seed.global, Some(0));
     }
 
     #[test]
-    fn publishing_wakes_a_parked_subscriber() {
-        let hub = Arc::new(PushHub::default());
+    fn a_late_subscriber_gets_its_seed_from_next_visible_without_a_wake() {
+        let hub = PushHub::default();
         hub.note_connected();
-        let subscriber = hub.subscribe();
-        subscriber.inbox.take().unwrap();
+        let mut late = hub.subscribe();
+        assert!(matches!(
+            late.next_visible().now_or_never(),
+            Some(update) if update.initial
+        ));
+    }
+
+    #[test]
+    fn publishing_wakes_a_parked_subscriber() {
+        let hub = PushHub::default();
+        hub.note_connected();
+        let mut subscriber = hub.subscribe();
+        subscriber.take();
 
         let counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
         let waker = waker_ref(&counter);
         let mut context = Context::from_waker(&waker);
-        let next = subscriber.inbox.next();
+        let next = subscriber.next_visible();
         futures::pin_mut!(next);
         assert!(matches!(next.as_mut().poll(&mut context), Poll::Pending));
 
@@ -962,7 +717,7 @@ mod push_tests {
 
     #[test]
     fn steady_state_delivery_contains_only_entries_that_rose() {
-        let hub = Arc::new(PushHub::default());
+        let hub = PushHub::default();
         hub.note_connected();
         hub.apply_event(event(
             &[("old-a", 3), ("old-b", 7)],
@@ -972,13 +727,13 @@ mod push_tests {
             false,
         ));
         let subscriber = hub.subscribe();
-        let seed = subscriber.inbox.take().unwrap();
+        let seed = subscriber.take();
         assert!(seed.initial);
         assert_eq!(seed.runs.len(), 2);
         assert_eq!(seed.projects.len(), 2);
 
         hub.apply_event(event(&[("old-a", 4)], &[("project-a", 5)], 0, &[], false));
-        let delta = subscriber.inbox.take().unwrap();
+        let delta = subscriber.take();
         assert!(!delta.initial);
         assert_eq!(delta.runs, versions(&[("old-a", 4)]));
         assert_eq!(delta.projects, versions(&[("project-a", 5)]));
@@ -989,14 +744,14 @@ mod push_tests {
 
     #[test]
     fn stale_versions_are_ignored_instead_of_waking_consumers() {
-        let hub = Arc::new(PushHub::default());
+        let hub = PushHub::default();
         hub.note_connected();
         hub.apply_event(event(&[("run", 9)], &[("project", 11)], 4, &[], false));
         let subscriber = hub.subscribe();
-        subscriber.inbox.take().unwrap();
+        subscriber.take();
 
         hub.apply_event(event(&[("run", 8)], &[("project", 10)], 3, &[], false));
-        assert_eq!(subscriber.inbox.take(), None);
+        assert!(subscriber.take().is_empty());
         let state = hub.0.lock().unwrap();
         assert_eq!(state.snapshot.runs["run"], 9);
         assert_eq!(state.snapshot.projects["project"], 11);
@@ -1005,23 +760,23 @@ mod push_tests {
 
     #[test]
     fn zero_version_for_a_new_entity_is_not_confused_with_no_change() {
-        let hub = Arc::new(PushHub::default());
+        let hub = PushHub::default();
         hub.note_connected();
         let subscriber = hub.subscribe();
-        subscriber.inbox.take().unwrap();
+        subscriber.take();
 
         hub.apply_event(event(&[("run", 0)], &[("project", 0)], 0, &[], false));
-        let delta = subscriber.inbox.take().unwrap();
+        let delta = subscriber.take();
         assert_eq!(delta.runs, versions(&[("run", 0)]));
         assert_eq!(delta.projects, versions(&[("project", 0)]));
     }
 
     #[test]
     fn unread_events_coalesce_into_one_monotonic_delivery() {
-        let hub = Arc::new(PushHub::default());
+        let hub = PushHub::default();
         hub.note_connected();
         let subscriber = hub.subscribe();
-        subscriber.inbox.take().unwrap();
+        subscriber.take();
 
         hub.apply_event(event(&[("run", 2)], &[], 5, &["run"], false));
         hub.apply_event(event(
@@ -1032,36 +787,36 @@ mod push_tests {
             true,
         ));
 
-        let delta = subscriber.inbox.take().unwrap();
+        let delta = subscriber.take();
         assert_eq!(delta.runs, versions(&[("run", 4), ("other", 3)]));
         assert_eq!(delta.projects, versions(&[("project", 6)]));
         assert_eq!(delta.global, Some(5));
         assert_eq!(delta.metrics_gen, versions(&[("run", 2)]));
         assert_eq!(delta.resync_gen, Some(2));
-        assert_eq!(subscriber.inbox.take(), None);
+        assert!(subscriber.take().is_empty());
     }
 
     #[test]
     fn subscribers_are_independent_and_late_mounts_get_current_seed() {
-        let hub = Arc::new(PushHub::default());
+        let hub = PushHub::default();
         hub.note_connected();
         let first = hub.subscribe();
-        first.inbox.take().unwrap();
+        first.take();
 
         hub.apply_event(event(&[("run", 3)], &[], 0, &[], false));
         let late = hub.subscribe();
-        let late_seed = late.inbox.take().unwrap();
+        let late_seed = late.take();
         assert!(late_seed.initial);
         assert_eq!(late_seed.runs, versions(&[("run", 3)]));
 
-        assert_eq!(first.inbox.take().unwrap().runs, versions(&[("run", 3)]));
+        assert_eq!(first.take().runs, versions(&[("run", 3)]));
         assert_eq!(hub.0.lock().unwrap().subscribers.len(), 2);
         drop(first);
         assert_eq!(hub.0.lock().unwrap().subscribers.len(), 2);
 
         hub.apply_event(event(&[("run", 4)], &[], 0, &[], false));
         assert_eq!(hub.0.lock().unwrap().subscribers.len(), 1);
-        assert_eq!(late.inbox.take().unwrap().runs, versions(&[("run", 4)]));
+        assert_eq!(late.take().runs, versions(&[("run", 4)]));
     }
 }
 

@@ -393,7 +393,7 @@ async fn handle_socket(
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(EVENT_COALESCE_MS));
     // Delay, not Skip: Delay reschedules a full period after a late tick fires (first event after quiet still flushes immediately), so one connection's frames are genuinely ≥ the period apart; Skip re-anchors to phase boundaries and can emit two frames milliseconds apart. Cache correctness does NOT ride on this spacing (series_cache's bump gate owns that — spacing arguments proved unsound across sockets); this is honest per-connection rate limiting only.
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    'serve: loop {
+    loop {
         let dirty_any = !dirty_runs.is_empty()
             || !dirty_projects.is_empty()
             || dirty_global != 0
@@ -445,12 +445,12 @@ async fn handle_socket(
                 // it the buffer and re-slice by offset instead of re-parsing.
                 let path = path.to_owned();
                 let body_start = buf.len() - body.len();
-                while tasks.len() >= MAX_IN_FLIGHT {
+                if tasks.len() >= MAX_IN_FLIGHT {
                     tokio::select! {
                         _ = tasks.join_next() => {}
-                        _ = closing.changed() => break 'serve,
+                        _ = closing.changed() => break,
                     }
-                    // This loop stopped reading, so the peer's queued pongs are not its silence.
+                    // The cap wait reads nothing, so the peer's queued pongs are not its silence.
                     last_heard = tokio::time::Instant::now();
                 }
                 let svc = svc.clone();

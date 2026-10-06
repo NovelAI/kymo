@@ -581,7 +581,7 @@ impl BumpCoalescer {
     fn new(activity: Arc<crate::activity::ActivityTracker>) -> Self {
         Self {
             state: std::sync::Mutex::new(CoalescerState::default()),
-            draining: tokio::sync::watch::channel(false).0,
+            draining: tokio::sync::watch::Sender::new(false),
             activity,
         }
     }

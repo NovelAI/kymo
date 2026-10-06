@@ -3,13 +3,14 @@ use dioxus::prelude::*;
 use crate::components::metric_grid::MetricGrid;
 use crate::grpc::proto::RunLifecycleState;
 use crate::route::{ChartQuery, Route};
+use crate::state::app_state::request_refresh;
 use crate::state::trash::{clock_wait_ms, compact_duration, effective_lifecycle};
 use crate::state::{DashboardState, DirectRunLoad};
 use crate::util::primary;
 
 #[component]
 pub fn RunPage(project_id: String, run_id: String, chart: ChartQuery) -> Element {
-    let mut state = use_context::<DashboardState>();
+    let state = use_context::<DashboardState>();
     // `chart` is consumed by DashboardLayout's URL→overlay sync, not here;
     // it is a prop only because route fields are.
     let _ = chart;
@@ -79,8 +80,7 @@ pub fn RunPage(project_id: String, run_id: String, chart: ChartQuery) -> Element
                 button {
                     class: "btn btn-ghost",
                     onmousedown: primary(move |_| {
-                        let next = state.direct_run_refresh.peek().wrapping_add(1);
-                        state.direct_run_refresh.set(next);
+                        request_refresh(state.direct_run_refresh)
                     }),
                     "Retry"
                 }

@@ -214,6 +214,14 @@ pub enum DirectRunLoad {
     Error(String),
 }
 
+/// Bump a reload generation, unless the socket is down: the reconnect's resync reloads the page, and a reload queued now would go out beside it.
+pub fn request_refresh(mut refresh: Signal<u64>) {
+    if crate::grpc::connection().1 {
+        let next = refresh.peek().wrapping_add(1);
+        refresh.set(next);
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct DashboardState {
     pub project_id: Signal<String>,
@@ -385,16 +393,6 @@ impl DashboardState {
             grid_mounted: Signal::new(false),
             grpc: CopyValue::new(GrpcClient::new()),
         }
-    }
-
-    /// Does nothing while disconnected: the reconnect's resync reloads the list, and a refresh queued now would go out beside it.
-    pub fn request_runs_refresh(&self) {
-        if !crate::grpc::connection().1 {
-            return;
-        }
-        let mut refresh = self.runs_refresh;
-        let next = refresh.peek().wrapping_add(1);
-        refresh.set(next);
     }
 
     pub fn remember_display_runs(&self, runs: &[RunInfo]) {

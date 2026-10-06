@@ -9,6 +9,7 @@ use crate::grpc::proto::{
 };
 use crate::grpc::GrpcClient;
 use crate::route::Route;
+use crate::state::app_state::request_refresh;
 use crate::state::trash::{
     clock_wait_ms, compact_duration, effective_lifecycle, extrapolated_now_ms, lookup_trashed_runs,
     monotonic_now_ms,
@@ -217,7 +218,7 @@ impl TrashPageData {
 #[component]
 pub fn TrashPage() -> Element {
     let mut data = use_signal(TrashPageData::default);
-    let mut refresh = use_signal(|| 0u64);
+    let refresh = use_signal(|| 0u64);
     let restoring = use_signal(HashSet::<String>::new);
     let action_message = use_signal(String::new);
 
@@ -228,9 +229,8 @@ pub fn TrashPage() -> Element {
         let mut subscription = crate::grpc::subscribe_push();
         loop {
             let update = subscription.next_visible().await;
-            if update.initial || update.global.is_some() || update.resync_gen.is_some() {
-                let next = refresh.peek().wrapping_add(1);
-                refresh.set(next);
+            if update.global.is_some() || update.resync_gen.is_some() {
+                request_refresh(refresh);
             }
         }
     });
@@ -308,10 +308,7 @@ pub fn TrashPage() -> Element {
                         button {
                             class: "btn btn-ghost",
                             disabled: page.loading,
-                            onmousedown: primary(move |_| {
-                                let next = refresh.peek().wrapping_add(1);
-                                refresh.set(next);
-                            }),
+                            onmousedown: primary(move |_| request_refresh(refresh)),
                             "Retry"
                         }
                     }
@@ -401,11 +398,13 @@ pub fn TrashPage() -> Element {
                                                 ..Default::default()
                                             })
                                             .await;
+                                        if *refresh.peek() != expected_refresh {
+                                            return;
+                                        }
                                         match response {
                                             Ok(response)
                                                 if response.global_version == expected_version
-                                                    && data.peek().version == expected_version
-                                                    && *refresh.peek() == expected_refresh => {
+                                                    && data.peek().version == expected_version => {
                                                 let previous_count = data.peek().runs.len();
                                                 let final_page = response.next.is_none();
                                                 let mut page = data.write();
@@ -418,18 +417,15 @@ pub fn TrashPage() -> Element {
                                                     focus_after_final_page(previous_count).await;
                                                 }
                                             }
-                                            Ok(_) if *refresh.peek() == expected_refresh => {
+                                            Ok(_) => {
                                                 data.write().loading_more = false;
-                                                let next = refresh.peek().wrapping_add(1);
-                                                refresh.set(next);
+                                                request_refresh(refresh);
                                             }
-                                            Ok(_) => {}
-                                            Err(status) if *refresh.peek() == expected_refresh => {
+                                            Err(status) => {
                                                 let mut page = data.write();
                                                 page.loading_more = false;
                                                 page.load_more_error = Some(status.message().to_string());
                                             }
-                                            Err(_) => {}
                                         }
                                     });
                                 }),
@@ -450,7 +446,7 @@ fn trash_row(
     mut restoring: Signal<HashSet<String>>,
     mut action_message: Signal<String>,
     mut data: Signal<TrashPageData>,
-    mut refresh: Signal<u64>,
+    refresh: Signal<u64>,
 ) -> Element {
     let Some(run) = record.run.as_ref() else {
         return rsx! {};
@@ -633,11 +629,7 @@ fn trash_row(
                                         }
                                     }
                                 }
-                                // While disconnected, the reconnect's resync reloads the page, and a refresh queued now would go out beside it.
-                                if crate::grpc::connection().1 {
-                                    let next = refresh.peek().wrapping_add(1);
-                                    refresh.set(next);
-                                }
+                                request_refresh(refresh);
                                 restoring.write().remove(&key);
                             });
                         }

@@ -12,7 +12,7 @@ use crate::components::sidebar::Sidebar;
 use crate::components::uplot_chart::ZoomBridge;
 use crate::grpc::proto::{MetricInfo, RunLifecycleState};
 use crate::route::{focus_chart, Route};
-use crate::state::app_state::{ExplicitRunKey, ExplicitRunMetadata};
+use crate::state::app_state::{request_refresh, ExplicitRunKey, ExplicitRunMetadata};
 use crate::state::layout_config::{resolve_rect_locally, RunRef};
 use crate::state::push::PushBridge;
 use crate::state::visibility::{
@@ -254,9 +254,8 @@ pub fn DashboardLayout(project_id: String) -> Element {
                     let new_ids: std::collections::HashSet<String> =
                         new_runs.iter().map(|r| r.run_id.clone()).collect();
                     let removed_runs = old_runs
-                        .iter()
+                        .into_iter()
                         .filter(|run| !new_ids.contains(&run.run_id))
-                        .cloned()
                         .collect::<Vec<_>>();
                     state.remember_display_runs(&removed_runs);
                     // Hidden/removed runs leave the project selection, while
@@ -265,11 +264,7 @@ pub fn DashboardLayout(project_id: String) -> Element {
                     // the URL, independently of this project-list selection.
                     let mut next_selected = state.selected_runs.peek().clone();
                     next_selected.retain(|run_id| new_ids.contains(run_id));
-                    if old_ids.is_empty() {
-                        next_selected.extend(new_ids.iter().cloned());
-                    } else {
-                        next_selected.extend(new_ids.difference(&old_ids).cloned());
-                    }
+                    next_selected.extend(new_ids.difference(&old_ids).cloned());
                     if *state.selected_runs.peek() != next_selected {
                         state.selected_runs.set(next_selected);
                     }
@@ -472,8 +467,7 @@ pub fn DashboardLayout(project_id: String) -> Element {
                         Err(status)
                             if crate::state::visibility::is_terminal_run_status(&status) =>
                         {
-                            let next = state.direct_run_refresh.peek().wrapping_add(1);
-                            state.direct_run_refresh.set(next);
+                            request_refresh(state.direct_run_refresh);
                             return;
                         }
                         Err(_) => unreachable!("retry_visible_run returns only lifecycle errors"),

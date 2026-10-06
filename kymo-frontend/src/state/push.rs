@@ -5,16 +5,16 @@ use dioxus::prelude::*;
 use gloo_timers::future::sleep;
 
 use crate::grpc::proto::RunLifecycleState;
+use crate::state::app_state::request_refresh;
 use crate::state::layout_config::{run_ref_ids, RunRef, ViewContext};
 use crate::state::visibility::retry_visible;
 use crate::state::{DashboardState, DirectRunLoad, LayoutConfig};
 
-fn refresh_direct_run(mut state: DashboardState) {
+fn refresh_direct_run(state: DashboardState) {
     if state.current_run.peek().is_some()
         || !matches!(&*state.direct_run.peek(), DirectRunLoad::Idle)
     {
-        let next = state.direct_run_refresh.peek().wrapping_add(1);
-        state.direct_run_refresh.set(next);
+        request_refresh(state.direct_run_refresh);
     }
 }
 
@@ -194,7 +194,7 @@ fn apply_project_versions(
     }
     if changes.refresh_list {
         // Schedule coverage in this synchronous continuation, before an equal delayed observation can interleave.
-        state.request_runs_refresh();
+        request_refresh(state.runs_refresh);
     }
     if changes.refresh_direct {
         refresh_direct_run(state);
@@ -250,10 +250,10 @@ pub fn PushBridge() -> Element {
             let mut subscription = crate::grpc::subscribe_push();
             loop {
                 let update = subscription.next_visible().await;
-                if let Some(generation) = update
-                    .resync_gen
-                    .filter(|generation| *generation > *resync_gen.peek())
-                {
+                // Skipped while disconnected, like every reload: the reconnect's resync carries a higher generation, and fetches queued now would go out beside its own.
+                if let Some(generation) = update.resync_gen.filter(|generation| {
+                    *generation > *resync_gen.peek() && crate::grpc::connection().1
+                }) {
                     // List, direct-view and metric resources subscribe to resync; the resource below owns the version poll.
                     resync_gen.set(generation);
                 }

@@ -5,6 +5,7 @@ use crate::components::theme_toggle::ThemeToggle;
 use crate::components::user_settings::{UserSettingsButton, UserSettingsPanel};
 use crate::grpc::GrpcClient;
 use crate::route::Route;
+use crate::state::app_state::request_refresh;
 use crate::util::{is_app_escape, local_storage, local_time, primary};
 
 const SORT_KEY: &str = "kymo_projects_sort";
@@ -42,7 +43,7 @@ pub fn ProjectsPage() -> Element {
     // connection resynced — forces `projects` use_resource to re-run. Trash
     // lifecycle changes also move this shared generation; most leave the
     // projects list unchanged.
-    let mut generation = use_signal(|| 0u64);
+    let generation = use_signal(|| 0u64);
 
     use_future(move || async move {
         let mut subscription = crate::grpc::subscribe_push();
@@ -52,9 +53,8 @@ pub fn ProjectsPage() -> Element {
             // drives the INITIAL fetch: the resource below never settles
             // before generation moves, so a tab opened in the background
             // fetches nothing until it's first shown.
-            if update.initial || update.global.is_some() || update.resync_gen.is_some() {
-                let g = *generation.peek();
-                generation.set(g + 1);
+            if update.global.is_some() || update.resync_gen.is_some() {
+                request_refresh(generation);
             }
         }
     });

@@ -55,9 +55,6 @@ pub async fn lookup_trashed_runs(
     project_id: &str,
     run_ids: &[String],
 ) -> Result<Vec<RunRecord>, String> {
-    if run_ids.is_empty() {
-        return Ok(Vec::new());
-    }
     let grpc = GrpcClient::new();
     let mut records = Vec::new();
     for chunk in run_ids.chunks(IDENTITY_LOOKUP_CHUNK) {

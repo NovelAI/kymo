@@ -16,6 +16,7 @@ use crate::components::uplot_chart::run_color;
 use crate::grpc::proto::{RunInfo, RunStatus, TrashRunOutcome, TrashRunResult};
 use crate::grpc::GrpcClient;
 use crate::route::Route;
+use crate::state::app_state::request_refresh;
 use crate::state::trash::lookup_trashed_runs;
 use crate::state::DashboardState;
 use crate::util::{is_app_escape, js_bridge::js_string, local_storage, primary};
@@ -216,12 +217,9 @@ fn remove_active_runs(state: DashboardState, run_ids: &HashSet<String>) {
     if !run_ids.is_empty() {
         let mut next_runs = state.runs.peek().clone();
         let removed_runs = next_runs
-            .iter()
-            .filter(|run| run_ids.contains(&run.run_id))
-            .cloned()
+            .extract_if(.., |run| run_ids.contains(&run.run_id))
             .collect::<Vec<_>>();
         state.remember_display_runs(&removed_runs);
-        next_runs.retain(|run| !run_ids.contains(&run.run_id));
         let mut runs = state.runs;
         runs.set(next_runs);
 
@@ -257,14 +255,12 @@ fn submit_trash_runs(project_id: String, requested: Vec<String>, ui: TrashMutati
                             ambiguous.push(run_id.clone());
                             continue;
                         };
-                        if matches!(
-                            result.outcome(),
-                            TrashRunOutcome::Error | TrashRunOutcome::Unknown
-                        ) {
-                            ambiguous.push(run_id.clone());
-                        }
                         let outcome = match result.outcome() {
                             TrashRunOutcome::Trashed | TrashRunOutcome::AlreadyTrashed => Ok(()),
+                            TrashRunOutcome::Error | TrashRunOutcome::Unknown => {
+                                ambiguous.push(run_id.clone());
+                                Err(result_failure(&result))
+                            }
                             _ => Err(result_failure(&result)),
                         };
                         results.insert(run_id.clone(), outcome);
@@ -309,7 +305,7 @@ fn submit_trash_runs(project_id: String, requested: Vec<String>, ui: TrashMutati
         }
         apply_trash_results(&results, &requested, ui);
         // Reconcile the list, which also covers outcome-unknown transport failures: the server may have committed a chunk whose response was lost.
-        ui.dashboard.request_runs_refresh();
+        request_refresh(ui.dashboard.runs_refresh);
         busy.set(false);
     });
 }
@@ -345,7 +341,6 @@ fn apply_trash_results(
     let failed = summary.failed.len();
     let failure_detail = summary.first_failure.as_deref().unwrap_or("unknown error");
     let message = match (moved, failed) {
-        (0, 0) => "No runs were selected.".to_string(),
         (moved, 0) => format!(
             "Moved {moved} {} to Trash.",
             if moved == 1 { "run" } else { "runs" }
@@ -659,13 +654,15 @@ fn InlineRunRename(
                 let result = GrpcClient::new()
                     .rename_run(&target.project_id, &target.run_id, &run_name)
                     .await;
+                // Re-read the canonical list whatever the outcome: a response can arrive after a newer rename/status ListRuns refresh and must not become the last local writer, and a transport cut can hide a committed rename; while disconnected, the reconnect's resync reconciles instead.
+                request_refresh(state.runs_refresh);
+                busy.set(false);
                 match result {
                     Ok(response) => {
                         let Some(updated) = response.run.filter(|run| {
                             run.project_id == target.project_id && run.run_id == target.run_id
                         }) else {
                             let message = "Server returned an invalid run.".to_string();
-                            busy.set(false);
                             error.set(message.clone());
                             on_error.call(message);
                             return;
@@ -683,19 +680,11 @@ fn InlineRunRename(
                             runs.set(next_runs);
                             state.remember_display_runs(std::slice::from_ref(&remembered));
                         }
-                        // The response is authoritative for this mutation but
-                        // can arrive after a newer rename/status ListRuns
-                        // refresh. Re-read the canonical list so an older
-                        // response cannot become the last local writer.
-                        state.request_runs_refresh();
-                        busy.set(false);
                         on_renamed.call(renamed_name);
                         on_close.call(restore_focus);
                     }
                     Err(status) => {
-                        // A transport cut can hide a committed rename: reconcile, keeping the inline draft for retry.
-                        state.request_runs_refresh();
-                        busy.set(false);
+                        // The inline draft stays for a retry.
                         let message = match status.message() {
                             "" => "Couldn’t rename the run.".to_string(),
                             detail => format!("Couldn’t rename the run: {detail}"),

@@ -2239,6 +2239,7 @@ dependencies = [
  "prost",
  "serde",
  "serde_json",
+ "tokio",
  "tonic",
  "tonic-prost-build",
  "wasm-bindgen",
