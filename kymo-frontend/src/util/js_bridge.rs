@@ -4,7 +4,7 @@ use super::unique_id;
 
 const MOUNT_CALL: &str = "window.__kymo_bridges.mount(__BRIDGE_NAME__,__BRIDGE_OWNER__,";
 
-/// One registry for page-wide JavaScript bridges. Mounting a successor tears down its predecessor synchronously; an old Rust scope can unmount only the owner it created, so a late drop cannot kill that successor. Use this registry for page-role singleton listeners with Rust channels; keep element-lifetime listeners on element flags, per-gesture window listeners self-removing, and permanent teardown-free installs on window flags. Bridge-local `catch (_) { td(); }` paths are defensive only: Dioxus web sends currently do not throw, so ordinary teardown must always come through this registry.
+/// One registry for page-wide JavaScript bridges. Mounting a successor tears down its predecessor synchronously; an old Rust scope can unmount only the owner it created, so a late drop cannot kill that successor. Use this registry for page-role singleton listeners, with or without a Rust channel; keep element-lifetime listeners on element flags, per-gesture window listeners self-removing, and permanent teardown-free installs on window flags. Bridge-local `catch (_) { td(); }` paths are defensive only: Dioxus web sends currently do not throw, so ordinary teardown must always come through this registry.
 pub const LIFECYCLE_JS: &str = r#"window.__kymo_bridges??=(()=>{const slots=new Map();return{
 mount(name,owner,cleanup){
   try{slots.get(name)?.teardown();}catch(error){console.error('[kymo bridge] predecessor cleanup failed',error);}

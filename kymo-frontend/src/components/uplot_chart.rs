@@ -1,5 +1,6 @@
 mod create_js;
 
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use dioxus::prelude::*;
@@ -119,20 +120,10 @@ if(window.__kymo_charts&&window.__kymo_charts['{id}']){{
 }}
 if(window.__kymo_hoversrc==='{id}')window.__kymo_hoversrc=null;
 document.getElementById('{id}-tip')?.remove();
-if(window.__kymo_cfghash) delete window.__kymo_cfghash['{id}'];
 if(window.__kymo_data) delete window.__kymo_data['{id}'];
 }})();"#,
         id = id,
     )
-}
-
-async fn create_chart(id: &str, config: &ChartJsConfig) {
-    let js = build_create_js(id, config);
-    match document::eval(&js).join::<String>().await {
-        Ok(message) if message.is_empty() => {}
-        Ok(message) => crate::util::warn(&format!("[chart:{id}] uPlot create failed: {message}")),
-        Err(error) => crate::util::warn(&format!("[chart:{id}] uPlot create failed: {error}")),
-    }
 }
 
 fn set_data_js(id: &str) -> String {
@@ -155,315 +146,250 @@ dioxus.close();
     )
 }
 
+/// The x-axis semantics a chart renders under: scale kind (step / time / custom metric), wall vs relative, and log bucketing.
+#[derive(Clone, Hash, PartialEq, Eq)]
+pub struct ShownAxis {
+    pub log_x: bool,
+    pub time: bool,
+    pub wall: bool,
+    /// Custom-x metric name; empty = none.
+    pub x_metric: String,
+}
+
+impl ShownAxis {
+    /// Step-based x: zoom refetches through the step store.
+    pub fn step_axis(&self) -> bool {
+        !self.time && self.x_metric.is_empty()
+    }
+
+    /// Axis label above a copied text table: step, time, or the custom metric's full path.
+    pub fn x_label(&self) -> &str {
+        if self.time {
+            "time"
+        } else if !self.x_metric.is_empty() {
+            &self.x_metric
+        } else {
+            "step"
+        }
+    }
+}
+
+/// A chart model, compared by allocation, never by its columns: models are immutable once built, so only a new Rc changes content. Comparing columns would cost real time on fat charts (~10^5 floats) on every parent render and never match across a NaN; a new Rc with equal content costs one redundant data push and setData. Sound only while the comparing side holds the previous model alive, as UPlotChart's props and use_reactive do, so a new model can never reuse its address.
+#[derive(Clone)]
+pub struct ChartModel(pub Rc<DenseChart>);
+
+impl PartialEq for ChartModel {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 #[component]
 pub fn UPlotChart(
-    chart: DenseChart,
-    /// Identity stamp of the model `chart` derives from (metric_rect's monotonic NEXT_DATA_SEQ). Data-change detection compares THIS, never the columns: models are immutable once stamped, so a new stamp is the only way content changes — a full-column fingerprint scan was real time on fat charts (~10^5 floats), multiplied by every live push. False positives (fresh stamp, equal content) just cost one redundant uPlot setData.
-    data_key: u64,
-    /// Optional pre-computed hex colors per series. If None, color is derived
-    /// via hash_color of each series label. Length must match chart.series.len().
-    #[props(default)]
-    colors: Option<Vec<String>>,
-    /// Optional display labels per series. If None, uses `chart.series[i].label`.
-    #[props(default)]
-    labels: Option<Vec<String>>,
+    /// The response as received, time axes still in ms (converted below).
+    chart: ChartModel,
+    /// Display labels and hex colors, one per `chart.series`.
+    labels: Vec<String>,
+    colors: Vec<String>,
     /// Exact owning run names, separate from decorated metric/tag labels.
     /// None means the run's metadata is not available for name grouping.
     run_names: Vec<Option<String>>,
-    #[props(default = false)] log_x: bool,
-    /// log(x+1) rendering is ALLOWED (step-axis log charts); it engages only when the chart contains step 0, mirroring the server's grid rule.
-    #[props(default = false)]
-    log_shift: bool,
-    /// The +1ms render offset to remove from tooltip and clipboard x values.
-    #[props(default = false)]
-    time_log_shift: bool,
-    #[props(default = false)] log_y: bool,
-    #[props(default = 280)] height: u32,
-    #[props(default = 0)] color_version: u64,
+    axis: ShownAxis,
+    log_y: bool,
     /// From the request options: stroke smoothed values over raw evidence. Unsmoothed envelope charts render min/max data instead of bucket means.
-    #[props(default = false)]
     smoothed: bool,
-    #[props(default = "step".to_string())] x_label: String,
-    #[props(default = true)] zoom_refetch: bool,
-    #[props(default = false)] is_time_axis: bool,
-    #[props(default = false)] is_wall_time: bool,
 ) -> Element {
     let user_config = use_context::<UserConfigState>();
     let chart_id = use_hook(next_chart_id);
 
-    // Use a generation counter keyed on the model's identity instead of PartialEq
-    // (f64 NaN != NaN would re-render forever) or content hashing (a full-column
-    // scan per render).
-    let mut data_signal = use_signal(|| chart.clone());
-    let mut data_gen = use_signal(|| 0u64);
-    let mut log_x_signal = use_signal(|| log_x);
-    let mut log_shift_signal = use_signal(|| log_shift);
-    let mut time_log_shift_signal = use_signal(|| time_log_shift);
-    let mut log_y_signal = use_signal(|| log_y);
-    let mut height_signal = use_signal(|| height);
-    let mut color_ver_signal = use_signal(|| color_version);
-    let mut smoothed_signal = use_signal(|| smoothed);
-    let mut x_label_signal = use_signal(|| x_label.clone());
-    let mut zoom_refetch_signal = use_signal(|| zoom_refetch);
-    let mut is_time_signal = use_signal(|| is_time_axis);
-    let mut is_wall_signal = use_signal(|| is_wall_time);
-    let mut colors_signal = use_signal(|| colors.clone());
-    let mut labels_signal = use_signal(|| labels.clone());
-    let mut run_names_signal = use_signal(|| run_names.clone());
-    // The structural config last sent for this chart. Comparing it before rendering the 50-KiB create script keeps ordinary live-data refreshes on the small uPlot.setData path; if the browser chart disappeared, that path reports false and lazily rebuilds the script.
+    // The structural config last sent for this chart: an equal config sends only uPlot.setData, skipping the create script (see build_create_js).
     let mut last_create_config = use_signal(|| Option::<ChartJsConfig>::None);
-    if *colors_signal.read() != colors {
-        colors_signal.set(colors.clone());
-    }
-    if *labels_signal.read() != labels {
-        labels_signal.set(labels.clone());
-    }
-    if *run_names_signal.read() != run_names {
-        run_names_signal.set(run_names.clone());
-    }
 
-    let mut data_fp = use_signal(|| data_key);
-    {
-        if data_key != *data_fp.peek() {
-            data_fp.set(data_key);
-            data_signal.set(chart.clone());
-            let g = *data_gen.peek();
-            data_gen.set(g + 1);
-        }
-    }
-    if *log_x_signal.read() != log_x {
-        log_x_signal.set(log_x);
-    }
-    if *log_shift_signal.read() != log_shift {
-        log_shift_signal.set(log_shift);
-    }
-    if *time_log_shift_signal.read() != time_log_shift {
-        time_log_shift_signal.set(time_log_shift);
-    }
-    if *log_y_signal.read() != log_y {
-        log_y_signal.set(log_y);
-    }
-    if *height_signal.read() != height {
-        height_signal.set(height);
-    }
-    if *color_ver_signal.read() != color_version {
-        color_ver_signal.set(color_version);
-    }
-    if *smoothed_signal.read() != smoothed {
-        smoothed_signal.set(smoothed);
-    }
-    if *x_label_signal.read() != x_label {
-        x_label_signal.set(x_label.clone());
-    }
-    if *zoom_refetch_signal.read() != zoom_refetch {
-        zoom_refetch_signal.set(zoom_refetch);
-    }
-    if *is_time_signal.read() != is_time_axis {
-        is_time_signal.set(is_time_axis);
-    }
-    if *is_wall_signal.read() != is_wall_time {
-        is_wall_signal.set(is_wall_time);
-    }
+    // Push every new data model; rebuild the uPlot instance only when its structural config changes. use_reactive reruns the effect when any prop differs and holds the last props, keeping the previous chart alive (see ChartModel).
+    use_effect(use_reactive(
+        (
+            &chart, &labels, &colors, &run_names, &axis, &log_y, &smoothed,
+        ),
+        {
+            let id = chart_id.clone();
+            move |(ChartModel(chart), labels, colors, run_names, axis, log_y, smoothed)| {
+                let log_x = axis.log_x;
+                let font_size = user_config.font_size();
 
-    // Push every new data model; rebuild the uPlot instance only when its structural config changes.
-    use_effect({
-        let id = chart_id.clone();
-        move || {
-            let _gen = *data_gen.read(); // subscribe to data changes
-            let chart = data_signal.read().clone();
-            let log_x = *log_x_signal.read();
-            let log_shift = *log_shift_signal.read();
-            let time_log_shift = *time_log_shift_signal.read();
-            let log_y = *log_y_signal.read();
-            let height = *height_signal.read();
-            let _color_ver = *color_ver_signal.read();
-            let smoothed = *smoothed_signal.read();
-            let x_label = x_label_signal.read().clone();
-            let zoom_refetch = *zoom_refetch_signal.read();
-            let is_time_axis = *is_time_signal.read();
-            let is_wall_time = *is_wall_signal.read();
-            let font_size = user_config.font_size();
+                // ONE shared axis in chart.x_values; every series column aligns to it index-for-index (NaN where a run has no data in a slot).
+                if chart.series.is_empty() || chart.x_values.is_empty() {
+                    return;
+                }
+                // Zero-present log x on a step or time axis renders log(x+1) (ChartJsConfig::log_shift), the rule the server's bucket ladder applies to the same model, so x = 0 stays on the chart. Zero-less charts keep plain log(x); custom-x never shifts.
+                let log_shift =
+                    log_x && axis.x_metric.is_empty() && chart.x_values.first() == Some(&0.0);
+                // Time axes render seconds.
+                let unit = if axis.time { 1000.0 } else { 1.0 };
+                let shift = if log_shift { 1.0 } else { 0.0 };
+                let mut x_values: Vec<f64> =
+                    chart.x_values.iter().map(|&x| (x + shift) / unit).collect();
+                let n_axis = x_values.len();
 
-            // ONE shared axis in chart.x_values; every series column aligns to it index-for-index (NaN where a run has no data in a slot).
-            if chart.series.is_empty() || chart.x_values.is_empty() {
-                return;
-            }
-            let mut x_values = chart.x_values.clone();
-            let n_axis = x_values.len();
+                let has_range = chart.series.iter().any(|s| !s.min_values.is_empty());
+                let has_raw = chart.series.iter().any(|s| !s.raw_values.is_empty());
 
-            let has_range = chart.series.iter().any(|s| !s.min_values.is_empty());
-            let has_raw = chart.series.iter().any(|s| !s.raw_values.is_empty());
-
-            // Columns arrive axis-length from the server; the resize is a shape guard (pads short with NaN, truncates long), not a join.
-            let col = |src: &[f64]| -> Vec<f64> {
-                let mut c = src.to_vec();
-                c.resize(n_axis, f64::NAN);
-                c
-            };
-            // Envelope columns ship as wire truth, including mins <= 0 on log-y charts: those CLIP at the bottom border instead of gapping (uPlot's log scale clamps non-positive values a decade under the scale min, so the band visibly runs into the border), yNiceLog keeps them from driving the y-range, and the tooltip prints the real number. The wire never carries a non-finite value other than NaN; logged ±inf render as marker circles at the border they exceed.
-            // Raw/envelope blocks first, values lines after, matching build_create_js's series opts (see the top-of-file comment).
-            let mut all_series = Vec::new();
-            // Slots where the log axis clips a run's lowest drawn evidence get a synthesized kind-5 border circle below.
-            let mut synth_marks: Vec<Vec<u32>> = Vec::with_capacity(chart.series.len());
-            for s in chart.series.iter() {
-                let samples = if s.raw_values.len() == s.values.len() {
-                    &s.raw_values
-                } else {
-                    &s.values
+                // Columns arrive axis-length from the server; the resize is a shape guard (pads short with NaN, truncates long), not a join.
+                let col = |src: &[f64]| -> Vec<f64> {
+                    let mut c = src.to_vec();
+                    c.resize(n_axis, f64::NAN);
+                    c
                 };
-                if has_raw {
-                    all_series.push(col(samples));
-                }
-                // The run's lowest drawn evidence: its envelope min, else its samples.
-                let mut floor = samples;
-                if has_range {
-                    // A missing envelope on an enveloped chart means the run has no finite sample at all (the server ships envelopes dense, never sparse or all-NaN): NaN columns, nothing to band.
-                    if s.min_values.len() == s.values.len() && s.max_values.len() == s.values.len()
-                    {
-                        all_series.push(col(&s.min_values));
-                        all_series.push(col(&s.max_values));
-                        floor = &s.min_values;
+                // Envelope columns ship as wire truth, including mins <= 0 on log-y charts: those CLIP at the bottom border instead of gapping (uPlot's log scale clamps non-positive values a decade under the scale min, so the band visibly runs into the border), yNiceLog keeps them from driving the y-range, and the tooltip prints the real number. The wire never carries a non-finite value other than NaN; logged ±inf render as marker circles at the border they exceed.
+                // Raw/envelope blocks first, values lines after, matching build_create_js's series opts (see the top-of-file comment).
+                let mut all_series = Vec::new();
+                // Slots where the log axis clips a run's lowest drawn evidence get a synthesized kind-5 border circle below.
+                let mut synth_marks: Vec<Vec<u32>> = Vec::with_capacity(chart.series.len());
+                for s in chart.series.iter() {
+                    let samples = if s.raw_values.len() == s.values.len() {
+                        &s.raw_values
                     } else {
-                        all_series.push(vec![f64::NAN; n_axis]);
-                        all_series.push(vec![f64::NAN; n_axis]);
+                        &s.values
+                    };
+                    if has_raw {
+                        all_series.push(col(samples));
                     }
+                    // The run's lowest drawn evidence: its envelope min, else its samples.
+                    let mut floor = samples;
+                    if has_range {
+                        // A missing envelope on an enveloped chart means the run has no finite sample at all (the server ships envelopes dense, never sparse or all-NaN): NaN columns, nothing to band.
+                        if s.min_values.len() == s.values.len()
+                            && s.max_values.len() == s.values.len()
+                        {
+                            all_series.push(col(&s.min_values));
+                            all_series.push(col(&s.max_values));
+                            floor = &s.min_values;
+                        } else {
+                            all_series.push(vec![f64::NAN; n_axis]);
+                            all_series.push(vec![f64::NAN; n_axis]);
+                        }
+                    }
+                    // NaN gap slots fail the comparison and stay unmarked.
+                    synth_marks.push(if log_y {
+                        (0..floor.len())
+                            .filter(|&i| floor[i] <= 0.0)
+                            .map(|i| i as u32)
+                            .collect()
+                    } else {
+                        Vec::new()
+                    });
                 }
-                // NaN gap slots fail the comparison and stay unmarked.
-                synth_marks.push(if log_y {
-                    (0..floor.len())
-                        .filter(|&i| floor[i] <= 0.0)
-                        .map(|i| i as u32)
-                        .collect()
+                for s in chart.series.iter() {
+                    all_series.push(col(&s.values));
+                }
+
+                // Append one NaN-marker column per real series, marking where the run LOGGED a non-finite value (server-computed nan_indices, indexing the shared axis) or where the log axis clipped its envelope or sample. Only when a marker exists somewhere, so healthy charts pay nothing. The value is the marker KIND (1 NaN, 2 +inf, 3 -inf, 4 unplottable x, 5 log-clipped envelope or sample — frontend-only, never on the wire): markers live on a dummy scale and the draw hook pins their circles to the plot's border (top for +inf, bottom for the rest), so the kind value never plots.
+                let needs_markers = chart.series.iter().any(|s| !s.nan_indices.is_empty())
+                    || synth_marks.iter().any(|v| !v.is_empty());
+                let nan_markers = if needs_markers {
+                    for (si, s) in chart.series.iter().enumerate() {
+                        let mut marker = vec![f64::NAN; n_axis];
+                        for &i in &synth_marks[si] {
+                            if let Some(slot) = marker.get_mut(i as usize) {
+                                *slot = 5.0;
+                            }
+                        }
+                        // A server marker at the same slot says strictly more than the synthesized clip circle and wins.
+                        for (mi, &i) in s.nan_indices.iter().enumerate() {
+                            if let Some(slot) = marker.get_mut(i as usize) {
+                                *slot = s.nan_kinds.get(mi).copied().unwrap_or(1) as f64;
+                            }
+                        }
+                        all_series.push(marker);
+                    }
+                    chart.series.len()
                 } else {
-                    Vec::new()
-                });
-            }
-            for s in chart.series.iter() {
-                all_series.push(col(&s.values));
-            }
+                    0
+                };
 
-            // Append one NaN-marker column per real series, marking where the run LOGGED a non-finite value (server-computed nan_indices, indexing the shared axis) or where the log axis clipped its envelope or sample. Only when a marker exists somewhere, so healthy charts pay nothing. The value is the marker KIND (1 NaN, 2 +inf, 3 -inf, 4 unplottable x, 5 log-clipped envelope or sample — frontend-only, never on the wire): markers live on a dummy scale and the draw hook pins their circles to the plot's border (top for +inf, bottom for the rest), so the kind value never plots.
-            let needs_markers = chart.series.iter().any(|s| !s.nan_indices.is_empty())
-                || synth_marks.iter().any(|v| !v.is_empty());
-            let nan_markers = if needs_markers {
-                for (si, s) in chart.series.iter().enumerate() {
-                    let mut marker = vec![f64::NAN; n_axis];
-                    for &i in &synth_marks[si] {
-                        if let Some(slot) = marker.get_mut(i as usize) {
-                            *slot = 5.0;
-                        }
+                // Two trailing data-only columns (no series entries — uPlot never touches data past its series list): the chart-level bucket x extents, in the axis's units (seconds on a time axis), read by the tooltip's x-range header and whole-bucket zoom. They hold REAL x: no log shift.
+                let has_xrange = chart.xr_min.iter().any(|v| !v.is_nan());
+                if has_xrange {
+                    for extent in [&chart.xr_min, &chart.xr_max] {
+                        all_series.push(col(extent).into_iter().map(|x| x / unit).collect());
                     }
-                    // A server marker at the same slot says strictly more than the synthesized clip circle and wins.
-                    for (mi, &i) in s.nan_indices.iter().enumerate() {
-                        if let Some(slot) = marker.get_mut(i as usize) {
-                            *slot = s.nan_kinds.get(mi).copied().unwrap_or(1) as f64;
-                        }
-                    }
-                    all_series.push(marker);
                 }
-                chart.series.len()
-            } else {
-                0
-            };
 
-            // Two trailing data-only columns (no series entries — uPlot never touches data past its series list): the chart-level bucket x extents, straight off the model, feeding the tooltip's x readout only. They hold REAL x — the log shift below never touches them.
-            let has_xrange = chart.xr_min.iter().any(|v| !v.is_nan());
-            if has_xrange {
-                all_series.push(col(&chart.xr_min));
-                all_series.push(col(&chart.xr_max));
-            }
-
-            // Log x: step charts containing step 0 render in log(x+1) — the same zero-present rule the server's bucket ladder applies, read off the same model, so the two can't disagree — and step 0 stays on the chart; splits, formatters, and zoom dispatches convert back to real steps in the JS. Zero-less charts keep plain log(x). Time axes folded their +1ms into the ms->s transform upstream (metric_rect); custom-x never shifts, and its nonpositive x (exceptional markers server-side) trims defensively.
-            let shifted = log_x && log_shift && x_values.first() == Some(&0.0);
-            if shifted {
-                for v in x_values.iter_mut() {
-                    *v += 1.0;
-                }
-            }
-            if log_x && !x_values.is_empty() && x_values[0] <= 0.0 {
-                let start = x_values
-                    .iter()
-                    .position(|&s| s > 0.0)
-                    .unwrap_or(x_values.len());
-                x_values = x_values[start..].to_vec();
-                all_series = all_series.iter().map(|s| s[start..].to_vec()).collect();
-            }
-
-            let display_labels: Vec<String> = match labels_signal.read().clone() {
-                Some(overrides) if overrides.len() == chart.series.len() => overrides,
-                _ => chart.series.iter().map(|s| s.label.clone()).collect(),
-            };
-            let resolved_colors: Vec<String> = match colors_signal.read().clone() {
-                Some(overrides) if overrides.len() == chart.series.len() => overrides,
-                _ => chart.series.iter().map(|s| hash_color(&s.label)).collect(),
-            };
-
-            push_data_to_js(&id, &x_values, &all_series);
-
-            // Per run: envelope has area somewhere (see ChartJsConfig::banded). Straight off the wire columns: NaN slots and absent envelopes fail the < and count as degenerate.
-            let banded: Vec<bool> = chart
-                .series
-                .iter()
-                .map(|s| {
-                    s.min_values
+                // Custom-x's nonpositive x (exceptional markers server-side) trims defensively.
+                if log_x && x_values[0] <= 0.0 {
+                    let start = x_values
                         .iter()
-                        .zip(s.max_values.iter())
-                        .any(|(&a, &b)| a < b)
-                })
-                .collect();
-            let cfg = ChartJsConfig {
-                labels: display_labels,
-                colors: resolved_colors,
-                run_ids: chart.series.iter().map(|s| s.run_id.clone()).collect(),
-                run_names: run_names_signal.read().clone(),
-                has_range,
-                banded,
-                has_raw,
-                smoothed,
-                has_xrange,
-                nan_markers,
-                xnan_counts: chart.series.iter().map(|s| s.xnan_count).collect(),
-                log_x,
-                log_shift: shifted,
-                time_log_shift,
-                log_y,
-                height,
-                font_size,
-                zoom_refetch,
-                is_time_axis,
-                is_wall_time,
-                x_label,
-            };
-            // Structure-unchanged refreshes swap the arrays in place:
-            // live runs tick on every pushed update, and a full destroy/
-            // recreate per tick reset cursor and tooltip mid-hover. setData
-            // re-ranges x per the scale's auto policy: full extent normally
-            // (zoom-refetch charts carry the zoom window in the data
-            // itself), current window while a client-side zoom is active
-            // (__kymo_userzoom) — either way it commits, so new points
-            // paint without wiping the zoom.
-            let structure_unchanged = last_create_config.peek().as_ref() == Some(&cfg);
-            if structure_unchanged {
-                let set_js = set_data_js(&id);
-                let create_id = id.clone();
+                        .position(|&s| s > 0.0)
+                        .unwrap_or(x_values.len());
+                    x_values = x_values[start..].to_vec();
+                    all_series = all_series.iter().map(|s| s[start..].to_vec()).collect();
+                }
+
+                push_data_to_js(&id, &x_values, &all_series);
+
+                // Per run: envelope has area somewhere (see ChartJsConfig::banded). Straight off the wire columns: NaN slots and absent envelopes fail the < and count as degenerate.
+                let banded: Vec<bool> = chart
+                    .series
+                    .iter()
+                    .map(|s| {
+                        s.min_values
+                            .iter()
+                            .zip(s.max_values.iter())
+                            .any(|(&a, &b)| a < b)
+                    })
+                    .collect();
+                let cfg = ChartJsConfig {
+                    labels,
+                    colors,
+                    run_ids: chart.series.iter().map(|s| s.run_id.clone()).collect(),
+                    run_names,
+                    has_range,
+                    banded,
+                    has_raw,
+                    smoothed,
+                    has_xrange,
+                    nan_markers,
+                    xnan_counts: chart.series.iter().map(|s| s.xnan_count).collect(),
+                    axis,
+                    log_shift,
+                    log_y,
+                    font_size,
+                };
+                // Structure-unchanged refreshes swap the arrays in place:
+                // live runs tick on every pushed update, and a full destroy/
+                // recreate per tick reset cursor and tooltip mid-hover. setData
+                // re-ranges x per the scale's auto policy: full extent normally
+                // (zoom-refetch charts carry the zoom window in the data
+                // itself), current window while a client-side zoom is active
+                // (__kymo_userzoom) — either way it commits, so new points
+                // paint without wiping the zoom.
+                let structure_unchanged = last_create_config.peek().as_ref() == Some(&cfg);
+                if !structure_unchanged {
+                    last_create_config.set(Some(cfg.clone()));
+                }
+                let id = id.clone();
                 spawn(async move {
-                    // Chart object can be missing (earlier create failed,
-                    // DOM detached), or setData itself can reject malformed
-                    // browser state — fall back to a full create without
-                    // leaving a parked evaluator channel.
-                    if !matches!(document::eval(&set_js).join::<bool>().await, Ok(true)) {
-                        create_chart(&create_id, &cfg).await;
+                    // The chart can be missing (an earlier create failed, the DOM detached) or setData can reject malformed browser state: fall through to a full create.
+                    if structure_unchanged
+                        && matches!(
+                            document::eval(&set_data_js(&id)).join::<bool>().await,
+                            Ok(true)
+                        )
+                    {
+                        return;
                     }
-                });
-            } else {
-                let create_id = id.clone();
-                last_create_config.set(Some(cfg.clone()));
-                spawn(async move {
-                    create_chart(&create_id, &cfg).await;
+                    let failure = match document::eval(&build_create_js(&id, &cfg))
+                        .join::<String>()
+                        .await
+                    {
+                        Ok(message) if message.is_empty() => return,
+                        Ok(message) => message,
+                        Err(error) => error.to_string(),
+                    };
+                    crate::util::warn(&format!("[chart:{id}] uPlot create failed: {failure}"));
                 });
             }
-        }
-    });
+        },
+    ));
 
     use_drop({
         let id = chart_id.clone();
@@ -480,13 +406,9 @@ pub fn UPlotChart(
         }
     });
 
-    let h = *height_signal.read();
     rsx! {
-        div {
-            id: "{chart_id}",
-            class: "chart-container",
-            style: "min-height: {h}px;",
-        }
+        // Sized by CSS (`--kymo-chart-height`, set by the section or the maximize overlay); create.js and its ResizeObserver follow the box.
+        div { id: "{chart_id}", class: "chart-container" }
     }
 }
 

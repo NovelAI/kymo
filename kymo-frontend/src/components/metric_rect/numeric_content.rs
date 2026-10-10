@@ -4,8 +4,8 @@ use std::rc::Rc;
 
 use dioxus::prelude::*;
 
-use super::{evict_panel_caches, next_data_seq, CHART_CACHE};
-use crate::components::uplot_chart::UPlotChart;
+use super::{evict_panel_caches, CHART_CACHE};
+use crate::components::uplot_chart::{ChartModel, ShownAxis, UPlotChart};
 use crate::grpc::chart_delta::DenseChart;
 use crate::grpc::proto::{ChartRequest, SeriesRef, SmoothingConfig};
 use crate::state::chart_sync::{self, ChartCacheEntry};
@@ -35,7 +35,6 @@ enum ChartFetch {
 
 #[derive(Clone)]
 struct ChartAnswer {
-    data_seq: u64,
     response: Rc<DenseChart>,
     request: Rc<ChartRequest>,
 }
@@ -49,17 +48,8 @@ fn settled_failure(status: tonic::Status) -> ChartFetch {
     ChartFetch::Unavailable(message)
 }
 
-/// The x-axis semantics a chart renders under: scale kind (step / time / custom metric), wall vs relative, and log bucketing. Derived from the REQUEST a response answered ([`ShownAxis::of_request`]) so the render always describes the response being painted, or from live options for the fresh-panel fallback ([`ShownAxis::of_options`]) — the two agree whenever the cached request came from the same options.
-#[derive(Clone, Debug, PartialEq)]
-struct ShownAxis {
-    log_x: bool,
-    time: bool,
-    wall: bool,
-    /// Custom-x metric name; empty = none.
-    x_metric: String,
-}
-
 impl ShownAxis {
+    /// The axis of the request a response answered, so the render always describes the response being painted.
     fn of_request(r: &ChartRequest) -> Self {
         let time = r.use_timestamp_axis;
         ShownAxis {
@@ -74,40 +64,6 @@ impl ShownAxis {
                     .map(|s| s.metric_name.clone())
                     .unwrap_or_default()
             },
-        }
-    }
-
-    fn of_options(options: &RectOptions) -> Self {
-        use crate::state::layout_config::XAxisMode;
-        let time = matches!(
-            options.x_axis_mode,
-            XAxisMode::RelativeTime | XAxisMode::WallTime
-        );
-        ShownAxis {
-            log_x: options.log_x,
-            time,
-            wall: matches!(options.x_axis_mode, XAxisMode::WallTime),
-            x_metric: if time {
-                String::new()
-            } else {
-                options.x_axis_metric.clone()
-            },
-        }
-    }
-
-    /// Step-based x: zoom refetches through the step store, and the log ladder may shift.
-    fn step_axis(&self) -> bool {
-        !self.time && self.x_metric.is_empty()
-    }
-
-    /// Axis label; on a custom axis it also keys the cursor-sync group, so it keeps the full metric path (the tail alone would sync train/epoch with eval/epoch).
-    fn x_label(&self) -> String {
-        if self.time {
-            "time".to_string()
-        } else if !self.x_metric.is_empty() {
-            self.x_metric.clone()
-        } else {
-            "step".to_string()
         }
     }
 }
@@ -150,7 +106,7 @@ fn options_allow_noncontributors(options: &RectOptions, has_step_zoom: bool) -> 
 }
 
 #[cfg(test)]
-mod shown_axis_tests {
+mod tests {
     use super::super::{
         every_source_terminal, needs_metric_type_check, sole_detected_display_type,
     };
@@ -223,40 +179,31 @@ mod shown_axis_tests {
         assert_eq!(sole_detected_display_type((false, false, false)), None);
     }
 
-    /// The fallback and the request-derived semantics agree whenever the cached request came from the same options, so a fresh panel can never disagree with its first settled answer.
+    /// A request's axis follows its timestamp and custom-x fields: the render describes the response that request answered.
     #[test]
-    fn options_and_their_request_derive_the_same_axis() {
+    fn requests_derive_their_axis() {
         for (mode, metric, log_x) in [
             (XAxisMode::Step, "", false),
             (XAxisMode::Step, "", true),
             (XAxisMode::Step, "train/epoch", true),
             (XAxisMode::RelativeTime, "", true),
-            (XAxisMode::RelativeTime, "train/epoch", true),
             (XAxisMode::WallTime, "", false),
-            (XAxisMode::WallTime, "train/epoch", false),
         ] {
             let use_ts = matches!(mode, XAxisMode::RelativeTime | XAxisMode::WallTime);
-            let is_relative = matches!(mode, XAxisMode::RelativeTime);
-            let options = RectOptions {
-                x_axis_mode: mode,
-                x_axis_metric: metric.to_string(),
-                log_x,
-                ..Default::default()
-            };
-            // The request the fetch builds from these options.
+            // A request as the fetch builds one from these axis options.
             let request = ChartRequest {
                 x_series: (!use_ts && !metric.is_empty()).then(|| SeriesRef {
                     metric_name: metric.to_string(),
                     ..Default::default()
                 }),
                 use_timestamp_axis: use_ts,
-                relative_time: is_relative,
+                relative_time: matches!(mode, XAxisMode::RelativeTime),
                 log_buckets: log_x,
                 ..Default::default()
             };
             let shown = ShownAxis::of_request(&request);
-            assert_eq!(shown, ShownAxis::of_options(&options));
-            assert_eq!(request.x_series.is_some(), !use_ts && !metric.is_empty());
+            assert_eq!(shown.log_x, log_x);
+            assert_eq!(shown.wall, matches!(mode, XAxisMode::WallTime));
             assert_eq!(shown.step_axis(), !use_ts && metric.is_empty());
             assert_eq!(
                 shown.x_label(),
@@ -349,19 +296,12 @@ mod shown_axis_tests {
 pub(super) fn NumericContent(
     /// The panel's resolved refs, from AutoContent's single resolution pass.
     refs: Memo<Rc<Vec<SeriesRef>>>,
-    chart_height: u32,
-    color_version: u64,
-    options: RectOptions,
+    options: ReadSignal<RectOptions>,
     loading: Signal<bool>,
     zone: Signal<Zone>,
     cache_key: String,
 ) -> Element {
     let state = use_context::<DashboardState>();
-
-    let mut options_signal = use_signal(|| options.clone());
-    if *options_signal.read() != options {
-        options_signal.set(options.clone());
-    }
 
     // The x-zoom lives in DashboardState::step_zoom, not per chart: every
     // zoom gesture (drag, reset click, axis pan, pinch) bubbles into the
@@ -383,21 +323,18 @@ pub(super) fn NumericContent(
     let mut width_observer = use_hook(|| CopyValue::new(None::<ElementResizeObserver>));
 
     // Bound runs known to have NO data on this panel's metrics (the last complete linear response without custom X had no series for them) — excluded from the version key below so their steady ingest bumps stop triggering probes. Signal for reactivity, seeded from the panel cache so a Far remount doesn't forget and reprobe.
-    let noncontrib: Signal<Rc<std::collections::HashSet<String>>> = use_signal({
-        let cache_key = cache_key.clone();
-        move || {
-            CHART_CACHE
-                .with(|c| c.borrow_mut().get(&cache_key))
-                .map(|e| e.noncontrib.clone())
-                .unwrap_or_default()
-        }
+    let noncontrib: Signal<Rc<std::collections::HashSet<String>>> = use_signal(|| {
+        CHART_CACHE
+            .with(|c| c.borrow_mut().get(&cache_key))
+            .map(|e| e.noncontrib.clone())
+            .unwrap_or_default()
     });
     // Per-run invalidation: this rect refetches only when one of ITS runs'
     // versions changes (or its run set changes) — another run logging
     // elsewhere on the page never touches this chart.
     let my_version = use_memo(move || {
         // A range-trimmed response cannot prove a run silent elsewhere, custom X can yield an all-empty exact-step join even when both metrics are already registered, and log X can drop every negative axis position. Mirror the wire semantics so a cache-seeded exclusion cannot suppress those runs after an axis transition.
-        let options = options_signal.read();
+        let options = options.read();
         let has_step_zoom = options.is_step_axis() && state.step_zoom.read().is_some();
         let allow_noncontributors = options_allow_noncontributors(&options, has_step_zoom);
         let nc = noncontrib.read();
@@ -427,7 +364,7 @@ pub(super) fn NumericContent(
             // The refresh heartbeat: version-bump propagations (floored and gated in use_version_bridge) restart this resource through it. Only the subscription matters — entry validity is decided by fresh_for, not the key.
             let _refresh = *data_seq.read();
             let refs = refs.read().clone();
-            let opts = options_signal.read().clone();
+            let opts = options.read().clone();
             // Subscribe to the shared zoom only on step-axis charts — the read
             // is conditional, so time/custom-x charts never react to it.
             let zoom = if opts.is_step_axis() {
@@ -511,7 +448,6 @@ pub(super) fn NumericContent(
                         )
                     {
                         return ChartFetch::Answer(ChartAnswer {
-                            data_seq: e.data_seq,
                             response: e.response.clone(),
                             request: Rc::new(e.request.clone()),
                         });
@@ -520,7 +456,6 @@ pub(super) fn NumericContent(
                     if let Some(keep) = chart_sync::subset_keep(&e.request, &request) {
                         if e.fresh_for(keep.iter().map(String::as_str), &ver, &mg, epoch) {
                             return ChartFetch::Answer(ChartAnswer {
-                                data_seq: next_data_seq(),
                                 response: Rc::new(chart_sync::filter_response(&e.response, &keep)),
                                 request: Rc::new(request.clone()),
                             });
@@ -631,9 +566,7 @@ pub(super) fn NumericContent(
                 ));
                 let resp_rc = Rc::new(full);
                 let nc_rc = Rc::new(nc_new);
-                let data_seq = next_data_seq();
                 let answer = ChartAnswer {
-                    data_seq,
                     response: resp_rc.clone(),
                     request: Rc::new(request.clone()),
                 };
@@ -641,7 +574,6 @@ pub(super) fn NumericContent(
                     let entry = ChartCacheEntry {
                         request,
                         response: resp_rc.clone(),
-                        data_seq,
                         versions,
                         metrics_gen: Rc::new(mg_snap),
                         epoch: epoch_snap,
@@ -667,35 +599,9 @@ pub(super) fn NumericContent(
         Some(ChartFetch::Answer(answer)) => Some(answer.clone()),
         Some(ChartFetch::Unavailable(_)) => None,
         _ => cached_entry.as_ref().map(|e| ChartAnswer {
-            data_seq: e.data_seq,
             response: e.response.clone(),
             request: Rc::new(e.request.clone()),
         }),
-    };
-    // Rendering semantics — axis kind, log bucketing, smoothed — must describe the response being PAINTED, not the live options: mid option-toggle the cache serves the previous response for a refetch cycle, and live-derived semantics would run the ms->s transform over step x, render linear buckets on a log scale, drop a shifted chart's zero slot, or stroke the wrong primary mark. The request cached alongside each response is that response's ground truth (every settled answer is put there before it renders); live options only cover the fresh-panel case where nothing is cached yet.
-    let shown_axis = chart_to_show
-        .as_ref()
-        .map(|answer| ShownAxis::of_request(&answer.request))
-        .unwrap_or_else(|| ShownAxis::of_options(&options));
-    let x_label = shown_axis.x_label();
-    let shown_smoothed = chart_to_show
-        .as_ref()
-        .map(|answer| {
-            answer
-                .request
-                .smoothing
-                .as_ref()
-                .is_some_and(|sm| sm.algorithm != 0)
-        })
-        .unwrap_or_else(|| {
-            !matches!(
-                options.smoothing,
-                crate::state::layout_config::SmoothingAlgorithm::None
-            )
-        });
-    let unavailable = match &*read {
-        Some(ChartFetch::Unavailable(message)) => Some(message.clone()),
-        _ => None,
     };
     let has_points = chart_to_show
         .as_ref()
@@ -709,37 +615,27 @@ pub(super) fn NumericContent(
         // tooltip/highlight loops. The placeholder holds the height; the
         // data stays cached for instant remount.
         Some(_) if has_points && zone_now != Zone::Visible => rsx! {
-            div { class: "chart-container", style: "min-height: {chart_height}px;" }
+            div { class: "chart-container" }
         },
         Some(ChartAnswer {
-            data_seq,
             response: chart,
-            ..
+            request,
         }) if has_points => {
-            // Time modes: ms -> seconds. The per-bucket x extents live in the same ms domain as the axis and feed the tooltip's x-range header, which formats seconds — convert them together or the header reads ~1000x off.
-            let time_log_shift =
-                shown_axis.time && shown_axis.log_x && chart.x_values.first() == Some(&0.0);
-            let display_chart = if shown_axis.time {
-                let mut c = (*chart).clone();
-                // Match the server's log(t_ms + 1) buckets before converting to seconds.
-                // Tooltip and copy readouts undo the shift; bucket x extents stay unshifted.
-                let shift = if time_log_shift { 1.0 } else { 0.0 };
-                c.x_values = c.x_values.iter().map(|&t| (t + shift) / 1000.0).collect();
-                c.xr_min = c.xr_min.iter().map(|&t| t / 1000.0).collect();
-                c.xr_max = c.xr_max.iter().map(|&t| t / 1000.0).collect();
-                c
-            } else {
-                (*chart).clone()
-            };
-
+            // The axis and smoothing come from the request this response answered, not the live options: mid option-toggle the cache serves the previous response for a refetch cycle, and live options would run the ms->s transform over step x, render linear buckets on a log scale, drop a shifted chart's zero slot, or stroke the wrong primary mark.
+            let smoothed = request
+                .smoothing
+                .as_ref()
+                .is_some_and(|sm| sm.algorithm != 0);
+            // Run colors live in localStorage; subscribe to the generation the sidebar bumps after an override changes.
+            let _color_version = *state.color_version.read();
             // Each series' run_id names its run: run_name for the label, ordinal for the color.
             let all_runs = state.display_runs();
-            let labels: Vec<String> = display_chart
+            let labels: Vec<String> = chart
                 .series
                 .iter()
                 .map(|s| crate::state::rewrite_label_with_run_name(&s.label, &s.run_id, &all_runs))
                 .collect();
-            let (colors, run_names): (Vec<String>, Vec<Option<String>>) = display_chart
+            let (colors, run_names): (Vec<String>, Vec<Option<String>>) = chart
                 .series
                 .iter()
                 .map(|s| {
@@ -756,23 +652,13 @@ pub(super) fn NumericContent(
 
             rsx! {
                 UPlotChart {
-                    chart: display_chart,
-                    data_key: data_seq,
-                    labels: Some(labels),
+                    chart: ChartModel(chart),
+                    labels: labels,
                     run_names: run_names,
-                    colors: Some(colors),
-                    log_x: shown_axis.log_x,
-                    // Step charts render log-x as log(x+1), matching the server's bucket ladder (time axes fold their +1ms into the ms->s transform above; custom-x keeps plain log).
-                    log_shift: shown_axis.log_x && shown_axis.step_axis(),
-                    time_log_shift: time_log_shift,
-                    log_y: options.log_y,
-                    height: chart_height,
-                    color_version: color_version,
-                    smoothed: shown_smoothed,
-                    x_label: x_label.clone(),
-                    zoom_refetch: shown_axis.step_axis(),
-                    is_time_axis: shown_axis.time,
-                    is_wall_time: shown_axis.wall,
+                    colors: colors,
+                    axis: ShownAxis::of_request(&request),
+                    log_y: options.read().log_y,
+                    smoothed: smoothed,
                 }
             }
         }
@@ -789,19 +675,18 @@ pub(super) fn NumericContent(
                 n => format!("No plottable data: {n} samples have an x this axis can't show"),
             };
             rsx! {
-                div { class: "rect-empty", style: "height: {chart_height}px;", "{message}" }
+                div { class: "rect-empty", "{message}" }
             }
         }
-        None if unavailable.is_some() => {
-            let message = unavailable.as_deref().unwrap_or_default();
-            rsx! {
-                div { class: "rect-empty", style: "height: {chart_height}px;", "{message}" }
-            }
-        }
-        // Nothing known yet: first fetch in flight, deferred with no cache
-        // (a never-fetched offscreen panel), or the width gate.
-        None => rsx! {
-            div { class: "rect-loading", style: "height: {chart_height}px;", "Loading..." }
+        None => match &*read {
+            Some(ChartFetch::Unavailable(message)) => rsx! {
+                div { class: "rect-empty", "{message}" }
+            },
+            // Nothing known yet: first fetch in flight, deferred with no cache
+            // (a never-fetched offscreen panel), or the width gate.
+            _ => rsx! {
+                div { class: "rect-loading", "Loading..." }
+            },
         },
     };
 

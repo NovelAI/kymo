@@ -91,9 +91,11 @@ pub fn Section(
     let visible_indices: Vec<usize> = pages[page].clone();
     let page_input_style = format!("width: calc({}ch + 6px);", total_pages.to_string().len());
 
+    // Every panel's content sizes itself by the section's chart height (kymo.css), so a height change changes no panel props.
     let grid_style = format!(
-        "grid-template-columns: repeat({}, 1fr);",
-        config.max_columns.max(1)
+        "grid-template-columns: repeat({}, 1fr); --kymo-chart-height: {}px;",
+        config.max_columns.max(1),
+        config.chart_height
     );
 
     rsx! {
@@ -281,10 +283,7 @@ pub fn Section(
                                 div {
                                     key: "{rect.id}",
                                     style: "{span_style}",
-                                    MetricRect {
-                                        config: rect.clone(),
-                                        chart_height: config.chart_height,
-                                    }
+                                    MetricRect { config: rect.clone() }
                                 }
                             }
                         }

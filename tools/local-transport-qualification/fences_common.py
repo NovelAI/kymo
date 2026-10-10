@@ -29,6 +29,33 @@ def drag_handle(page, handle, to_x: float) -> None:
     page.mouse.up()
 
 
+CHART_HEIGHT = "e => getComputedStyle(e).getPropertyValue('--kymo-chart-height')"
+
+
+def drag_chart_height(page, rect, dy: float) -> str:
+    """Drag `rect`'s resize grip `dy` pixels vertically, wait for its section's chart height to change, and return the new height."""
+    before = rect.evaluate(CHART_HEIGHT)
+    # The section's chart height stays within 100-800 px, so a drag at the edge it heads for would never change it.
+    height = float(before.removesuffix("px"))
+    if min(800, max(100, height + dy)) == height:
+        raise AssertionError(
+            f"a {dy:+} px drag cannot move the chart height off {before}"
+        )
+    rect.hover()
+    grip = rect.locator(".rect-resize-handle").bounding_box()
+    assert grip is not None
+    x, y = grip["x"] + grip["width"] / 2, grip["y"] + grip["height"] / 2
+    page.mouse.move(x, y)
+    page.mouse.down()
+    page.mouse.move(x, y + dy, steps=6)
+    page.mouse.up()
+    page.wait_for_function(
+        f"([e, before]) => ({CHART_HEIGHT})(e) !== before",
+        arg=[rect.element_handle(), before],
+    )
+    return rect.evaluate(CHART_HEIGHT)
+
+
 def render_turn(page) -> None:
     """Wait two animation frames; this is not an RPC-drain or idle barrier."""
     page.evaluate(

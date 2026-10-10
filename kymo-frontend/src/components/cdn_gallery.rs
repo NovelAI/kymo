@@ -403,7 +403,6 @@ async fn fetch_manifest(cdn_key: &str) -> Result<Option<Manifest>, String> {
 #[component]
 pub fn CdnGallery(
     runs: Vec<CdnRunData>,
-    height: u32,
     display_mode: CdnDisplayMode,
     /// Signal the gallery writes to once the manifest class is known
     /// ("image_gallery" / "metadata" / "file_list" / "mixed"). Lets the editor hide
@@ -460,7 +459,7 @@ pub fn CdnGallery(
             lightbox.set(None);
         }
         return rsx! {
-            div { class: "cdn-gallery", style: "height: {height}px;",
+            div { class: "cdn-gallery",
                 div { class: "cdn-gallery-empty", "No CDN data" }
             }
         };
@@ -568,7 +567,7 @@ pub fn CdnGallery(
     }
 
     rsx! {
-        div { class: "cdn-gallery", style: "height: {height}px;",
+        div { class: "cdn-gallery",
             // Step slider — pointless with a single step (e.g. info/run_info metadata, always step 0)
             if total_steps > 1 {
                 // MAXIMIZE_KEYS_JS (dashboard_layout.rs) presses the step buttons by aria-label for ↑/↓ in a maximized panel.

@@ -349,6 +349,8 @@ input[type="checkbox"]:checked::before {
     display: flex;
     min-height: 0;
 }
+/* Box-less, so the wrapper takes no part in .main-wrap's flex column. MAXIMIZE_RESIZE_JS (dashboard_layout.rs) writes the measured height inline over this value. */
+.maximize-height { display: contents; --kymo-chart-height: 280px; }
 .maximize-content > .metric-rect {
     flex: 1;
     display: flex;
@@ -1036,7 +1038,7 @@ input[type="checkbox"]:checked::before {
 .rect-header {
     display: flex;
     align-items: center;
-    /* no margin-bottom: the chart's own 8px top pad (uplot_chart.rs) is the title-to-plot gap */
+    /* no margin-bottom: the chart's own 8px top pad (create.js) is the title-to-plot gap */
     /* anchor for the .rect-actions overlay */
     position: relative;
 }
@@ -1051,7 +1053,7 @@ input[type="checkbox"]:checked::before {
     align-items: center;
     min-width: 0;
 }
-/* Hover target grown from existing geometry: to the card edges via the padding tokens, down into the top half of the chart's 8px top pad (uplot_chart.rs). Chart cursor and reset-click unzoom go dead in the strip (renames instead), so it must not reach drawn rows; z 1 or the later-DOM chart internals win the hit-test. */
+/* Hover target grown from existing geometry: to the card edges via the padding tokens, down into the top half of the chart's 8px top pad (create.js). Chart cursor and reset-click unzoom go dead in the strip (renames instead), so it must not reach drawn rows; z 1 or the later-DOM chart internals win the hit-test. */
 .rect-title::before {
     content: '';
     position: absolute;
@@ -1139,10 +1141,11 @@ input[type="checkbox"]:checked::before {
 
 .rect-error { height: 120px; color: var(--warning); }
 
-/* Height comes from the render site: rect-level placeholders set the
-   section's chart_height inline (so charts without data still track
-   vertical resizes); placeholders nested in a sized viewer fill it. */
-.rect-loading, .rect-empty { height: 100%; }
+/* A panel's placeholders and type-mismatch error take its chart height, so charts without data still
+   track vertical resizes; the log viewer's placeholders fill it instead. The `>` keeps the gallery's
+   own mixed-manifest error at the 120px above. */
+.rect-loading, .rect-empty, .metric-rect > .rect-error { height: var(--kymo-chart-height); }
+.text-stream-log :is(.rect-loading, .rect-empty) { height: 100%; }
 
 /* === uPlot overrides === */
 .u-select { background: rgba(245, 243, 194, 0.15) !important; }
@@ -1417,6 +1420,7 @@ input[type="checkbox"]:checked::before {
 /* === uPlot Chart === */
 .chart-container {
     width: 100%;
+    height: var(--kymo-chart-height);
     position: relative;
     /* No cursor here: create.js sets it per region (crosshair at plot height, ew-resize on the axis strip). */
     user-select: none;
@@ -1482,6 +1486,7 @@ input[type="checkbox"]:checked::before {
 
 /* === CDN Gallery === */
 .cdn-gallery {
+    height: var(--kymo-chart-height);
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -2242,6 +2247,7 @@ button.editor-section-toggle:focus-visible {
 /* === Text Stream Viewer === */
 
 .text-stream-viewer {
+    height: var(--kymo-chart-height);
     display: flex;
     flex-direction: column;
     overflow: hidden;

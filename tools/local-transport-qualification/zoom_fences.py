@@ -11,9 +11,9 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
-from playwright.sync_api import Page, sync_playwright
+from playwright.sync_api import Page, TimeoutError, sync_playwright
 
-from fences_common import fitted_box, render_turn as settle
+from fences_common import drag_chart_height, fitted_box, render_turn as settle
 
 
 SOURCE_TITLE = "zoom_a_source"
@@ -731,8 +731,49 @@ def client_zoom_fences(
         ):
             raise AssertionError(f"client sync peer did not zoom: {state}")
 
+    # A section height change resizes the charts in place, so a client zoom, which lives on the chart instance, survives it.
+    charts = page.evaluate_handle(
+        "ids => ids.map(id => window.__kymo_charts[id])", identifiers
+    )
+    rect = page.locator(f"#{source['id']}").locator(
+        "xpath=ancestor::*[contains(@class, 'metric-rect')][1]"
+    )
+    heights = charts.evaluate("charts => charts.map(chart => chart.height)")
+    drag_chart_height(page, rect, 80)
+    try:
+        page.wait_for_function(
+            """([ids, before]) => ids.every((id, i) => {
+                const chart = window.__kymo_charts[id];
+                return chart && chart.height !== before[i]
+                    && Math.abs(chart.height - chart.root.parentElement.getBoundingClientRect().height) < 1;
+            })""",
+            arg=[identifiers, heights],
+        )
+    except TimeoutError as error:
+        raise AssertionError(
+            "the client-zoomed charts did not take their section's new height"
+        ) from error
+    if not page.evaluate(
+        "([charts, ids]) => charts.every((chart, i) => chart === window.__kymo_charts[ids[i]])",
+        [charts, identifiers],
+    ):
+        raise AssertionError("a section height change rebuilt a client-zoomed chart")
+    for before, after in zip(zoomed, states()):
+        if not after["userzoom"]:
+            raise AssertionError(
+                f"a section height change reset a client zoom: {after}"
+            )
+        assert_close(
+            after["min"], before["min"], "client zoom minimum after a height change"
+        )
+        assert_close(
+            after["max"], before["max"], "client zoom maximum after a height change"
+        )
+    # The click below aims at the chart as it now sits.
+    source = chart_snapshot(page, source["id"])
+
     with single_click_enabled(page):
-        vertical_drags_do_not_reset(page, chart_snapshot(page, source["id"]))
+        vertical_drags_do_not_reset(page, source)
         page.mouse.click(x_at_fraction(source, 0.5), y_mid(source))
         settle(page)
         for state in states():

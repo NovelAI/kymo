@@ -17,33 +17,20 @@ use crate::components::sidebar::{names_repeat, sidebar_run_label};
 use crate::components::uplot_chart::{hash_color, run_color};
 use crate::grpc::proto::{RunInfo, RunStatus, SeriesRef, TextLine};
 use crate::state::app_state::find_run;
-use crate::state::layout_config::XAxisMode;
 use crate::state::visibility::{self, Zone};
 use crate::state::{run_ordinal_for, stamp_covers, DashboardState, UserConfigState};
 use crate::util::resize_observer::ElementResizeObserver;
 use crate::util::{is_app_escape, primary};
 
-/// Format a step value based on the X-axis mode.
-fn format_step(step: i64, first_step: i64, mode: &XAxisMode) -> String {
-    match mode {
-        XAxisMode::RelativeTime => {
-            let secs = (step - first_step) as f64 / 1000.0;
-            if secs < 60.0 {
-                format!("{secs:.0}s")
-            } else if secs < 3600.0 {
-                format!("{:.1}m", secs / 60.0)
-            } else {
-                format!("{:.1}h", secs / 3600.0)
-            }
-        }
-        XAxisMode::WallTime => {
-            let total_secs = step / 1000;
-            let h = (total_secs / 3600) % 24;
-            let m = (total_secs / 60) % 60;
-            let s = total_secs % 60;
-            format!("{h:02}:{m:02}:{s:02}")
-        }
-        XAxisMode::Step => format!("step {step}"),
+/// A line's time since the stream's first line, for its tooltip: captured output is stepped by its timestamp in ms.
+fn format_elapsed(step: i64, first_step: i64) -> String {
+    let secs = (step - first_step) as f64 / 1000.0;
+    if secs < 60.0 {
+        format!("{secs:.0}s")
+    } else if secs < 3600.0 {
+        format!("{:.1}m", secs / 60.0)
+    } else {
+        format!("{:.1}h", secs / 3600.0)
     }
 }
 
@@ -119,14 +106,10 @@ fn metric_label<'a>(metric_names: &[String], line_metric_name: &'a str) -> Optio
 #[component]
 pub fn TextStreamViewer(
     stream_refs: Vec<SeriesRef>,
-    #[props(default = 280)] height: u32,
-    #[props(default)] x_axis_mode: XAxisMode,
-    /// Viewport zone from the owning rect: out-of-band viewers freeze and catch up on re-entry; None always fetches.
-    #[props(default)]
-    zone: Option<Signal<Zone>>,
-    /// Key for remembering search, the active tab, and per-log scroll across body unmounts; grid and maximized copies use separate keys, and None doesn't persist.
-    #[props(default)]
-    persist_key: Option<String>,
+    /// Viewport zone from the owning rect: out-of-band viewers freeze and catch up on re-entry.
+    zone: Signal<Zone>,
+    /// Key for remembering search, the active tab, and per-log scroll across body unmounts; grid and maximized copies use separate keys.
+    persist_key: String,
 ) -> Element {
     let state = use_context::<DashboardState>();
     let mut runs = Vec::<RunStreams>::new();
@@ -153,10 +136,7 @@ pub fn TextStreamViewer(
         }
     }
 
-    let initial = use_hook({
-        let persist_key = persist_key.clone();
-        move || remembered_panel(persist_key.as_deref())
-    });
+    let initial = use_hook(|| remembered_panel(&persist_key));
     let mut search_draft = use_signal(|| initial.draft.clone());
     let mut search = use_signal(|| initial.committed.clone());
     let mut chosen_tab = use_signal(|| initial.tab.clone());
@@ -169,7 +149,7 @@ pub fn TextStreamViewer(
         let persist_key = persist_key.clone();
         move || {
             remember_panel(
-                persist_key.as_deref(),
+                &persist_key,
                 TextPanelState {
                     draft: search_draft.peek().clone(),
                     committed: search.peek().clone(),
@@ -234,7 +214,7 @@ pub fn TextStreamViewer(
         });
 
     rsx! {
-        div { class: "text-stream-viewer", style: "height: {height}px;",
+        div { class: "text-stream-viewer",
             form {
                 class: "text-stream-toolbar",
                 onsubmit: move |event| {
@@ -306,19 +286,16 @@ pub fn TextStreamViewer(
                     let live = find_run(&display_runs, &run.run_id).is_some_and(|info| {
                         matches!(info.status(), RunStatus::Running | RunStatus::Stuck)
                     });
-                    let scroll_key = persist_key.as_deref()
-                        .map(|panel| text_scroll_key(panel, &log_key));
                     rsx! {
                         VirtualTextLog {
                             key: "{log_key}",
                             source: run.clone(),
                             display_name: tab_labels[active].1.clone(),
                             live,
-                            x_axis_mode: x_axis_mode.clone(),
                             search: committed_search.clone(),
                             search_revision,
                             zone,
-                            persist_key: scroll_key,
+                            scroll_key: text_scroll_key(&persist_key, &log_key),
                             log_key: log_key.clone(),
                             line_count,
                         }
@@ -334,11 +311,10 @@ fn VirtualTextLog(
     source: RunStreams,
     display_name: String,
     live: bool,
-    x_axis_mode: XAxisMode,
     search: String,
     search_revision: Signal<u64>,
-    zone: Option<Signal<Zone>>,
-    persist_key: Option<String>,
+    zone: Signal<Zone>,
+    scroll_key: String,
     log_key: String,
     line_count: Signal<Option<(String, u64)>>,
 ) -> Element {
@@ -347,15 +323,13 @@ fn VirtualTextLog(
     let line_height = use_memo(move || user_config.font_size().scale_px(DEFAULT_LINE_HEIGHT_PX));
     let line_height_px = *line_height.read();
     let mut viewport = use_signal(|| {
-        ScrollViewport::new(
-            remembered_scroll(persist_key.as_deref()).unwrap_or(if live {
-                ScrollAnchor::End
-            } else {
-                ScrollAnchor::Line(0.0)
-            }),
-        )
+        ScrollViewport::new(remembered_scroll(&scroll_key).unwrap_or(if live {
+            ScrollAnchor::End
+        } else {
+            ScrollAnchor::Line(0.0)
+        }))
     });
-    use_drop(move || remember_scroll(persist_key.as_deref(), viewport.peek().anchor()));
+    use_drop(move || remember_scroll(&scroll_key, viewport.peek().anchor()));
     // Wait for layout and deduplicate unchanged request windows.
     let requested = use_memo(move || viewport.read().window(*line_height.read()));
     let mut body = use_signal(|| None::<web_sys::HtmlElement>);
@@ -371,7 +345,7 @@ fn VirtualTextLog(
             &state.run_versions.read(),
         )
     });
-    let allowed = use_memo(move || zone.map(|z| *z.read() != Zone::Far).unwrap_or(true));
+    let allowed = use_memo(move || *zone.read() != Zone::Far);
     let mut loading = use_signal(|| false);
     let data_seq = crate::state::use_version_bridge(my_version, loading, allowed);
     let fetch_source = source.clone();
@@ -410,11 +384,7 @@ fn VirtualTextLog(
                 return;
             }
             let first_paint = !matches!(*content.peek(), Some(Ok(_)));
-            let _admission = visibility::admit_fetch(
-                || zone.map(|z| *z.peek()).unwrap_or(Zone::Visible),
-                first_paint,
-            )
-            .await;
+            let _admission = visibility::admit_fetch(|| *zone.peek(), first_paint).await;
             loading.set(true);
 
             let sent =
@@ -571,7 +541,7 @@ fn VirtualTextLog(
                                 {
                                     let color = hash_color(&line.metric_name);
                                     let source_label = metric_label(&source.metric_names, &line.metric_name);
-                                    let tooltip = format_step(line.step, value.first_step, &x_axis_mode);
+                                    let tooltip = format_elapsed(line.step, value.first_step);
                                     let line_key = format!(
                                         "{}:{}:{}",
                                         line.metric_name, line.step, line.line_index

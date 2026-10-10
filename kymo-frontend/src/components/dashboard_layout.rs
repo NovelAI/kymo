@@ -33,23 +33,21 @@ const EXPLICIT_METADATA_CONCURRENCY: usize = 16;
 /// Matches `retry_visible_while`'s interval — same failure, same patience.
 const EXPLICIT_METADATA_RETRY: Duration = Duration::from_secs(5);
 
-/// Available chart height after the measured content area and font-sized chrome.
-static MAXIMIZED_CHART_HEIGHT: GlobalSignal<u32> = Signal::global(|| 280);
-
-/// Sent at once for the first measurement (a `?chart=` link opens maximized) and while no chart is maximized, so a maximize is built at the window's height instead of being rebuilt when a delayed measurement lands; debounced 100 ms while one is, so a window drag settles before the maximized chart follows. Mounted through the js_bridge registry so an unmounted layout never leaves an observer and its timer alive.
+/// Writes `.main-wrap`'s height less the font-sized chrome as `--kymo-chart-height` on the box-less `.maximize-height` wrapper around the overlay, so a write restyles only the overlay, never the whole main column. Written at once for the first measurement (a `?chart=` link opens maximized) and while nothing is maximized, so a maximized panel starts at the window's height (a log plans its first request for it); debounced 100 ms while one is, so a window drag settles before the panel follows (each change resizes its chart and moves a log's request window). Mounted through the js_bridge registry so an unmounted layout never leaves an observer and its timer alive.
 const MAXIMIZE_RESIZE_JS: &str = r#"(()=>{
-const el=document.querySelector('.main-wrap');
+// The wrapper's one element child is the overlay, present while a panel is maximized.
+const el=document.querySelector('.main-wrap'),host=el.querySelector('.maximize-height');
 let last=-1,t=0;
-function send(){
+function write(){
   const style=getComputedStyle(el);
   // Match .maximize-overlay padding and .metric-rect's padding + 1lh title; .main-wrap already excludes the navbar and any notice bar.
   const chrome=2*parseFloat(style.getPropertyValue('--spacing-md'))
     +2*parseFloat(style.getPropertyValue('--spacing-xs'))+parseFloat(style.lineHeight);
   const h=Math.max(0,Math.floor(el.clientHeight-chrome));
-  // A NaN frame (e.g. a stylesheet that failed to load) would close the Rust u32 receiver.
-  if(!Number.isFinite(h)||h===last)return;last=h;dioxus.send(h);
+  // A NaN frame (e.g. a stylesheet that failed to load) keeps the last height.
+  if(!Number.isFinite(h)||h===last)return;last=h;host.style.setProperty('--kymo-chart-height',h+'px');
 }
-const ro=new ResizeObserver(()=>{clearTimeout(t);if(last<0||!document.getElementById(__MAXIMIZE_OVERLAY_ID__))send();else t=setTimeout(send,100);});
+const ro=new ResizeObserver(()=>{clearTimeout(t);if(last<0||!host.firstElementChild)write();else t=setTimeout(write,100);});
 window.__kymo_bridges.mount(__BRIDGE_NAME__,__BRIDGE_OWNER__,()=>{clearTimeout(t);ro.disconnect();});
 ro.observe(el);
 })()"#;
@@ -643,15 +641,7 @@ pub fn DashboardLayout(project_id: String) -> Element {
         div {
             class: "app-shell",
             onmounted: move |_| {
-                let js = maximize_bridge
-                    .script(MAXIMIZE_RESIZE_JS)
-                    .replace("__MAXIMIZE_OVERLAY_ID__", &js_string(MAXIMIZE_OVERLAY_ID));
-                spawn(async move {
-                    let mut eval = document::eval(&js);
-                    while let Ok(height) = eval.recv::<u32>().await {
-                        *MAXIMIZED_CHART_HEIGHT.write() = height;
-                    }
-                });
+                document::eval(&maximize_bridge.script(MAXIMIZE_RESIZE_JS));
             },
             Navbar {}
             div { class: "content-row",
@@ -671,7 +661,8 @@ pub fn DashboardLayout(project_id: String) -> Element {
                     main { class: "main-content", inert: state.maximized.read().is_some().then_some(true),
                         Outlet::<Route> {}
                     }
-                    MaximizeOverlay {}
+                    // MAXIMIZE_RESIZE_JS holds this node, writes its style and reads an element child as a maximized panel, so it must stay unconditional, hold only the overlay, and Dioxus must never set a style here.
+                    div { class: "maximize-height", MaximizeOverlay {} }
                 }
                 // Docked after the main column, which narrows while it's open.
                 DashboardOptionsPanel {}
@@ -722,8 +713,6 @@ fn MaximizeOverlay() -> Element {
     };
     let rect_id = rect_config.id.clone();
 
-    let chart_height = *MAXIMIZED_CHART_HEIGHT.read();
-
     rsx! {
         div {
             id: MAXIMIZE_OVERLAY_ID,
@@ -755,7 +744,6 @@ fn MaximizeOverlay() -> Element {
                         // A one-item keyed list: Dioxus 0.7.9 ignores `key:` on a component nested in elements, and a reused instance would carry the previous chart's hooks (cache key, fetched data, gallery step) into the next one (←/→, chart links).
                         key: "{id}",
                         config: rect_config.clone(),
-                        chart_height: chart_height,
                         is_maximized: true,
                     }
                 }

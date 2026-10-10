@@ -1,4 +1,4 @@
-use super::{normalized_hex_color, parse_hex_color};
+use super::{normalized_hex_color, parse_hex_color, ShownAxis};
 use crate::state::FontSize;
 
 const TEMPLATE: &str = include_str!("create.js");
@@ -24,33 +24,23 @@ pub(super) struct ChartJsConfig {
     /// Two trailing data-only columns (after the NaN-marker columns) hold
     /// the x extent of the raw points behind each union slot, unioned
     /// across series. No series entries — uPlot ignores data columns past
-    /// its series list — they exist for the tooltip's x readout only.
+    /// its series list — they feed the tooltip's x-range header and whole-bucket zoom.
     pub(super) has_xrange: bool,
     /// Number of trailing "NaN marker" columns appended after all real series
     /// columns (one per real series, same order/colors). Each marks where the
-    /// run logged a non-finite value with a hollow circle pinned to the
-    /// bottom of the chart, like wandb.
+    /// run logged a non-finite value or an unplottable x, or where the log y
+    /// axis clips it, with a hollow circle pinned to the plot's border (top
+    /// for +inf, bottom for the rest), like wandb.
     pub(super) nan_markers: usize,
     /// Per series: how many samples sit behind its kind-4 (unplottable-x)
     /// markers — the tooltip appends "×N" on those rows when N > 1.
     pub(super) xnan_counts: Vec<u32>,
-    pub(super) log_x: bool,
-    /// Step-axis log charts render in log(x+1), matching the server's bucket ladder: the data is shifted +1 before uPlot, and the splits/formatters/zoom dispatches convert back to real steps.
+    pub(super) axis: ShownAxis,
+    /// Zero-present log x on a step or time axis renders log(x+1) in the wire's units (steps, ms), matching the server's bucket ladder: the data is shifted before uPlot. A step chart's splits, formatters and zoom dispatches convert back to real steps; tooltip and copy readouts undo the shift (+1 step, +0.001 s).
     pub(super) log_shift: bool,
-    /// Tooltip and copy readouts undo the +0.001s used to render zero-present log-time charts.
-    pub(super) time_log_shift: bool,
     pub(super) log_y: bool,
-    pub(super) height: u32,
     /// Canvas font/gutter input included in the structural config.
     pub(super) font_size: FontSize,
-    /// Whether zoom should refetch (step-based X) or be client-side only
-    pub(super) zoom_refetch: bool,
-    /// X-axis shows time values (seconds for relative, epoch for wall)
-    pub(super) is_time_axis: bool,
-    /// Wall-clock time (format as HH:MM:SS) vs relative (format as elapsed)
-    pub(super) is_wall_time: bool,
-    /// Human-readable x-axis label shown above the copied text table; on a custom axis, the full metric name that keys `sync_key`.
-    pub(super) x_label: String,
 }
 
 /// Escape the contents of a single-quoted JS literal; unlike `util::js_bridge::js_string`, this does not add the surrounding quotes. Besides the
@@ -91,7 +81,7 @@ fn render_template(replacements: &[(&str, String)]) -> String {
         rendered.push_str(&rest[..start]);
         let token_and_rest = &rest[start..];
         let offset = template.len() - rest.len() + start;
-        // Line numbers exist only for malformed-template diagnostics; keep the ordinary render path from rescanning the 50-KiB prefix once per token.
+        // Line numbers exist only for malformed-template diagnostics; keep the ordinary render path from rescanning the template's prefix once per token.
         let line = || {
             template[..offset]
                 .bytes()
@@ -120,23 +110,26 @@ fn render_template(replacements: &[(&str, String)]) -> String {
     rendered
 }
 
-/// Cursor-sync group: charts on the same x axis (step, relative time, wall time, or one custom metric) mirror each other's crosshair, compact tooltips, zoom and selection boxes. Step charts come first because `zoom_refetch` also gives them the syncX scale, so a group never mixes sync scales.
-fn sync_key(cfg: &ChartJsConfig) -> String {
-    if cfg.zoom_refetch {
+/// Cursor-sync group: charts on the same x axis (step, relative time, wall time, or one custom metric) mirror each other's crosshair, compact tooltips, zoom and selection boxes.
+fn sync_key(axis: &ShownAxis) -> String {
+    if axis.step_axis() {
         "step".to_string()
-    } else if cfg.is_wall_time {
+    } else if axis.wall {
         "wall".to_string()
-    } else if cfg.is_time_axis {
+    } else if axis.time {
         "rel".to_string()
     } else {
         // The full metric name: esc_js escapes it, and a lossy rewrite could map two metrics to one key.
         // The m- prefix keeps a metric named step, wall or rel out of those built-in groups.
-        format!("m-{}", cfg.x_label)
+        format!("m-{}", axis.x_metric)
     }
 }
 
 /// Build the JS that creates a uPlot chart. Rust's `ChartJsConfig` equality gate keeps ordinary data-only refreshes out of this roughly 52-KiB renderer entirely; the embedded config hash is a second, browser-side race guard so overlapping same-config create evaluations coalesce through `setData` instead of destroying and recreating the chart. A genuinely different config still falls through to destroy + recreate.
 pub(super) fn build_create_js(id: &str, cfg: &ChartJsConfig) -> String {
+    let log_x = cfg.axis.log_x;
+    let zoom_refetch = cfg.axis.step_axis();
+    let x_shift = cfg.log_shift && zoom_refetch;
     // This hash is an ephemeral same-page equality token only; it is never persisted or sent over the wire, so cross-process stability is deliberately unnecessary.
     let cfg_hash = {
         use std::hash::{Hash, Hasher};
@@ -214,11 +207,11 @@ pub(super) fn build_create_js(id: &str, cfg: &ChartJsConfig) -> String {
 
     // NaN markers: appended AFTER all real series + bands so the block/band
     // index math above is untouched. One marker column per real series; the
-    // column holds the marker KIND where the run logged a non-finite value
-    // (NaN elsewhere). Nothing renders through the series machinery —
+    // column holds the marker KIND (1-5, see UPlotChart) at each marked
+    // slot (NaN elsewhere). Nothing renders through the series machinery —
     // each marker series sits on the dummy 'nan' scale so it can never
     // stretch the y range, and the draw hook paints its hollow circles
-    // pinned to the plot's bottom edge.
+    // pinned to the plot's border (top for +inf, bottom for the rest).
     for _ in 0..cfg.nan_markers {
         series_opts.push(
             "{'scale':'nan','stroke':'transparent','width':0,'points':{show:false},'paths':()=>null}"
@@ -250,13 +243,13 @@ pub(super) fn build_create_js(id: &str, cfg: &ChartJsConfig) -> String {
         })
         .collect();
 
-    let x_splits = if cfg.log_shift {
+    let x_splits = if x_shift {
         "{splits:xSplits,filter:function(u,s){return s}}"
     } else {
         "{}"
     };
     // uPlot's default log range snaps to powers of 10; pin to the zoom's own endpoints, but via logSafeX so an extrapolated <=0/non-finite bound can't freeze the per-decade tick walk.
-    let x_range = if cfg.log_x { "{range:logSafeX}" } else { "{}" };
+    let x_range = if log_x { "{range:logSafeX}" } else { "{}" };
     // yNice/yNiceLog: nice bounds under a 10% slack cap, measured linearly or in decades to match the scale's geometry.
     let y_range = if cfg.log_y {
         "{range:yNiceLog}"
@@ -270,10 +263,10 @@ pub(super) fn build_create_js(id: &str, cfg: &ChartJsConfig) -> String {
     let x_axis_size = 11 + axis_font_size;
     let y_axis_min_size = 11 + cfg.font_size.scale_px(24);
     // Cursor sync exchanges real x: every step chart defines a derived syncX scale over original steps whose fwd/bwd reproduce its plotted pixel geometry, so linear, plain-log, and log(x+1) charts meet in one native sync group.
-    let sync_scale = if cfg.zoom_refetch {
-        if cfg.log_shift {
+    let sync_scale = if zoom_refetch {
+        if x_shift {
             "{syncX:{from:'x',distr:100,fwd:v=>Math.log10(v+1),bwd:v=>Math.pow(10,v)-1,range:(u,mn,mx)=>[mn-1,mx-1]}}"
-        } else if cfg.log_x {
+        } else if log_x {
             // Identity domain, but the geometry must match the plotted distr-3 log scale — a bare `from` scale defaults to linear and would misplace the mirrored crosshair.
             "{syncX:{from:'x',distr:100,fwd:v=>Math.log10(v),bwd:v=>Math.pow(10,v),range:(u,mn,mx)=>[mn,mx]}}"
         } else {
@@ -292,7 +285,6 @@ pub(super) fn build_create_js(id: &str, cfg: &ChartJsConfig) -> String {
                 .to_string(),
         ),
         ("__KYMO_ID__", esc_js(id)),
-        ("__KYMO_CHART_HEIGHT__", cfg.height.to_string()),
         ("__KYMO_AXIS_FONT_SIZE__", axis_font_size.to_string()),
         ("__KYMO_X_AXIS_SIZE__", x_axis_size.to_string()),
         ("__KYMO_Y_AXIS_MIN_SIZE__", y_axis_min_size.to_string()),
@@ -302,23 +294,23 @@ pub(super) fn build_create_js(id: &str, cfg: &ChartJsConfig) -> String {
         ("__KYMO_SMOOTHED__", cfg.smoothed.to_string()),
         ("__KYMO_HAS_XRANGE__", cfg.has_xrange.to_string()),
         ("__KYMO_NAN_MARKERS__", cfg.nan_markers.to_string()),
-        ("__KYMO_ZOOM_REFETCH__", cfg.zoom_refetch.to_string()),
-        ("__KYMO_X_SHIFT__", u8::from(cfg.log_shift).to_string()),
+        ("__KYMO_ZOOM_REFETCH__", zoom_refetch.to_string()),
+        ("__KYMO_X_SHIFT__", u8::from(x_shift).to_string()),
         (
             "__KYMO_READOUT_X_SHIFT__",
-            if cfg.log_shift {
-                "1"
-            } else if cfg.time_log_shift {
+            if !cfg.log_shift {
+                "0"
+            } else if cfg.axis.time {
                 "0.001"
             } else {
-                "0"
+                "1"
             }
             .to_string(),
         ),
         ("__KYMO_X_SPLITS__", x_splits.to_string()),
         (
             "__KYMO_X_DISTR__",
-            if cfg.log_x { "3" } else { "1" }.to_string(),
+            if log_x { "3" } else { "1" }.to_string(),
         ),
         ("__KYMO_X_RANGE__", x_range.to_string()),
         (
@@ -341,14 +333,14 @@ pub(super) fn build_create_js(id: &str, cfg: &ChartJsConfig) -> String {
         ),
         ("__KYMO_BANDS_LIST__", bands_js.join(",")),
         ("__KYMO_CFG_HASH__", format!("{cfg_hash:x}")),
-        ("__KYMO_IS_TIME__", cfg.is_time_axis.to_string()),
-        ("__KYMO_IS_WALL__", cfg.is_wall_time.to_string()),
-        ("__KYMO_X_LABEL__", esc_js(&cfg.x_label)),
-        ("__KYMO_SYNC_KEY__", esc_js(&sync_key(cfg))),
+        ("__KYMO_IS_TIME__", cfg.axis.time.to_string()),
+        ("__KYMO_IS_WALL__", cfg.axis.wall.to_string()),
+        ("__KYMO_X_LABEL__", esc_js(cfg.axis.x_label())),
+        ("__KYMO_SYNC_KEY__", esc_js(&sync_key(&cfg.axis))),
         ("__KYMO_SYNC_SCALE__", sync_scale.to_string()),
         (
             "__KYMO_SYNC_SCALE_KEY__",
-            if cfg.zoom_refetch { "syncX" } else { "x" }.to_string(),
+            if zoom_refetch { "syncX" } else { "x" }.to_string(),
         ),
     ];
     render_template(&replacements)
@@ -371,16 +363,15 @@ mod tests {
             has_xrange: true,
             nan_markers: 2,
             xnan_counts: vec![0, 3],
-            log_x: true,
+            axis: ShownAxis {
+                log_x: true,
+                time: false,
+                wall: false,
+                x_metric: String::new(),
+            },
             log_shift: true,
-            time_log_shift: false,
             log_y: true,
-            height: 321,
             font_size: FontSize::default(),
-            zoom_refetch: true,
-            is_time_axis: false,
-            is_wall_time: false,
-            x_label: "step".into(),
         }
     }
 
@@ -397,16 +388,15 @@ mod tests {
             has_xrange: false,
             nan_markers: 0,
             xnan_counts: vec![0],
-            log_x: false,
+            axis: ShownAxis {
+                log_x: false,
+                time: true,
+                wall: true,
+                x_metric: String::new(),
+            },
             log_shift: false,
-            time_log_shift: false,
             log_y: false,
-            height: 200,
             font_size: FontSize::default(),
-            zoom_refetch: false,
-            is_time_axis: true,
-            is_wall_time: true,
-            x_label: "time".into(),
         }
     }
 
@@ -468,7 +458,6 @@ mod tests {
 
         assert!(!js.contains("__KYMO_"));
         assert!(js.contains("distr:1"));
-        assert!(js.contains("height:200"));
         assert!(js.contains("font:'13px sans-serif'"));
         assert!(js.contains("!sameWallDay(s.min,s.max)"));
         assert!(js.contains("if(isWallTime)return fmtWall(v,true)"));
@@ -527,8 +516,10 @@ mod tests {
     #[test]
     fn zero_present_log_time_keeps_zoom_unshifted_and_restores_readout_x() {
         let mut config = minimal_config();
-        config.log_x = true;
-        config.time_log_shift = true;
+        // Only relative time starts at zero.
+        config.axis.wall = false;
+        config.axis.log_x = true;
+        config.log_shift = true;
         let js = build_create_js("chart-7", &config);
 
         assert!(js.contains("let xShift=0;"));
@@ -538,23 +529,24 @@ mod tests {
     /// AI-1429: a custom axis syncs only with its own metric, never with one differing only in punctuation nor, when named "step", with the step charts.
     #[test]
     fn custom_axes_sync_only_with_the_same_metric() {
-        let key = |zoom_refetch, metric: &str| {
-            let mut cfg = full_config();
-            cfg.zoom_refetch = zoom_refetch;
-            cfg.x_label = metric.to_string();
-            sync_key(&cfg)
+        let key = |metric: &str| {
+            sync_key(&ShownAxis {
+                x_metric: metric.to_string(),
+                ..full_config().axis
+            })
         };
-        assert_ne!(key(false, "train/epoch"), key(false, "train_epoch"));
-        assert_ne!(key(false, "step"), key(true, "step"));
+        assert_ne!(key("train/epoch"), key("train_epoch"));
+        // A custom metric named step against the step axis.
+        assert_ne!(key("step"), key(""));
     }
 
     #[test]
     fn does_not_interpret_tokens_from_dynamic_values() {
         let mut config = minimal_config();
         config.labels[0] = "__KYMO_COLORS__".to_string();
-        config.is_time_axis = false;
-        config.is_wall_time = false;
-        config.x_label = "sync'key\n".to_string();
+        config.axis.time = false;
+        config.axis.wall = false;
+        config.axis.x_metric = "sync'key\n".to_string();
         let js = build_create_js("chart'7\n", &config);
 
         assert!(js.contains("'__KYMO_COLORS__'"));
@@ -588,7 +580,9 @@ mod tests {
     #[test]
     fn chart_copy_metadata_uses_the_x_label_and_live_column_layout() {
         let mut config = minimal_config();
-        config.x_label = "custom'x\n".to_string();
+        config.axis.time = false;
+        config.axis.wall = false;
+        config.axis.x_metric = "custom'x\n".to_string();
         let js = build_create_js("chart-7", &config);
 
         assert!(js.contains("xLabel:'custom\\'x\\n'"));

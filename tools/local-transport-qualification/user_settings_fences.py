@@ -284,6 +284,62 @@ def assert_maximized_chart_fits(page: Page) -> None:
         ) from error
 
 
+# The ids of mounted charts that show `runId` and, given a `color` (#rrggbb or rgb(a)), draw every visible stroke of the run's own series in it: each of its band blocks and lines, in create.js's rawStride/lineBase layout.
+RUN_CHARTS = """([runId, color]) => {
+    const rgb = value => {
+        const hex = /^#([0-9a-f]{6})$/i.exec(value || '');
+        if (hex) {
+            const n = parseInt(hex[1], 16);
+            return [n >> 16, (n >> 8) & 255, n & 255].join();
+        }
+        const fn = /^rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)/.exec(value || '');
+        return fn ? fn.slice(1).join() : null;
+    };
+    return Object.entries(window.__kymo_charts).filter(([, chart]) => {
+        const hl = chart.__kymo_hl;
+        const runs = chart.root.isConnected ? hl.runs.flatMap((run, i) => run === runId ? [i] : []) : [];
+        if (!runs.length) return false;
+        if (!color) return true;
+        const strokes = runs.flatMap(run => {
+            const own = [chart.__kymo_copy.lineBase + run];
+            for (let k = 0; k < hl.rs; k++) own.push(1 + run * hl.rs + k);
+            return own;
+        }).map(index => rgb(chart.series[index].stroke(chart, index))).filter(Boolean);
+        return strokes.length > 0 && strokes.every(stroke => stroke === rgb(color));
+    }).map(([id]) => id);
+}"""
+
+
+def assert_run_color_repaints(page: Page) -> None:
+    # A run color change repaints every mounted chart showing the run: NumericContent rebuilds the colors when the sidebar bumps the color generation. The charts must be mounted before the change, or a remount would draw the new color without that subscription.
+    trigger = page.locator(".run-overflow-trigger").first
+    run_id = trigger.locator("xpath=ancestor::*[@data-run-id][1]").get_attribute(
+        "data-run-id"
+    )
+    charts = page.wait_for_function(
+        f"run => {{ const ids = ({RUN_CHARTS})([run, null]); return ids.length > 0 && ids; }}",
+        arg=run_id,
+    ).json_value()
+    trigger.press("Enter")
+    page.locator(".run-overflow-menu:popover-open").get_by_role(
+        "button", name="Change color…", exact=True
+    ).press("Enter")
+    picker = page.locator(".color-picker")
+    swatch = picker.locator(".color-swatch:not(.color-swatch-active)").first
+    color = swatch.get_attribute("title").removeprefix("Use ")
+    swatch.click()
+    expect(picker).to_have_count(0)
+    try:
+        page.wait_for_function(
+            f"([args, charts]) => {{ const ids = ({RUN_CHARTS})(args); return charts.every(id => ids.includes(id)); }}",
+            arg=[[run_id, color], charts],
+        )
+    except TimeoutError as error:
+        raise AssertionError(
+            f"charts {charts} did not repaint run {run_id} in {color}"
+        ) from error
+
+
 def run_fences(page: Page, *, dashboard_path: str | None = None) -> None:
     parsed = urlsplit(page.url)
     origin = f"{parsed.scheme}://{parsed.netloc}/"
@@ -555,21 +611,29 @@ def run_fences(page: Page, *, dashboard_path: str | None = None) -> None:
             raise AssertionError(f"narrow options panel is misplaced: {laid}")
         close_panel(page, panel, defaults, "Escape")
 
-        # A maximize right after a window resize builds its chart once, at the new height, and one already maximized follows the window. A chart built at a stale height fits only once built again (its container doesn't size it), which drops the readout under the pointer, so the first instance must be the one that fits.
+        # A maximize right after a window resize builds its chart at the new height (a stale one would jump and draw twice), and the chart then follows the window by resizing in place. Each chart records the height uPlot was built at.
+        page.evaluate(
+            "() => { window.uPlot = new Proxy(window.uPlot, {construct(target, args) { const chart = Reflect.construct(target, args); chart.__fence_built_height = args[0].height; return chart; }}); }"
+        )
         page.set_viewport_size({"width": 640, "height": 1_100})
         page.locator('.metric-rect button[title="Maximize"]').first.click()
         built = page.wait_for_function(
             "() => Object.values(window.__kymo_charts).find(chart => chart.root.closest('.maximize-content'))"
         )
         assert_maximized_chart_fits(page)
-        # uPlot's destroy() removes the root it built.
-        assert built.evaluate("chart => chart.root.isConnected"), (
-            "the maximized chart was rebuilt after the window resize"
+        heights = built.evaluate("chart => [chart.__fence_built_height, chart.height]")
+        assert heights[0] == heights[1], (
+            f"the maximized chart was built at a stale height: {heights}"
         )
         page.set_viewport_size({"width": 640, "height": 900})
         assert_maximized_chart_fits(page)
+        # uPlot's destroy() removes the root it built.
+        assert built.evaluate("chart => chart.root.isConnected"), (
+            "the maximized chart was rebuilt to follow the window"
+        )
         page.keyboard.press("Escape")
         page.locator(".maximize-overlay").wait_for(state="detached")
+        assert_run_color_repaints(page)
         assert_large_log_geometry(page)
         page.goto(origin + "trash", wait_until="domcontentloaded")
         wait_font(page, 24)

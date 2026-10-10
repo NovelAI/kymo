@@ -737,12 +737,11 @@ impl LayoutConfig {
             .find(|r| r.id == id)
     }
 
-    /// Name of the section holding rect `id`.
-    pub fn section_of_rect(&self, id: &str) -> Option<&str> {
+    /// The section holding rect `id`.
+    pub fn section_of_rect(&self, id: &str) -> Option<&SectionConfig> {
         self.sections
             .iter()
             .find(|s| s.rects.iter().any(|r| r.id == id))
-            .map(|s| s.name.as_str())
     }
 
     /// The rect with the given id plus its section's `max_columns`, which bounds the chart panel's Width control.
@@ -2096,7 +2095,10 @@ mod user_section_tests {
         let rect = user_rect("rect-1");
         diff.add_rect(&base, "section-1-abc", &rect);
         let shown = diff.apply(&base);
-        assert_eq!(shown.section_of_rect("rect-1"), Some("section-1-abc"));
+        assert_eq!(
+            shown.section_of_rect("rect-1").map(|s| s.name.as_str()),
+            Some("section-1-abc")
+        );
         let mut edited = rect.clone();
         edited.label = "renamed".to_string();
         diff.update_rect(&base, &edited);
@@ -2596,7 +2598,7 @@ impl LayoutDiff {
         let (mut rect, section) = match effective_base.find_rect(id) {
             Some(rect) => (
                 rect.clone(),
-                effective_base.section_of_rect(id)?.to_string(),
+                effective_base.section_of_rect(id)?.name.clone(),
             ),
             None => {
                 let add = self.added_rects.iter().find(|add| add.rect.id == id)?;

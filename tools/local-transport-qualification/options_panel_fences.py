@@ -12,7 +12,13 @@ from urllib.parse import unquote, urlencode, urlsplit
 
 from playwright.sync_api import Locator, Page, expect, sync_playwright
 
-from fences_common import drag_handle, fitted_box, request_frame
+from fences_common import (
+    CHART_HEIGHT,
+    drag_chart_height,
+    drag_handle,
+    fitted_box,
+    request_frame,
+)
 
 from user_settings_fences import (
     VIEWPORT,
@@ -661,27 +667,6 @@ def settings_beside_the_panel(page: Page, section: Locator) -> None:
     )
     dismiss(page, panel, section, "Close")
     expect(container).to_have_attribute("data-options-target", "false")
-
-
-CHART_HEIGHT = "e => getComputedStyle(e).getPropertyValue('--kymo-chart-height')"
-
-
-def drag_chart_height(page: Page, rect: Locator, dy: float) -> str:
-    """Drag `rect`'s resize grip `dy` pixels vertically, wait for its section's chart height to change, and return the new height."""
-    before = rect.evaluate(CHART_HEIGHT)
-    rect.hover()
-    grip = rect.locator(".rect-resize-handle").bounding_box()
-    assert grip is not None
-    x, y = grip["x"] + grip["width"] / 2, grip["y"] + grip["height"] / 2
-    page.mouse.move(x, y)
-    page.mouse.down()
-    page.mouse.move(x, y + dy, steps=6)
-    page.mouse.up()
-    page.wait_for_function(
-        f"([e, before]) => ({CHART_HEIGHT})(e) !== before",
-        arg=[rect.element_handle(), before],
-    )
-    return rect.evaluate(CHART_HEIGHT)
 
 
 def double_presses_act_once(

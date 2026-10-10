@@ -61,8 +61,6 @@ const CHART_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
 const CDN_KEYS_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
 
 thread_local! {
-    /// Monotonic identity for chart models handed to UPlotChart (see data_key): every distinct model gets a fresh number. A counter, NOT the Rc address — the allocator reuses a dropped model's address for the next one, so pointer identity would silently equate different data.
-    static NEXT_DATA_SEQ: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
     /// Per-panel chart cache (chart_sync::ChartCacheEntry), surviving body unmounts (see MetricRect). Validity = ChartCacheEntry::fresh_for (the reply's version echo and send-time snapshots vs current values), never which version bump triggered a resource run. Entries always hold a FULL response (deltas splice before storing): they answer run-subset requests locally, splice the next delta, and re-render instantly on remount. Rc: hits are refcount bumps, not multi-MB copies. Both entry count and estimated retained heap bytes are hard-bounded.
     static CHART_CACHE: RefCell<Store<ChartCacheEntry>> =
         RefCell::new(Store::with_weight_limit(256, CHART_CACHE_MAX_BYTES));
@@ -74,14 +72,6 @@ thread_local! {
     #[allow(clippy::type_complexity)]
     static TYPE_CACHE: RefCell<Store<(u64, Vec<String>, (bool, bool, bool))>> =
         RefCell::new(Store::new(2048));
-}
-
-fn next_data_seq() -> u64 {
-    NEXT_DATA_SEQ.with(|c| {
-        let v = c.get();
-        c.set(v + 1);
-        v
-    })
 }
 
 /// The gallery cache hit rule (CDN_KEYS_CACHE): an entry serves a request whose refs match while every requested run's stamp covers what the client knows ([`crate::state::stamp_covers`]).
@@ -232,7 +222,6 @@ fn refs_known(bindings: &[MetricBinding], current_run: Option<&str>, runs_loaded
 #[component]
 pub fn MetricRect(
     config: RectConfig,
-    chart_height: u32,
     /// True when this rect is being rendered inside the maximize overlay —
     /// hides the maximize button and disables the resize handle.
     #[props(default = false)]
@@ -277,11 +266,9 @@ pub fn MetricRect(
         div {
             class: "{slot_class}",
             "data-slot-id": "{config.id}",
-            style: "--kymo-chart-height: {chart_height}px;",
             if is_maximized || *renaming.read() || *zone.read() != Zone::Far {
                 MetricRectBody {
                     config: config.clone(),
-                    chart_height: chart_height,
                     is_maximized: is_maximized,
                     zone: zone,
                     renaming: renaming,
@@ -294,7 +281,6 @@ pub fn MetricRect(
 #[component]
 fn MetricRectBody(
     config: RectConfig,
-    chart_height: u32,
     is_maximized: bool,
     zone: Signal<Zone>,
     mut renaming: Signal<bool>,
@@ -368,7 +354,6 @@ fn MetricRectBody(
                 .read()
                 .as_ref()
                 .is_some_and(|p| p.target == PanelTarget::Chart));
-    let color_ver = *state.color_version.read();
     let options = config.options.clone();
     // Key into the module-level caches. The overlay copy gets its own entries — its width (and so its chart request) differs from the grid rect's, and the two must not evict each other per open/close.
     let cache_key = use_hook(|| {
@@ -384,8 +369,6 @@ fn MetricRectBody(
             rect_id: config.id.clone(),
             bindings: config.bindings.clone(),
             display_type_hint: config.display_type,
-            chart_height: chart_height,
-            color_version: color_ver,
             options: options,
             loading: loading,
             cdn_class: cdn_class,
@@ -542,9 +525,9 @@ fn MetricRectBody(
                                             let dy = val["dy"].as_f64().unwrap_or(0.0) as i32;
                                             // One gesture, two edits: the height belongs to the section, the span to the rect.
                                             if dy != 0 {
-                                                let section = state.layout_config.peek().as_ref().and_then(|l| l.section_of_rect(&rid).map(str::to_string));
-                                                if let Some(section) = section {
-                                                    let height = (chart_height as i32 + dy).clamp(100, 800) as u32;
+                                                let section = state.layout_config.peek().as_ref().and_then(|l| l.section_of_rect(&rid).map(|s| (s.name.clone(), s.chart_height)));
+                                                if let Some((section, height)) = section {
+                                                    let height = (height as i32 + dy).clamp(100, 800) as u32;
                                                     state.edit_section_settings(&section, |s| s.chart_height = height);
                                                 } else {
                                                     crate::util::warn(&format!("[resize] {rid} is no longer in the layout; its height drag was dropped"));
@@ -613,11 +596,9 @@ fn note_resolved_display_type(
 #[component]
 fn AutoContent(
     rect_id: String,
-    bindings: Vec<MetricBinding>,
+    bindings: ReadSignal<Vec<MetricBinding>>,
     display_type_hint: DisplayType,
-    chart_height: u32,
-    color_version: u64,
-    options: RectOptions,
+    options: ReadSignal<RectOptions>,
     /// Flipped true while a leaf content's data query is in flight, so the
     /// parent MetricRect can show a spinner and the leaves can gate their
     /// own version-driven refetches against being cancelled mid-flight.
@@ -636,39 +617,27 @@ fn AutoContent(
 ) -> Element {
     let state = use_context::<DashboardState>();
 
-    let needs_type_check = needs_metric_type_check(&rect_id, &bindings);
-
-    let mut bindings_signal = use_signal(|| bindings.clone());
-    if *bindings_signal.read() != bindings {
-        bindings_signal.set(bindings.clone());
-    }
-    let mut max_runs_signal = use_signal(|| options.max_runs);
-    if *max_runs_signal.read() != options.max_runs {
-        max_runs_signal.set(options.max_runs);
-    }
+    let needs_type_check = needs_metric_type_check(&rect_id, &bindings.read());
+    let max_runs = use_memo(move || options.read().max_runs);
 
     // ONE resolution pass per panel — AutoContent is the parent of every content viewer. The leaves query these refs, so a run list or names landing restarts nothing whose refs are unchanged.
     let refs = use_memo(move || {
         Rc::new(
-            resolve_capped_bindings(
-                &bindings_signal.read(),
-                &state.view_context(),
-                *max_runs_signal.read(),
-            )
-            .into_iter()
-            .map(|r| SeriesRef {
-                project_id: r.project_id,
-                run_id: r.run_id,
-                metric_name: r.metric_name,
-                tags: vec![],
-            })
-            .collect::<Vec<_>>(),
+            resolve_capped_bindings(&bindings.read(), &state.view_context(), *max_runs.read())
+                .into_iter()
+                .map(|r| SeriesRef {
+                    project_id: r.project_id,
+                    run_id: r.run_id,
+                    metric_name: r.metric_name,
+                    tags: vec![],
+                })
+                .collect::<Vec<_>>(),
         )
     });
     // The one readiness rule: hold the panel until its runs and their names are known.
     let ready = use_memo(move || {
         refs_known(
-            &bindings_signal.read(),
+            &bindings.read(),
             state.current_run.read().as_deref(),
             *state.runs_loaded.read(),
         ) && {
@@ -798,13 +767,13 @@ fn AutoContent(
     let render_for_type = |dt: &DisplayType| -> Element {
         match dt {
             DisplayType::Cdn => rsx! {
-                CdnContent { refs: refs, chart_height: chart_height, cdn_display_mode: options.cdn_display_mode, loading: loading, cdn_class: cdn_class, metadata_diff_only: options.metadata_diff_only, zone: zone, cache_key: cache_key.clone() }
+                CdnContent { refs: refs, cdn_display_mode: options.read().cdn_display_mode, loading: loading, cdn_class: cdn_class, metadata_diff_only: options.read().metadata_diff_only, zone: zone, cache_key: cache_key.clone() }
             },
             DisplayType::TextStream => rsx! {
-                TextStreamViewer { stream_refs: refs.read().to_vec(), height: chart_height, x_axis_mode: crate::state::layout_config::XAxisMode::RelativeTime, zone: Some(zone), persist_key: cache_key.clone() }
+                TextStreamViewer { stream_refs: refs.read().to_vec(), zone: zone, persist_key: cache_key.clone() }
             },
             DisplayType::Numeric => rsx! {
-                NumericContent { refs: refs, chart_height: chart_height, color_version: color_version, options: options.clone(), loading: loading, zone: zone, cache_key: cache_key.clone() }
+                NumericContent { refs: refs, options: options, loading: loading, zone: zone, cache_key: cache_key.clone() }
             },
         }
     };
@@ -812,12 +781,12 @@ fn AutoContent(
     // Not ready: the fixed-height box holds the layout stable until the missing knowledge lands (the run list, a point lookup, or the URL run's record). No leaf is mounted, so nothing queried under it.
     if !*ready.read() {
         crate::state::heal_loading(loading);
-        return rsx! { div { class: "rect-loading", style: "height: {chart_height}px;", "Loading..." } };
+        return rsx! { div { class: "rect-loading", "Loading..." } };
     }
     // A ready panel with no refs has no runs to show: knowledge, not a wait. No leaf mounts.
     if refs.read().is_empty() {
         crate::state::heal_loading(loading);
-        return rsx! { div { class: "rect-empty", style: "height: {chart_height}px;", "No runs shown" } };
+        return rsx! { div { class: "rect-empty", "No runs shown" } };
     }
 
     let read = detected_types.read();
@@ -843,13 +812,13 @@ fn AutoContent(
         Some(TypeFetch::UseHint) => render_for_type(&display_type_hint),
         Some(TypeFetch::RunUnavailable) => {
             crate::state::heal_loading(loading);
-            rsx! { div { class: "rect-empty", style: "height: {chart_height}px;", "Run no longer available" } }
+            rsx! { div { class: "rect-empty", "Run no longer available" } }
         }
         // Still loading, and no type check is needed: use the hint.
         None if !needs_type_check => render_for_type(&display_type_hint),
         // Still loading, or the not-ready value held through the readiness restart.
         None | Some(TypeFetch::Unready) => {
-            rsx! { div { class: "rect-loading", style: "height: {chart_height}px;", "Loading..." } }
+            rsx! { div { class: "rect-loading", "Loading..." } }
         }
     }
 }
@@ -865,7 +834,6 @@ enum CdnFetch {
 #[component]
 fn CdnContent(
     refs: Memo<Rc<Vec<SeriesRef>>>,
-    chart_height: u32,
     cdn_display_mode: CdnDisplayMode,
     loading: Signal<bool>,
     cdn_class: Signal<Option<String>>,
@@ -983,14 +951,14 @@ fn CdnContent(
                 crate::components::uplot_chart::run_color,
             );
             rsx! {
-                CdnGallery { runs: run_data, height: chart_height, display_mode: cdn_display_mode, cdn_class: cdn_class, metadata_diff_only: metadata_diff_only, persist_key: cache_key.clone() }
+                CdnGallery { runs: run_data, display_mode: cdn_display_mode, cdn_class: cdn_class, metadata_diff_only: metadata_diff_only, persist_key: cache_key.clone() }
             }
         }
         CdnFetch::Unavailable => rsx! {
-            div { class: "rect-empty", style: "height: {chart_height}px;", "Run no longer available" }
+            div { class: "rect-empty", "Run no longer available" }
         },
         CdnFetch::Pending => rsx! {
-            div { class: "rect-loading", style: "height: {chart_height}px;", "Loading..." }
+            div { class: "rect-loading", "Loading..." }
         },
     }
 }

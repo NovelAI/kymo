@@ -23,40 +23,36 @@ pub(super) fn text_scroll_key(panel: &str, log_key: &str) -> String {
         .expect("text scroll identity contains only JSON strings")
 }
 
-pub(super) fn remembered_scroll(key: Option<&str>) -> Option<ScrollAnchor> {
-    key.and_then(|key| TEXT_SCROLL.with(|cache| cache.borrow_mut().get(key)))
+pub(super) fn remembered_scroll(key: &str) -> Option<ScrollAnchor> {
+    TEXT_SCROLL.with(|cache| cache.borrow_mut().get(key))
 }
 
-pub(super) fn remember_scroll(key: Option<&str>, anchor: ScrollAnchor) {
-    if let Some(key) = key {
-        TEXT_SCROLL.with(|cache| {
-            cache.borrow_mut().put_weighted(
-                key.to_string(),
-                anchor,
-                key.len() + size_of::<ScrollAnchor>(),
-            );
-        });
-    }
+pub(super) fn remember_scroll(key: &str, anchor: ScrollAnchor) {
+    TEXT_SCROLL.with(|cache| {
+        cache.borrow_mut().put_weighted(
+            key.to_string(),
+            anchor,
+            key.len() + size_of::<ScrollAnchor>(),
+        );
+    });
 }
 
-pub(super) fn remembered_panel(persist_key: Option<&str>) -> TextPanelState {
-    persist_key
-        .and_then(|key| TEXT_PANEL.with(|cache| cache.borrow_mut().get(key)))
+pub(super) fn remembered_panel(key: &str) -> TextPanelState {
+    TEXT_PANEL
+        .with(|cache| cache.borrow_mut().get(key))
         .unwrap_or_default()
 }
 
-pub(super) fn remember_panel(persist_key: Option<&str>, state: TextPanelState) {
-    if let Some(key) = persist_key {
-        let weight = key.len()
-            + state.draft.len()
-            + state.committed.len()
-            + state.tab.as_ref().map_or(0, String::len);
-        TEXT_PANEL.with(|cache| {
-            cache
-                .borrow_mut()
-                .put_weighted(key.to_string(), state, weight)
-        });
-    }
+pub(super) fn remember_panel(key: &str, state: TextPanelState) {
+    let weight = key.len()
+        + state.draft.len()
+        + state.committed.len()
+        + state.tab.as_ref().map_or(0, String::len);
+    TEXT_PANEL.with(|cache| {
+        cache
+            .borrow_mut()
+            .put_weighted(key.to_string(), state, weight)
+    });
 }
 
 pub(super) fn text_run_key(project_id: &str, run_id: &str) -> String {
@@ -107,14 +103,12 @@ mod tests {
             committed: "warning".to_string(),
             tab: Some(text_run_key("project", "run-b")),
         };
-        remember_panel(Some(&panel), expected.clone());
-        assert_eq!(remembered_panel(Some(&panel)), expected);
+        remember_panel(&panel, expected.clone());
+        assert_eq!(remembered_panel(&panel), expected);
         assert_eq!(
-            remembered_panel(Some(&maximized_panel)),
+            remembered_panel(&maximized_panel),
             TextPanelState::default()
         );
-        remember_panel(None, expected);
-        assert_eq!(remembered_panel(None), TextPanelState::default());
     }
 
     #[test]
@@ -134,29 +128,27 @@ mod tests {
             text_scroll_key(&panel, &search),
         ];
         for (index, key) in keys.iter().enumerate() {
-            remember_scroll(Some(key), ScrollAnchor::Line((index + 1) as f64 * 1000.0));
+            remember_scroll(key, ScrollAnchor::Line((index + 1) as f64 * 1000.0));
         }
         for (index, key) in keys.iter().enumerate() {
             assert_eq!(
-                remembered_scroll(Some(key)),
+                remembered_scroll(key),
                 Some(ScrollAnchor::Line((index + 1) as f64 * 1000.0))
             );
         }
-        remember_scroll(Some(&keys[0]), ScrollAnchor::End);
-        assert_eq!(remembered_scroll(Some(&keys[0])), Some(ScrollAnchor::End));
+        remember_scroll(&keys[0], ScrollAnchor::End);
+        assert_eq!(remembered_scroll(&keys[0]), Some(ScrollAnchor::End));
 
         assert_ne!(
             text_scroll_key("a", "b\u{1f}c"),
             text_scroll_key("a\u{1f}b", "c"),
         );
-        remember_scroll(None, ScrollAnchor::Line(901.25));
-        assert_eq!(remembered_scroll(None), None);
     }
 
     #[test]
     fn scroll_cache_accounts_for_identity_bytes() {
         let oversized_key = "z".repeat(2 * 1024 * 1024);
-        remember_scroll(Some(&oversized_key), ScrollAnchor::Line(789.0));
-        assert_eq!(remembered_scroll(Some(&oversized_key)), None);
+        remember_scroll(&oversized_key, ScrollAnchor::Line(789.0));
+        assert_eq!(remembered_scroll(&oversized_key), None);
     }
 }

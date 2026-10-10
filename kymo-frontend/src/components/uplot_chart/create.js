@@ -19,12 +19,12 @@ if(!data||!data.length)return'chart data is missing';
 // no gaps and stays typed.
 // An indexed loop, not Array.from(c,fn): the callback form costs ~7x more on typed arrays (set_data_js repeats this).
 data=data.map((c,i)=>{if(i==0)return c;let n=c.length,o=new Array(n);for(let j=0;j<n;j++){let v=c[j];o[j]=v!==v?null:v;}return o;});
-let w=el.getBoundingClientRect().width||600;
-if(!window.__kymo_cfghash) window.__kymo_cfghash={};
+// The chart takes its container's box, as the ResizeObserver below does, so height is not structural config and a height change resizes in place. A hidden container has no box: it falls back to 600 wide at its CSS height.
+let box=el.getBoundingClientRect(),w=box.width||600,h=box.height||parseFloat(getComputedStyle(el).height);
 let prev=window.__kymo_charts['__KYMO_ID__'];
 // isConnected guards a recreated container div: updating a chart
 // whose canvas was detached would paint nothing, forever.
-if(prev&&prev.root&&prev.root.isConnected&&window.__kymo_cfghash['__KYMO_ID__']==='__KYMO_CFG_HASH__'){
+if(prev&&prev.root&&prev.root.isConnected&&prev.__kymo_cfghash==='__KYMO_CFG_HASH__'){
   // Same-config create evals can overlap when a queued create races a
   // missing-chart fallback. Coalesce the later eval in place so that
   // delivery races cannot reset cursor/tooltip/highlight mid-hover.
@@ -61,7 +61,7 @@ let isSmoothed=__KYMO_SMOOTHED__;
 let nanCols=__KYMO_NAN_MARKERS__;
 // Marker columns (and series) live at nanBase+i — after the values lines.
 let nanBase=lineBase+labels.length;
-// X-range columns (no series entries; tooltip-only) trail the markers.
+// X-range columns (no series entries; read by tooltips and whole-bucket zoom) trail the markers.
 let hasXr=__KYMO_HAS_XRANGE__;
 let xrBase=nanBase+nanCols;
 let zoomRefetch=__KYMO_ZOOM_REFETCH__;
@@ -233,7 +233,7 @@ let yNiceLog=function(u,mn,mx){
 // a NaN reads as a hoverable sample. One source so the two can't drift apart.
 let markR=3.5,markGap=1.5;
 let u=new uPlot({
-  width:w,height:__KYMO_CHART_HEIGHT__,
+  width:w,height:h,
   // Replaces uPlot's autoPadSide (17 top / 25 right). Top 8 is the whole title-to-plot gap (.rect-header has no margin-bottom) and absorbs y-max stroke caps; the rename hover strip (.rect-title::before) deadens its top half and must stay <= it. Right 12 keeps the last x label's centered half on-canvas and leaves a gutter for edge-hover and gutter-select drags.
   padding:[8,12,0,0],
   legend:{show:false},
@@ -327,7 +327,7 @@ u.over.appendChild(hotpt);
 // columns when a structural config change rebuilds the uPlot instance.
 u.__kymo_copy={xLabel:'__KYMO_X_LABEL__',lineBase:lineBase,seriesCount:labels.length,nanBase:nanBase,nanCols:nanCols,xShift:readoutXShift};
 window.__kymo_charts['__KYMO_ID__']=u;
-window.__kymo_cfghash['__KYMO_ID__']='__KYMO_CFG_HASH__';
+u.__kymo_cfghash='__KYMO_CFG_HASH__';
 // Dynamic metadata read by the once-installed gesture listeners. Keep it on
 // the current uPlot instance so a config rebuild cannot leave those listeners
 // using the first build's x-range column offsets or log transform.
@@ -349,12 +349,10 @@ window.__kymo_ro['__KYMO_ID__']=new ResizeObserver(()=>{
   if(c){
     let r=el.getBoundingClientRect();
     if(r.width>0){
-      // Use container height when it exceeds initial height (maximize), else
-      // keep the configured value so non-flex contexts don't collapse.
-      let nh=r.height>c.height?r.height:c.height;
-      if(Math.abs(c.width-r.width)<=1&&Math.abs(c.height-nh)<=1)return;
+      // The box is the chart's size: its height is fixed by CSS (--kymo-chart-height), which the chart can't inflate, so this setSize never re-triggers the observer. Height compares exactly, so a 1 px height change still lands.
+      if(Math.abs(c.width-r.width)<=1&&c.height===r.height)return;
       let owner=window.__kymo_zg;
-      c.setSize({width:r.width,height:nh});
+      c.setSize({width:r.width,height:r.height});
       // Only a real container resize invalidates the frozen source geometry.
       // Restore/cancel after uPlot releases its commit queue; internal axis
       // size convergence also fires setSize hooks but never reaches here.

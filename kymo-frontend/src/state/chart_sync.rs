@@ -20,8 +20,6 @@ pub struct ChartCacheEntry {
     /// The request answered, `cache_state` stripped (transport detail, not query identity).
     pub request: ChartRequest,
     pub response: Rc<DenseChart>,
-    /// Identity stamp of `response` (metric_rect NEXT_DATA_SEQ): uplot_chart keys data-change detection on this, so it must change exactly when `response` is a different model.
-    pub data_seq: u64,
     /// The change signals this response depended on, for [`Self::fresh_for`], over the request's runs: data versions ([`crate::state::answer_stamps`]); send-time registry counters; and the resync epoch.
     pub versions: Rc<HashMap<String, u64>>,
     pub metrics_gen: Rc<HashMap<String, u64>>,
@@ -451,7 +449,6 @@ mod tests {
                 xr_max: vec![0.0; axis_len],
                 series,
             }),
-            data_seq: 1,
             versions: Rc::new(HashMap::new()),
             metrics_gen: Rc::new(HashMap::new()),
             epoch: 0,
@@ -969,7 +966,6 @@ mod tests {
         let entry = ChartCacheEntry {
             request: req(&["a", "b"], 500),
             response: Rc::new(out),
-            data_seq: 1,
             versions: Rc::new(HashMap::new()),
             metrics_gen: Rc::new(HashMap::new()),
             epoch: 0,
@@ -987,7 +983,6 @@ mod tests {
                 x_values: vec![0.0, 1.0],
                 ..Default::default()
             }),
-            data_seq: 1,
             versions: Rc::new(HashMap::new()),
             metrics_gen: Rc::new(HashMap::new()),
             epoch: 0,
@@ -1065,7 +1060,6 @@ mod tests {
         let entry = ChartCacheEntry {
             request: req(&["a", "b"], 500),
             response: Rc::new(DenseChart::default()),
-            data_seq: 1,
             versions: Rc::new([("a".into(), 3u64)].into()),
             metrics_gen: Rc::new([("b".into(), 2u64)].into()),
             epoch: 7,
