@@ -50,7 +50,12 @@ except (ImportError, RuntimeError) as e:
         f"the installed grpc/protobuf runtime (original error: {e})"
     ) from e
 from kymo import _gpu
-from kymo._cdn import encoded_gallery_item, gallery_manifest, metadata_manifest
+from kymo._cdn import (
+    encoded_gallery_item,
+    gallery_manifest,
+    metadata_manifest,
+    readable_metadata,
+)
 from kymo._log import logger as _log
 from kymo.api import _check_fork_safe
 from kymo._wire import (
@@ -956,7 +961,11 @@ def _snapshot_rich_queue_items(cdn_batches: list[tuple]) -> list[tuple]:
                     "JSON-serializable values"
                 ) from error
             # Freeze metadata to its rendered JSON, as _snapshot_config does, so the payload never carries tensors or other objects the worker might fail to unpickle.
-            batch = (*batch[:3], Metadata(json.loads(manifest)["data"]), *batch[4:])
+            data = json.loads(manifest)["data"]
+            # A lone surrogate (an os.fsdecode()d filename, cwd or argument) renders as a \ud escape that the dashboard's JSON reader rejects. Replace it as captions and filenames are, here rather than in the frozen metadata_manifest, so a spool written by an older client still replays the bytes it published. Escaped non-BMP text also matches and comes back unchanged.
+            if b"\\ud" in manifest:
+                data = readable_metadata(data)
+            batch = (*batch[:3], Metadata(data), *batch[4:])
         try:
             # Standard pickle copies array/tensor storage into this byte string;
             # multiprocessing reducers may instead publish shared storage whose

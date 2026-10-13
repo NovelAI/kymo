@@ -48,6 +48,10 @@ Known limitations:
   redoes that task (artifact versions resume from their markers). Set
   --stall-timeout above the longest task.
 - A run file that downloads shorter than wandb's listed size is kept.
+- Without --force, a run file already at wandb's listed size is not
+  downloaded again, even if its content changed. With --force, every
+  restart downloads every run file again, so repeated watchdog restarts can
+  keep a long run's export from finishing.
 - A run's console log is held whole in memory before it is written.
 - A run resumed after it finished can keep its older history parquet when
   the re-export runs before wandb has generated the new one.
@@ -291,14 +295,14 @@ def run_needs_heavy(prev, state, heartbeat, hlc, cfg):
     )
 
 
-def download_run_file(f, files_dir):
-    """Download one run file; returns bytes downloaded (0 if already present)."""
+def download_run_file(f, files_dir, force):
+    """Download one run file; returns bytes downloaded (0 if already present at its listed size and not forced)."""
     rel = PurePosixPath(f.name)
     if rel.is_absolute() or ".." in rel.parts:
         raise ValueError(f"suspicious file path: {f.name}")
     dest = files_dir.joinpath(*rel.parts)
     size = f.size or 0
-    if dest.exists() and dest.stat().st_size == size:
+    if not force and dest.exists() and dest.stat().st_size == size:
         return 0
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.parent / (dest.name + ".part")
@@ -579,7 +583,8 @@ def export_run_heavy(entity, project, run_id, run_dir, cfg, stats):
                 files_dir = run_dir / "files"
                 with ThreadPoolExecutor(cfg.file_threads) as pool:
                     futs = {
-                        pool.submit(download_run_file, f, files_dir): f for f in files
+                        pool.submit(download_run_file, f, files_dir, cfg.force): f
+                        for f in files
                     }
                     for fut, f in futs.items():
                         try:
@@ -892,7 +897,7 @@ def main():
     ap.add_argument(
         "--force",
         action="store_true",
-        help="re-export all encountered runs even if unchanged",
+        help="re-export all encountered runs and re-download all their run files, even if unchanged",
     )
     ap.add_argument(
         "--retry-errors",

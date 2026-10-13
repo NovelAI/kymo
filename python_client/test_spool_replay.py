@@ -184,6 +184,10 @@ class FrameValidationTests(unittest.TestCase):
             content_id(metadata, "json"),
             "a8c998a6bafafe65d6b0d81f2e434bf09be03992abbc52a51fdbe30bbe27ad2a.json",
         )
+        # log() replaces lone surrogates before spooling (readable_metadata); the serializer keeps them, so a spool written by an older client replays the bytes it published.
+        self.assertIn(
+            b"file-\\udcff.png", metadata_manifest({"path": "file-\udcff.png"})
+        )
 
     def test_gallery_manifest_text_replaces_lone_surrogates(self):
         items = [

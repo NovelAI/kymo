@@ -18,6 +18,11 @@ def _manifest_text(value: str) -> str:
     return value.encode("utf-8", errors="replace").decode("utf-8")
 
 
+def readable_metadata(data):
+    """Return JSON-shaped metadata with _manifest_text applied to every string, keys included. Takes decoded JSON (json.loads output), whose surrogate pairs are already joined: a pair split into two lone halves would become "??". Keys that differ only where they become "?" merge, the later winning."""
+    return json.loads(_manifest_text(json.dumps(data, ensure_ascii=False)))
+
+
 def content_id(data: bytes, extension: str) -> str:
     """Return the resource id produced by the CDN upload endpoint."""
     return f"{hashlib.sha256(data).hexdigest()}.{extension.lower()}"

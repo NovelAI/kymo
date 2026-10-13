@@ -156,6 +156,27 @@ async fn transaction_clock_ms(
         .await
 }
 
+/// Locks the project row, which every lifecycle write (InitRun, RenameRun, TerminateRun, Trash, Restore) takes before any run row. Lifecycle gates are per run, and InitRun, RenameRun and TerminateRun share theirs, so the gates do not keep these writes apart; this order keeps them out of a lock cycle.
+async fn lock_project(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    project_id: &str,
+) -> std::result::Result<(), sqlx::Error> {
+    sqlx::query("SELECT 1 FROM projects WHERE project_id = $1 FOR UPDATE")
+        .bind(project_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Whether `error` is PostgreSQL's deadlock_detected: its transaction was the victim and rolled back.
+fn is_deadlock(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<sqlx::Error>()
+        .and_then(|error| error.as_database_error())
+        .and_then(|error| error.code())
+        .is_some_and(|code| code == "40P01")
+}
+
 pub struct RenameRunOutcome {
     pub row: RunInfoRow,
     pub server_now_ms: i64,
@@ -965,10 +986,7 @@ impl PgStore {
         // Lock before reading `runs`: concurrent InitRun calls for the same
         // new identity serialize here, so the follower observes the leader's
         // committed row instead of racing the bare INSERT below.
-        sqlx::query("SELECT project_id FROM projects WHERE project_id = $1 FOR UPDATE")
-            .bind(project_id)
-            .fetch_one(&mut *tx)
-            .await?;
+        lock_project(&mut tx, project_id).await?;
 
         // Atomically claim the bare run ID before inspecting the project-local
         // lifecycle row. A conflicting INSERT waits for the winner's
@@ -1301,19 +1319,7 @@ impl PgStore {
         run_name: &str,
     ) -> Result<Option<RenameRunOutcome>> {
         let mut tx = self.pool.begin().await?;
-        // Match InitRun's project -> run lock order. InitRun and RenameRun both
-        // hold shared lifecycle gates, so PostgreSQL owns their serialization;
-        // taking these rows in opposite order lets a concurrent re-init
-        // deadlock with a rename.
-        let project: Option<String> =
-            sqlx::query_scalar("SELECT project_id FROM projects WHERE project_id = $1 FOR UPDATE")
-                .bind(project_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        if project.is_none() {
-            tx.rollback().await?;
-            return Ok(None);
-        }
+        lock_project(&mut tx, project_id).await?;
         let changed = sqlx::query(
             "UPDATE runs
              SET run_name = $3
@@ -1380,16 +1386,7 @@ impl PgStore {
         terminated_at_ms: Option<i64>,
     ) -> Result<Option<TerminateRunOutcome>> {
         let mut tx = self.pool.begin().await?;
-        // Match InitRun and RenameRun's project -> run database lock order.
-        let project: Option<String> =
-            sqlx::query_scalar("SELECT project_id FROM projects WHERE project_id = $1 FOR UPDATE")
-                .bind(project_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        if project.is_none() {
-            tx.rollback().await?;
-            return Ok(None);
-        }
+        lock_project(&mut tx, project_id).await?;
         let run: Option<(i64, String)> = sqlx::query_as(
             "UPDATE runs
              SET exit_code = $3,
@@ -1898,9 +1895,9 @@ impl PgStore {
         })
     }
 
-    /// Trash one internal transaction. The public RPC deliberately has no
-    /// size limit; QueryService feeds this method chunks of 256 positions and
-    /// continues after a failed chunk.
+    /// Trash one chunk in one transaction. The public RPC deliberately has no size limit; QueryService feeds this method chunks of 256 positions and continues after a failed chunk.
+    ///
+    /// A writer that locks several runs without lifecycle gates (the ingest coalescer's bump_run_versions, a registry insert through its foreign-key checks, the reaper's note_purge_attempts and finalize_purged_runs) can take this chunk's runs in another order. PostgreSQL then aborts one side; those retry on their next tick or pass, and a chunk that was the victim retries once.
     pub async fn trash_runs_chunk(
         &self,
         project_id: &str,
@@ -1908,12 +1905,28 @@ impl PgStore {
         pending_last_ingested_at_ms: &HashMap<String, i64>,
     ) -> Result<TrashChunkOutcome> {
         debug_assert!(!run_ids.is_empty());
+        match self
+            .trash_runs_chunk_once(project_id, run_ids, pending_last_ingested_at_ms)
+            .await
+        {
+            Err(error) if is_deadlock(&error) => {
+                tracing::warn!("trash chunk in {project_id} was a deadlock victim; retrying once");
+                self.trash_runs_chunk_once(project_id, run_ids, pending_last_ingested_at_ms)
+                    .await
+            }
+            outcome => outcome,
+        }
+    }
 
+    async fn trash_runs_chunk_once(
+        &self,
+        project_id: &str,
+        run_ids: &[String],
+        pending_last_ingested_at_ms: &HashMap<String, i64>,
+    ) -> Result<TrashChunkOutcome> {
         let mut tx = self.pool.begin().await?;
-        // This path deliberately locks runs before its project row. QueryService
-        // holds exclusive per-run lifecycle gates around the whole operation,
-        // so other lifecycle mutations for these identities cannot overlap it.
-        // Keep that exclusion if this database lock order changes.
+        // Locking runs first would close a cycle through the ingest coalescer, which locks runs without lifecycle gates: Trash holds run A and waits for the project row, InitRun holds that and waits for run B, and the coalescer holds B and waits for A.
+        lock_project(&mut tx, project_id).await?;
         let before: Vec<RunRecordRow> = sqlx::query_as(run_record_sql!(
             "SELECT",
             " FROM runs
@@ -1924,10 +1937,7 @@ impl PgStore {
         .bind(run_ids)
         .fetch_all(&mut *tx)
         .await?;
-        let now_ms: i64 =
-            sqlx::query_scalar("SELECT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT")
-                .fetch_one(&mut *tx)
-                .await?;
+        let now_ms = transaction_clock_ms(&mut tx).await?;
 
         let before_by_id: HashMap<String, RunRecordRow> = before
             .into_iter()
@@ -2010,9 +2020,7 @@ impl PgStore {
         run_id: &str,
     ) -> Result<RestoreMutationOutcome> {
         let mut tx = self.pool.begin().await?;
-        // See trash_runs_chunk: QueryService's exclusive per-run gate makes
-        // this run-first/project-second order safe against project-first
-        // lifecycle writers for the same identity.
+        lock_project(&mut tx, project_id).await?;
         let before: Option<RunRecordRow> = sqlx::query_as(run_record_sql!(
             "SELECT",
             " FROM runs WHERE project_id = $1 AND run_id = $2 FOR UPDATE"
@@ -2021,10 +2029,7 @@ impl PgStore {
         .bind(run_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let now_ms: i64 =
-            sqlx::query_scalar("SELECT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT")
-                .fetch_one(&mut *tx)
-                .await?;
+        let now_ms = transaction_clock_ms(&mut tx).await?;
 
         let Some(before) = before else {
             let purged: bool = sqlx::query_scalar(
@@ -3790,7 +3795,7 @@ mod live_pg_tests {
 
     #[tokio::test]
     #[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL"]
-    async fn live_query_gates_serialize_reverse_lifecycle_lock_orders() -> Result<()> {
+    async fn live_query_gates_serialize_concurrent_lifecycle_writes() -> Result<()> {
         let _suite_guard = live_database_suite_gate().lock().await;
         let pg_url = live_test_url("KYMO_LIVE_TEST_DATABASE_URL")?;
         let suffix = unique_suffix();
@@ -3826,10 +3831,7 @@ mod live_pg_tests {
 
         tokio::time::timeout(Duration::from_secs(30), async {
             for round in 0..24 {
-                // Trash locks the run row before the project row. These
-                // three handlers lock project before run. Exercising the
-                // public handlers proves their shared/exclusive lifecycle
-                // gates keep the opposite database orders from overlapping.
+                // Trash and these three handlers all lock the project row before the run row. Exercising the public handlers proves they serialize, through their shared/exclusive lifecycle gates and that order, without a lock cycle.
                 let barrier = tokio::sync::Barrier::new(4);
                 let concurrent_name = format!("concurrent-{round}");
 
@@ -3901,9 +3903,7 @@ mod live_pg_tests {
                     trashed.results
                 );
 
-                // Restore has the same run-first/project-second database
-                // order as Trash. Race it with Rename and require that the
-                // pair completes with the fixture active for the next round.
+                // Restore takes the project row first, as Rename does. Race them and require that the pair completes with the fixture active for the next round.
                 let barrier = tokio::sync::Barrier::new(2);
                 let restore = async {
                     barrier.wait().await;
@@ -3950,8 +3950,105 @@ mod live_pg_tests {
             Ok::<(), anyhow::Error>(())
         })
         .await
-        .map_err(|_| anyhow::anyhow!("reverse-order lifecycle races timed out"))??;
+        .map_err(|_| anyhow::anyhow!("concurrent lifecycle races timed out"))??;
 
+        store.delete_live_projects(&[project_id]).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL"]
+    async fn live_trash_and_restore_take_the_project_row_before_their_runs() -> Result<()> {
+        let _suite_guard = live_database_suite_gate().lock().await;
+        let pg_url = live_test_url("KYMO_LIVE_TEST_DATABASE_URL")?;
+        let suffix = unique_suffix();
+        let project_id = format!("lifecycle-order-{suffix}");
+        let run_id = format!("run-{suffix}");
+        let store = PgStore::connect(&pg_url).await?;
+        store.init_run(&project_id, &run_id, &run_id, None).await?;
+        for restore in [false, true] {
+            // Another writer, such as the ingest coalescer, holds the run.
+            let mut other = store.pool.begin().await?;
+            sqlx::query("SELECT run_id FROM runs WHERE project_id = $1 AND run_id = $2 FOR UPDATE")
+                .bind(&project_id)
+                .bind(&run_id)
+                .execute(&mut *other)
+                .await?;
+            let mutation = async {
+                if restore {
+                    store.restore_run(&project_id, &run_id).await?;
+                } else {
+                    let run_ids = std::slice::from_ref(&run_id);
+                    store
+                        .trash_runs_chunk(&project_id, run_ids, &HashMap::new())
+                        .await?;
+                }
+                anyhow::Ok(())
+            };
+            // Blocked behind `other`, the mutation must already hold the project row.
+            let release = async {
+                let probe = "SELECT 1 FROM projects WHERE project_id = $1 FOR UPDATE SKIP LOCKED";
+                while sqlx::query(probe)
+                    .bind(&project_id)
+                    .fetch_optional(&store.pool)
+                    .await?
+                    .is_some()
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                other.commit().await?;
+                anyhow::Ok(())
+            };
+            tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::try_join!(mutation, release)
+            })
+            .await
+            .context("the project row stayed free while the mutation waited for its run")??;
+        }
+        store.delete_live_projects(&[project_id]).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL"]
+    async fn live_trash_retries_a_chunk_that_lost_a_deadlock() -> Result<()> {
+        let _suite_guard = live_database_suite_gate().lock().await;
+        let pg_url = live_test_url("KYMO_LIVE_TEST_DATABASE_URL")?;
+        let suffix = unique_suffix();
+        let project_id = format!("trash-retry-{suffix}");
+        let run_id = format!("run-{suffix}");
+        let store = PgStore::connect(&pg_url).await?;
+        store.init_run(&project_id, &run_id, &run_id, None).await?;
+        // Which transaction PostgreSQL aborts in a real cycle is not specified, so the first attempt's UPDATE raises deadlock_detected itself. A sequence counts the attempts: nextval survives the rollback.
+        let inject = format!("inject_deadlock_{suffix}");
+        sqlx::raw_sql(&format!(
+            "CREATE SEQUENCE {inject};
+             CREATE FUNCTION {inject}() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+               IF nextval('{inject}') = 1 THEN
+                 RAISE EXCEPTION 'injected' USING ERRCODE = 'deadlock_detected';
+               END IF;
+               RETURN NEW;
+             END $$;
+             CREATE TRIGGER {inject} BEFORE UPDATE ON runs FOR EACH ROW
+               WHEN (NEW.run_id = '{run_id}') EXECUTE FUNCTION {inject}();"
+        ))
+        .execute(&store.pool)
+        .await?;
+        let outcome = store
+            .trash_runs_chunk(&project_id, std::slice::from_ref(&run_id), &HashMap::new())
+            .await;
+        let attempts: i64 = sqlx::query_scalar(&format!("SELECT last_value FROM {inject}"))
+            .fetch_one(&store.pool)
+            .await?;
+        sqlx::raw_sql(&format!(
+            "DROP TRIGGER {inject} ON runs; DROP FUNCTION {inject}(); DROP SEQUENCE {inject};"
+        ))
+        .execute(&store.pool)
+        .await?;
+
+        outcome?;
+        anyhow::ensure!(attempts == 2, "{attempts} attempts, not 2");
         store.delete_live_projects(&[project_id]).await?;
         Ok(())
     }

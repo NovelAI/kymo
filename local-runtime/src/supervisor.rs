@@ -1619,15 +1619,17 @@ async fn wait_for_server(child: &mut Child, socket: &Path, bearer: &str) -> Resu
         if let Some(status) = child.try_wait()? {
             bail!("kymo-server exited during startup: {status}");
         }
-        if let Ok(channel) = native_channel(socket).await {
-            let mut client = KymoClient::new(channel);
-            if client
-                .list_projects(bearer_request(bearer, ListProjectsRequest {})?)
-                .await
-                .is_ok()
-            {
-                return Ok(());
-            }
+        let request = bearer_request(bearer, ListProjectsRequest {})?;
+        // Inside the deadline: a server that accepts the socket but never answers must not hold startup past it.
+        let ready = tokio::time::timeout_at(deadline, async {
+            KymoClient::new(native_channel(socket).await?)
+                .list_projects(request)
+                .await?;
+            anyhow::Ok(())
+        })
+        .await;
+        if matches!(ready, Ok(Ok(()))) {
+            return Ok(());
         }
         ensure!(
             tokio::time::Instant::now() < deadline,
@@ -1689,22 +1691,26 @@ async fn wait_for_postgresql(child: &mut Child, psql: &Path, socket_dir: &Path) 
         if let Some(status) = child.try_wait()? {
             bail!("PostgreSQL exited during startup: {status}");
         }
-        let output = Command::new(psql)
-            .arg("-h")
-            .arg(socket_dir)
-            .arg("-p")
-            .arg(POSTGRESQL_PORT.to_string())
-            .arg("-U")
-            .arg("mkdb2")
-            .arg("-d")
-            .arg("postgres")
-            .arg("-Atc")
-            .arg("SELECT 1")
-            .output()
-            .await?;
-        let ready =
-            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "1";
-        if ready {
+        // Inside the deadline, as in wait_for_server; a psql that overruns it is killed.
+        let output = tokio::time::timeout_at(
+            deadline,
+            Command::new(psql)
+                .arg("-h")
+                .arg(socket_dir)
+                .arg("-p")
+                .arg(POSTGRESQL_PORT.to_string())
+                .arg("-U")
+                .arg("mkdb2")
+                .arg("-d")
+                .arg("postgres")
+                .arg("-Atc")
+                .arg("SELECT 1")
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .context("PostgreSQL did not become ready")??;
+        if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "1" {
             return Ok(());
         }
         ensure!(
@@ -2301,6 +2307,47 @@ mod tests {
         now: tokio::time::Instant,
     ) -> bool {
         idle_eligible(snapshot, holds, now, crate::liveness::LOCAL_IDLE_TIMEOUT)
+    }
+
+    #[test]
+    fn startup_probes_give_up_at_their_deadline_when_never_answered() {
+        let _serial = crate::serialize_process_test();
+        let temporary = tempfile::tempdir().unwrap();
+        let socket = temporary.path().join("native.sock");
+        let psql = temporary.path().join("psql");
+        std::fs::write(&psql, "#!/bin/sh\nexec sleep 600\n").unwrap();
+        std::fs::set_permissions(&psql, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            // Listens but never accepts, so a connection opens and never gets an answer.
+            let _listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let mut child = Command::new("/bin/sleep")
+                .arg("600")
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            for probe in ["kymo-server", "PostgreSQL"] {
+                let started = tokio::time::Instant::now();
+                let result = tokio::time::timeout(START_TIMEOUT * 2, async {
+                    if probe == "kymo-server" {
+                        wait_for_server(&mut child, &socket, "token").await
+                    } else {
+                        wait_for_postgresql(&mut child, &psql, temporary.path()).await
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| panic!("the {probe} probe outlived its deadline"));
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    format!("{probe} did not become ready")
+                );
+                assert_eq!(started.elapsed(), START_TIMEOUT);
+            }
+        });
     }
 
     #[test]

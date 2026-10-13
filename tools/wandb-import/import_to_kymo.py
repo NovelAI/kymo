@@ -120,7 +120,13 @@ import httpx
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from kymo._cdn import content_id, gallery_item, gallery_manifest, metadata_manifest
+from kymo._cdn import (
+    content_id,
+    gallery_item,
+    gallery_manifest,
+    metadata_manifest,
+    readable_metadata,
+)
 from kymo._generated import kymo_pb2, kymo_pb2_grpc
 from kymo._local_runtime import ensure_local_endpoint, grpc_channel, http_client
 from kymo._wire import (
@@ -1327,7 +1333,7 @@ def import_run_info(sender, ctx, run_dir, run_meta, created_ms):
     wb_meta = read_json(run_dir / "files" / "wandb-metadata.json")
     artifacts = read_json(run_dir / "artifacts.json")
     doc = build_run_info(run_meta, wb_meta, summary, artifacts, created_ms)
-    manifest_id = sender.upload(metadata_manifest(doc), "json")
+    manifest_id = sender.upload(metadata_manifest(readable_metadata(doc)), "json")
     sender.queue(
         ctx.project_id,
         ctx.run_id,

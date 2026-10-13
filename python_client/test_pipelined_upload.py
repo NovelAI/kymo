@@ -1424,6 +1424,21 @@ class AccountingTests(unittest.TestCase):
                     client_module.metadata_manifest(decoded[3].data), manifest
                 )
 
+    def test_metadata_snapshot_replaces_lone_surrogates(self):
+        # os.fsdecode(b"file-\xff.png"): a POSIX filename, cwd or argument that is not UTF-8. The escaped non-BMP text in "fine" also matches the guard and must come back unchanged.
+        name, readable = "file-\udcff.png", "file-?.png"
+        fine = {"fine": "\u00fcn\u00efcode \U0001f600"}
+        # A key that becomes an existing one after the replacement merges with it, the later value winning.
+        data = {readable: "old", "path": name, name: [name, {"inner": name}], **fine}
+        (item,) = client_module._snapshot_rich_queue_items(
+            [("metadata_batch", "demo/meta", 1, Metadata(data))]
+        )
+        (decoded,) = client_module._decode_queue_item(item)
+        self.assertEqual(
+            decoded[3].data,
+            {"path": readable, readable: [readable, {"inner": readable}], **fine},
+        )
+
     def test_unpicklable_rich_payload_fails_before_capture_or_publication(self):
         class Target:
             items = []
