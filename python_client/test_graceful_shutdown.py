@@ -54,6 +54,7 @@ fake kymo server):
 Run:  python3 test_graceful_shutdown.py
 """
 
+import contextlib
 import hashlib
 import http.server
 import json
@@ -87,6 +88,11 @@ FAKE_FLUSH_POINTS = 10_000
 # ---------------------------------------------------------------------------
 
 
+def recorded(p):
+    """A point as the fake server records it: (metric_name, step, payload_kind, tag, timestamp_ms)."""
+    return (p.metric_name, p.step, p.WhichOneof("payload"), p.tag, p.timestamp_ms)
+
+
 class FakeKymo(kymo_pb2_grpc.KymoServicer):
     """Counts everything. `call_delay` + `per_point_delay` model an overloaded
     server (fixed per-flush cost + throughput bound). Delays use an Event so
@@ -118,8 +124,10 @@ class FakeKymo(kymo_pb2_grpc.KymoServicer):
         # must cancel it; later streams behave normally.
         self.blackhole_first = blackhole_first
         self.stop_event = threading.Event()
+        # Set as the first point arrives, before any commit or ACK: the client's upload worker has started and read a group.
+        self.first_point = threading.Event()
         self.lock = threading.Lock()
-        self.points = []  # (metric_name, step, payload_kind, tag, timestamp_ms)
+        self.points = []  # recorded(p) of each committed point
         self.ingest_calls = 0
         self.bidi_streams = 0
         self.terminates = []
@@ -150,15 +158,7 @@ class FakeKymo(kymo_pb2_grpc.KymoServicer):
         recv = []
         for batch in request_iterator:
             for p in batch.points:
-                recv.append(
-                    (
-                        p.metric_name,
-                        p.step,
-                        p.WhichOneof("payload"),
-                        p.tag,
-                        p.timestamp_ms,
-                    )
-                )
+                recv.append(recorded(p))
                 n += 1
         delay = self.call_delay + n * self.per_point_delay
         if delay:
@@ -196,21 +196,15 @@ class FakeKymo(kymo_pb2_grpc.KymoServicer):
                 pass
             return
 
-        def commit(cut):
-            """Return False when cancellation makes this cut uncommitted."""
+        def ack_or_inject_fault(cut):
             delay = self.call_delay + len(cut) * self.per_point_delay
             if delay:
                 self.stop_event.wait(delay)
             if not context.is_active():
-                return False
+                return "stop", None
             with self.lock:
                 self.points.extend(cut)
                 self.ingest_calls += 1
-            return True
-
-        def ack_or_inject_fault(cut):
-            if not commit(cut):
-                return "stop", None
             if self.break_after and my_stream == 1 and consumed >= self.break_after:
                 context.set_code(grpc.StatusCode.UNAVAILABLE)
                 context.set_details("injected post-commit/pre-ACK stream break")
@@ -226,15 +220,8 @@ class FakeKymo(kymo_pb2_grpc.KymoServicer):
             for batch in request_iterator:
                 for p in batch.points:
                     consumed += 1
-                    pending.append(
-                        (
-                            p.metric_name,
-                            p.step,
-                            p.WhichOneof("payload"),
-                            p.tag,
-                            p.timestamp_ms,
-                        )
-                    )
+                    self.first_point.set()
+                    pending.append(recorded(p))
                     if len(pending) == FAKE_FLUSH_POINTS:
                         cut, pending = pending, []
                         outcome, ack = ack_or_inject_fault(cut)
@@ -500,11 +487,9 @@ def driver_command(cfg: dict):
 def kill_driver_group(proc):
     try:
         os.killpg(proc.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
+    # macOS refuses (EPERM) a group whose only process has exited unreaped.
+    except (ProcessLookupError, PermissionError):
+        proc.kill()
     return proc.communicate(timeout=5)
 
 
@@ -575,42 +560,33 @@ def spool_files(spool_dir, run_id, suffix=".mkspool"):
 def read_spool_records(path):
     records = []
     with open(path, "rb") as fh:
-        header = pickle.load(fh)
+        pickle.load(fh)  # the header
         while True:
             try:
                 records.append(pickle.load(fh))
             except EOFError:
                 break
-    return header, records
+    return records
+
+
+def spooled_train_records(files):
+    """Numeric train/* records across spool files (log() also queues extras like system/log_overhead_ms and info/run_info, which it leaves out)."""
+    for f in files:
+        for record in read_spool_records(f):
+            if record[0].startswith("numeric") and record[1].startswith("train/"):
+                yield record
 
 
 def spooled_train_points(files):
-    """Numeric train/* points across spool files (log() also queues extras
-    like system/log_overhead_ms and info/run_info, which we don't count)."""
-    n = 0
-    for f in files:
-        _, records = read_spool_records(f)
-        n += sum(
-            1
-            for r in records
-            if r[0].startswith("numeric") and r[1].startswith("train/")
-        )
-    return n
+    return sum(1 for _ in spooled_train_records(files))
 
 
 def spooled_train_point_keys(files):
     """ClickHouse sort keys for numeric train/* records in spool files."""
-    keys = set()
-    for f in files:
-        _, records = read_spool_records(f)
-        for record in records:
-            if not record[0].startswith("numeric") or not record[1].startswith(
-                "train/"
-            ):
-                continue
-            tag = record[4] if record[0] == "numeric_tagged_ts" else ""
-            keys.add((record[1], record[2], tag))
-    return keys
+    return {
+        (record[1], record[2], record[4] if record[0] == "numeric_tagged_ts" else "")
+        for record in spooled_train_records(files)
+    }
 
 
 def expected_train_point_keys(steps, metrics):
@@ -808,8 +784,7 @@ def scenario_hung_server(spool_dir):
     spooled_numeric = spooled_train_points(files)
     spooled_imgs = 0
     for f in files:
-        _, records = read_spool_records(f)
-        for rec in records:
+        for rec in read_spool_records(f):
             if rec[0] == "cdn_batch_encoded":
                 spooled_imgs += 1
                 assert rec[3][0]["data"][:8] == b"\x89PNG\r\n\x1a\n", (
@@ -1258,9 +1233,9 @@ def signal_driver(
     group=True,
     pause_worker=False,
 ):
-    """Run the driver as run name, logging STEPS steps of METRICS metrics unless cfg says otherwise, against a fake server started with server (start_fake_server's arguments); once its output shows wait_for and 0.3 s more have passed, send it signals, 50 ms apart, to its whole process group as a terminal's Ctrl-C or a scheduler's cancel does, or else to it alone. With pause_worker, its upload worker is stopped (SIGSTOP) 0.2 s before them and resumed once the driver has exited.
+    """Run the driver as run name, logging STEPS steps of METRICS metrics unless cfg says otherwise, against a fake server started with server (start_fake_server's arguments); once its output shows wait_for, 0.3 s more have passed and the fake server has its first point, send it signals, 50 ms apart, to its whole process group as a terminal's Ctrl-C or a scheduler's cancel does, or else to it alone. With pause_worker, its upload worker is stopped (SIGSTOP) 0.2 s before them and resumed, if it is still there, once the driver has exited.
 
-    Returns (servicer, run_id, returncode, output, sent, console, gone): the fake server's servicer, the run's id, and when (time.monotonic()) the first signal went, and the seconds from then to the driver's exit, which gives the console back, and to the end of its output, which every process of its group holds open, the upload worker included. The group must be gone within 60 s, scaled by the machine's load (load_factor).
+    Returns (servicer, run_id, returncode, output, sent, console, gone): the fake server's servicer, the run's id, the driver's exit status and its output, when (time.monotonic()) the first signal went, and the seconds from then to the driver's exit, which gives the console back, and to the end of its output, which every process of its group holds open, the upload worker included. The group must be gone within 60 s, scaled by the machine's load (load_factor).
     """
     servicer, grpc_addr, cdn_addr, stop = start_fake_server(
         **(server or {"call_delay": 0.1, "per_point_delay": 0.0002})
@@ -1303,6 +1278,10 @@ def signal_driver(
             assert chunk, f"driver exited early\n{output.decode(errors='replace')}"
             output.extend(chunk)
         time.sleep(0.3)
+        # The scenarios test a running upload worker: one still starting under spawn would leave only the parent's not-started path (_kill_unstarted_worker kills it and the parent spools), and a paused one must already hold a group.
+        assert servicer.first_point.wait(30 * load_factor()), (
+            f"the upload worker sent nothing\n{output.decode(errors='replace')}"
+        )
         if pause_worker:
             paused = int(re.search(rb"WORKER_PID (\d+)", output).group(1))
             os.kill(paused, signal.SIGSTOP)
@@ -1325,7 +1304,8 @@ def signal_driver(
             if console is None and proc.poll() is not None:
                 console = time.monotonic() - sent
                 if paused is not None:
-                    os.kill(paused, signal.SIGCONT)
+                    with contextlib.suppress(ProcessLookupError):
+                        os.kill(paused, signal.SIGCONT)
             if selector.select(0.01):
                 chunk = os.read(proc.stdout.fileno(), 65536)
                 if not chunk:
@@ -1486,7 +1466,7 @@ def scenario_ctrl_c_during_the_encoder_wait(spool_dir):
         spooled = {
             record[2]
             for path in spool_files(spool_dir, run_id)
-            for record in read_spool_records(path)[1]
+            for record in read_spool_records(path)
             if record[1] == "demo/gallery"
         }
         lost = sum(

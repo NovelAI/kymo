@@ -421,20 +421,17 @@ impl DirtyVersions {
 }
 
 async fn dispatch(svc: &KymoService, path: &str, body: &[u8]) -> Result<Vec<u8>, Status> {
-    macro_rules! unary {
-        ($req:ty, $resp:ty, $method:ident) => {{
-            let msg = <$req>::decode(body)
-                .map_err(|e| Status::invalid_argument(format!("request decode: {e}")))?;
-            let resp: tonic::Response<$resp> = Kymo::$method(svc, tonic::Request::new(msg)).await?;
-            Ok(resp.into_inner().encode_to_vec())
-        }};
-    }
     macro_rules! dispatch_routes {
         ($(($name:ident, $request:ident, $response:ident, $method:ident)),* $(,)?) => {
             match path {
                 $(
-                    crate::ws_rpc::$name =>
-                        unary!(proto::$request, proto::$response, $method),
+                    crate::ws_rpc::$name => {
+                        let msg = <proto::$request>::decode(body)
+                            .map_err(|e| Status::invalid_argument(format!("request decode: {e}")))?;
+                        let resp: tonic::Response<proto::$response> =
+                            Kymo::$method(svc, tonic::Request::new(msg)).await?;
+                        Ok(resp.into_inner().encode_to_vec())
+                    }
                 )*
                 other => Err(Status::unimplemented(format!(
                     "not proxied over ws: {other}"
@@ -851,15 +848,8 @@ mod tests {
 
     /// Incompressible: xorshift noise.
     fn noise(bytes: usize) -> Vec<u8> {
-        let mut state = 0x9e37_79b9_7f4a_7c15u64;
-        (0..bytes)
-            .map(|_| {
-                state ^= state << 13;
-                state ^= state >> 7;
-                state ^= state << 17;
-                state as u8
-            })
-            .collect()
+        let mut rng = crate::Rng(0x9e37_79b9_7f4a_7c15);
+        (0..bytes).map(|_| rng.next() as u8).collect()
     }
 
     /// An independent decoder, for round trips.
