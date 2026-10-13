@@ -4,8 +4,13 @@ import base64
 import json
 import os
 import pickle
+import shlex
+import signal
 import subprocess
+import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 import uuid
@@ -76,18 +81,15 @@ class LocalEndpointTests(unittest.TestCase):
                 ordinal=7,
             )
         )
-        completed = subprocess.CompletedProcess(
-            ["python", "-m", "kymo._control_rpc"],
-            0,
-            stdout=expected.SerializeToString(),
-            stderr=b"",
-        )
+        stdin = mock.Mock()
+        process = mock.Mock(returncode=0, stdin=stdin)
+        process.communicate.return_value = (expected.SerializeToString(), b"")
         request = client_module.kymo_pb2.InitRunRequest(
             project_id="project", run_id="run", run_name="name"
         )
         with mock.patch.object(
-            client_module.subprocess, "run", return_value=completed
-        ) as run:
+            client_module.subprocess, "Popen", return_value=process
+        ) as popen:
             actual = client_module._run_control_rpc(
                 "InitRun",
                 request,
@@ -97,11 +99,14 @@ class LocalEndpointTests(unittest.TestCase):
                 local_endpoint=endpoint,
             )
 
-        command = run.call_args.args[0]
-        payload = json.loads(run.call_args.kwargs["input"])
+        command = popen.call_args.args[0]
+        # Written whole to its stdin before the wait.
+        payload = json.loads(stdin.write.call_args.args[0])
+        stdin.close.assert_called_once()
+        process.communicate.assert_called_once_with(timeout=30)
         self.assertNotIn(SERVER_BEARER, repr(command))
         self.assertEqual(payload["local_endpoint"]["server_bearer"], SERVER_BEARER)
-        self.assertFalse(run.call_args.kwargs["close_fds"])
+        self.assertFalse(popen.call_args.kwargs["close_fds"])
         self.assertEqual(actual, expected)
 
     def test_control_child_dispatches_only_the_allowlisted_rpc(self):
@@ -133,6 +138,129 @@ class LocalEndpointTests(unittest.TestCase):
         stub.TerminateRun.assert_called_once_with(request, timeout=5.0)
         with self.assertRaisesRegex(ValueError, "unsupported"):
             control_rpc._dispatch({**payload, "method": "DeleteProject"})
+        # With after, the control process an earlier end of the run left running, it sends once that one has ended, within the same deadline.
+        earlier = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(0.3)"]
+        )
+        threading.Thread(target=earlier.wait, daemon=True).start()
+        stub.TerminateRun.reset_mock()
+        sent_after = []
+
+        def gone(pid):
+            # Not earlier.poll(), which reads None while the waiting thread, having reaped the process, has yet to record its status.
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return True
+            return False
+
+        stub.TerminateRun.side_effect = lambda request, timeout: (
+            sent_after.append((gone(earlier.pid), timeout)) or response
+        )
+        with (
+            mock.patch.object(
+                control_rpc.grpc, "insecure_channel", return_value=channel
+            ),
+            mock.patch.object(control_rpc.kymo_pb2_grpc, "KymoStub", return_value=stub),
+        ):
+            control_rpc._dispatch({**payload, "after": earlier.pid})
+        ((ended, timeout),) = sent_after
+        self.assertTrue(ended)
+        self.assertLess(timeout, 4.8)
+        with self.assertRaisesRegex(ValueError, "process id"):
+            control_rpc._dispatch({**payload, "after": True})
+
+    @unittest.skipUnless(
+        os.path.exists("/proc/self/stat"), "a zombie reads as running without /proc"
+    )
+    def test_a_control_process_sends_after_an_earlier_one_that_is_a_zombie(self):
+        # The earlier control process that the next waits for is a zombie once it has ended until its parent reaps it, for good where that parent has exited under a PID 1 that never reaps: os.kill(pid, 0) still finds it, which would hold the next until its alarm, unsent. A zombie's state in /proc reads as ended.
+        payload = {
+            "method": "TerminateRun",
+            "request": base64.b64encode(
+                client_module.kymo_pb2.TerminateRunRequest(
+                    project_id="project", run_id="run", exit_code=130
+                ).SerializeToString()
+            ).decode("ascii"),
+            "server_address": "127.0.0.1:50051",
+            "timeout": 5,
+            "local_endpoint": None,
+        }
+        sent = threading.Event()
+        stub = mock.Mock()
+        stub.TerminateRun.side_effect = lambda request, timeout: (
+            sent.set() or client_module.kymo_pb2.TerminateRunResponse()
+        )
+        earlier = subprocess.Popen([sys.executable, "-c", "pass"])
+        waiting = threading.Thread(
+            target=control_rpc._dispatch,
+            args=({**payload, "after": earlier.pid},),
+            daemon=True,
+        )
+        with (
+            mock.patch.object(
+                control_rpc.grpc, "insecure_channel", return_value=mock.MagicMock()
+            ),
+            mock.patch.object(control_rpc.kymo_pb2_grpc, "KymoStub", return_value=stub),
+        ):
+            try:
+                # Exited, and left unreaped.
+                os.waitid(os.P_PID, earlier.pid, os.WEXITED | os.WNOWAIT)
+                waiting.start()
+                self.assertTrue(sent.wait(5))
+            finally:
+                # Reaped, a wait that missed the zombie ends, sending through the stand-ins.
+                earlier.wait()
+                if waiting.is_alive():
+                    waiting.join(5)
+
+    def test_a_control_process_whose_start_hangs_dies_by_its_alarm(self):
+        # A run's TerminateRun goes out with the group's signals blocked, so no Ctrl-C or SIGTERM ends its control process: its alarm does, 2 s past its timeout, set before site's processing (a sitecustomize here) and its imports of kymo and grpc (a grpc that hangs here), at SIGALRM's default action and unblocked though the program ignores or blocks it.
+        hangs = "import time\ntime.sleep(60)\n"
+        left = []
+        with (
+            tempfile.TemporaryDirectory() as site,
+            tempfile.TemporaryDirectory() as imports,
+        ):
+            with open(os.path.join(site, "sitecustomize.py"), "w") as file:
+                file.write(hangs)
+            with open(os.path.join(imports, "grpc.py"), "w") as file:
+                file.write(hangs)
+            mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+            alarm = signal.getsignal(signal.SIGALRM)
+            started = time.monotonic()
+            try:
+                for path, program in ((site, "ignores"), (imports, "blocks")):
+                    if program == "ignores":
+                        signal.signal(signal.SIGALRM, signal.SIG_IGN)
+                    else:
+                        signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGALRM])
+                    with mock.patch.dict(os.environ, {"PYTHONPATH": path}):
+                        left.append(
+                            client_module._run_control_rpc(
+                                "TerminateRun",
+                                client_module.kymo_pb2.TerminateRunRequest(),
+                                client_module.kymo_pb2.TerminateRunResponse,
+                                server_address="127.0.0.1:1",
+                                timeout=0.5,
+                                leave=lambda: False,
+                            )
+                        )
+                    signal.signal(signal.SIGALRM, alarm)
+                    signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+                for process in left:
+                    process.wait(timeout=30)
+            finally:
+                signal.signal(signal.SIGALRM, alarm)
+                signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+                for process in left:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+        self.assertEqual(
+            [process.returncode for process in left], [-signal.SIGALRM] * 2
+        )
+        self.assertLess(time.monotonic() - started, 10)
 
     def test_ensure_validates_and_normalizes_the_launcher_contract(self):
         completed = subprocess.CompletedProcess(
@@ -161,6 +289,89 @@ class LocalEndpointTests(unittest.TestCase):
             check=False,
             close_fds=False,
         )
+
+    def test_an_ensure_in_its_own_session_keeps_the_default_mask(self):
+        # The ensure before a run's TerminateRun runs as a session leader, which a group Ctrl-C or SIGTERM never reaches, with no signal blocked though its caller blocks some, since a local stack it starts keeps its mask; past its timeout it is killed and reaped, as subprocess.run would. Where posix_spawn has no setsid (CPython built against glibc older than 2.26), it leads a process group of its own instead.
+        real_spawn = os.posix_spawn
+
+        def without_setsid(*args, setsid=False, **kwargs):
+            if setsid:
+                raise NotImplementedError("posix_spawn: setsid unavailable")
+            return real_spawn(*args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            launcher = os.path.join(directory, "kymo")
+            facts = os.path.join(directory, "facts.json")
+            with open(launcher, "w") as file:
+                file.write(
+                    f"#!{sys.executable}\n"
+                    "import json, os, signal, time\n"
+                    "blocked = signal.pthread_sigmask(signal.SIG_BLOCK, [])\n"
+                    "facts = {'leader': os.getsid(0) == os.getpid(), 'group': os.getpgid(0) == os.getpid(), 'pid': os.getpid(), 'blocked': sorted(map(int, blocked))}\n"
+                    f"with open({facts!r}, 'w') as handle: handle.write(json.dumps(facts))\n"
+                    "time.sleep(float(os.environ['KYMO_TEST_LAUNCHER_SLEEP']))\n"
+                    f"print({json.dumps(endpoint_payload())!r})\n"
+                )
+            os.chmod(launcher, 0o700)
+            before = signal.pthread_sigmask(
+                signal.SIG_BLOCK, [signal.SIGINT, signal.SIGTERM]
+            )
+            try:
+                with mock.patch.object(
+                    local_runtime, "_launcher_path", return_value=launcher
+                ):
+                    for spawn, leader in ((real_spawn, True), (without_setsid, False)):
+                        with (
+                            mock.patch.dict(
+                                os.environ, {"KYMO_TEST_LAUNCHER_SLEEP": "0"}
+                            ),
+                            mock.patch.object(local_runtime.os, "posix_spawn", spawn),
+                        ):
+                            endpoint = local_runtime.ensure_local_endpoint(
+                                timeout=30, own_session=True
+                            )
+                        with open(facts) as file:
+                            ran = json.load(file)
+                        self.assertEqual(endpoint.installation_uuid, INSTALLATION_UUID)
+                        self.assertEqual(
+                            (ran["leader"], ran["group"], ran["blocked"]),
+                            (leader, True, []),
+                        )
+                    with (
+                        mock.patch.dict(os.environ, {"KYMO_TEST_LAUNCHER_SLEEP": "30"}),
+                        self.assertRaisesRegex(RuntimeError, "did not become ready"),
+                    ):
+                        started = time.monotonic()
+                        local_runtime.ensure_local_endpoint(timeout=1, own_session=True)
+                self.assertLess(time.monotonic() - started, 5)
+                with open(facts) as file:
+                    pid = json.load(file)["pid"]
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, before)
+
+    def test_an_ensure_in_its_own_session_starts_with_sigpipe_at_its_default(self):
+        # Python ignores SIGPIPE and SIGXFSZ at its start, and exec keeps an ignored disposition: the ensure's spawn sets them to their default actions, as subprocess does, so a shell launcher's pipeline ends as it would anywhere else (its writer killed by SIGPIPE, 141).
+        with tempfile.TemporaryDirectory() as directory:
+            launcher = os.path.join(directory, "kymo")
+            status = os.path.join(directory, "status")
+            with open(launcher, "w") as file:
+                file.write(
+                    "#!/bin/sh\n"
+                    f"(yes; echo $? > {shlex.quote(status)}) 2>/dev/null | head -n 1 > /dev/null\n"
+                    f"printf '%s\\n' {shlex.quote(json.dumps(endpoint_payload()))}\n"
+                )
+            os.chmod(launcher, 0o700)
+            with mock.patch.object(
+                local_runtime, "_launcher_path", return_value=launcher
+            ):
+                endpoint = local_runtime.ensure_local_endpoint(
+                    timeout=30, own_session=True
+                )
+            with open(status) as file:
+                self.assertEqual(file.read().strip(), str(128 + signal.SIGPIPE))
+        self.assertEqual(endpoint.installation_uuid, INSTALLATION_UUID)
 
     def test_ensure_passes_a_canonical_nonsecret_init_hold(self):
         completed = subprocess.CompletedProcess(

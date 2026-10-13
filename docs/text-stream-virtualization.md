@@ -71,7 +71,7 @@ do not continuously rescan an active search. Re-submit to refresh its result set
 
 ## Regression and hand test
 
-Run the browser regression against a clean `dx serve` or a static server hosting a frontend bundle. A hosted build needs a server origin, but the fence intercepts `/grpc-ws`, so any `http://` origin works (`KYMO_FRONTEND_SERVER_ORIGIN=http://127.0.0.1:1 dx serve`):
+Run the browser regression against a clean `dx serve` or a static server hosting a frontend bundle. A hosted build needs a server origin, but the fence intercepts both `/grpc-ws2` and `/grpc-ws`, so any `http://` origin works (`KYMO_FRONTEND_SERVER_ORIGIN=http://127.0.0.1:1 dx serve`):
 
 ```sh
 python tools/local-transport-qualification/text_scroll_fences.py http://127.0.0.1:8080/ --browser chromium

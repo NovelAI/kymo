@@ -5,24 +5,17 @@ use crate::proto::smoothing_config::Algorithm;
 /// Server-side cap on the smoothing window: chart_params clamps the wire value to it, and the smoothers and delta planner rely on that bound.
 pub(crate) const MAX_SMOOTHING_WINDOW: u32 = 4096;
 
-/// Spacing of an x grid if it is uniform (within float tolerance), else
-/// None. Step grids are integers cast to f64, so contiguous logging — the
-/// overwhelmingly common case — compares exactly and takes the fast
-/// index-space smoothers; anything irregular gets the x-aware path.
-fn uniform_spacing(xs: &[f64]) -> Option<f64> {
+/// Whether all x gaps agree within float tolerance. Contiguous integer steps compare exactly and take index-space Savitzky–Golay; irregular grids use the x-aware fit.
+fn is_uniform(xs: &[f64]) -> bool {
     #[cfg(test)]
     SPACING_DERIVATIONS.with(|counts| counts.set((counts.get().0 + 1, counts.get().1)));
-    if xs.len() < 2 {
-        return Some(1.0);
-    }
-    let d0 = xs[1] - xs[0];
+    xs.len() < 2 || same_gaps(xs[1] - xs[0], xs.windows(2).map(|w| w[1] - w[0]))
+}
+
+/// Whether every gap agrees with the first, `d0`, within [`is_uniform`]'s float tolerance.
+pub(crate) fn same_gaps(d0: f64, mut gaps: impl Iterator<Item = f64>) -> bool {
     let tol = d0.abs() * 1e-9 + 1e-12;
-    for w in xs.windows(2) {
-        if ((w[1] - w[0]) - d0).abs() > tol {
-            return None;
-        }
-    }
-    Some(d0)
+    !gaps.any(|gap| (gap - d0).abs() > tol)
 }
 
 /// Median interval between consecutive distinct x values — the x-unit the window scales are quoted in
@@ -72,7 +65,7 @@ pub(crate) fn smoothing_plan(xs: &[f64], algo: Algorithm, step_sized_x: bool) ->
         Algorithm::Ema | Algorithm::Triangular if step_sized_x => SmoothingPlan::NoState,
         Algorithm::Ema | Algorithm::Triangular => SmoothingPlan::Median(median_dx(xs).to_bits()),
         Algorithm::SavitzkyGolay => {
-            if uniform_spacing(xs).is_some() {
+            if is_uniform(xs) {
                 SmoothingPlan::Uniform
             } else {
                 SmoothingPlan::Median(median_dx(xs).to_bits())
@@ -91,52 +84,154 @@ pub(crate) fn take_spacing_derivations() -> (usize, usize) {
     SPACING_DERIVATIONS.with(|counts| counts.replace((0, 0)))
 }
 
-/// One-sided exponentially weighted polynomial regression, evaluated at each current x. Moments are kept in coordinates whose origin moves with the current sample; translating the five scalar moments and solving the at-most 3x3 normal equations is constant work per point. The coordinate unit is the time constant τ, which keeps the moment matrix well-scaled at any τ.
-fn ema_polyfit(xs: &[f64], y: &[f64], tau: f64, dx_ref: f64, poly_order: u32) -> Vec<f64> {
-    let mut out = vec![f64::NAN; y.len()];
-    let deg = poly_order.min(2) as usize;
-    let mut mw = [0.0f64; 5];
-    let mut sw = [0.0f64; 3];
-    let mut prev_x = f64::NAN;
+/// What a causal smoother carries from one sample to the next: its moments, the last finite sample's x and (Triangular) its weight. A fit resumed from a recorded state takes the same arithmetic as the uninterrupted one, so held chart state (query/held.rs) replays from checkpoints bit for bit.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CausalState {
+    mw: [f64; 5],
+    sw: [f64; 3],
+    prev_x: f64,
+    /// Triangular's 1 + elapsed x since the first sample, in dx_ref units; unused by EMA.
+    weight: f64,
+}
 
-    for (i, &yv) in y.iter().enumerate() {
-        if !yv.is_finite() {
-            continue;
-        }
-        if prev_x.is_finite() {
-            // In units of τ, old u becomes u − h at the new origin.
-            let h = ((xs[i] - prev_x) / dx_ref).max(0.0) / tau;
-            let decay = (-h).exp();
-            if decay == 0.0 {
-                // Avoid 0 * inf when an enormous x gap underflows the old
-                // state's weight to exactly zero.
-                mw = [0.0; 5];
-                sw = [0.0; 3];
-            } else {
-                let old_mw = mw;
-                let old_sw = sw;
-                for (k, moment) in mw.iter_mut().enumerate().take(2 * deg + 1) {
-                    let mut translated = 0.0;
-                    for (l, &moment) in old_mw.iter().enumerate().take(k + 1) {
-                        translated += binomial(k, l) * (-h).powi((k - l) as i32) * moment;
+impl CausalState {
+    pub(crate) const START: Self = Self {
+        mw: [0.0; 5],
+        sw: [0.0; 3],
+        prev_x: f64::NAN,
+        weight: 1.0,
+    };
+
+    /// The state's bits, for exact comparison (a fresh state's `prev_x` is NaN).
+    pub(crate) fn bits(&self) -> [u64; 10] {
+        let ([a, b, c, d, e], [f, g, h]) = (self.mw, self.sw);
+        [a, b, c, d, e, f, g, h, self.prev_x, self.weight].map(f64::to_bits)
+    }
+}
+
+/// Causal smoothers record their state before every sample whose index is a multiple of this.
+pub(crate) const CAUSAL_CHECKPOINT_STRIDE: usize = 512;
+
+/// A causal smoother with its parameters, run sample by sample ([`Self::run`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CausalSmoother {
+    /// One-sided exponentially weighted polynomial regression, evaluated at each current x. Moments are kept in coordinates whose origin moves with the current sample; translating the five scalar moments and solving the at-most 3x3 normal equations is constant work per point. The coordinate unit is the time constant τ, which keeps the moment matrix well-scaled at any τ.
+    Ema { tau: f64, dx_ref: f64, deg: usize },
+    /// Causal triangular-weighted polynomial regression, evaluated at each
+    /// current x. Where [`Self::Ema`] weights the past by a geometric decay in
+    /// x, this ramps the weight up LINEARLY in x: a sample's weight is one plus
+    /// its x-distance from the run's first sample, in dx_ref units. On a
+    /// contiguous step grid that is 1, 2, 3, … (the newest point counts most),
+    /// but a logging gap lifts the weight across it by the gap's width rather
+    /// than by one. Every earlier point keeps a linearly-shrinking share instead
+    /// of decaying away, so the window is the whole history so far and there is
+    /// no bandwidth parameter.
+    ///
+    /// As in the EMA fit, moments are carried in coordinates whose origin tracks
+    /// the current sample; here the coordinate UNIT also grows with the elapsed
+    /// x, so the oldest point sits near u = −1 whatever the run length and the
+    /// moment matrix stays well-scaled even at order 2. Rescaling the unit
+    /// (u ↦ r·u) maps moment_k ↦ rᵏ·moment_k, folded into the same binomial
+    /// origin shift [`Self::Ema`] uses. The fitted value is read at the current
+    /// point (u = 0), which is unit-invariant, so the rescale changes only
+    /// conditioning, not the result.
+    ///
+    /// Within a fixed dx_ref the output at a sample depends only on the samples up to it, so appending later points never moves an earlier value — the delta reach is 0, exactly as for EMA. Step/custom-x smoothing fixes dx_ref at one step; time smoothing uses the whole series' median interval, so an append that shifts the median rescales every output and the exact [`SmoothingPlan`] gate answers full. Reach 0 is therefore the behavior across a delta continuation, not a promise that a time-axis median shift can never move history.
+    Triangular { dx_ref: f64, deg: usize },
+}
+
+impl CausalSmoother {
+    /// Fold one finite sample at `x` into `st` and return the fitted value there. Inlined into [`Self::run`]'s loop: as a call, Triangular builds took 8-28% longer, though EMA's 1-2% less (`response_builder_benchmark`).
+    #[inline(always)]
+    fn step(self, st: &mut CausalState, x: f64, yv: f64) -> f64 {
+        match self {
+            Self::Ema { tau, dx_ref, deg } => {
+                if st.prev_x.is_finite() {
+                    // In units of τ, old u becomes u − h at the new origin.
+                    let h = ((x - st.prev_x) / dx_ref).max(0.0) / tau;
+                    let decay = (-h).exp();
+                    if decay == 0.0 {
+                        // Avoid 0 * inf when an enormous x gap underflows the old
+                        // state's weight to exactly zero.
+                        st.mw = [0.0; 5];
+                        st.sw = [0.0; 3];
+                    } else {
+                        translate_moments(&mut st.mw, 2 * deg + 1, 1.0, h, decay);
+                        translate_moments(&mut st.sw, deg + 1, 1.0, h, decay);
                     }
-                    *moment = decay * translated;
                 }
-                for (k, moment) in sw.iter_mut().enumerate().take(deg + 1) {
-                    let mut translated = 0.0;
-                    for (l, &moment) in old_sw.iter().enumerate().take(k + 1) {
-                        translated += binomial(k, l) * (-h).powi((k - l) as i32) * moment;
-                    }
-                    *moment = decay * translated;
+                st.mw[0] += 1.0;
+                st.sw[0] += yv;
+                st.prev_x = x;
+                fit_from_moments(&st.mw, &st.sw, deg)
+            }
+            Self::Triangular { dx_ref, deg } => {
+                if st.prev_x.is_finite() {
+                    let prev_weight = st.weight;
+                    // Weight accumulates the x-distance covered (in dx_ref units), so
+                    // a gap raises it by the gap's width, not by one.
+                    st.weight += (x - st.prev_x) / dx_ref;
+                    // One change of variables u ↦ r·u − h that both moves the origin
+                    // to this sample and rescales the unit from prev_weight·dx_ref to
+                    // weight·dx_ref, so u stays bounded as the elapsed x grows.
+                    let r = prev_weight / st.weight;
+                    let h = (x - st.prev_x) / (st.weight * dx_ref);
+                    translate_moments(&mut st.mw, 2 * deg + 1, r, h, 1.0);
+                    translate_moments(&mut st.sw, deg + 1, r, h, 1.0);
                 }
+                st.mw[0] += st.weight;
+                st.sw[0] += st.weight * yv;
+                st.prev_x = x;
+                fit_from_moments(&st.mw, &st.sw, deg)
             }
         }
-        mw[0] += 1.0;
-        sw[0] += yv;
-        prev_x = xs[i];
-        out[i] = fit_from_moments(&mw, &sw, deg);
     }
-    out
+
+    /// Run the smoother over samples whose first has absolute index `base`, from `state` (the state before that sample), leaving the state after the last. Non-finite y are skipped and output NaN. With `checkpoints`, records `(index, state before it)` at every absolute index that is a multiple of [`CAUSAL_CHECKPOINT_STRIDE`], then the state after the last sample at the index past it.
+    pub(crate) fn run(
+        self,
+        xs: &[f64],
+        y: &[f64],
+        state: &mut CausalState,
+        base: usize,
+        mut checkpoints: Option<&mut Vec<(usize, CausalState)>>,
+    ) -> Vec<f64> {
+        let mut out = vec![f64::NAN; y.len()];
+        for (i, &yv) in y.iter().enumerate() {
+            if let Some(cps) = checkpoints.as_deref_mut() {
+                if (base + i).is_multiple_of(CAUSAL_CHECKPOINT_STRIDE) {
+                    cps.push((base + i, *state));
+                }
+            }
+            if !yv.is_finite() {
+                continue;
+            }
+            out[i] = self.step(state, xs[i], yv);
+        }
+        if let Some(cps) = checkpoints {
+            cps.push((base + y.len(), *state));
+        }
+        out
+    }
+}
+
+/// The first `terms` moments under the change of variables u ↦ r·u − h, scaled: moment_k ↦ scale · Σ_l C(k, l)·rˡ·(−h)^(k−l)·moment_l. With r = 1 the rescale factors are exactly 1.
+#[inline(always)]
+fn translate_moments<const N: usize>(
+    moments: &mut [f64; N],
+    terms: usize,
+    r: f64,
+    h: f64,
+    scale: f64,
+) {
+    let old = *moments;
+    for (k, moment) in moments.iter_mut().enumerate().take(terms) {
+        let mut acc = 0.0;
+        for (l, &m) in old.iter().enumerate().take(k + 1) {
+            acc += binomial(k, l) * r.powi(l as i32) * (-h).powi((k - l) as i32) * m;
+        }
+        *moment = scale * acc;
+    }
 }
 
 fn binomial(n: usize, k: usize) -> f64 {
@@ -148,72 +243,6 @@ fn binomial(n: usize, k: usize) -> f64 {
         [1.0, 4.0, 6.0, 4.0, 1.0],
     ];
     C[n][k]
-}
-
-/// Causal triangular-weighted polynomial regression, evaluated at each
-/// current x. Where [`ema_polyfit`] weights the past by a geometric decay in
-/// x, this ramps the weight up LINEARLY in x: a sample's weight is one plus
-/// its x-distance from the run's first sample, in dx_ref units. On a
-/// contiguous step grid that is 1, 2, 3, … (the newest point counts most),
-/// but a logging gap lifts the weight across it by the gap's width rather
-/// than by one. Every earlier point keeps a linearly-shrinking share instead
-/// of decaying away, so the window is the whole history so far and there is
-/// no bandwidth parameter.
-///
-/// As in the EMA fit, moments are carried in coordinates whose origin tracks
-/// the current sample; here the coordinate UNIT also grows with the elapsed
-/// x, so the oldest point sits near u = −1 whatever the run length and the
-/// moment matrix stays well-scaled even at order 2. Rescaling the unit
-/// (u ↦ r·u) maps moment_k ↦ rᵏ·moment_k, folded into the same binomial
-/// origin shift [`ema_polyfit`] uses. The fitted value is read at the current
-/// point (u = 0), which is unit-invariant, so the rescale changes only
-/// conditioning, not the result.
-///
-/// Within a fixed dx_ref the output at a sample depends only on the samples up to it, so appending later points never moves an earlier value — the delta reach is 0, exactly as for EMA. Step/custom-x smoothing fixes dx_ref at one step; time smoothing uses the whole series' median interval, so an append that shifts the median rescales every output and the exact [`SmoothingPlan`] gate answers full. Reach 0 is therefore the behavior across a delta continuation, not a promise that a time-axis median shift can never move history.
-fn triangular_polyfit(xs: &[f64], y: &[f64], dx_ref: f64, poly_order: u32) -> Vec<f64> {
-    let mut out = vec![f64::NAN; y.len()];
-    let deg = poly_order.min(2) as usize;
-    let mut mw = [0.0f64; 5];
-    let mut sw = [0.0f64; 3];
-    let mut prev_x = f64::NAN;
-    let mut weight = 1.0f64; // 1 + elapsed x since the first sample, in dx_ref units
-    for (i, &yv) in y.iter().enumerate() {
-        if !yv.is_finite() {
-            continue;
-        }
-        if prev_x.is_finite() {
-            let prev_weight = weight;
-            // Weight accumulates the x-distance covered (in dx_ref units), so
-            // a gap raises it by the gap's width, not by one.
-            weight += (xs[i] - prev_x) / dx_ref;
-            // One change of variables u ↦ r·u − h that both moves the origin
-            // to this sample and rescales the unit from prev_weight·dx_ref to
-            // weight·dx_ref, so u stays bounded as the elapsed x grows.
-            let r = prev_weight / weight;
-            let h = (xs[i] - prev_x) / (weight * dx_ref);
-            let old_mw = mw;
-            let old_sw = sw;
-            for (k, moment) in mw.iter_mut().enumerate().take(2 * deg + 1) {
-                let mut acc = 0.0;
-                for (l, &m) in old_mw.iter().enumerate().take(k + 1) {
-                    acc += binomial(k, l) * r.powi(l as i32) * (-h).powi((k - l) as i32) * m;
-                }
-                *moment = acc;
-            }
-            for (k, moment) in sw.iter_mut().enumerate().take(deg + 1) {
-                let mut acc = 0.0;
-                for (l, &m) in old_sw.iter().enumerate().take(k + 1) {
-                    acc += binomial(k, l) * r.powi(l as i32) * (-h).powi((k - l) as i32) * m;
-                }
-                *moment = acc;
-            }
-        }
-        mw[0] += weight;
-        sw[0] += weight * yv;
-        prev_x = xs[i];
-        out[i] = fit_from_moments(&mw, &sw, deg);
-    }
-    out
 }
 
 /// Savitzky-Golay smoothing, biweight-windowed: each output point is the
@@ -244,12 +273,47 @@ fn triangular_polyfit(xs: &[f64], y: &[f64], dx_ref: f64, poly_order: u32) -> Ve
 /// point — masks those positions back to NaN, so a hole in the input is
 /// never filled in what reaches the wire.
 fn savitzky_golay(y: &[f64], window: usize, poly_order: u32) -> Vec<f64> {
-    let n = y.len();
+    savitzky_golay_range(y, 0, y.len(), 0, y.len(), window, poly_order)
+}
+
+/// The input indices outputs [from, to) of [`savitzky_golay`] over `n` samples read: their windows, clipped edges and the prefix-sum blocks holding them.
+pub(crate) fn savgol_inputs(n: usize, window: usize, from: usize, to: usize) -> (usize, usize) {
+    let to = to.min(n);
+    if from >= to {
+        return (from.min(n), from.min(n));
+    }
+    let (half, _) = savgol_geometry(window);
+    let mut lo = from.saturating_sub(half);
+    let mut hi = (to + half).min(n);
+    let (lo_int, hi_int) = (half, n.saturating_sub(half));
+    let (first, last) = (from.max(lo_int), to.min(hi_int));
+    if first < last {
+        let block = 2 * half;
+        let first_block = lo_int + (first - lo_int) / block * block;
+        let last_block_end = (lo_int + ((last - 1 - lo_int) / block + 1) * block).min(hi_int);
+        lo = lo.min(first_block - half);
+        hi = hi.max(last_block_end + half);
+    }
+    (lo, hi)
+}
+
+/// Outputs [from, to) of [`savitzky_golay`] over a series of `n` samples, given its values y[base..base + yw.len()] as `yw`, which must cover [`savgol_inputs`]. Each output takes the same arithmetic as in the whole-series call, which is this call over the whole series.
+pub(crate) fn savitzky_golay_range(
+    yw: &[f64],
+    base: usize,
+    n: usize,
+    from: usize,
+    to: usize,
+    window: usize,
+    poly_order: u32,
+) -> Vec<f64> {
+    let to = to.min(n);
     let deg = poly_order.min(2) as usize;
-    let mut out = vec![f64::NAN; n];
-    if n == 0 {
+    let mut out = vec![f64::NAN; to.saturating_sub(from)];
+    if from >= to {
         return out;
     }
+    let y = |j: usize| yw[j - base];
     let (half, h_s) = savgol_geometry(window);
 
     // Interior shortcut: on a full, NaN-free window the odd weighted
@@ -274,18 +338,19 @@ fn savitzky_golay(y: &[f64], window: usize, poly_order: u32) -> Vec<f64> {
     };
 
     // NaN prefix counts: O(1) per-window cleanliness check.
-    let mut nan_pfx = vec![0u32; n + 1];
-    for (i, v) in y.iter().enumerate() {
+    let mut nan_pfx = vec![0u32; yw.len() + 1];
+    for (i, v) in yw.iter().enumerate() {
         nan_pfx[i + 1] = nan_pfx[i] + u32::from(v.is_nan());
     }
+    let nans_before = |j: usize| nan_pfx[j - base];
 
     // Clipped windows at the data edges: direct weighted fits.
-    for (c, output) in out.iter_mut().enumerate().take(half.min(n)) {
-        *output = sg_fit_window(y, 0, (c + half + 1).min(n), c, h_s, deg);
+    for c in from..to.min(half.min(n)) {
+        out[c - from] = sg_fit_window(&y, 0, (c + half + 1).min(n), c, h_s, deg);
     }
-    for (c, output) in out.iter_mut().enumerate().skip(n.saturating_sub(half)) {
+    for c in from.max(n.saturating_sub(half))..to {
         if c >= half {
-            *output = sg_fit_window(y, c - half, n, c, h_s, deg);
+            out[c - from] = sg_fit_window(&y, c - half, n, c, h_s, deg);
         }
     }
 
@@ -296,7 +361,8 @@ fn savitzky_golay(y: &[f64], window: usize, poly_order: u32) -> Vec<f64> {
     // NaN divert to the direct path.
     let lo_int = half;
     let hi_int = n.saturating_sub(half);
-    if lo_int >= hi_int {
+    let (first, last) = (from.max(lo_int), to.min(hi_int));
+    if first >= last {
         return out;
     }
     let cap = 4 * half + 1;
@@ -310,14 +376,15 @@ fn savitzky_golay(y: &[f64], window: usize, poly_order: u32) -> Vec<f64> {
     let h2 = h_s * h_s;
     let h4 = h2 * h2;
     let h6 = h4 * h2;
-    let mut block_start = lo_int;
-    while block_start < hi_int {
+    // Blocks of 2·half outputs from lo_int; only those holding an output of [from, to) are built.
+    let mut block_start = lo_int + (first - lo_int) / (2 * half) * (2 * half);
+    while block_start < last {
         let block_end = (block_start + 2 * half).min(hi_int);
         let lo = block_start - half;
         let len = block_end + half - lo;
         let origin = (len / 2) as f64;
         for u in 0..len {
-            let v = y[lo + u];
+            let v = y(lo + u);
             let v = if v.is_nan() { 0.0 } else { v };
             let x = u as f64 - origin;
             let x2 = x * x;
@@ -330,9 +397,9 @@ fn savitzky_golay(y: &[f64], window: usize, poly_order: u32) -> Vec<f64> {
             p5[u + 1] = p5[u] + x3 * x2 * v;
             p6[u + 1] = p6[u] + x3 * x3 * v;
         }
-        for c in block_start..block_end {
-            if nan_pfx[c + half + 1] != nan_pfx[c - half] {
-                out[c] = sg_fit_window(y, c - half, c + half + 1, c, h_s, deg);
+        for c in block_start.max(first)..block_end.min(last) {
+            if nans_before(c + half + 1) != nans_before(c - half) {
+                out[c - from] = sg_fit_window(&y, c - half, c + half + 1, c, h_s, deg);
                 continue;
             }
             let a = c - half - lo;
@@ -355,7 +422,7 @@ fn savitzky_golay(y: &[f64], window: usize, poly_order: u32) -> Vec<f64> {
                 + d3 * d3 * q0;
             let sw0 = q0 - 2.0 * t2 / h2 + t4 / h4;
             let sw2 = t2 / h2 - 2.0 * t4 / h4 + t6 / h6;
-            out[c] = alpha * sw0 + beta * sw2;
+            out[c - from] = alpha * sw0 + beta * sw2;
         }
         block_start = block_end;
     }
@@ -401,8 +468,15 @@ fn biweight_fit(points: impl Iterator<Item = (f64, f64)>, deg: usize) -> f64 {
 }
 
 /// Direct fit over y[lo..hi] with weights centered at `c`, returning the fitted value at `c`.
-fn sg_fit_window(y: &[f64], lo: usize, hi: usize, c: usize, h_s: f64, deg: usize) -> f64 {
-    biweight_fit((lo..hi).map(|j| ((j as f64 - c as f64) / h_s, y[j])), deg)
+fn sg_fit_window(
+    y: &impl Fn(usize) -> f64,
+    lo: usize,
+    hi: usize,
+    c: usize,
+    h_s: f64,
+    deg: usize,
+) -> f64 {
+    biweight_fit((lo..hi).map(|j| ((j as f64 - c as f64) / h_s, y(j))), deg)
 }
 
 /// Fitted value at x = 0 of the weighted least-squares polynomial of degree ≤ `deg`, from mw[k] = Σw·xᵏ and sw[k] = Σw·xᵏ·y. It sums qₖ(0)·⟨qₖ, y⟩/Dₖ over the weight-orthogonal monic polynomials qₖ, Dₖ = ⟨qₖ, qₖ⟩ (an unpivoted LDLᵀ of the moment matrix), so each degree adds one term to the lower degree's arithmetic.
@@ -466,6 +540,34 @@ fn savgol_x(xs: &[f64], y: &[f64], h_x: f64, deg: usize) -> Vec<f64> {
     out
 }
 
+/// One output of [`savgol_x`] over a series of `n` samples read through `x` and `y`: the window the whole-series sweep reaches at index `i` (x is ascending, so its two pointers stop where these scans do) and the same fit over it.
+#[allow(clippy::neg_cmp_op_on_partial_ord)] // The sweep's own comparisons, negated where it advances.
+pub(crate) fn savgol_x_at(
+    x: &impl Fn(usize) -> f64,
+    y: &impl Fn(usize) -> f64,
+    n: usize,
+    i: usize,
+    h_x: f64,
+    deg: usize,
+) -> f64 {
+    let xi = x(i);
+    let mut lo = i;
+    while lo > 0 && !(xi - x(lo - 1) > h_x) {
+        lo -= 1;
+    }
+    let mut hi = i;
+    while hi + 1 < n && x(hi + 1) - xi <= h_x {
+        hi += 1;
+    }
+    biweight_fit((lo..=hi).map(|j| ((x(j) - xi) / h_x, y(j))), deg)
+}
+
+/// [`savgol_x`]'s half-width in x for a window and median plan.
+pub(crate) fn savgol_x_half_width(window: usize, median_bits: u64) -> f64 {
+    let (_, h_s) = savgol_geometry(window);
+    h_s * f64::from_bits(median_bits)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,7 +578,7 @@ mod tests {
         let (half, h_s) = savgol_geometry(window);
         let lo = c.saturating_sub(half);
         let hi = (c + half + 1).min(y.len());
-        sg_fit_window(y, lo, hi, c, h_s, 2)
+        sg_fit_window(&|j| y[j], lo, hi, c, h_s, 2)
     }
 
     /// Reference values from an independent implementation (numpy weighted
@@ -602,8 +704,17 @@ mod tests {
         let fits = |order| {
             [
                 savitzky_golay(&y, 4, order),
-                ema_polyfit(&xs, &y, 10.0, 1.0, order),
-                triangular_polyfit(&xs, &y, 1.0, order),
+                CausalSmoother::Ema {
+                    tau: 10.0,
+                    dx_ref: 1.0,
+                    deg: order as usize,
+                }
+                .run(&xs, &y, &mut { CausalState::START }, 0, None),
+                CausalSmoother::Triangular {
+                    dx_ref: 1.0,
+                    deg: order as usize,
+                }
+                .run(&xs, &y, &mut { CausalState::START }, 0, None),
             ]
         };
         assert_eq!(fits(2), fits(1));
@@ -614,7 +725,12 @@ mod tests {
     fn early_ema_samples_fit_full_degree() {
         let (xs, y) = ([0.0, 1.0, 2.0], [0.0, 0.0, 1.0]);
         for tau in [1e6, 1e3, 2.0] {
-            let out = ema_polyfit(&xs, &y, tau, 1.0, 2);
+            let out = CausalSmoother::Ema {
+                tau,
+                dx_ref: 1.0,
+                deg: 2,
+            }
+            .run(&xs, &y, &mut { CausalState::START }, 0, None);
             assert!((out[2] - 1.0).abs() < 1e-9, "tau={tau}: {}", out[2]);
         }
     }
@@ -822,6 +938,8 @@ use std::ops::ControlFlow;
 
 use crate::chart_delta::{DenseChart, DenseSeries};
 
+pub(crate) mod incremental;
+
 /// A bucket downsamples only if it EXPECTS at least this many points; fewer ship raw (docs/log-scale-buckets.md: "a bucket with only 2 points should just be two non-downsampled points"). Step axes expect one point per integer step, so the test is width >= 4 — grid-pure, deliberately blind to missing points; non-step axes use the bucket's distinct-x count instead. Both are monotone against a FIXED threshold, which lets the delta planner compare the exact verified held structure with the current structure.
 const ENV_MIN_POINTS: f64 = 4.0;
 
@@ -850,7 +968,7 @@ enum GridKind {
     Log { m: i32, shift: bool },
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct Grid {
     kind: GridKind,
     base: i64,
@@ -876,7 +994,7 @@ impl Grid {
         }
     }
 
-    /// Instantiated index of the cell containing `x`; None = below the grid, raw by fiat.
+    /// Instantiated index of the cell containing `x`; None = below the grid, raw by fiat. An `x` past the instantiated cells is a caller bug: debug builds assert, release builds clamp it into the edge cell.
     fn index(&self, x: f64) -> Option<usize> {
         Self::id(self.kind, x).map(|id| {
             let offset = id - self.base;
@@ -915,22 +1033,39 @@ pub struct GridSpec {
     pub shift_one: bool,
 }
 
-/// The grid for a chart that decided to downsample. Linear: [`stable_grid`], as ever. Log ladder: the largest subdivision s = 2^m whose cell count over the chart's positive span stays within target — ids are consecutive, so the count is closed-form, no data scanned; a sub-octave zoom therefore scales s up to match linear slot density. `p_lo` (the smallest positive x) clamps to 1 on step axes — sub-integer octaves cannot hold a step. No positive x at all falls back to the linear grid: a bounded grid beats shipping every distinct nonpositive x raw.
+/// The grid for a chart that decided to downsample. Linear: [`stable_grid`]. Log ladder: the largest subdivision s = 2^m whose cell count over the chart's positive span stays within target — ids are consecutive, so the count is closed-form, no data scanned; a sub-octave zoom therefore scales s up to match linear slot density. `p_lo` (the smallest positive x) clamps to 1 on step axes — sub-integer octaves cannot hold a step. No positive x at all falls back to the linear grid: a bounded grid beats shipping every distinct nonpositive x raw.
 fn make_grid(xs: &[&[f64]], g_first: f64, g_last: f64, spec: GridSpec) -> Grid {
+    make_grid_from(log_ladder_floor(xs, g_first, spec), g_first, g_last, spec)
+}
+
+/// The log ladder's `p_lo` ([`make_grid`]): the smallest x a ladder cell can hold, from each run's first x above the shifted zero; infinite without one (and on linear grids, which ignore it).
+fn log_ladder_floor(xs: &[&[f64]], g_first: f64, spec: GridSpec) -> f64 {
+    if !spec.log_buckets {
+        return f64::INFINITY;
+    }
+    // log(x+1) only when the chart contains x = 0 — otherwise plain log(x).
+    let shift = if spec.shift_one && g_first == 0.0 {
+        1.0
+    } else {
+        0.0
+    };
+    let mut p_lo = f64::INFINITY;
+    for r in xs {
+        let i = r.partition_point(|&v| v + shift <= 0.0);
+        if let Some(&v) = r.get(i) {
+            p_lo = p_lo.min(v);
+        }
+    }
+    if spec.is_step_axis {
+        p_lo = p_lo.max(1.0 - shift);
+    }
+    p_lo
+}
+
+/// [`make_grid`] given its [`log_ladder_floor`].
+fn make_grid_from(p_lo: f64, g_first: f64, g_last: f64, spec: GridSpec) -> Grid {
     if spec.log_buckets {
-        // log(x+1) only when the chart contains x = 0 — otherwise plain log(x).
         let shift_one = spec.shift_one && g_first == 0.0;
-        let shift = if shift_one { 1.0 } else { 0.0 };
-        let mut p_lo = f64::INFINITY;
-        for r in xs {
-            let i = r.partition_point(|&v| v + shift <= 0.0);
-            if let Some(&v) = r.get(i) {
-                p_lo = p_lo.min(v);
-            }
-        }
-        if spec.is_step_axis {
-            p_lo = p_lo.max(1.0 - shift);
-        }
         if p_lo.is_finite() && p_lo <= g_last {
             let cells_for = |m: i32| {
                 let k = GridKind::Log {
@@ -1044,7 +1179,18 @@ fn decide_axis(xs: &[&[f64]], g_first: f64, g_last: f64, spec: GridSpec) -> Deci
     if spec.target == 0 || g_last <= g_first {
         return Decision::Passthrough(sorted_distinct(xs));
     }
-    let cap = if spec.is_step_axis && !spec.log_buckets {
+    let cap = decision_cap(g_first, g_last, spec);
+    if spec.is_step_axis {
+        if let Some(d) = decide_step(xs, cap) {
+            return d;
+        }
+    }
+    decide_general(xs, cap)
+}
+
+/// The distinct-x count above which [`decide_axis`] downsamples a chart spanning [g_first, g_last] (target > 0, g_last > g_first): every path decides exactly `distinct > cap`.
+fn decision_cap(g_first: f64, g_last: f64, spec: GridSpec) -> usize {
+    if spec.is_step_axis && !spec.log_buckets {
         let (_, width, _) = stable_grid(g_first, g_last, spec.target);
         if width >= ENV_MIN_POINTS {
             spec.target
@@ -1053,13 +1199,7 @@ fn decide_axis(xs: &[&[f64]], g_first: f64, g_last: f64, spec: GridSpec) -> Deci
         }
     } else {
         spec.target
-    };
-    if spec.is_step_axis {
-        if let Some(d) = decide_step(xs, cap) {
-            return d;
-        }
     }
-    decide_general(xs, cap)
 }
 
 /// Step-axis fast path: each run is strictly-ascending unique integers, so a
@@ -1206,7 +1346,8 @@ fn decide_general(xs: &[&[f64]], cap: usize) -> Decision {
 /// ([`numeric_delta_from_col`]) so they cannot diverge. Each instantiated cell is either
 /// ENVELOPE (one slot at the midpoint of its point extent) or RAW (each distinct
 /// x in it is its own exact slot).
-struct AxisPlan {
+#[derive(Clone, PartialEq)]
+pub(crate) struct AxisPlan {
     grid: Grid,
     /// Per instantiated cell: does it downsample?
     env: Vec<bool>,
@@ -1274,7 +1415,7 @@ fn plan_axis(xs: &[&[f64]], grid: Grid, spec: GridSpec) -> AxisPlan {
             ControlFlow::Continue(())
         });
     } else {
-        // Distinct x ascend, so each cell's x arrive consecutively: count them on the fly, buffering the ≤ ENV_MIN_POINTS-1 x a still-raw cell may yet dump to the raw list (the ENV_MIN_POINTS-th distinct x settles it as envelope and drops the buffer; a cell that ends short ships it raw). Below-grid x (log ladder, x <= 0) streams straight to the raw list. ext accumulates for raw cells too — harmless, nothing reads it there.
+        // Distinct x ascend, so each cell's x arrive consecutively: count them on the fly, buffering the ≤ ENV_MIN_POINTS-1 x a still-raw cell may yet dump to the raw list (the ENV_MIN_POINTS-th distinct x settles it as envelope and drops the buffer; a cell that ends short ships it raw). Below-grid x (log ladder, x <= 0) streams straight to the raw list. ext accumulates for raw cells too: held state's advance (chart/incremental.rs) reads a raw cell's extent when appends flip it to an envelope, so it must cover every x the cell holds.
         let mut cur: Option<Option<usize>> = None;
         let mut cnt = 0usize;
         let mut buf: Vec<f64> = Vec::with_capacity(ENV_MIN_POINTS as usize - 1);
@@ -1454,6 +1595,16 @@ fn passthrough_from_col(
     if xs.iter().any(|x| x.windows(2).any(|w| w[0] == w[1])) {
         return 0;
     }
+    passthrough_dirty_from_col(old_axis, xs, age, continuing)
+}
+
+/// [`passthrough_from_col`] for series known to repeat no x. Only non-OLD samples count, so a caller may pass just those.
+fn passthrough_dirty_from_col(
+    old_axis: &[f64],
+    xs: &[&[f64]],
+    age: &[&[u8]],
+    continuing: &[bool],
+) -> usize {
     let mut first_dirty_x = f64::INFINITY;
     for ((x, a), &cont) in xs.iter().zip(age).zip(continuing) {
         for (&v, &k) in x.iter().zip(a.iter()) {
@@ -1544,7 +1695,7 @@ fn mixed_from_col(
     if let Some(col) = walk_raw(None, &mut op, &mut np, &mut from_col) {
         return col;
     }
-    for (c, &dirty) in dirty_env.iter().enumerate().take(cells) {
+    for (c, &dirty) in dirty_env.iter().enumerate() {
         if old_plan.env[c] != new_plan.env[c] {
             return from_col; // mode flip: the cell's slots restructure
         }
@@ -1611,7 +1762,7 @@ mod delta_planner_tests {
         let kinds: Vec<Vec<u8>> = xs.iter().map(|x| vec![0u8; x.len()]).collect();
         let kr: Vec<&[u8]> = kinds.iter().map(Vec::as_slice).collect();
         let xnan: Vec<&[f64]> = xs.iter().map(|_| [].as_slice()).collect();
-        shared_chart(&xr, &pr, &rr, &kr, &xnan, w > 0, spec)
+        shared_chart(&xr, &pr, &rr, &kr, &xnan, w > 0, spec, false).0
     }
 
     /// Age flags for a series holding its first `old_n` samples: the last
@@ -1922,7 +2073,9 @@ mod delta_planner_tests {
 /// a run with no plottable x (column 0); empty otherwise. `spec` is the
 /// request's axis geometry — labels/run_ids on the result are left empty for
 /// the caller to fill.
-pub fn shared_chart(
+/// With `capture`, also returns the axis layout for held chart state ([`incremental`]); `None` without it, or with no plottable point.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn shared_chart(
     xs: &[&[f64]],
     plot: &[&[f64]],
     raw: &[&[f64]],
@@ -1930,49 +2083,68 @@ pub fn shared_chart(
     xnan: &[&[f64]],
     is_smoothed: bool,
     spec: GridSpec,
-) -> DenseChart {
+    capture: bool,
+) -> (DenseChart, Option<incremental::HeldAxis>) {
     let n = xs.len();
     let Some((g_first, g_last)) = axis_bounds(xs) else {
-        return DenseChart {
+        let chart = DenseChart {
             series: (0..n).map(|_| DenseSeries::default()).collect(),
             ..Default::default()
         };
+        return (chart, None);
     };
 
     // One chart-wide decision, the same for every run: bucket on a grid, or
     // pass every distinct x through. The distinct axis is built ONLY when we
     // pass through — never to feed the decision (see decide_axis).
     match decide_axis(xs, g_first, g_last, spec) {
-        Decision::Passthrough(axis) => {
-            shared_passthrough(axis, xs, plot, raw, kinds, xnan, is_smoothed)
-        }
+        Decision::Passthrough(axis) => (
+            shared_passthrough(axis, xs, plot, raw, kinds, xnan, is_smoothed),
+            capture.then_some(incremental::HeldAxis::Passthrough),
+        ),
         Decision::Downsample => {
-            let grid = make_grid(xs, g_first, g_last, spec);
-            let plan = plan_axis(xs, grid, spec);
-            if !plan.any_env_occupied() {
+            let p_lo = log_ladder_floor(xs, g_first, spec);
+            let grid = make_grid_from(p_lo, g_first, g_last, spec);
+            let mut plan = plan_axis(xs, grid, spec);
+            let (chart, plan) = if !plan.any_env_occupied() {
                 // Every cell came out raw (a log ladder over sparse-enough data): the distinct axis IS the chart, and the emission shape is passthrough's — band only under duplicate-x, exactly what the delta planner mirrors.
-                return shared_passthrough(plan.raw_xs, xs, plot, raw, kinds, xnan, is_smoothed);
-            }
-            let ma = mixed_axis(plan);
-            let mut series = Vec::with_capacity(n);
-            for i in 0..n {
-                let mut a = bucket_run(
-                    xs[i],
-                    plot[i],
-                    if is_smoothed { raw[i] } else { plot[i] },
-                    kinds[i],
-                    is_smoothed,
-                    &ma,
-                );
-                fold_xnan(&mut a, xnan[i], |x| ma.anchor_slot(x));
-                series.push(a);
-            }
-            DenseChart {
-                x_values: ma.x,
-                xr_min: ma.xr_min,
-                xr_max: ma.xr_max,
-                series,
-            }
+                let axis = if capture {
+                    plan.raw_xs.clone()
+                } else {
+                    std::mem::take(&mut plan.raw_xs)
+                };
+                let chart = shared_passthrough(axis, xs, plot, raw, kinds, xnan, is_smoothed);
+                (chart, plan)
+            } else {
+                let ma = mixed_axis(plan);
+                let mut series = Vec::with_capacity(n);
+                for i in 0..n {
+                    let mut a = bucket_run(
+                        xs[i],
+                        plot[i],
+                        if is_smoothed { raw[i] } else { plot[i] },
+                        kinds[i],
+                        is_smoothed,
+                        &ma,
+                    );
+                    fold_xnan(&mut a, xnan[i], |x| ma.anchor_slot(x));
+                    series.push(a);
+                }
+                let chart = DenseChart {
+                    x_values: ma.x,
+                    xr_min: ma.xr_min,
+                    xr_max: ma.xr_max,
+                    series,
+                };
+                (chart, ma.plan)
+            };
+            let held = capture.then_some(incremental::HeldAxis::Grid {
+                plan,
+                p_lo,
+                g_first,
+                g_last,
+            });
+            (chart, held)
         }
     }
 }
@@ -2217,17 +2389,9 @@ fn bucket_run(
         // finite evidence still rides as a range (rule: marker keeps its band).
         if nfkind[c] != 0 {
             markers.push((slot as u32, nfkind[c] as u32));
-            if cnt[c] >= 1 {
-                y_min[slot] = ymin[c];
-                y_max[slot] = ymax[c];
-                any_range = true;
-            }
-            continue;
-        }
-        if cnt[c] == 0 {
+        } else if cnt[c] == 0 {
             continue; // run has no data in this bucket — gap
-        }
-        if is_smoothed {
+        } else if is_smoothed {
             // The smoothed line is the smoothed value interpolated at the slot x.
             out.values[slot] = lerp_at(&fin, &mut lptr, ma.x[slot]);
         } else {
@@ -2235,9 +2399,11 @@ fn bucket_run(
             out.values[slot] = sum_y[c] / cnt[c] as f64;
         }
         // Dense envelope: every occupied bucket ships min/max, min == max behind a single sample.
-        y_min[slot] = ymin[c];
-        y_max[slot] = ymax[c];
-        any_range = true;
+        if cnt[c] >= 1 {
+            y_min[slot] = ymin[c];
+            y_max[slot] = ymax[c];
+            any_range = true;
+        }
     }
 
     // Markers are finalized (sorted + de-duped by slot) in fold_xnan.
@@ -2293,10 +2459,33 @@ pub fn smooth_run(
     step_sized_x: bool,
 ) -> Vec<f64> {
     let plan = smoothing_plan(xs, algo, step_sized_x);
-    smooth_run_with_plan(xs, y, algo, window, time_constant, poly_order, plan)
+    smooth_run_with_plan(xs, y, algo, window, time_constant, poly_order, plan, None)
 }
 
-/// Run a smoother with its already-derived semantic plan. Production preparation calls this after deriving the live plan once; audit reconstruction supplies the proven current plan and derives nothing from its conservative old snapshot.
+/// The causal smoother an EMA or Triangular algorithm runs under a plan.
+pub(crate) fn causal_smoother(
+    algo: Algorithm,
+    time_constant: f64,
+    poly_order: u32,
+    plan: SmoothingPlan,
+) -> CausalSmoother {
+    let deg = poly_order.min(2) as usize;
+    match algo {
+        Algorithm::Ema => CausalSmoother::Ema {
+            tau: time_constant,
+            dx_ref: plan.causal_dx_ref(),
+            deg,
+        },
+        Algorithm::Triangular => CausalSmoother::Triangular {
+            dx_ref: plan.causal_dx_ref(),
+            deg,
+        },
+        Algorithm::None | Algorithm::SavitzkyGolay => unreachable!("{algo:?} is not causal"),
+    }
+}
+
+/// Run a smoother with its already-derived semantic plan. Production preparation calls this after deriving the live plan once; audit reconstruction supplies the proven current plan and derives nothing from its conservative old snapshot. With `checkpoints`, also records a causal smoother's checkpoints ([`CausalSmoother::run`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn smooth_run_with_plan(
     xs: &[f64],
     y: &[f64],
@@ -2305,6 +2494,7 @@ pub(crate) fn smooth_run_with_plan(
     time_constant: f64,
     poly_order: u32,
     plan: SmoothingPlan,
+    checkpoints: Option<&mut Vec<(usize, CausalState)>>,
 ) -> Vec<f64> {
     debug_assert_eq!(xs.len(), y.len());
     debug_assert!(window <= MAX_SMOOTHING_WINDOW);
@@ -2313,31 +2503,21 @@ pub(crate) fn smooth_run_with_plan(
         .map(|v| if v.is_finite() { *v } else { f64::NAN })
         .collect();
     let mut out = match algo {
-        Algorithm::None => sanitized.clone(),
-        Algorithm::Ema => ema_polyfit(
-            xs,
-            &sanitized,
-            time_constant,
-            plan.causal_dx_ref(),
-            poly_order,
-        ),
-        Algorithm::Triangular => {
-            let dx_ref = plan.causal_dx_ref();
-            triangular_polyfit(xs, &sanitized, dx_ref, poly_order)
+        Algorithm::Ema | Algorithm::Triangular => {
+            let smoother = causal_smoother(algo, time_constant, poly_order, plan);
+            smoother.run(xs, &sanitized, &mut { CausalState::START }, 0, checkpoints)
         }
+        Algorithm::None => sanitized.clone(),
         Algorithm::SavitzkyGolay => {
             let w = window as usize;
             match plan {
                 SmoothingPlan::Uniform => savitzky_golay(&sanitized, w, poly_order),
-                SmoothingPlan::Median(bits) => {
-                    let (_, h_s) = savgol_geometry(w);
-                    savgol_x(
-                        xs,
-                        &sanitized,
-                        h_s * f64::from_bits(bits),
-                        poly_order.min(2) as usize,
-                    )
-                }
+                SmoothingPlan::Median(bits) => savgol_x(
+                    xs,
+                    &sanitized,
+                    savgol_x_half_width(w, bits),
+                    poly_order.min(2) as usize,
+                ),
                 SmoothingPlan::NoState => panic!("Savitzky-Golay smoother requires a spacing plan"),
             }
         }
@@ -2828,7 +3008,10 @@ mod shared_chart_tests {
         let raw_s: Vec<&[f64]> = raw.iter().map(|v| v.as_slice()).collect();
         let kinds_s: Vec<&[u8]> = kinds.iter().map(|v| v.as_slice()).collect();
         let xnan_s: Vec<&[f64]> = xnan.iter().map(|v| v.as_slice()).collect();
-        shared_chart(&xs_s, &plot_s, &raw_s, &kinds_s, &xnan_s, smoothed, spec)
+        shared_chart(
+            &xs_s, &plot_s, &raw_s, &kinds_s, &xnan_s, smoothed, spec, false,
+        )
+        .0
     }
 
     fn run_axis(

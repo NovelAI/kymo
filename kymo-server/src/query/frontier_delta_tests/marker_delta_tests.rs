@@ -8,12 +8,7 @@ fn settled_negative_log_markers_keep_polls_and_appends_small() {
             let mut request = req(&["a"], 10_000);
             request.use_timestamp_axis = use_time;
             request.log_buckets = true;
-            request.smoothing = (algorithm != Algorithm::None).then_some(proto::SmoothingConfig {
-                algorithm: algorithm as i32,
-                window_size: 20,
-                time_constant: std::f64::consts::LOG2_E,
-                poly_order: 1,
-            });
+            request.smoothing = smoothing(algorithm, 20, std::f64::consts::LOG2_E, 1);
             let held_rows = shaped(2_001);
             let held = build(&request, std::slice::from_ref(&held_rows));
             let held_model = inflate_full(&held);
@@ -254,12 +249,7 @@ fn anchorless_runs_mark_the_first_column() {
             let mut request = req(&["a", "b"], 12);
             request.use_timestamp_axis = use_time;
             request.log_buckets = true;
-            request.smoothing = (algorithm != Algorithm::None).then_some(proto::SmoothingConfig {
-                algorithm: algorithm as i32,
-                window_size: 5,
-                time_constant: std::f64::consts::LOG2_E,
-                poly_order: 1,
-            });
+            request.smoothing = smoothing(algorithm, 5, std::f64::consts::LOG2_E, 1);
             let full = inflate_full(&build(&request, &[marker.clone(), axis.clone()]));
             assert!(full.xr_min.iter().any(|v| v.is_finite()), "downsampled");
             assert_eq!(full.series[0].nan_indices, vec![0]);
@@ -387,8 +377,7 @@ fn smoothers_bound_new_negative_timestamps_with_an_unchanged_plan() {
             });
             let held = build(&request, &[samples(60), other.clone()]);
             let current = [samples(61), other];
-            let mut continued = request.clone();
-            continued.cache_state = echo(&held);
+            let continued = continuation(&request, &held);
             let p = chart_params(&continued);
             let verified = verified_inputs(&continued, &current, &held.frontiers).unwrap();
             let prepared = prepare(
@@ -396,12 +385,13 @@ fn smoothers_bound_new_negative_timestamps_with_an_unchanged_plan() {
                 &p,
                 &current
                     .iter()
-                    .map(|rows| rows.as_slice())
+                    .map(|rows| Arc::new(SeriesSnapshot::full(rows.to_vec())))
                     .collect::<Vec<_>>(),
                 None,
                 Some(&verified),
                 false,
                 None,
+                false,
             )
             .unwrap()
             .series;
@@ -410,7 +400,15 @@ fn smoothers_bound_new_negative_timestamps_with_an_unchanged_plan() {
                 chart::SmoothingPlan::Median(100f64.to_bits())
             );
             assert!(
-                smoothing_state_matches(&continued, &p, &prepared, 2),
+                continuing_series_match(
+                    &continued,
+                    &p,
+                    prepared
+                        .iter()
+                        .filter(|ps| ps.continues)
+                        .map(|ps| ps.smoothing_plan),
+                    2,
+                ),
                 "{algorithm:?}: fixture must isolate the negative-input gate"
             );
             let truth = inflate_full(&build(&request, &current));

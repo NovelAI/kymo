@@ -56,9 +56,7 @@ fn hi_idle() -> bool {
     HI_IN_FLIGHT.with(|c| c.get() == 0)
 }
 
-/// Hold until every visible FIRST PAINT settles, `keep_waiting` turns false, or the monotonic `deadline_ms` passes. The initial grace beat lets a
-/// same-flush burst of visible fetches take their tokens before the first
-/// idle check.
+/// Hold until every visible FIRST PAINT settles, `keep_waiting` turns false, or the monotonic `deadline_ms` passes. The initial grace beat lets a same-flush burst of visible fetches take their tokens before the first idle check.
 pub(crate) async fn wait_for_visible_idle(deadline_ms: f64, keep_waiting: impl Fn() -> bool) {
     let grace_ms = (deadline_ms - monotonic_now_ms()).clamp(0.0, 150.0);
     sleep(Duration::from_millis(grace_ms as u64)).await;
@@ -80,14 +78,15 @@ pub(crate) async fn wait_for_visible_idle(deadline_ms: f64, keep_waiting: impl F
 pub async fn admit_fetch(zone: impl Fn() -> Zone, first_paint: bool) -> Option<HiFetchToken> {
     crate::grpc::wait_until_page_visible().await;
     if zone() == Zone::Near {
-        // A Near-zone prefetch waits for the visible first paints (or its promotion), capped: with slow queries and constant live-run churn the
-        // gate can stay busy for a long time, and a prefetch delayed past the cap
-        // helps nobody — by then it's what the user is about to scroll to.
+        // A Near-zone prefetch waits for the visible first paints (or its promotion), capped: with slow queries and constant live-run churn the gate can stay busy for a long time, and a prefetch delayed past the cap helps nobody — by then it's what the user is about to scroll to.
         wait_for_visible_idle(monotonic_now_ms() + 2_000.0, || zone() == Zone::Near).await;
         crate::grpc::wait_until_page_visible().await;
     }
     (first_paint && zone() == Zone::Visible).then(HiFetchToken::new)
 }
+
+/// How long a failed request waits before it is retried.
+pub const RETRY_WAIT: Duration = Duration::from_secs(5);
 
 /// Retry `op` until it succeeds, parked while the tab is hidden — retries
 /// must not turn a hidden tab into traffic. For error recovery only;
@@ -119,31 +118,17 @@ pub async fn retry_visible_run<T>(
     retry_visible_while(what, op, |status| !is_terminal_run_status(status)).await
 }
 
-/// Chart validation errors cannot heal on a retry of the same request. Keep
-/// lifecycle terminal handling, and additionally return InvalidArgument so
-/// the panel can render the server's explanation instead of issuing the same
-/// rejected chart every five seconds forever.
-pub fn is_terminal_chart_status(status: &tonic::Status) -> bool {
+/// Whether no retry of the same request can heal `status`: the run's terminal lifecycle states, or InvalidArgument, the request itself being unaskable (a chart the server rejects, or a saved run key it never accepts). The caller settles instead of retrying the same rejected request every five seconds forever. Not folded into [`is_terminal_run_status`]: an unaskable request is not a lifecycle state.
+pub fn retry_cannot_heal(status: &tonic::Status) -> bool {
     is_terminal_run_status(status) || status.code() == tonic::Code::InvalidArgument
 }
 
+/// [`retry_visible_run`] that also settles on InvalidArgument ([`retry_cannot_heal`]), so the panel renders the server's explanation.
 pub async fn retry_visible_chart<T>(
     what: &str,
     op: impl AsyncFnMut() -> Result<T, tonic::Status>,
 ) -> Result<T, tonic::Status> {
-    retry_visible_while(what, op, |status| !is_terminal_chart_status(status)).await
-}
-
-/// One attempt behind the visibility gate — the non-retrying counterpart of
-/// [`retry_visible_run`], for callers that schedule their own retries and so
-/// need the gate on each individual attempt.
-///
-/// Gating a whole fan-out once is not equivalent: `buffer_unordered` admits
-/// later requests as slots free, long after the pass started, so a request
-/// admitted after the tab was hidden would fire unparked.
-pub async fn visible_attempt<T, E>(op: impl AsyncFnOnce() -> Result<T, E>) -> Result<T, E> {
-    crate::grpc::wait_until_page_visible().await;
-    op().await
+    retry_visible_while(what, op, |status| !retry_cannot_heal(status)).await
 }
 
 async fn retry_visible_while<T, E: std::fmt::Display>(
@@ -158,7 +143,7 @@ async fn retry_visible_while<T, E: std::fmt::Display>(
             Err(e) if !should_retry(&e) => return Err(e),
             Err(e) => {
                 crate::util::warn(&format!("[{what}] failed: {e}; retrying"));
-                sleep(Duration::from_secs(5)).await;
+                sleep(RETRY_WAIT).await;
             }
         }
     }
@@ -166,33 +151,21 @@ async fn retry_visible_while<T, E: std::fmt::Display>(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_terminal_chart_status, is_terminal_run_status};
+    use super::{is_terminal_run_status, retry_cannot_heal};
 
     #[test]
-    fn only_terminal_run_lifecycle_codes_stop_retries() {
-        assert!(is_terminal_run_status(&tonic::Status::failed_precondition(
-            "expired"
-        )));
-        assert!(is_terminal_run_status(&tonic::Status::not_found("purged")));
-        assert!(!is_terminal_run_status(&tonic::Status::unavailable(
-            "retry"
-        )));
-        assert!(!is_terminal_run_status(&tonic::Status::internal("retry")));
-    }
-
-    #[test]
-    fn invalid_chart_shapes_stop_but_transient_capacity_retries() {
-        assert!(is_terminal_chart_status(&tonic::Status::invalid_argument(
-            "too wide"
-        )));
-        assert!(is_terminal_chart_status(
-            &tonic::Status::failed_precondition("trashed")
-        ));
-        assert!(!is_terminal_chart_status(
-            &tonic::Status::resource_exhausted("temporary pressure")
-        ));
-        assert!(!is_terminal_chart_status(&tonic::Status::unavailable(
-            "retry"
-        )));
+    fn terminal_runs_and_unaskable_requests_settle_and_transient_failures_retry() {
+        use tonic::Status;
+        for (status, terminal, settles) in [
+            (Status::failed_precondition("expired"), true, true),
+            (Status::not_found("purged"), true, true),
+            (Status::invalid_argument("too wide"), false, true),
+            (Status::resource_exhausted("pressure"), false, false),
+            (Status::unavailable("retry"), false, false),
+            (Status::internal("retry"), false, false),
+        ] {
+            assert_eq!(is_terminal_run_status(&status), terminal, "{status}");
+            assert_eq!(retry_cannot_heal(&status), settles, "{status}");
+        }
     }
 }

@@ -15,7 +15,7 @@ use tracing::instrument;
 
 use crate::clickhouse::{ChClient, MetricRow, RichMetricRow};
 use crate::events::VersionEvent;
-use crate::lifecycle::{LifecycleGates, RunKey};
+use crate::lifecycle::{LifecycleGates, ReadGuards, RunKey};
 use crate::pg::{
     PgStore, RichMutationCandidate, RichMutationDecision, RunAccessError, RunLifecycleClass,
     TouchedRun,
@@ -505,6 +505,8 @@ struct CoalescerState {
     /// not yet announced. These make ListRuns refresh after delayed replay for
     /// explicitly finished or crashed runs.
     projects_changed: HashMap<String, u64>,
+    /// Last-logged values the bump rolled forward but not yet announced, staged like `runs_changed`. Unlike a version, a value lost to a tick that fails or is cancelled after its commit is not re-announced (the retry finds its minute already rolled); the project's next roll-forward or any list refetch repairs an open page.
+    last_logged_changed: HashMap<String, i64>,
     /// Run ids of the registry statement currently in flight — staged BEFORE the await, cleared when the attempt confirms. An unknown-outcome attempt (cancelled mid-await, or an error that may still have committed — a connection lost after the statement reached Postgres) gets its runs folded into [`Self::metrics_changed`] wholesale, safe on both outcomes: committed means the rows are there and the announcement is right; not committed means the entries are still pending, so the real commit announces itself via RETURNING and the early announcement cost one harmless no-op re-list. Cancellation needs no handler — the NEXT attempt finding this non-empty IS the detection.
     reg_in_flight: std::collections::BTreeSet<String>,
     /// Metrics already committed to the registry, (project, run, metric) → type precedence — registration costs a write only on a metric's first appearance or type upgrade, not per flush. Starts empty each boot: re-registering is an idempotent ON CONFLICT, and the re-send doubles as self-healing for anything a previous process missed (e.g. a metric first logged during a deploy overlap). Purely an optimization, so CLEARED when it outgrows [`KNOWN_CAP`] — repopulation costs one redundant upsert per still-active metric. Written only post-commit, so an entry never claims a registration that didn't land.
@@ -518,6 +520,7 @@ impl CoalescerState {
             || !self.metrics_changed.is_empty()
             || !self.runs_changed.is_empty()
             || !self.projects_changed.is_empty()
+            || !self.last_logged_changed.is_empty()
     }
 
     /// Precedence-max merge one pending registration. Cap admission is mark_dirty's concern, not this rule's: a key that was ever accepted must never be silently dropped.
@@ -646,7 +649,7 @@ impl BumpCoalescer {
             loop {
                 tokio::select! {
                     _ = tick.tick() => {
-                        // Timeboxed: a hung statement (black-holed connection, no client-side statement timeout) must not block the loop — and with it heartbeat ticks and SIGTERM observation. Cancellation loses nothing: dirty state stays in its maps until absorbed post-commit, staged announcements (projects_changed / runs_changed / metrics_changed) hold until a frame actually sends, an unknown-outcome registry attempt is announced by the next attempt (see reg_in_flight), and a cancelled bump simply re-bumps.
+                        // Timeboxed: a hung statement (black-holed connection, no client-side statement timeout) must not block the loop — and with it heartbeat ticks and SIGTERM observation. Cancellation loses nothing: dirty state stays in its maps until absorbed post-commit, staged announcements (projects_changed / runs_changed / metrics_changed) hold until a frame actually sends, an unknown-outcome registry attempt is announced by the next attempt (see reg_in_flight), and a cancelled bump simply re-bumps (a rolled-forward Last-logged value excepted, see last_logged_changed).
                         let _ = tokio::time::timeout(
                             Duration::from_secs(10),
                             coalescer.write_dirty(&pg, &events),
@@ -782,6 +785,9 @@ impl BumpCoalescer {
                     state.absorb_heartbeats(&hb_batch);
                     state.runs_changed.extend(bumped.runs);
                     state.projects_changed.extend(bumped.projects);
+                    state
+                        .last_logged_changed
+                        .extend(bumped.project_last_logged_at_ms);
                 }
                 Err(e) => {
                     // Nothing left the maps — the next tick retries. Postgres is likely down, so skip the registry statement too. Staged announcements keep.
@@ -843,6 +849,9 @@ impl BumpCoalescer {
                     .into_iter()
                     .collect(),
                 metrics_changed_runs: std::mem::take(&mut state.metrics_changed)
+                    .into_iter()
+                    .collect(),
+                project_last_logged_at_ms: std::mem::take(&mut state.last_logged_changed)
                     .into_iter()
                     .collect(),
                 ..Default::default()
@@ -1777,7 +1786,7 @@ pub(crate) async fn acquire_write_fences(
     gates: &LifecycleGates,
     rows: &[MetricRow],
     admission_deadline: Option<tokio::time::Instant>,
-) -> Result<(Vec<OwnedRwLockReadGuard<()>>, OwnedRwLockReadGuard<()>), Status> {
+) -> Result<(ReadGuards, OwnedRwLockReadGuard<()>), Status> {
     async fn bounded<T>(
         deadline: Option<tokio::time::Instant>,
         stage: &'static str,

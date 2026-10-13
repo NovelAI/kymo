@@ -141,7 +141,6 @@ def recovery():
     assert recovered["cdn_origin"] == second["cdn_origin"]
     index = urlopen(recovered["dashboard_origin"] + "/", timeout=5).read()
     assert b'id="kymo-runtime-config"' in index
-    assert b"/trash/_kymo-grpc-ws-local-v1" in index
     assert recovered["cdn_origin"].encode() in index
     run_url = subprocess.check_output(
         [

@@ -12,7 +12,7 @@ use crate::route::Route;
 use crate::state::layout_config::CdnDisplayMode;
 use crate::state::panel_cache::Store;
 use crate::state::visibility::retry_visible;
-use crate::util::primary;
+use crate::util::{primary, set_if_changed};
 
 thread_local! {
     /// persist_key -> the step the user navigated to, so a gallery scrolled out of the band (its panel body unmounts, see metric_rect.rs) comes back on the same step. Only explicit navigation writes it — an untouched gallery keeps the default jump-to-latest on remount.
@@ -452,12 +452,8 @@ pub fn CdnGallery(
     let mut lightbox = use_signal(|| None::<LightboxImage>);
 
     if all_steps.is_empty() {
-        if cdn_class.peek().is_some() {
-            cdn_class.set(None);
-        }
-        if lightbox.peek().is_some() {
-            lightbox.set(None);
-        }
+        set_if_changed(cdn_class, None);
+        set_if_changed(lightbox, None);
         return rsx! {
             div { class: "cdn-gallery",
                 div { class: "cdn-gallery-empty", "No CDN data" }
@@ -527,9 +523,7 @@ pub fn CdnGallery(
         let next = current_manifest_results(&class_keys, read.as_ref())
             .and_then(classify_manifests)
             .map(|class| class.as_str().to_string());
-        if *cdn_class.peek() != next {
-            cdn_class.set(next);
-        }
+        set_if_changed(cdn_class, next);
     });
 
     let (presentation, run_manifests, lightbox_view) = {

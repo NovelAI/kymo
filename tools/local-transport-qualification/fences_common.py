@@ -1,16 +1,29 @@
 """Small, protobuf-independent helpers for browser qualification fixtures."""
 
 import struct
+import zlib
 
 
-def request_frame(frame: bytes) -> tuple[int, str, bytes]:
-    """Decode the frozen /grpc-ws request envelope; leave protobuf decoding to the caller."""
+def request_frame(frame: bytes, route: str = "/grpc-ws") -> tuple[int, str, bytes]:
+    """Decode a request envelope from the socket at `route` (its URL path, /grpc-ws by default), inflating a compressed body; leave protobuf decoding to the caller. Only /grpc-ws2 reads the compression bit (the path length's top bit, REQUEST_DEFLATED in proto/ws_rpc.rs), as the server does: elsewhere it is part of the path length."""
     if not isinstance(frame, bytes) or len(frame) < 6:
         raise ValueError("invalid RPC request frame")
     request_id, path_len = struct.unpack_from("<IH", frame)
+    flag = 0x8000 if route == "/grpc-ws2" else 0
+    deflated, path_len = path_len & flag, path_len & ~flag
     if path_len == 0 or len(frame) < 6 + path_len:
         raise ValueError("invalid RPC path length")
-    return request_id, frame[6 : 6 + path_len].decode(), frame[6 + path_len :]
+    body = frame[6 + path_len :]
+    if deflated:
+        # Exactly one complete zlib stream, as the server requires: zlib.decompress accepts trailing bytes.
+        inflater = zlib.decompressobj()
+        try:
+            body = inflater.decompress(body)
+        except zlib.error as error:
+            raise ValueError("invalid compressed RPC body") from error
+        if not inflater.eof or inflater.unused_data:
+            raise ValueError("invalid compressed RPC body")
+    return request_id, frame[6 : 6 + path_len].decode(), body
 
 
 def encode_response(request_id: int, body: bytes, *, code: int = 0) -> bytes:

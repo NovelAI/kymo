@@ -9,7 +9,7 @@ mod routes;
 mod ws;
 #[path = "../../../proto/ws_rpc.rs"]
 #[allow(dead_code)]
-mod ws_rpc;
+pub(crate) mod ws_rpc;
 
 pub use client::GrpcClient;
 pub use gen::proto;

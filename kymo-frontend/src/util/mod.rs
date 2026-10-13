@@ -172,6 +172,14 @@ pub fn focus_on_mount(e: MountedEvent) {
     });
 }
 
+/// Sets `signal` to `value` unless it already holds an equal one, since `set` notifies its subscribers even then. The comparison peeks, subscribing no one.
+pub fn set_if_changed<T: PartialEq + 'static>(mut signal: dioxus::prelude::Signal<T>, value: T) {
+    use dioxus::prelude::*;
+    if *signal.peek() != value {
+        signal.set(value);
+    }
+}
+
 /// Instant actions run on primary press (AI-1418), excluding right/middle buttons and macOS Control-click context menus.
 pub fn primary<F>(mut f: F) -> impl FnMut(Event<MouseData>) + Clone + 'static
 where
@@ -190,6 +198,24 @@ where
         }
         f(e);
     }
+}
+
+/// A display clock for labels that age: re-renders the calling component each time the wait that `wait_ms` returns has passed. Returns the tick, for an effect that must follow it too.
+pub fn use_clock_tick(mut wait_ms: impl FnMut() -> u64 + 'static) -> dioxus::prelude::Signal<u64> {
+    use dioxus::prelude::*;
+    let mut tick = use_signal(|| 0u64);
+    // Each run sleeps a fresh `wait_ms()`. The tick's `set` reruns it, so the clock keeps ticking, and so does any write to a signal `wait_ms` reads, so the wait is recomputed from the new value.
+    let _clock = use_resource(move || {
+        let current = *tick.read();
+        let wait_ms = wait_ms();
+        async move {
+            gloo_timers::future::sleep(std::time::Duration::from_millis(wait_ms)).await;
+            tick.set(current.wrapping_add(1));
+        }
+    });
+    // A subscribed read: each tick re-renders the caller, whose labels then age.
+    let _ = *tick.read();
+    tick
 }
 
 #[cfg(test)]

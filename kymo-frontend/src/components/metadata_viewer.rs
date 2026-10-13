@@ -91,7 +91,6 @@ pub(crate) struct MetadataColumn {
 pub fn MetadataViewer(
     columns: Vec<MetadataColumn>,
     /// When true, hide rows whose values match across all runs (and any branches whose subtree contains no diffs). Comparison is meaningful only with two or more runs, so single-run views retain every key.
-    #[props(default = false)]
     diff_only: bool,
 ) -> Element {
     if columns.is_empty() {
@@ -146,7 +145,7 @@ pub fn MetadataViewer(
                     }
                 }
                 tbody {
-                    {render_rows(&display_keys, &columns, "", 0, &collapsed.read(), collapsed)}
+                    {render_rows(&display_keys, &columns, "", 0, collapsed)}
                 }
             }
         }
@@ -228,8 +227,7 @@ fn render_rows(
     columns: &[MetadataColumn],
     parent_path: &str,
     depth: usize,
-    collapsed: &BTreeSet<String>,
-    collapsed_signal: Signal<BTreeSet<String>>,
+    mut collapsed: Signal<BTreeSet<String>>,
 ) -> Element {
     let indent = depth as f32 * 12.0;
 
@@ -284,9 +282,8 @@ fn render_rows(
                 },
                 KeyNode::Branch(key, children) => {
                     let path = child_pointer(parent_path, key);
-                    let is_collapsed = collapsed.contains(&path);
+                    let is_collapsed = collapsed.read().contains(&path);
                     let toggle_path = path.clone();
-                    let mut sig = collapsed_signal;
 
                     rsx! {
                         tr { class: "metadata-row metadata-branch",
@@ -299,7 +296,7 @@ fn render_rows(
                                     class: "metadata-branch-toggle",
                                     aria_expanded: !is_collapsed,
                                     onmousedown: primary(move |_| {
-                                        let mut set = sig.write();
+                                        let mut set = collapsed.write();
                                         if set.contains(&toggle_path) {
                                             set.remove(&toggle_path);
                                         } else {
@@ -317,7 +314,7 @@ fn render_rows(
                             }
                         }
                         if !is_collapsed {
-                            {render_rows(children, columns, &path, depth + 1, collapsed, collapsed_signal)}
+                            {render_rows(children, columns, &path, depth + 1, collapsed)}
                         }
                     }
                 },

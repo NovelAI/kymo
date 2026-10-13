@@ -1153,7 +1153,8 @@ class RpcTap:
 
         def from_page(message) -> None:
             if isinstance(message, bytes):
-                method = request_frame(message)[1].rsplit("/", 1)[-1]
+                path = request_frame(message, urlsplit(ws.url).path)[1]
+                method = path.rsplit("/", 1)[-1]
                 self.sent.append(method)
                 if method == self.hold:
                     self.held.append((server, message))

@@ -11,7 +11,7 @@ Nothing in hosted mode authenticates. Anyone who can reach the gRPC port can rea
 | Component | Default listener | Serves |
 |---|---|---|
 | `kymo-server` gRPC | `0.0.0.0:50051` | Training clients |
-| `kymo-server` HTTP | `0.0.0.0:8080` | Dashboard WebSocket (`/grpc-ws`), media (`/cdn/…`, read and upload), firing alerts (`/alerts`) |
+| `kymo-server` HTTP | `0.0.0.0:8080` | Dashboard WebSocket (`/grpc-ws2`, compressed; `/grpc-ws` for older dashboards and as the fallback), media (`/cdn/…`, read and upload), firing alerts (`/alerts`) |
 | `kymo-server` metrics | `0.0.0.0:9090` | Prometheus `/metrics` |
 | Dashboard | `0.0.0.0:80` (dashboard image) | Browser UI; talks only to the HTTP port |
 | PostgreSQL | | Projects, runs, and registry metadata |
@@ -46,7 +46,7 @@ Settings are environment variables; an unset one takes its default.
 | `KYMO_IMPORT_ENABLED` | `false` | Accept wandb imports (`tools/wandb-import/import_to_kymo.py`). Enable it only while importing: an import can backdate and terminate any run it names. |
 | `RUST_LOG` | `info` | Log filter |
 
-Capacity knobs: `KYMO_INGEST_BYTE_CAP` (bytes of buffered ingest, default 512 MiB), `KYMO_FLUSH_CONCURRENCY` (concurrent ClickHouse inserts, default 4), `KYMO_SERIES_CACHE_MB` (chart cache, default 256), `KYMO_TEXT_INDEX_CACHE_MB` (log index cache, default 64), and `KYMO_CHART_INFLIGHT_SERIES` (concurrent chart reads, default 32).
+Capacity knobs: `KYMO_INGEST_BYTE_CAP` (bytes of buffered ingest, default 512 MiB), `KYMO_FLUSH_CONCURRENCY` (concurrent ClickHouse inserts, default 4), `KYMO_SERIES_CACHE_MB` (chart cache, default 256), `KYMO_TEXT_INDEX_CACHE_MB` (log index cache, default 64), `KYMO_CHART_INFLIGHT_SERIES` (concurrent chart reads, default 32), `KYMO_CHART_BYTE_BUDGET_MB` (bytes chart requests pin and build at once, default 768), `KYMO_CHART_BUILD_SLOTS` (concurrent chart builds, default 4), `KYMO_CHART_MEMO` (answer repeated unchanged chart polls from memory, default on), `KYMO_CHART_HELD_STATE` (answer chart polls after new rows by advancing the chart held from the previous poll: `off`, `shadow` or `on`, default off) and `KYMO_CHART_HELD_STATE_MB` (memory for that state, default 128).
 
 ## Storage and backups
 
@@ -95,7 +95,7 @@ docker run -d --name kymo-server \
 docker run -d --name kymo-dashboard -p 80:80 kymo-dashboard
 ```
 
-Serve the dashboard at the root of its host. Another web server works if, like the image's nginx, it answers unknown paths with `index.html` and makes `index.html` revalidate; only the content-hashed `/assets/*-dxh<hex>.*` files may be cached for good. A dashboard served over HTTPS needs an `https://` server origin, for example through a TLS proxy in front of port 8080. The server pings dashboard WebSockets every 20 seconds, so a proxy idle timeout longer than that (nginx's default is 60 seconds) keeps them open.
+Serve the dashboard at the root of its host. Another web server works if, like the image's nginx, it answers unknown paths with `index.html` and makes `index.html` revalidate; only the content-hashed `/assets/*-dxh<hex>.*` files may be cached for good. A dashboard served over HTTPS needs an `https://` server origin, for example through a TLS proxy in front of port 8080. A proxy that routes by path must pass `/grpc-ws` and should pass `/grpc-ws2`: without it the dashboard runs uncompressed, and once `/grpc-ws2` is refused, the browser's tabs of that dashboard try it again when they reconnect at least 125 seconds later or after the server shuts down cleanly. The server pings dashboard WebSockets every 20 seconds, so a proxy idle timeout longer than that (nginx's default is 60 seconds) keeps them open.
 
 Upgrade the server and the dashboard together. A tab left open on a dashboard the server no longer supports keeps what it shows but stops updating; reload it.
 

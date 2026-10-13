@@ -4,6 +4,7 @@ use wasm_bindgen::JsCast;
 
 use crate::state::section_order::SectionGap;
 use crate::state::DashboardState;
+use crate::util::set_if_changed;
 
 #[derive(Clone)]
 struct DragSession {
@@ -171,10 +172,7 @@ impl SectionDrag {
         event.prevent_default();
         event.data_transfer().set_drop_effect("move");
         let next = list.and_then(|list| self.gap_at(event, list));
-        let mut marker = self.marker;
-        if *marker.peek() != next {
-            marker.set(next);
-        }
+        set_if_changed(self.marker, next);
     }
 
     /// Clears the marker once the pointer leaves the list, not when it
@@ -186,9 +184,8 @@ impl SectionDrag {
             .and_then(|web_event| web_event.related_target())
             .and_then(|related| related.dyn_into::<web_sys::Node>().ok())
             .is_some_and(|node| list.is_some_and(|list| list.contains(Some(&node))));
-        let mut marker = self.marker;
-        if !inside && marker.peek().is_some() {
-            marker.set(None);
+        if !inside {
+            set_if_changed(self.marker, None);
         }
     }
 

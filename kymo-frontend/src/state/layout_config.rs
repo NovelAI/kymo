@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::grpc::proto::metric_info::MetricType;
-use crate::grpc::proto::MetricInfo;
+use crate::grpc::proto::{MetricInfo, SeriesRef};
 use crate::util::sections::group_by_prefix;
 use crate::util::{local_storage, natural_cmp, warn};
 
@@ -44,13 +44,6 @@ pub struct MetricBinding {
 }
 
 // --- Resolution ---
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct ResolvedRef {
-    pub project_id: String,
-    pub run_id: String,
-    pub metric_name: String,
-}
 
 /// What bindings resolve against.
 #[derive(PartialEq)]
@@ -104,7 +97,7 @@ pub fn resolve_capped_bindings(
     bindings: &[MetricBinding],
     ctx: &ViewContext,
     max_runs: u32,
-) -> Vec<ResolvedRef> {
+) -> Vec<SeriesRef> {
     let max_runs = if max_runs == 0 {
         usize::MAX
     } else {
@@ -129,10 +122,11 @@ pub fn resolve_capped_bindings(
             reached.insert(run_id.as_str());
             // Bindings carry no per-source style or alias, so exact duplicates have no distinct presentation. Keep the first occurrence/order and avoid duplicate chart series, CDN columns, and server reads.
             if seen.insert((project_id, run_id.as_str(), binding.metric_name.as_str())) {
-                refs.push(ResolvedRef {
+                refs.push(SeriesRef {
                     project_id: project_id.to_string(),
                     run_id: run_id.clone(),
                     metric_name: binding.metric_name.clone(),
+                    tags: vec![],
                 });
             }
         }
@@ -153,7 +147,7 @@ pub(crate) mod binding_resolution_tests {
         )
     }
 
-    fn binding(runs: RunRef, metric_name: &str) -> MetricBinding {
+    pub(crate) fn binding(runs: RunRef, metric_name: &str) -> MetricBinding {
         MetricBinding {
             project: ProjectRef::Current,
             runs,
@@ -179,28 +173,19 @@ pub(crate) mod binding_resolution_tests {
         );
 
         assert_eq!(
-            refs,
+            refs.iter()
+                .map(|r| (
+                    r.project_id.as_str(),
+                    r.run_id.as_str(),
+                    r.metric_name.as_str(),
+                    r.tags.len()
+                ))
+                .collect::<Vec<_>>(),
             vec![
-                ResolvedRef {
-                    project_id: "project".to_string(),
-                    run_id: "run-a".to_string(),
-                    metric_name: "loss".to_string(),
-                },
-                ResolvedRef {
-                    project_id: "project".to_string(),
-                    run_id: "run-b".to_string(),
-                    metric_name: "loss".to_string(),
-                },
-                ResolvedRef {
-                    project_id: "project".to_string(),
-                    run_id: "run-a".to_string(),
-                    metric_name: "accuracy".to_string(),
-                },
-                ResolvedRef {
-                    project_id: "other-project".to_string(),
-                    run_id: "run-a".to_string(),
-                    metric_name: "loss".to_string(),
-                },
+                ("project", "run-a", "loss", 0),
+                ("project", "run-b", "loss", 0),
+                ("project", "run-a", "accuracy", 0),
+                ("other-project", "run-a", "loss", 0),
             ]
         );
     }
@@ -238,7 +223,7 @@ pub(crate) mod binding_resolution_tests {
         bindings: &[MetricBinding],
         ctx: &ViewContext,
         max_runs: u32,
-    ) -> Vec<ResolvedRef> {
+    ) -> Vec<SeriesRef> {
         let refs = resolve_capped_bindings(bindings, ctx, 0);
         if max_runs == 0 {
             return refs;
@@ -581,9 +566,7 @@ pub struct RectOptions {
 }
 
 impl RectOptions {
-    /// Plain step axis — no custom x metric, no time mode. The only axis
-    /// with a shared zoom range, and the only one where an unzoomed
-    /// response can prove a run silent (chart_sync noncontrib).
+    /// Plain step axis — no custom x metric, no time mode: the only axis with a shared zoom range.
     pub fn is_step_axis(&self) -> bool {
         self.x_axis_metric.is_empty() && matches!(self.x_axis_mode, XAxisMode::Step)
     }
@@ -627,10 +610,11 @@ impl Default for RectOptions {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// The declaration order, which the derived `Ord` follows, is the server's precedence for a name logged as several types, by one run or across a run set: CDN < NUMERIC < TEXT_STREAM.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DisplayType {
-    Numeric,
     Cdn,
+    Numeric,
     TextStream,
 }
 

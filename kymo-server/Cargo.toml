@@ -43,12 +43,15 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 crc32c = "0.6.8"
 base64 = "0.22"
 async-trait = "0.1.92"
+# Pure-Rust zlib for the dashboard socket's /grpc-ws2 compression (ws_proxy.rs). runtime_detection (from flate2 1.1.10) lets zlib-rs pick its SIMD paths (AVX2, SSE4.2, PCLMULQDQ on x86_64) on the CPU it runs on: without it only those enabled at compile time run, and the image (Dockerfile) sets no target-cpu.
+flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs", "runtime_detection"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 clickhouse = { version = "0.13", features = ["test-util"] }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect"] }
 
 [build-dependencies]
 protoc-bin-vendored = "3"

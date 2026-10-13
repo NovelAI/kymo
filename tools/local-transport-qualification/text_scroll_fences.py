@@ -78,7 +78,7 @@ class Fixture:
             socket.send(encode_response(0, event.SerializeToString()))
 
     def request(self, socket: WebSocketRoute, message: bytes) -> None:
-        identifier, path, payload = request_frame(message)
+        identifier, path, payload = request_frame(message, urlsplit(socket.url).path)
         if path == "/kymo.push/control":
             return
         method = path.rsplit("/", 1)[-1]
@@ -729,10 +729,7 @@ def prepare(page: Page, fixture: Fixture, url: str) -> None:
             # A local-runtime-feature dx bundle needs the same JSON normally
             # embedded by the local dashboard server. Hosted bundles ignore it.
             config = json.dumps(
-                {
-                    "websocket_path": "/trash/_kymo-grpc-ws-local-v1",
-                    "cdn_origin": f"http://127.0.0.1:{urlsplit(url).port or 8080}",
-                }
+                {"cdn_origin": f"http://127.0.0.1:{urlsplit(url).port or 8080}"}
             )
             html = html.replace(
                 "<head>",

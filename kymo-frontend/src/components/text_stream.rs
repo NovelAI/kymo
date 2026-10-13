@@ -18,9 +18,9 @@ use crate::components::uplot_chart::{hash_color, run_color};
 use crate::grpc::proto::{RunInfo, RunStatus, SeriesRef, TextLine};
 use crate::state::app_state::find_run;
 use crate::state::visibility::{self, Zone};
-use crate::state::{run_ordinal_for, stamp_covers, DashboardState, UserConfigState};
+use crate::state::{stamp_covers, DashboardState, UserConfigState};
 use crate::util::resize_observer::ElementResizeObserver;
-use crate::util::{is_app_escape, primary};
+use crate::util::{is_app_escape, primary, set_if_changed};
 
 /// A line's time since the stream's first line, for its tooltip: captured output is stepped by its timestamp in ms.
 fn format_elapsed(step: i64, first_step: i64) -> String {
@@ -41,7 +41,7 @@ fn stream_failure_is_permanent(status: &tonic::Status) -> bool {
     )
 }
 
-/// The text skip rule: a fetch-resource re-run for the window and search revision on screen does not query while that answer's version stamp covers the run's known version ([`stamp_covers`]). Any other cause — a new window, a search resubmit, or a version above the stamp (a retry repeats one of these) — queries as before; the last keeps a live log following new lines. An error on screen answers nothing, so it never skips.
+/// The text skip rule: a fetch-resource re-run for the window and search revision on screen does not query while that answer's version stamp covers the run's known version ([`stamp_covers`]). Any other cause — a new window, a search resubmit, or a version above the stamp (a retry repeats one of these) — queries; the last keeps a live log following new lines. An error on screen answers nothing, so it never skips.
 fn text_skip_query(
     shown: Option<&WindowData>,
     window: VirtualWindow,
@@ -124,9 +124,7 @@ pub fn TextStreamViewer(
             .iter_mut()
             .find(|run| run.project_id == project_id && run.run_id == run_id)
         {
-            if !run.metric_names.contains(&metric_name) {
-                run.metric_names.push(metric_name);
-            }
+            run.metric_names.push(metric_name);
         } else {
             runs.push(RunStreams {
                 project_id,
@@ -197,7 +195,8 @@ pub fn TextStreamViewer(
         .zip(run_keys)
         .enumerate()
         .map(|(index, ((run, (text, full)), run_key))| {
-            let color = run_color(&run.run_id, run_ordinal_for(&display_runs, &run.run_id));
+            let ordinal = find_run(&display_runs, &run.run_id).map_or(0, |info| info.ordinal);
+            let color = run_color(&run.run_id, ordinal);
             (run_key, color, text, full, index == active)
         })
         .collect::<Vec<_>>();
@@ -347,7 +346,7 @@ fn VirtualTextLog(
     });
     let allowed = use_memo(move || *zone.read() != Zone::Far);
     let mut loading = use_signal(|| false);
-    let data_seq = crate::state::use_version_bridge(my_version, loading, allowed);
+    let refresh = crate::state::use_version_bridge(my_version, loading, allowed);
     let fetch_source = source.clone();
     let fetch_search = search.clone();
     let _fetch = use_resource(move || {
@@ -358,7 +357,7 @@ fn VirtualTextLog(
         let revision = *search_revision.read();
         // Searches are snapshots; live versions refresh only unfiltered logs.
         if fetch_search.is_empty() {
-            let _version = *data_seq.read();
+            let _refresh = *refresh.read();
         }
         let _retry = *retry_tick.read();
         let allowed = *allowed.read();
@@ -449,14 +448,12 @@ fn VirtualTextLog(
             if let Some(next) = next {
                 let count = next.as_ref().ok().map(|data| (log_key, data.total_lines));
                 content.set(Some(next));
-                if *line_count.peek() != count {
-                    line_count.set(count);
-                }
+                set_if_changed(line_count, count);
             }
             loading.set(false);
             drop(_admission);
             if retry_needed {
-                gloo_timers::future::sleep(std::time::Duration::from_secs(5)).await;
+                gloo_timers::future::sleep(visibility::RETRY_WAIT).await;
                 crate::grpc::wait_until_page_visible().await;
                 let next = retry_tick.peek().wrapping_add(1);
                 retry_tick.set(next);
@@ -585,7 +582,6 @@ mod tests {
     };
     use crate::components::text_stream::viewport::VirtualWindow;
     use crate::grpc::proto::RunInfo;
-    use crate::state::visibility::is_terminal_run_status;
 
     fn streams(project_id: &str, run_id: &str) -> RunStreams {
         RunStreams {
@@ -678,7 +674,7 @@ mod tests {
         assert!(text_skip_query(Some(&shown), window, 2, Some(3)));
         // A version above the stamp refetches — that is how a live log follows new lines.
         assert!(!text_skip_query(Some(&shown), window, 2, Some(6)));
-        // A new window, a search resubmit (a new revision), and nothing answered all query as before.
+        // A new window, a search resubmit (a new revision), and nothing answered all query.
         assert!(!text_skip_query(
             Some(&shown),
             VirtualWindow {
@@ -693,14 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn failures_choose_terminal_permanent_or_retry_behavior() {
-        assert!(is_terminal_run_status(&tonic::Status::not_found("purged")));
-        assert!(is_terminal_run_status(&tonic::Status::failed_precondition(
-            "expired"
-        )));
-        assert!(!is_terminal_run_status(&tonic::Status::unavailable(
-            "network"
-        )));
+    fn rejected_requests_are_permanent_and_others_retry() {
         assert!(stream_failure_is_permanent(
             &tonic::Status::resource_exhausted("line too large")
         ));

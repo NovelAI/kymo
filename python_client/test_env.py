@@ -39,7 +39,7 @@ class EnvironmentAliasTests(unittest.TestCase):
 
     def test_invalid_value_fails(self):
         with self.assertRaises(ValueError):
-            self.resolve({"MKDB2_LIMIT": "invalid"})
+            self.resolve({"KYMO_LIMIT": "invalid"})
 
     def test_blank_values_are_unset_and_fall_back(self):
         self.assertEqual(self.resolve({"KYMO_LIMIT": " \t "}), 4)
@@ -68,10 +68,11 @@ class EnvironmentAliasTests(unittest.TestCase):
         ):
             _env.string("KYMO_SERVER", "MKDB2_SERVER", "default")
 
-    def test_boolean_aliases_are_typed_and_invalid_values_fail(self):
+    def test_boolean_aliases_read_an_unrecognized_value_as_disabled(self):
         for values, expected in (
             ({}, False),
             ({"KYMO_FLAG": "yes"}, True),
+            ({"KYMO_FLAG": "invalid"}, False),
         ):
             with (
                 self.subTest(values=values),
@@ -88,10 +89,6 @@ class EnvironmentAliasTests(unittest.TestCase):
                 self.assertRaises(ValueError),
             ):
                 _env.boolean("KYMO_FLAG", "MKDB2_FLAG")
-        with mock.patch.dict(os.environ, {"KYMO_VERBOSE": "invalid"}, clear=True):
-            self.assertFalse(
-                _env.boolean("KYMO_VERBOSE", "PYMKDB2_VERBOSE", strict=False)
-            )
 
     def test_import_kymo_rejects_legacy_names_before_package_side_effects(self):
         checkout = Path(__file__).parent.resolve()

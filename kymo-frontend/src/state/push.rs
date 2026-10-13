@@ -244,8 +244,6 @@ pub fn PushBridge() -> Element {
 
     // Event pump.
     use_future(move || {
-        let run_versions = state.run_versions;
-        let metrics_gen = state.metrics_gen;
         async move {
             let mut subscription = crate::grpc::subscribe_push();
             loop {
@@ -258,7 +256,7 @@ pub fn PushBridge() -> Element {
                     resync_gen.set(generation);
                 }
 
-                fold_versions(run_versions, &update.runs);
+                fold_versions(state.run_versions, &update.runs);
                 if update.initial || !update.projects.is_empty() {
                     let observation = if update.initial {
                         ProjectObservation::Seed
@@ -267,7 +265,7 @@ pub fn PushBridge() -> Element {
                     };
                     apply_project_versions(state, &update.projects, observation);
                 }
-                fold_versions(metrics_gen, &update.metrics_gen);
+                fold_versions(state.metrics_gen, &update.metrics_gen);
 
                 let global_changed = !update.initial && update.global.is_some();
                 if global_changed
@@ -290,8 +288,6 @@ pub fn PushBridge() -> Element {
     // so it keys on (resync_gen, runs_loaded). On later reconnects it may run
     // alongside the resync-triggered ListRuns; an uncovered newer project version below forces one covering list refresh after the poll observation.
     let _resync = use_resource(move || {
-        let grpc = state.grpc;
-        let run_versions = state.run_versions;
         let n = *resync_gen.read();
         let runs_loaded = *state.runs_loaded.read();
         // A saved layout can become available after the first run-list fetch.
@@ -303,7 +299,7 @@ pub fn PushBridge() -> Element {
             if n == 0 || !runs_loaded {
                 return;
             }
-            let grpc = grpc.read().clone();
+            let grpc = state.grpc.read().clone();
             // The main catch-up for versions pushed while no connection
             // existed — a run that logged its last points during the gap
             // never pushes again — so retry until it lands (a newer resync
@@ -318,7 +314,7 @@ pub fn PushBridge() -> Element {
                 .await;
                 // Merge, don't replace: pushed entries for runs outside
                 // this poll's scope must survive.
-                fold_versions(run_versions, &resp.run_versions);
+                fold_versions(state.run_versions, &resp.run_versions);
                 caught_up_project_versions.insert(project, resp.project_version);
             }
             apply_project_versions(state, &caught_up_project_versions, ProjectObservation::Live);

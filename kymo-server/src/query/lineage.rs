@@ -70,17 +70,34 @@ impl VerifiedLineages {
     pub(super) fn cutoff(&self, index: usize) -> Option<i64> {
         self.cutoffs.get(index).copied().flatten()
     }
+
+    /// Every ref's cutoff, in request order.
+    pub(super) fn cutoffs(&self) -> &[Option<i64>] {
+        &self.cutoffs
+    }
 }
 
 #[derive(Default, Debug)]
 pub(super) struct LineageState {
     pub(super) verification: Option<Result<VerifiedLineages, Rejection>>,
     current: Vec<(String, LineageStamp)>,
+    /// Every ref's echoed maximum, unverified, when the echo was rejected because a lineage moved ([`Rejection::Digest`]).
+    rotated: Option<Vec<Option<i64>>>,
 }
 
 impl LineageState {
     pub(super) fn rejection(&self) -> Option<Rejection> {
         self.verification.as_ref()?.as_ref().err().copied()
+    }
+
+    /// The verified cutoffs, when the echoed state proved the client's rows.
+    pub(super) fn verified(&self) -> Option<&VerifiedLineages> {
+        self.verification.as_ref()?.as_ref().ok()
+    }
+
+    /// The maxima a client echoed on lineages its series have since left: they name the held state it held (stage 3b), never rows to trust.
+    pub(super) fn rotated_cutoffs(&self) -> Option<&[Option<i64>]> {
+        self.rotated.as_deref()
     }
 }
 
@@ -204,6 +221,7 @@ pub(super) fn inspect_lineages(
         }
     }
     LineageState {
+        rotated: matches!(verification, Some(Err(Rejection::Digest(_)))).then(|| cutoffs.clone()),
         verification: verification.map(|result| result.map(|()| VerifiedLineages { cutoffs })),
         current,
     }

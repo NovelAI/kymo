@@ -1,12 +1,16 @@
 """Validated launcher handoff and private local transports."""
 
+import functools
 import json
 import logging
 import math
 import os
+import select
 import shutil
+import signal
 import subprocess
 import sysconfig
+import time
 import uuid
 from collections import namedtuple
 from dataclasses import asdict, dataclass
@@ -21,6 +25,8 @@ from kymo._env import number as _env_number
 _log = logging.getLogger("kymo")
 _PROTOCOL_VERSION = 2
 _DEFAULT_ENSURE_TIMEOUT = 600.0
+# How often an ensure in a session of its own asks its caller whether to give up (_run_in_own_session): kymo.client._SHUTDOWN_STEP.
+_LEAVE_STEP = 0.05
 _REQUIRED_FIELDS = {
     "protocol_min",
     "protocol_max",
@@ -142,7 +148,10 @@ def ensure_local_endpoint(
     expected_installation_uuid: Optional[str] = None,
     timeout: Optional[float] = None,
     init_hold_id: Optional[str] = None,
+    own_session: bool = False,
+    leave=None,
 ) -> LocalEndpoint:
+    """Run `kymo ensure` and validate the endpoint it returns; with own_session, in a session of its own (_run_in_own_session), giving up once leave() says so."""
     if expected_installation_uuid is not None:
         expected_installation_uuid = _uuid(
             expected_installation_uuid, "expected_installation_uuid"
@@ -156,26 +165,30 @@ def ensure_local_endpoint(
     if init_hold_id is not None:
         command.extend(("--init-hold-id", init_hold_id))
     try:
-        completed = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            text=True,
-            timeout=timeout,
-            check=False,
-            # Worker recovery may run after gRPC has started helper threads.
-            # Force posix_spawn rather than fork-before-exec on POSIX.
-            close_fds=False,
-        )
+        if own_session:
+            returncode, stdout = _run_in_own_session(command, timeout, leave)
+        else:
+            completed = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                text=True,
+                timeout=timeout,
+                check=False,
+                # Worker recovery may run after gRPC has started helper threads.
+                # Force posix_spawn rather than fork-before-exec on POSIX.
+                close_fds=False,
+            )
+            returncode, stdout = completed.returncode, completed.stdout
     except subprocess.TimeoutExpired as error:
         raise RuntimeError(
             f"local kymo runtime did not become ready within {timeout:g}s"
         ) from error
-    if completed.returncode != 0:
+    if returncode != 0:
         raise RuntimeError(
             "local kymo runtime failed to start; run `kymo doctor` for details"
         )
     try:
-        payload = json.loads(completed.stdout)
+        payload = json.loads(stdout)
         endpoint = _validate_endpoint(payload)
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         raise RuntimeError(
@@ -189,6 +202,69 @@ def ensure_local_endpoint(
             "local kymo installation identity changed; refusing to deliver queued run data"
         )
     return endpoint
+
+
+def _run_in_own_session(command: list, timeout: float, leave=None) -> tuple:
+    """Run command as the leader of a session of its own, with the default signal mask, and SIGPIPE and SIGXFSZ at their default actions, as subprocess resets them, and return its exit status and stdout; subprocess.TimeoutExpired once timeout has passed, as subprocess.run, or once leave(), asked every _LEAVE_STEP at most, says to give up (kymo.client._terminate_run), killing it then or when the wait raises.
+
+    A signal to the caller's process group, a terminal's Ctrl-C or a scheduler's group SIGTERM, never reaches it, and a local stack it starts takes its mask, which the launcher's spawn keeps. posix_spawn's setsid, since subprocess forks before exec for a new session, which a multithreaded program must not do; where CPython has none (built against glibc older than 2.26, as python-build-standalone, which uv installs, and conda are), a process group of its own, which those signals miss as well.
+    """
+    reader, writer = os.pipe()
+    try:
+        spawn = functools.partial(
+            os.posix_spawn,
+            command[0],
+            command,
+            os.environ,
+            file_actions=[(os.POSIX_SPAWN_DUP2, writer, 1)],
+            setsigmask=(),
+            # Python ignores them at its start, and exec keeps an ignored disposition.
+            setsigdef=(signal.SIGPIPE, signal.SIGXFSZ),
+        )
+        try:
+            pid = spawn(setsid=True)
+        except NotImplementedError:
+            pid = spawn(setpgroup=0)
+    except BaseException:
+        os.close(reader)
+        raise
+    finally:
+        os.close(writer)
+    deadline = time.monotonic() + timeout
+    stdout = bytearray()
+    done = 0
+    try:
+        poller = select.poll()
+        poller.register(reader, select.POLLIN)
+        # Not `while <condition>:`, nor a body that ends in an `if`, whose back-edge on Python 3.13 and 3.14 lies outside this try, so a handler raising there would leave the launcher running (cpython#130279; test_no_loop_leaves_its_handler_at_the_back_edge).
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or (leave is not None and leave()):
+                raise subprocess.TimeoutExpired(command, timeout)
+            ready = poller.poll(min(remaining, _LEAVE_STEP) * 1000)
+            chunk = os.read(reader, 65536) if ready else None
+            if chunk == b"":
+                break
+            stdout += chunk or b""
+        # Its stdout has closed; it exits within the same deadline.
+        while True:
+            done, status = os.waitpid(pid, os.WNOHANG)
+            if done:
+                break
+            if time.monotonic() >= deadline or (leave is not None and leave()):
+                raise subprocess.TimeoutExpired(command, timeout)
+            time.sleep(0.01)
+    except BaseException:
+        if not done:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+            except OSError:
+                pass
+        raise
+    finally:
+        os.close(reader)
+    return os.waitstatus_to_exitcode(status), stdout.decode(errors="replace")
 
 
 def open_local_run(

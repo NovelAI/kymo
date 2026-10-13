@@ -14,7 +14,7 @@ from kymo._env import boolean as _env_boolean
 
 def _verbose_env() -> bool:
     # verbose logging must never make importing the client fail.
-    return _env_boolean("KYMO_VERBOSE", "PYMKDB2_VERBOSE", strict=False)
+    return _env_boolean("KYMO_VERBOSE", "PYMKDB2_VERBOSE")
 
 
 logger = logging.getLogger("kymo")

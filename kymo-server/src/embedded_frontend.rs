@@ -13,17 +13,7 @@ pub(crate) fn available() -> bool {
 
 #[derive(Clone, Serialize)]
 pub(crate) struct LocalBrowserConfig {
-    websocket_path: &'static str,
-    cdn_origin: String,
-}
-
-impl LocalBrowserConfig {
-    pub(crate) fn new(websocket_path: &'static str, cdn_origin: String) -> Self {
-        Self {
-            websocket_path,
-            cdn_origin,
-        }
-    }
+    pub(crate) cdn_origin: String,
 }
 
 pub(crate) struct Asset {
@@ -75,13 +65,10 @@ pub(crate) async fn serve(
 
 /// The shell carries per-install runtime config, so it is never cached.
 fn shell(bytes: &[u8], config: &LocalBrowserConfig) -> Response {
-    let Ok(index) = std::str::from_utf8(bytes) else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    };
-    let Ok(config) = serde_json::to_string(config) else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    };
-    let config = config.replace('<', "\\u003c");
+    let index = std::str::from_utf8(bytes).expect("build.rs read index.html as UTF-8");
+    let config = serde_json::to_string(config)
+        .expect("a struct of strings serializes")
+        .replace('<', "\\u003c");
     Response::builder()
         .header(header::CONTENT_TYPE, "text/html")
         .header(header::CACHE_CONTROL, "private, no-store")

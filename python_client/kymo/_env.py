@@ -80,28 +80,14 @@ def number(canonical: str, legacy: str, default: float) -> float:
     return resolve(canonical, legacy, default=default, parse=float)
 
 
-def boolean(
-    canonical: str, legacy: str, default: bool = False, *, strict: bool = True
-) -> bool:
-    if not strict:
-        if legacy in os.environ:
-            raise RetiredEnvError(f"{legacy} is no longer supported; use {canonical}")
-        raw = os.environ.get(canonical)
-        if raw is not None and raw.strip():
-            return raw.strip().lower() in ("1", "true", "yes", "on")
-        return default
-
-    def parse(raw: str) -> bool:
-        value = raw.strip().lower()
-        if value in ("1", "true", "yes", "on"):
-            return True
-        if value in ("0", "false", "no", "off"):
-            return False
-        raise ValueError(
-            f"{canonical}/{legacy} must be one of 1/true/yes/on or 0/false/no/off"
-        )
-
-    return resolve(canonical, legacy, default=default, parse=parse)
+def boolean(canonical: str, legacy: str, default: bool = False) -> bool:
+    """Any value but 1/true/yes/on (any case) reads as disabled, so reading the flag never fails; a retired name still raises."""
+    if legacy in os.environ:
+        raise RetiredEnvError(f"{legacy} is no longer supported; use {canonical}")
+    raw = os.environ.get(canonical)
+    if raw is not None and raw.strip():
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    return default
 
 
 def validate_worker_settings() -> None:

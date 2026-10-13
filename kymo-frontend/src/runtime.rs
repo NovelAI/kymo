@@ -6,13 +6,14 @@ use serde::Deserialize;
 #[cfg(feature = "local-runtime")]
 #[derive(Clone, Debug, Deserialize)]
 struct LocalConfig {
-    websocket_path: String,
     cdn_origin: String,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimeConfig {
     pub(crate) websocket_url: String,
+    /// The same socket with per-frame compression (grpc/ws.rs); hosted only, since loopback gains nothing from it.
+    pub(crate) deflate_websocket_url: Option<String>,
     pub(crate) cdn_origin: String,
 }
 
@@ -45,6 +46,7 @@ fn hosted_config(origin: &str) -> Result<RuntimeConfig, String> {
     };
     Ok(RuntimeConfig {
         websocket_url: format!("{websocket_origin}/grpc-ws"),
+        deflate_websocket_url: Some(format!("{websocket_origin}/grpc-ws2")),
         cdn_origin: origin.to_owned(),
     })
 }
@@ -87,9 +89,7 @@ fn load() -> Result<RuntimeConfig, String> {
         .ok_or("local dashboard configuration is missing")?;
     let local: LocalConfig = serde_json::from_str(&encoded)
         .map_err(|error| format!("invalid local dashboard configuration: {error}"))?;
-    if local.websocket_path != "/trash/_kymo-grpc-ws-local-v1"
-        || !valid_loopback_origin(&local.cdn_origin)
-    {
+    if !valid_loopback_origin(&local.cdn_origin) {
         return Err("invalid local dashboard endpoint configuration".to_owned());
     }
     let location = window.location();
@@ -105,7 +105,8 @@ fn load() -> Result<RuntimeConfig, String> {
         .host()
         .map_err(|_| "dashboard origin has no host")?;
     Ok(RuntimeConfig {
-        websocket_url: format!("{ws_scheme}://{host}{}", local.websocket_path),
+        websocket_url: format!("{ws_scheme}://{host}{}", crate::grpc::ws_rpc::LOCAL_WS_PATH),
+        deflate_websocket_url: None,
         cdn_origin: local.cdn_origin,
     })
 }
@@ -163,10 +164,16 @@ mod hosted_tests {
     fn hosted_origin_derives_the_websocket_and_rejects_the_rest() {
         let plain = hosted_config("http://kymo.example:8080/").unwrap();
         assert_eq!(plain.websocket_url, "ws://kymo.example:8080/grpc-ws");
-        assert_eq!(plain.cdn_origin, "http://kymo.example:8080");
         assert_eq!(
-            hosted_config("https://kymo.example").unwrap().websocket_url,
-            "wss://kymo.example/grpc-ws"
+            plain.deflate_websocket_url.as_deref(),
+            Some("ws://kymo.example:8080/grpc-ws2")
+        );
+        assert_eq!(plain.cdn_origin, "http://kymo.example:8080");
+        let tls = hosted_config("https://kymo.example").unwrap();
+        assert_eq!(tls.websocket_url, "wss://kymo.example/grpc-ws");
+        assert_eq!(
+            tls.deflate_websocket_url.as_deref(),
+            Some("wss://kymo.example/grpc-ws2")
         );
         for bad in ["", "kymo.example:8080", "http://", "ftp://kymo.example"] {
             assert!(hosted_config(bad).is_err(), "accepted {bad:?}");

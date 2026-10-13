@@ -14,7 +14,7 @@ use crate::state::trash::{
     clock_wait_ms, compact_duration, effective_lifecycle, extrapolated_now_ms, lookup_trashed_runs,
     monotonic_now_ms,
 };
-use crate::util::{js_bridge::js_string, local_time, primary};
+use crate::util::{js_bridge::js_string, local_time, primary, use_clock_tick};
 
 const TRASH_PAGE_SIZE: u32 = 100;
 const RESTORE: &str = "Restore";
@@ -261,23 +261,14 @@ pub fn TrashPage() -> Element {
 
     // Relative times advance from the latest server clock and rows become
     // unavailable at purge_at without waiting for another network event.
-    let mut clock_tick = use_signal(|| 0u64);
-    let _clock = use_resource(move || {
-        let tick = *clock_tick.read();
+    use_clock_tick(move || {
         let page = data.read();
-        let now_ms = page.now_ms();
-        let wait_ms = clock_wait_ms(
-            now_ms,
+        clock_wait_ms(
+            page.now_ms(),
             page.runs.iter().filter_map(|record| record.purge_at_ms),
             page.loaded,
-        );
-        drop(page);
-        async move {
-            gloo_timers::future::sleep(std::time::Duration::from_millis(wait_ms)).await;
-            clock_tick.set(tick.wrapping_add(1));
-        }
+        )
     });
-    let _ = *clock_tick.read();
 
     let page = data.read().clone();
     let now_ms = page.now_ms();

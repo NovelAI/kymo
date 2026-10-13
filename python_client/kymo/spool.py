@@ -169,7 +169,6 @@ def make_spool_path(
 def writer_active(path: str) -> bool:
     """True if a live SpoolWriter still holds its advisory lock on the file (see SpoolWriter.open). Errs toward False where flock is unsupported or node-local — replay_file's size-growth check backs this up for active writers, but an idle live writer on such a mount goes undetected (accepted residual, see SpoolWriter.open)."""
     try:
-        import errno
         import fcntl
     except ImportError:
         return False
@@ -271,13 +270,22 @@ def quarantine_spool(path: str) -> str:
     return _retire_spool(path, ".rejected")
 
 
+# The most a write checked against a deadline sends at once (_SpoolFile.write): about a millisecond on a local disk.
+_CUT_CHUNK = 1 << 20
+
+
+class SpoolWriteCut(Exception):
+    """A record was still being written when its writer's deadline passed (SpoolWriter.until), and was cut off: the file ends in whole records."""
+
+
 class _SpoolFile(io.FileIO):
-    """The spool's raw file: while discarding, writes are dropped, so a failed writer can empty its buffer without its stale bytes reaching the file.
+    """The spool's raw file: while discarding, writes are dropped, so a failed writer can empty its buffer without its stale bytes reaching the file; while a record is written, a write past until() raises SpoolWriteCut.
 
     It keeps its own offset, which counts the bytes that reached the file: the writer asks for every record's end, and FileIO's tell() would cost a syscall each time. The writer's lock makes it the file's only appender.
     """
 
     discarding = False
+    until = None
 
     def __init__(self, fd: int, mode: str):
         super().__init__(fd, mode)
@@ -286,6 +294,13 @@ class _SpoolFile(io.FileIO):
     def write(self, b) -> int:
         if self.discarding:
             return memoryview(b).nbytes
+        if self.until is not None:
+            if time.monotonic() >= self.until():
+                raise SpoolWriteCut(
+                    "the spool's deadline passed while it wrote a record"
+                )
+            # A large record goes out in parts, checked one by one: its buffered writer writes the rest.
+            b = memoryview(b)[:_CUT_CHUNK]
         written = super().write(b)
         self._offset += written
         return written
@@ -304,8 +319,10 @@ class SpoolWriter:
 
     A failed write or flush cuts the file back to its last whole record, since a reader rejects a file whose last record is torn. ``count`` is the records written, less any a cut removed; those still buffered reach the file at the next flush."""
 
-    def __init__(self, path: str, header: dict):
+    def __init__(self, path: str, header: dict, until=None):
         self._path = path
+        # A function returning when a record still being written is cut off whole (time.monotonic()), read at each of its writes to the file: a kill that follows finds no record half-written.
+        self.until = until
         self._header = dict(header, v=HEADER_VERSION, kind=SPOOL_KIND)
         self._fh = None
         self._sealed = False
@@ -341,6 +358,9 @@ class SpoolWriter:
             buffer_size = max(
                 io.DEFAULT_BUFFER_SIZE, min(os.fstat(fd).st_blksize, 8 << 20)
             )
+            if self.until is not None:
+                # One chunk at most, for every writer kymo makes, which all have until (the worker's spill end, the parent's salvage end), infinite until set. What it buffers can go out past the deadline, in the flush after a cut record or a spill's last flush, so it must stay within the one chunk any write the deadline catches may send, which its writes send at once anyway.
+                buffer_size = min(buffer_size, _CUT_CHUNK)
             raw = _SpoolFile(fd, "a")
         except BaseException:
             try:
@@ -380,15 +400,19 @@ class SpoolWriter:
         if self._sealed:
             raise RuntimeError(f"cannot append to sealed spool {self._path}")
         self.open()
+        raw = self._fh.raw
+        raw.until = self.until
         try:
             pickle.dump(record, self._fh, protocol=pickle.HIGHEST_PROTOCOL)
         except BaseException:
+            raw.until = None
             # Keep the whole records buffered before the failed one if they can still reach the file; the cut removes the failed one either way.
             try:
                 self._fh.flush()
             finally:
                 self._discard()
             raise
+        raw.until = None
         self._record_ends.append(self._fh.tell())
         # Records already wholly on disk survive any cut, so only the last of their ends is needed; ends still in a large buffer stay until they reach the file.
         if len(self._record_ends) > 8192:
@@ -448,7 +472,7 @@ class SpoolWriter:
         self._unsynced = True
 
     def seal(self) -> None:
-        """Make a nonempty spool immutable while retaining its writer lock.
+        """Make the spool immutable while retaining its writer lock.
 
         The live upload worker hands sealed segments to its replay helper. The
         open descriptor keeps external ``kymo.sync`` processes from racing

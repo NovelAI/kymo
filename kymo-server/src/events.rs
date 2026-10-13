@@ -18,6 +18,8 @@ pub struct VersionEvent {
     /// when a database commit acknowledgement is ambiguous and exact bumped
     /// versions may not be available to the request handler.
     pub resync: bool,
+    /// (project_id, last_logged_at ms) — the ingest heartbeat rolled the project's Last-logged value forward to this.
+    pub project_last_logged_at_ms: Vec<(String, i64)>,
 }
 
 impl VersionEvent {
@@ -27,6 +29,7 @@ impl VersionEvent {
             && self.global.is_none()
             && self.metrics_changed_runs.is_empty()
             && !self.resync
+            && self.project_last_logged_at_ms.is_empty()
     }
 }
 

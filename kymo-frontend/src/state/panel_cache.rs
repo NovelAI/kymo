@@ -27,11 +27,8 @@ impl<T> Store<T> {
 
     pub fn with_weight_limit(cap: usize, max_weight: usize) -> Self {
         Self {
-            map: HashMap::new(),
-            clock: 0,
-            cap,
             max_weight: Some(max_weight),
-            total_weight: 0,
+            ..Self::new(cap)
         }
     }
 
@@ -51,16 +48,12 @@ impl<T> Store<T> {
         self.put_weighted(key, value, 0);
     }
 
-    /// Insert an entry with its estimated retained heap bytes. Returns false
-    /// when one entry alone exceeds the store's budget; oversized responses
-    /// remain usable by their mounted panel but are not retained off-screen.
-    pub fn put_weighted(&mut self, key: String, value: T, weight: usize) -> bool {
-        if self.cap == 0 || self.max_weight.is_some_and(|limit| weight > limit) {
-            self.remove(&key);
-            return false;
-        }
-
+    /// Insert an entry with its estimated retained heap bytes. An entry alone over the store's budget is not kept: an oversized response remains usable by its mounted panel but is not retained off-screen.
+    pub fn put_weighted(&mut self, key: String, value: T, weight: usize) {
         self.remove(&key);
+        if self.cap == 0 || self.max_weight.is_some_and(|limit| weight > limit) {
+            return;
+        }
         while self.map.len() >= self.cap
             || self
                 .max_weight
@@ -79,14 +72,12 @@ impl<T> Store<T> {
         self.clock += 1;
         self.total_weight = self.total_weight.saturating_add(weight);
         self.map.insert(key, (self.clock, weight, value));
-        true
     }
 
-    pub fn remove(&mut self, key: &str) -> Option<T> {
-        self.map.remove(key).map(|(_, weight, value)| {
+    pub fn remove(&mut self, key: &str) {
+        if let Some((_, weight, _value)) = self.map.remove(key) {
             self.total_weight = self.total_weight.saturating_sub(weight);
-            value
-        })
+        }
     }
 }
 
@@ -122,23 +113,22 @@ mod tests {
     }
 
     #[test]
-    fn remove_returns_and_evicts_the_entry() {
+    fn remove_evicts_the_entry() {
         let mut store = Store::new(2);
         store.put("panel".to_string(), 7);
 
-        assert_eq!(store.remove("panel"), Some(7));
+        store.remove("panel");
         assert_eq!(store.get("panel"), None);
-        assert_eq!(store.remove("panel"), None);
     }
 
     #[test]
     fn weighted_store_evicts_lru_until_the_byte_budget_fits() {
         let mut store = Store::with_weight_limit(10, 10);
-        assert!(store.put_weighted("old".to_string(), 1, 4));
-        assert!(store.put_weighted("warm".to_string(), 2, 4));
+        store.put_weighted("old".to_string(), 1, 4);
+        store.put_weighted("warm".to_string(), 2, 4);
         assert_eq!(store.get("warm"), Some(2));
 
-        assert!(store.put_weighted("new".to_string(), 3, 5));
+        store.put_weighted("new".to_string(), 3, 5);
         assert_eq!(store.get("old"), None);
         assert_eq!(store.get("warm"), Some(2));
         assert_eq!(store.get("new"), Some(3));
@@ -147,13 +137,13 @@ mod tests {
     #[test]
     fn weighted_store_accounts_for_replacement_and_rejects_oversized_entries() {
         let mut store = Store::with_weight_limit(10, 10);
-        assert!(store.put_weighted("panel".to_string(), 1, 9));
-        assert!(store.put_weighted("panel".to_string(), 2, 2));
-        assert!(store.put_weighted("neighbor".to_string(), 3, 8));
+        store.put_weighted("panel".to_string(), 1, 9);
+        store.put_weighted("panel".to_string(), 2, 2);
+        store.put_weighted("neighbor".to_string(), 3, 8);
         assert_eq!(store.get("panel"), Some(2));
         assert_eq!(store.get("neighbor"), Some(3));
 
-        assert!(!store.put_weighted("huge".to_string(), 4, 11));
+        store.put_weighted("huge".to_string(), 4, 11);
         assert_eq!(store.get("huge"), None);
     }
 }

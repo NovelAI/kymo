@@ -5,10 +5,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use dioxus::prelude::*;
 use js_sys::{Array, Float64Array, Object, Reflect};
-use wasm_bindgen::JsValue;
+use wasm_bindgen::{JsCast, JsValue};
 
 use crate::grpc::chart_delta::DenseChart;
 use crate::state::UserConfigState;
+use crate::util::set_if_changed;
 use create_js::{build_create_js, esc_js, ChartJsConfig};
 
 static CHART_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -126,6 +127,17 @@ if(window.__kymo_data) delete window.__kymo_data['{id}'];
     )
 }
 
+/// Whether this chart's uPlot instance exists with its root still in the page.
+fn chart_alive(id: &str) -> bool {
+    let window = web_sys::window().unwrap();
+    Reflect::get(&window, &JsValue::from_str("__kymo_charts"))
+        .and_then(|charts| Reflect::get(&charts, &JsValue::from_str(id)))
+        .and_then(|chart| Reflect::get(&chart, &JsValue::from_str("root")))
+        .ok()
+        .and_then(|root| root.dyn_into::<web_sys::Node>().ok())
+        .is_some_and(|root| root.is_connected())
+}
+
 fn set_data_js(id: &str) -> String {
     format!(
         r#"return(()=>{{
@@ -198,12 +210,15 @@ pub fn UPlotChart(
     log_y: bool,
     /// From the request options: stroke smoothed values over raw evidence. Unsmoothed envelope charts render min/max data instead of bucket means.
     smoothed: bool,
+    /// The number of the server answer behind `chart` (ChartCacheEntry::reply), so an answer that kept the held model, and so changes no other prop, still reaches the liveness check below.
+    reply: u64,
 ) -> Element {
     let user_config = use_context::<UserConfigState>();
     let chart_id = use_hook(next_chart_id);
 
     // The structural config last sent for this chart: an equal config sends only uPlot.setData, skipping the create script (see build_create_js).
     let mut last_create_config = use_signal(|| Option::<ChartJsConfig>::None);
+    let mut revive = use_signal(|| 0u64);
 
     // Push every new data model; rebuild the uPlot instance only when its structural config changes. use_reactive reruns the effect when any prop differs and holds the last props, keeping the previous chart alive (see ChartModel).
     use_effect(use_reactive(
@@ -213,6 +228,8 @@ pub fn UPlotChart(
         {
             let id = chart_id.clone();
             move |(ChartModel(chart), labels, colors, run_names, axis, log_y, smoothed)| {
+                // Read for its subscription: the liveness check bumps it to rerun this effect, which pushes the held model again.
+                let _revive = *revive.read();
                 let log_x = axis.log_x;
                 let font_size = user_config.font_size();
 
@@ -391,6 +408,17 @@ pub fn UPlotChart(
         },
     ));
 
+    // An answer that kept the held model pushes no data; it only checks that the uPlot instance still exists (an earlier create failed, or its DOM was detached), and a missing one has the effect above push the held model again, whose setData fails and recreates it.
+    let mounted_reply = use_hook(|| reply);
+    use_effect(use_reactive((&reply,), {
+        let id = chart_id.clone();
+        move |(reply,)| {
+            if reply != mounted_reply && !chart_alive(&id) {
+                *revive.write() += 1;
+            }
+        }
+    }));
+
     use_drop({
         let id = chart_id.clone();
         move || {
@@ -439,10 +467,7 @@ pub fn ZoomBridge() -> Element {
                         let z = xmin
                             .zip(xmax)
                             .map(|(a, b)| (a.floor() as i64, b.ceil() as i64));
-                        let mut store = state.step_zoom;
-                        if *store.peek() != z {
-                            store.set(z);
-                        }
+                        set_if_changed(state.step_zoom, z);
                     }
                     Err(_) => {
                         // Structurally near-impossible while the listener is attached (it pins the channel); if it ever fires, zoom is dead until the next dashboard mount — say so.

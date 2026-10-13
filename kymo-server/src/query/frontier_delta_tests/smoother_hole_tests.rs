@@ -109,6 +109,7 @@ fn synthetic_series(
         age,
         continues,
         smoothing_plan: chart::SmoothingPlan::NoState,
+        checkpoints: Vec::new(),
     }
 }
 
@@ -152,8 +153,8 @@ fn assert_prepared_wire_continuation(
     prefix_is_tight: bool,
 ) -> DenseChart {
     let p = synthetic_params();
-    let held = respond(&held, &p);
-    let full = respond(&current, &p);
+    let held = respond(&held, &p, false).0;
+    let full = respond(&current, &p, false).0;
     let from = plan_delta_from_col(&mut current, &p);
     assert_eq!(from, expected_from);
     assert_eq!(full.x_values.len(), 16, "fixture must use envelope cells");
@@ -165,7 +166,7 @@ fn assert_prepared_wire_continuation(
         );
     }
     let held_wire = inflate_full(&emit_full(&held));
-    let delta = to_delta(&full, from, &current);
+    let delta = to_delta(&full, from, current.iter().map(|ps| ps.continues));
     let spliced = splice(&held_wire, &delta);
     assert!(eq(&spliced, &inflate_full(&emit_full(&full))));
     spliced
@@ -309,15 +310,15 @@ fn conservative_synthetic_new_hole_can_have_been_a_held_endpoint() {
     ];
     let p = synthetic_params();
     let prepared = synthetic_chart(&current);
-    let full = respond(&prepared, &p);
+    let full = respond(&prepared, &p, false).0;
     assert!(prefix_matches(
-        &respond(&synthetic_chart(&settled), &p),
+        &respond(&synthetic_chart(&settled), &p, false).0,
         &full,
         8,
         &prepared,
     ));
     assert!(!prefix_matches(
-        &respond(&synthetic_chart(&held), &p),
+        &respond(&synthetic_chart(&held), &p, false).0,
         &full,
         8,
         &prepared,
@@ -385,9 +386,9 @@ fn randomized_smoother_hole_histories_splice_to_the_independent_full_model() {
                 held_samples.push((x, held_value, age));
             }
         }
-        let held = respond(&synthetic_chart(&held_samples), &p);
+        let held = respond(&synthetic_chart(&held_samples), &p, false).0;
         let mut current = synthetic_chart(&current_samples);
-        let full = respond(&current, &p);
+        let full = respond(&current, &p, false).0;
         let from = plan_delta_from_col(&mut current, &p);
         assert!(
             from >= 2,
@@ -399,7 +400,7 @@ fn randomized_smoother_hole_histories_splice_to_the_independent_full_model() {
         );
         let rebuilt = splice(
             &inflate_full(&emit_full(&held)),
-            &to_delta(&full, from, &current),
+            &to_delta(&full, from, current.iter().map(|ps| ps.continues)),
         );
         assert!(
             eq(&rebuilt, &inflate_full(&emit_full(&full))),

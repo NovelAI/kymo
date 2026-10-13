@@ -25,7 +25,7 @@ from fences_common import encode_response, render_turn, request_frame
 PROJECT = "first-mount-fixture"
 RUN = "run-0"
 MEASURED_RUNS = 1_000
-# Deployed local route in kymo-server/src/http_transport.rs.
+# The local route, LOCAL_WS_PATH in proto/ws_rpc.rs.
 WS_PATH = "/trash/_kymo-grpc-ws-local-v1"
 
 
@@ -124,7 +124,7 @@ class Peer:
         socket.on_message(capture_callback(self.errors, self.receive))
 
     def receive(self, frame: str | bytes) -> None:
-        request_id, path, body = request_frame(frame)
+        request_id, path, body = request_frame(frame, WS_PATH)
         if path == "/kymo.push/control":
             return
         method = path.rsplit("/", 1)[-1]
@@ -518,7 +518,7 @@ class ScopePeer(Peer):
         self.held_poll: tuple[int, str] | None = None
 
     def receive(self, frame):
-        request_id, path, body = request_frame(frame)
+        request_id, path, body = request_frame(frame, WS_PATH)
         method = path.rsplit("/", 1)[-1]
         if method == "PollVersions":
             request = pb.PollVersionsRequest.FromString(body)
@@ -642,10 +642,7 @@ def serve_bundle(bundle: Path):
             if urlsplit(self.path).path.startswith("/assets/"):
                 return super().do_GET()
             encoded = json.dumps(
-                {
-                    "websocket_path": WS_PATH,
-                    "cdn_origin": f"http://127.0.0.1:{self.server.server_port}",
-                }
+                {"cdn_origin": f"http://127.0.0.1:{self.server.server_port}"}
             )
             html = (
                 (bundle / "index.html")

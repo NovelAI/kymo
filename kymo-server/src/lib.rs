@@ -56,6 +56,18 @@ pub mod local_proto {
 
 use proto::kymo_server::Kymo;
 
+/// Poll `ready` between short sleeps, bounded so a regression fails its test instead of hanging it.
+#[cfg(test)]
+async fn wait_until(mut ready: impl FnMut() -> bool) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !ready() {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("condition not reached within 5s");
+}
+
 fn validate_environment_namespace() -> anyhow::Result<()> {
     env::reject_retired_environment(retired_env::RETIRED_HOSTED_ENV)?;
     // Not in the shared list: the launcher would trip on unrelated software's CDN_ROOT.
@@ -69,6 +81,37 @@ fn validate_environment_namespace() -> anyhow::Result<()> {
         "KYMO_RUN_REAPER_INTERVAL_SECONDS is not supported; remove it (the production cadence is fixed at one hour)"
     );
     Ok(())
+}
+
+/// Run `f` with a metrics recorder of its own on this thread; return its output and what it recorded, rendered.
+#[cfg(test)]
+fn with_metrics<T>(f: impl FnOnce() -> T) -> (T, String) {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let out = metrics::with_local_recorder(&recorder, f);
+    (out, recorder.handle().render())
+}
+
+/// The randomized tests' xorshift generator.
+#[cfg(test)]
+struct Rng(u64);
+
+#[cfg(test)]
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n.max(1)
+    }
+    fn chance(&mut self, percent: u64) -> bool {
+        self.below(100) < percent
+    }
+    fn pick<T: Copy>(&mut self, items: &[T]) -> T {
+        items[self.below(items.len() as u64) as usize]
+    }
 }
 
 /// RAII timer that records its lifetime into `mkdb2_rpc_duration_seconds`

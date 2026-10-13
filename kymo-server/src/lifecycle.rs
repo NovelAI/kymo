@@ -12,6 +12,9 @@ use std::sync::{Arc, Weak};
 
 use tokio::sync::{Mutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
+/// Shared run guards from [`LifecycleGates::read_many`], one per distinct run.
+pub type ReadGuards = HashMap<RunKey, Arc<OwnedRwLockReadGuard<()>>>;
+
 /// The stable identity of a run. Ordering is used to acquire several gates in
 /// one deterministic order, avoiding lock-order inversions between requests.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -91,26 +94,8 @@ impl LifecycleGates {
         locks
     }
 
-    /// Acquire shared guards for a set of runs. The returned guards must stay
-    /// alive through the data-store operation they protect.
-    pub async fn read_many(
-        &self,
-        keys: impl IntoIterator<Item = RunKey>,
-    ) -> Vec<OwnedRwLockReadGuard<()>> {
-        let locks = self.locks_for(keys).await;
-        let mut guards = Vec::with_capacity(locks.len());
-        for (_, lock) in locks {
-            guards.push(lock.read_owned().await);
-        }
-        guards
-    }
-
-    /// One shared guard per distinct run, keyed — for callers that hand
-    /// individual runs' guards to detached work.
-    pub(crate) async fn read_many_keyed(
-        &self,
-        keys: impl IntoIterator<Item = RunKey>,
-    ) -> HashMap<RunKey, Arc<OwnedRwLockReadGuard<()>>> {
+    /// Acquire shared guards for a set of runs, one per distinct run, keyed so detached work on a run co-owns only that run's guard (a purge of run A waits for the scans reading A, never for run B's). The guards must stay alive through the data-store operation they protect.
+    pub async fn read_many(&self, keys: impl IntoIterator<Item = RunKey>) -> ReadGuards {
         let locks = self.locks_for(keys).await;
         let mut guards = HashMap::with_capacity(locks.len());
         for (key, lock) in locks {
@@ -178,9 +163,7 @@ mod tests {
         let gates = LifecycleGates::new();
         let b = RunKey::new("p", "b");
         let a = RunKey::new("p", "a");
-        let mut guards = gates
-            .read_many_keyed([b.clone(), a.clone(), a.clone()])
-            .await;
+        let mut guards = gates.read_many([b.clone(), a.clone(), a.clone()]).await;
         assert_eq!(guards.len(), 2);
 
         guards.remove(&b);

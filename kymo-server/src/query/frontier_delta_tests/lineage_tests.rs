@@ -2,50 +2,25 @@ use super::*;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use prost::Message;
 
-fn cache_append(
-    cache: &crate::series_cache::SeriesCache,
-    key: &crate::series_cache::SeriesKey,
-    rows: Vec<VersionedRawPoint>,
-) -> Arc<SeriesSnapshot> {
-    cache.note_bumps(std::iter::once(key.run_id.as_str()));
-    let crate::series_cache::Lookup::Stale { gen, .. } = cache.lookup(key) else {
-        panic!("bumped fixture must refresh its retained snapshot");
-    };
-    cache
-        .apply_increment(key, rows, std::time::Instant::now(), gen)
-        .unwrap()
-}
-
 #[test]
 fn recovered_evicted_lineages_keep_real_wire_deltas_for_every_smoother() {
-    use crate::series_cache::{Lookup, SeriesCache};
+    use crate::series_cache::{Lookup, SeriesCache, SeriesKey};
     for algorithm in ALGORITHMS {
-        let cache = SeriesCache::with_budget(1_024);
-        let key = crate::series_cache::SeriesKey::new("p", "a", "loss");
-        let other = crate::series_cache::SeriesKey::new("p", "other", "loss");
+        let cache = SeriesCache::with_budget(usize::MAX);
+        let key = SeriesKey::new("p", "a", "loss");
         let original = cache.insert_full(
             key.clone(),
             rows(8, 3).as_ref().clone(),
             std::time::Instant::now(),
         );
         let mut request = req(&["a"], 1_000);
-        request.smoothing = (algorithm != Algorithm::None).then_some(proto::SmoothingConfig {
-            algorithm: algorithm as i32,
-            window_size: 3,
-            time_constant: std::f64::consts::LOG2_E,
-            poly_order: 1,
-        });
+        request.smoothing = smoothing(algorithm, 3, std::f64::consts::LOG2_E, 1);
         let held =
             super::super::build_response(&request, std::slice::from_ref(&original), None, false)
                 .unwrap();
-        let mut continued = request.clone();
-        continued.cache_state = echo(&held);
+        let continued = continuation(&request, &held);
         for count in [8, 9] {
-            cache.insert_full(
-                other.clone(),
-                rows(8, 7).as_ref().clone(),
-                std::time::Instant::now(),
-            );
+            cache.evict_for_test(&key);
             assert!(matches!(cache.lookup(&key), Lookup::Miss));
             let reloaded = cache.insert_full(
                 key.clone(),
@@ -95,8 +70,7 @@ fn actual_cache_lineages_reject_regression_and_late_visibility_then_recover() {
     assert_eq!(first.lineage(), appended.lineage());
     let held = super::super::build_response(&request, std::slice::from_ref(&appended), None, true)
         .unwrap();
-    let mut continued = request.clone();
-    continued.cache_state = echo(&held);
+    let mut continued = continuation(&request, &held);
     for audit in [false, true] {
         let out =
             super::super::build_response(&continued, std::slice::from_ref(&first), None, audit)
@@ -202,13 +176,10 @@ fn lineage_rejections_are_counted_once_even_when_no_chart_points_remain() {
                 rows(remaining, 3).as_ref().clone(),
                 origin,
             ));
-            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-            let handle = recorder.handle();
-            let out = metrics::with_local_recorder(&recorder, || {
+            let (out, rendered) = crate::with_metrics(|| {
                 super::super::build_response(&continued, &[current], None, false).unwrap()
             });
             assert!(!out.delta && !out.audit_failed);
-            let rendered = handle.render();
             let expected = format!(
                 "mkdb2_chart_delta_total{{kind=\"{}\"}} 1",
                 Rejection::Digest(origin).label()
@@ -258,12 +229,7 @@ fn held_timestamp_rewrites_are_detected_for_every_smoother() {
         let mut request = req(&["a", "b"], 1_000);
         request.use_timestamp_axis = true;
         request.log_buckets = true;
-        request.smoothing = (algorithm != Algorithm::None).then_some(proto::SmoothingConfig {
-            algorithm: algorithm as i32,
-            window_size: 3,
-            time_constant: std::f64::consts::LOG2_E,
-            poly_order: 1,
-        });
+        request.smoothing = smoothing(algorithm, 3, std::f64::consts::LOG2_E, 1);
         let held = build(&request, &[a.clone(), b.clone()]);
         assert_eq!(inflate_full(&held).series[0].values[0], 42.0);
         for timestamp in [-1, 5, 90] {
@@ -354,7 +320,7 @@ fn missing_or_corrupt_lineage_state_seeds_a_full_response_then_recovers() {
     let request = req(&["a"], 300);
     let held = build(&request, &[rows(2_000, 3)]);
     let current = [rows(2_010, 3)];
-    let current_snapshots = [Arc::new(held.snapshots[0].refreshed_fixture(&current[0]))];
+    let current_snapshots = [held.snapshots[0].refreshed_fixture(&current[0])];
     let truth = inflate_full(
         &super::super::build_response(&request, &current_snapshots, None, false).unwrap(),
     );
@@ -411,8 +377,7 @@ fn missing_or_corrupt_lineage_state_seeds_a_full_response_then_recovers() {
                     .insert("\0kymo:row-snapshot-version".into(), version);
             }
         }
-        let mut continued = request.clone();
-        continued.cache_state = echo(&legacy);
+        let mut continued = continuation(&request, &legacy);
         let expected = if corruption == 3 {
             Rejection::Digest(LineageOrigin::Miss)
         } else {
@@ -480,12 +445,7 @@ fn backfill_starts_a_new_lineage_including_relative_time_for_every_smoother() {
             let mut request = req(&["a"], 1_000);
             request.use_timestamp_axis = relative;
             request.relative_time = relative;
-            request.smoothing = (algorithm != Algorithm::None).then_some(proto::SmoothingConfig {
-                algorithm: algorithm as i32,
-                window_size: 3,
-                time_constant: std::f64::consts::LOG2_E,
-                poly_order: 1,
-            });
+            request.smoothing = smoothing(algorithm, 3, std::f64::consts::LOG2_E, 1);
             let old = rows_at(&[(2, 1.0), (3, 3.0), (4, 4.0)]);
             let held = build(&request, std::slice::from_ref(&old));
             let mut changed = old.as_ref().clone();
@@ -540,8 +500,7 @@ fn unchanged_lineage_then_rewrite_still_fails_closed() {
     let request = req(&["a"], 1_000);
     let original = rows(100, 3);
     let held = build(&request, std::slice::from_ref(&original));
-    let mut continued = request.clone();
-    continued.cache_state = echo(&held);
+    let continued = continuation(&request, &held);
     let unchanged = build(&continued, std::slice::from_ref(&original));
     assert!(unchanged.delta);
     assert!(unchanged.x_values.is_empty());
@@ -578,8 +537,7 @@ fn cache_lineage_covers_warmup_and_conservatively_rejects_outside_rewrites() {
     outside[0].inserted_ms += 1;
     outside[249].value = 999.0;
     outside[249].inserted_ms += 1;
-    let mut continued = request.clone();
-    continued.cache_state = echo(&held);
+    let continued = continuation(&request, &held);
     let out = build(&continued, &[Arc::new(outside)]);
     // Cache lineage is series-wide: even an out-of-range rewrite reseeds one full response.
     assert!(!out.delta);
@@ -632,4 +590,111 @@ fn lineage_state_is_compact_and_older_servers_have_no_watermarks() {
         !state.frontiers.contains_key("f\0a\0loss"),
         "older servers must see no held data key and answer in full"
     );
+}
+
+#[test]
+fn chart_outputs_do_not_depend_on_how_the_cache_chunked_the_rows() {
+    use crate::series_cache::{SeriesCache, SeriesKey};
+    // Run a is scalar; run b is tagged (its '' rows are dropped by prepare). Rows are written tick by tick, a few per tag.
+    let runs: [(&str, &[&str]); 2] = [("a", &[""]), ("b", &["", "g0", "g1"])];
+    let mut written: Vec<Vec<VersionedRawPoint>> = vec![Vec::new(); runs.len()];
+    let write = |tick: i64, written: &mut Vec<Vec<VersionedRawPoint>>| {
+        for (run, (_, tags)) in runs.iter().enumerate() {
+            for (index, tag) in tags.iter().enumerate() {
+                let step = tick * 3 + index as i64;
+                written[run].push(VersionedRawPoint {
+                    tag: (*tag).into(),
+                    step,
+                    timestamp_ms: 1_000 + step * 5 - (tick % 7 == 0) as i64 * 5,
+                    value: match (tick * 7 + index as i64) % 53 {
+                        0 => f32::NAN,
+                        1 => f32::INFINITY,
+                        n => n as f32 * 0.75 - (tick % 13) as f32,
+                    },
+                    is_value: 1,
+                    inserted_ms: 10_000 + tick * 10,
+                });
+            }
+        }
+    };
+    let cache = SeriesCache::with_budget(usize::MAX);
+    let keys: Vec<_> = runs
+        .iter()
+        .map(|(run, _)| SeriesKey::new("p", *run, "loss"))
+        .collect();
+    for tick in 0..300 {
+        write(tick, &mut written);
+    }
+    let held: Vec<Arc<SeriesSnapshot>> = keys
+        .iter()
+        .zip(&written)
+        .map(|(key, rows)| cache.insert_full(key.clone(), sorted(rows), std::time::Instant::now()))
+        .collect();
+    // Grow the cached series through refreshes of 1-5 ticks, each re-reading the last rows it holds.
+    let mut grown = held.clone();
+    let mut tick = 300;
+    for refresh in 0..40 {
+        let from: Vec<usize> = written
+            .iter()
+            .map(|rows| rows.len().saturating_sub(3))
+            .collect();
+        for _ in 0..1 + (refresh * 3) % 5 {
+            write(tick, &mut written);
+            tick += 1;
+        }
+        for (index, key) in keys.iter().enumerate() {
+            grown[index] = cache_append(&cache, key, sorted(&written[index][from[index]..]));
+        }
+    }
+    assert!(grown
+        .iter()
+        .all(|rows| rows.tags().any(|tag| tag.chunks().count() > 1)));
+    // The same rows as one read: one chunk per tag.
+    let loaded: Vec<_> = written
+        .iter()
+        .map(|rows| Arc::new(SeriesSnapshot::full(sorted(rows))))
+        .collect();
+    let strip = |response: &proto::ChartResponse| {
+        let mut response = response.clone();
+        response
+            .frontiers
+            .retain(|key, _| !key.starts_with(LINEAGE_PREFIX) && key != LINEAGE_VERSION_KEY);
+        response
+    };
+    let mut cases = 0;
+    for algorithm in ALGORITHMS {
+        for axis in 0..3 {
+            for zoom in [false, true] {
+                let mut request = req(&["a", "b"], if zoom { 0 } else { 200 });
+                request.use_timestamp_axis = axis > 0;
+                request.relative_time = axis == 2;
+                if zoom {
+                    request.step_min = Some(150);
+                    request.y_series[1].tags = vec!["g1".into()];
+                }
+                request.smoothing = smoothing(algorithm, 5, 2.0, 1);
+                let build = |request: &proto::ChartRequest, rows: &[Arc<SeriesSnapshot>], audit| {
+                    super::super::build_response(request, rows, None, audit).unwrap()
+                };
+                let full = build(&request, &loaded, false);
+                assert_eq!(strip(&build(&request, &grown, false)), strip(&full));
+                // A continuation over the chunked rows splices to the one-read model, audited or not.
+                let continued = continuation(&request, &build(&request, &held, false));
+                for audit in [false, true] {
+                    let out = build(&continued, &grown, audit);
+                    assert!(!out.audit_failed);
+                    if out.delta {
+                        cases += 1;
+                        assert!(eq(
+                            &splice(&inflate_full(&build(&request, &held, false)), &out),
+                            &inflate_full(&full)
+                        ));
+                    } else {
+                        assert_eq!(strip(&out), strip(&full));
+                    }
+                }
+            }
+        }
+    }
+    assert!(cases > 20, "{cases} deltas");
 }

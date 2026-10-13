@@ -4,15 +4,16 @@ use std::rc::Rc;
 
 use dioxus::prelude::*;
 
-use super::{evict_panel_caches, CHART_CACHE};
+use super::{evict_panel_caches, same_metric_names, CHART_CACHE};
 use crate::components::uplot_chart::{ChartModel, ShownAxis, UPlotChart};
 use crate::grpc::chart_delta::DenseChart;
-use crate::grpc::proto::{ChartRequest, SeriesRef, SmoothingConfig};
+use crate::grpc::proto::{ChartRequest, ChartResponse, SeriesRef, SmoothingConfig};
 use crate::state::chart_sync::{self, ChartCacheEntry};
 use crate::state::layout_config::{ema_time_constant, RectOptions};
 use crate::state::visibility::{self, Zone};
 use crate::state::DashboardState;
 use crate::util::resize_observer::ElementResizeObserver;
+use crate::util::set_if_changed;
 
 /// What one run of the chart resource produced. `use_resource` keeps the
 /// stale value across restarts, so the render must be able to tell whether
@@ -25,27 +26,32 @@ enum ChartFetch {
     /// fetch cache, so a chart scrolled far away and back re-renders without
     /// a refetch.
     Deferred,
-    /// A real answer paired with the exact request semantics it was built
-    /// under. Transient query errors retry instead of settling.
-    Answer(ChartAnswer),
-    /// A terminal lifecycle or request error. Stale panel data is evicted and
-    /// the preserved explanation stays visible instead of retrying forever.
-    Unavailable(String),
+    /// A real answer, as its cache entry: the model with the request it answers and UPlotChart's `reply` (a run-subset filter's copy has the filtered model and its own request). Transient query errors retry instead of settling.
+    Answer(ChartCacheEntry),
+    /// A terminal lifecycle or request error, with the refs it was asked for. Stale panel data is evicted and the preserved explanation stays visible instead of retrying forever.
+    Unavailable(String, Rc<Vec<SeriesRef>>),
 }
 
-#[derive(Clone)]
-struct ChartAnswer {
-    response: Rc<DenseChart>,
-    request: Rc<ChartRequest>,
-}
+/// The number the next server answer takes as UPlotChart's `reply` (ChartCacheEntry::reply).
+static NEXT_REPLY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-fn settled_failure(status: tonic::Status) -> ChartFetch {
+fn settled_failure(status: tonic::Status, refs: Rc<Vec<SeriesRef>>) -> ChartFetch {
     let message = if visibility::is_terminal_run_status(&status) {
         "Run no longer available".to_string()
     } else {
         format!("Chart unavailable: {}", status.message())
     };
-    ChartFetch::Unavailable(message)
+    ChartFetch::Unavailable(message, refs)
+}
+
+/// A full reply as its model. One that fails validation is an error no retry heals: the same request would loop, and an empty chart in its place would read as "No data", cached as fresh.
+fn validated_full(wire: ChartResponse) -> Result<(DenseChart, ChartResponse), tonic::Status> {
+    match chart_sync::inflate_response(&wire) {
+        Some(full) => Ok((full, wire)),
+        None => Err(tonic::Status::data_loss(
+            "the server's reply failed validation",
+        )),
+    }
 }
 
 impl ShownAxis {
@@ -68,6 +74,7 @@ impl ShownAxis {
     }
 }
 
+/// Whether an answer to `request` can show which runs have no data on its metrics: a range-trimmed answer can't prove a run silent outside the range, an all-empty custom-X join loses every series identity on the wire even when both metrics are registered (and later ordinary data can make it plottable), and so does an all-negative log-X chart from a server that predates shipping unplottable counts (AI-1491), which keeps log-X excluded until that server is gone.
 fn request_proves_noncontributors(request: &ChartRequest) -> bool {
     request.x_series.is_none()
         && request.step_min.is_none()
@@ -96,6 +103,7 @@ fn noncontributors_from_response(
         .collect()
 }
 
+/// [`request_proves_noncontributors`] for the request `options` build, so a cache-seeded exclusion cannot suppress runs after an axis transition.
 fn options_allow_noncontributors(options: &RectOptions, has_step_zoom: bool) -> bool {
     use crate::state::layout_config::XAxisMode;
 
@@ -107,77 +115,13 @@ fn options_allow_noncontributors(options: &RectOptions, has_step_zoom: bool) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::super::{
-        every_source_terminal, needs_metric_type_check, sole_detected_display_type,
-    };
     use super::{
         noncontributors_from_response, options_allow_noncontributors,
         request_proves_noncontributors, ShownAxis,
     };
     use crate::grpc::chart_delta::DenseChart;
     use crate::grpc::proto::{ChartRequest, SeriesRef};
-    use crate::state::layout_config::{MetricBinding, ProjectRef, RectOptions, RunRef, XAxisMode};
-    use crate::state::DisplayType;
-
-    fn binding(runs: RunRef, metric_name: &str) -> MetricBinding {
-        MetricBinding {
-            project: ProjectRef::Current,
-            runs,
-            metric_name: metric_name.to_string(),
-        }
-    }
-
-    #[test]
-    fn retargeted_and_specific_bindings_detect_type() {
-        assert!(!needs_metric_type_check(
-            "loss",
-            &[binding(RunRef::Selected, "loss")]
-        ));
-        assert!(!needs_metric_type_check(
-            "loss",
-            &[binding(RunRef::Specific(vec![]), "loss")]
-        ));
-        assert!(!needs_metric_type_check(
-            "new-panel-id",
-            &[binding(RunRef::Selected, "")]
-        ));
-        assert!(needs_metric_type_check(
-            "loss",
-            &[binding(RunRef::Selected, "logs/std_out")]
-        ));
-        assert!(needs_metric_type_check(
-            "new-panel-id",
-            &[binding(RunRef::All, "images/sample")]
-        ));
-        assert!(needs_metric_type_check(
-            "loss",
-            &[binding(RunRef::Specific(vec!["run".to_string()]), "loss",)]
-        ));
-        assert!(needs_metric_type_check(
-            "loss",
-            &[
-                binding(RunRef::Selected, "loss"),
-                binding(RunRef::Selected, "accuracy"),
-            ]
-        ));
-    }
-
-    #[test]
-    fn type_detection_settles_unavailable_only_when_every_source_is_terminal() {
-        assert!(!every_source_terminal(0, 0));
-        assert!(!every_source_terminal(2, 1));
-        assert!(every_source_terminal(2, 2));
-    }
-
-    #[test]
-    fn editor_type_requires_one_unambiguous_detected_family() {
-        assert_eq!(
-            sole_detected_display_type((false, true, false)),
-            Some(DisplayType::Cdn),
-        );
-        assert_eq!(sole_detected_display_type((true, true, false)), None);
-        assert_eq!(sole_detected_display_type((false, false, false)), None);
-    }
+    use crate::state::layout_config::{RectOptions, XAxisMode};
 
     /// A request's axis follows its timestamp and custom-x fields: the render describes the response that request answered.
     #[test]
@@ -216,6 +160,32 @@ mod tests {
                 }
             );
         }
+    }
+
+    /// A full reply that fails validation settles the panel unavailable: an empty chart in its place would show "No data", cached as fresh.
+    #[test]
+    fn an_invalid_full_reply_settles_unavailable() {
+        use super::{settled_failure, validated_full, ChartFetch};
+        use crate::grpc::proto::{ChartResponse, ChartSeries};
+        let reply = |seg_len: u32| ChartResponse {
+            x_values: vec![0.0, 1.0],
+            series: vec![ChartSeries {
+                run_id: "r".into(),
+                seg_starts: vec![0],
+                seg_lens: vec![seg_len],
+                values: vec![1.0; seg_len as usize],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        // Three samples on a two-column axis.
+        let status = validated_full(reply(3)).unwrap_err();
+        assert!(matches!(
+            settled_failure(status, Default::default()),
+            ChartFetch::Unavailable(message, _)
+                if message == "Chart unavailable: the server's reply failed validation"
+        ));
+        assert!(validated_full(reply(2)).is_ok_and(|(full, _)| full.series[0].values == [1.0; 2]));
     }
 
     #[test]
@@ -297,21 +267,11 @@ pub(super) fn NumericContent(
     /// The panel's resolved refs, from AutoContent's single resolution pass.
     refs: Memo<Rc<Vec<SeriesRef>>>,
     options: ReadSignal<RectOptions>,
-    loading: Signal<bool>,
+    mut loading: Signal<bool>,
     zone: Signal<Zone>,
     cache_key: String,
 ) -> Element {
     let state = use_context::<DashboardState>();
-
-    // The x-zoom lives in DashboardState::step_zoom, not per chart: every
-    // zoom gesture (drag, reset click, axis pan, pinch) bubbles into the
-    // document-level ZoomBridge (uplot_chart.rs), which writes the store,
-    // and every step-axis chart's fetch reads it.
-    // One pathway covers linked charts following each other — including
-    // reset-click zoom-OUT, which the uPlot cursor sync does not replay — and
-    // panels that mount after the zoom (collapsed sections, other pages,
-    // the maximize overlay). Time/custom-x charts zoom client-side and
-    // stay out of it entirely.
 
     // Chart x-resolution follows the rect's actual on-screen width in
     // PHYSICAL pixels (css width × devicePixelRatio), tracked by a
@@ -319,7 +279,7 @@ pub(super) fn NumericContent(
     // width; one bucket per pixel is the most a screen can show. Quantized
     // upward to 250s so minor layout shifts don't refetch.
     // 0 = not yet measured (the fetch waits for the first measurement).
-    let mut chart_px = use_signal(|| 0u32);
+    let chart_px = use_signal(|| 0u32);
     let mut width_observer = use_hook(|| CopyValue::new(None::<ElementResizeObserver>));
 
     // Bound runs known to have NO data on this panel's metrics (the last complete linear response without custom X had no series for them) — excluded from the version key below so their steady ingest bumps stop triggering probes. Signal for reactivity, seeded from the panel cache so a Far remount doesn't forget and reprobe.
@@ -333,7 +293,6 @@ pub(super) fn NumericContent(
     // versions changes (or its run set changes) — another run logging
     // elsewhere on the page never touches this chart.
     let my_version = use_memo(move || {
-        // A range-trimmed response cannot prove a run silent elsewhere, custom X can yield an all-empty exact-step join even when both metrics are already registered, and log X can drop every negative axis position. Mirror the wire semantics so a cache-seeded exclusion cannot suppress those runs after an axis transition.
         let options = options.read();
         let has_step_zoom = options.is_step_axis() && state.step_zoom.read().is_some();
         let allow_noncontributors = options_allow_noncontributors(&options, has_step_zoom);
@@ -352,8 +311,7 @@ pub(super) fn NumericContent(
     // Fetch gate: an out-of-band panel (mounted only mid-rename) doesn't query and doesn't react to version bumps until it re-enters the band. A memo so Near <-> Visible flips don't restart an identical in-flight fetch (priority is peeked in the body).
     let allowed = use_memo(move || *zone.read() != Zone::Far);
     // The shared `loading` prop is both the corner spinner and the bridge's busy flag (same signal-sharing as text_stream): it spans the whole fetch — admission wait and retries included — so every fetch spins the chart it touches, and a pushed bump propagates when the flag clears instead of cancelling the fetch mid-flight. That propagation usually lands on the cache entry's echoed versions (folded into the client's map at receipt, see the fetch below) — a cache hit, not a second query.
-    let data_seq = crate::state::use_version_bridge(my_version, loading, allowed);
-    let mut loading = loading;
+    let refresh = crate::state::use_version_bridge(my_version, loading, allowed);
 
     // The per-panel response cache lives in CHART_CACHE (module-level, survives this body unmounting at Far): re-entering the band with nothing changed serves it instead of re-querying, so scrolling around a settled dashboard is network-free.
     let data = use_resource({
@@ -362,11 +320,10 @@ pub(super) fn NumericContent(
             let cache_key = cache_key.clone();
             let grpc = state.grpc.read().clone();
             // The refresh heartbeat: version-bump propagations (floored and gated in use_version_bridge) restart this resource through it. Only the subscription matters — entry validity is decided by fresh_for, not the key.
-            let _refresh = *data_seq.read();
+            let _refresh = *refresh.read();
             let refs = refs.read().clone();
             let opts = options.read().clone();
-            // Subscribe to the shared zoom only on step-axis charts — the read
-            // is conditional, so time/custom-x charts never react to it.
+            // Subscribe to the shared zoom (DashboardState::step_zoom) only on step-axis charts — the read is conditional, so time/custom-x charts never react to it.
             let zoom = if opts.is_step_axis() {
                 *state.step_zoom.read()
             } else {
@@ -409,8 +366,6 @@ pub(super) fn NumericContent(
                     None
                 };
 
-                // Custom-x / time charts never see a step range here: `zoom` is
-                // only read from the store on step-axis charts above.
                 // cache_state stays None here: `request` is the query identity
                 // (cache comparisons, the stored entry); the frontier echo is a
                 // transport detail added onto the wire copy at send time.
@@ -439,7 +394,7 @@ pub(super) fn NumericContent(
                     let ver = state.run_versions.peek();
                     let mg = state.metrics_gen.peek();
                     let epoch = *state.resync_gen.peek();
-                    if e.request == request
+                    if *e.request == request
                         && e.fresh_for(
                             request.y_series.iter().map(|s| s.run_id.as_str()),
                             &ver,
@@ -447,17 +402,15 @@ pub(super) fn NumericContent(
                             epoch,
                         )
                     {
-                        return ChartFetch::Answer(ChartAnswer {
-                            response: e.response.clone(),
-                            request: Rc::new(e.request.clone()),
-                        });
+                        return ChartFetch::Answer(e.clone());
                     }
                     // Deselection: a run-subset request fresh for the KEPT runs is answered from the superset response — no query, and the superset entry stays put so reselecting is equally free.
                     if let Some(keep) = chart_sync::subset_keep(&e.request, &request) {
                         if e.fresh_for(keep.iter().map(String::as_str), &ver, &mg, epoch) {
-                            return ChartFetch::Answer(ChartAnswer {
+                            return ChartFetch::Answer(ChartCacheEntry {
                                 response: Rc::new(chart_sync::filter_response(&e.response, &keep)),
-                                request: Rc::new(request.clone()),
+                                request: Rc::new(request),
+                                ..e.clone()
                             });
                         }
                     }
@@ -494,13 +447,14 @@ pub(super) fn NumericContent(
                     grpc.query_chart(wire).await.map(|r| (pre, r))
                 })
                 .await;
+                let mut failed = |status| {
+                    loading.set(false);
+                    evict_panel_caches(&cache_key);
+                    settled_failure(status, refs.clone())
+                };
                 let ((epoch_snap, mg_snap, sent_versions), mut resp) = match response {
                     Ok(response) => response,
-                    Err(status) => {
-                        loading.set(false);
-                        evict_panel_caches(&cache_key);
-                        return settled_failure(status);
-                    }
+                    Err(status) => return failed(status),
                 };
                 // The panel's name in a protocol alert, should one fire below.
                 let alert_metric = request
@@ -514,16 +468,16 @@ pub(super) fn NumericContent(
                         "server delta audit failed on '{alert_metric}'"
                     ));
                 }
-                // Every response inflates into the dense model at receipt (chart_sync::inflate_response); a delta splices back into a full one, verified against the server's result hashes (chart_sync::splice_response). A refusal — shape violation, malformed segments, hash mismatch — is a protocol failure: alert, refetch in full, and render only that; a splice is never rendered on guesswork. The refetch replaces the refused reply, frontiers and version echo included (its data is what renders); the send-time registry/epoch snapshots it keeps only under-claim.
+                // Every response inflates into the dense model at receipt (chart_sync::inflate_response); a delta splices back into a full one, verified against the server's result hashes, or keeps the held model when it changes nothing (chart_sync::splice_response). A refusal — shape violation, malformed segments, hash mismatch — is a protocol failure: alert, refetch in full, and render only that; a splice is never rendered on guesswork. The refetch replaces the refused reply, frontiers and version echo included (its data is what renders); the send-time registry/epoch snapshots it keeps only under-claim.
                 let spliced = if resp.delta {
                     cached
                         .as_ref()
                         .and_then(|e| chart_sync::splice_response(&e.response, &resp))
                 } else {
-                    chart_sync::inflate_response(&resp)
+                    chart_sync::inflate_response(&resp).map(Rc::new)
                 };
-                let (full, inflated) = match spliced {
-                    Some(f) => (f, true),
+                let full = match spliced {
+                    Some(full) => full,
                     None => {
                         crate::components::notice_bar::protocol_alert(format!(
                             "chart response refused on '{alert_metric}'; refetching in full"
@@ -533,30 +487,20 @@ pub(super) fn NumericContent(
                                 let _hi = visibility::admit_fetch(|| *zone.peek(), false).await;
                                 grpc.query_chart(request.clone()).await
                             })
-                            .await;
+                            .await
+                            .and_then(validated_full);
                         match replacement {
-                            // A full answer that STILL fails to inflate would loop; it renders as an empty chart instead (the alert above already fired), which proves nothing about which runs lack data.
-                            Ok(wire) => {
-                                let full = chart_sync::inflate_response(&wire);
+                            Ok((full, wire)) => {
                                 resp = wire;
-                                let inflated = full.is_some();
-                                (full.unwrap_or_default(), inflated)
+                                Rc::new(full)
                             }
-                            Err(status) => {
-                                loading.set(false);
-                                evict_panel_caches(&cache_key);
-                                return settled_failure(status);
-                            }
+                            Err(status) => return failed(status),
                         }
                     }
                 };
                 loading.set(false);
-                // Runs absent from a complete linear response without custom X have no data on this metric; remember them so their version bumps stop probing. An all-empty custom-X join loses every identity on the wire even though later ordinary data can make it plottable. So does an all-negative log-X chart from a server that predates shipping unplottable counts (AI-1491), which keeps log-X excluded until that server is gone.
-                let nc_new = if inflated {
-                    noncontributors_from_response(&request, &full)
-                } else {
-                    Default::default()
-                };
+                // Runs absent from a complete linear response without custom X have no data on this metric ([`request_proves_noncontributors`]); remember them so their version bumps stop probing.
+                let nc_new = noncontributors_from_response(&request, &full);
                 // The freshest server-stamped frontiers — delta or full, they describe the response being folded in and ride the next echo.
                 let frontiers = resp.frontiers;
                 let versions = Rc::new(crate::state::answer_stamps(
@@ -564,30 +508,23 @@ pub(super) fn NumericContent(
                     resp.run_versions,
                     sent_versions,
                 ));
-                let resp_rc = Rc::new(full);
-                let nc_rc = Rc::new(nc_new);
-                let answer = ChartAnswer {
-                    response: resp_rc.clone(),
-                    request: Rc::new(request.clone()),
+                let entry = ChartCacheEntry {
+                    request: Rc::new(request),
+                    response: full,
+                    reply: NEXT_REPLY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    versions,
+                    metrics_gen: Rc::new(mg_snap),
+                    epoch: epoch_snap,
+                    frontiers: Rc::new(frontiers),
+                    noncontrib: Rc::new(nc_new),
                 };
+                let weight = entry.estimated_heap_bytes();
                 CHART_CACHE.with(|c| {
-                    let entry = ChartCacheEntry {
-                        request,
-                        response: resp_rc.clone(),
-                        versions,
-                        metrics_gen: Rc::new(mg_snap),
-                        epoch: epoch_snap,
-                        frontiers: Rc::new(frontiers),
-                        noncontrib: nc_rc.clone(),
-                    };
-                    let weight = entry.estimated_heap_bytes();
-                    c.borrow_mut().put_weighted(cache_key, entry, weight)
+                    c.borrow_mut()
+                        .put_weighted(cache_key, entry.clone(), weight)
                 });
-                let mut noncontrib = noncontrib;
-                if *noncontrib.peek() != nc_rc {
-                    noncontrib.set(nc_rc);
-                }
-                ChartFetch::Answer(answer)
+                set_if_changed(noncontrib, entry.noncontrib.clone());
+                ChartFetch::Answer(entry)
             }
         }
     });
@@ -595,17 +532,14 @@ pub(super) fn NumericContent(
     let read = data.read();
     // Settled data, or the cache for every no-answer state: deferred out of band (pinned body at Far), the width gate, and the pending polls right after a scroll-back remounts this body — the old chart paints instantly instead of flashing "Loading...". Rc, so these are refcount bumps, not chart copies. (A run-subset answer renders filtered while this fallback holds the superset — the superset is at worst one frame stale here.)
     let cached_entry = CHART_CACHE.with(|c| c.borrow_mut().get(&cache_key));
-    let chart_to_show: Option<ChartAnswer> = match &*read {
-        Some(ChartFetch::Answer(answer)) => Some(answer.clone()),
-        Some(ChartFetch::Unavailable(_)) => None,
-        _ => cached_entry.as_ref().map(|e| ChartAnswer {
-            response: e.response.clone(),
-            request: Rc::new(e.request.clone()),
-        }),
-    };
-    let has_points = chart_to_show
-        .as_ref()
-        .is_some_and(|answer| !answer.response.x_values.is_empty());
+    // An answer or cache entry for other metrics is no answer for the refs ([`super::same_metric_names`]): `use_resource` keeps the last answer while a retargeted source refetches, and the cache keeps it until the new one lands.
+    let chart_to_show = match &*read {
+        Some(ChartFetch::Answer(answer)) => Some(answer),
+        Some(ChartFetch::Unavailable(..)) => None,
+        _ => cached_entry.as_ref(),
+    }
+    .filter(|answer| same_metric_names(&answer.request.y_series, &refs.read()));
+    let has_points = chart_to_show.is_some_and(|answer| !answer.response.x_values.is_empty());
     // Subscribed read: entering/leaving the viewport mounts/unmounts the
     // chart below.
     let zone_now = *zone.read();
@@ -617,9 +551,11 @@ pub(super) fn NumericContent(
         Some(_) if has_points && zone_now != Zone::Visible => rsx! {
             div { class: "chart-container" }
         },
-        Some(ChartAnswer {
+        Some(ChartCacheEntry {
             response: chart,
             request,
+            reply,
+            ..
         }) if has_points => {
             // The axis and smoothing come from the request this response answered, not the live options: mid option-toggle the cache serves the previous response for a refetch cycle, and live options would run the ms->s transform over step x, render linear buckets on a log scale, drop a shifted chart's zero slot, or stroke the wrong primary mark.
             let smoothed = request
@@ -630,41 +566,36 @@ pub(super) fn NumericContent(
             let _color_version = *state.color_version.read();
             // Each series' run_id names its run: run_name for the label, ordinal for the color.
             let all_runs = state.display_runs();
-            let labels: Vec<String> = chart
-                .series
-                .iter()
-                .map(|s| crate::state::rewrite_label_with_run_name(&s.label, &s.run_id, &all_runs))
-                .collect();
-            let (colors, run_names): (Vec<String>, Vec<Option<String>>) = chart
-                .series
-                .iter()
-                .map(|s| {
-                    if let Some(run) = all_runs.iter().find(|r| r.run_id == s.run_id) {
-                        (
-                            crate::components::uplot_chart::run_color(&run.run_id, run.ordinal),
-                            Some(run.run_name.clone()),
-                        )
-                    } else {
-                        (crate::components::uplot_chart::hash_color(&s.label), None)
-                    }
-                })
-                .unzip();
+            let (mut labels, mut colors, mut run_names) = (Vec::new(), Vec::new(), Vec::new());
+            for s in &chart.series {
+                let run = crate::state::app_state::find_run(&all_runs, &s.run_id);
+                labels.push(run.map_or_else(
+                    || s.label.clone(),
+                    |run| crate::state::rewrite_label_with_run_name(&s.label, run),
+                ));
+                colors.push(run.map_or_else(
+                    || crate::components::uplot_chart::hash_color(&s.label),
+                    |run| crate::components::uplot_chart::run_color(&run.run_id, run.ordinal),
+                ));
+                run_names.push(run.map(|run| run.run_name.clone()));
+            }
 
             rsx! {
                 UPlotChart {
-                    chart: ChartModel(chart),
+                    chart: ChartModel(chart.clone()),
                     labels: labels,
                     run_names: run_names,
                     colors: colors,
-                    axis: ShownAxis::of_request(&request),
+                    axis: ShownAxis::of_request(request),
                     log_y: options.read().log_y,
                     smoothed: smoothed,
+                    reply: *reply,
                 }
             }
         }
         // An empty answer is knowledge, and a refetch in flight doesn't
         // un-know it — these arms hold steady across restarts.
-        Some(ChartAnswer {
+        Some(ChartCacheEntry {
             response: chart, ..
         }) => {
             // Samples whose x this axis can't place still ship their counts over an empty axis.
@@ -679,9 +610,14 @@ pub(super) fn NumericContent(
             }
         }
         None => match &*read {
-            Some(ChartFetch::Unavailable(message)) => rsx! {
-                div { class: "rect-empty", "{message}" }
-            },
+            // Like an answer, an explanation for other metrics is none for the refs.
+            Some(ChartFetch::Unavailable(message, asked))
+                if same_metric_names(asked, &refs.read()) =>
+            {
+                rsx! {
+                    div { class: "rect-empty", "{message}" }
+                }
+            }
             // Nothing known yet: first fetch in flight, deferred with no cache
             // (a never-fetched offscreen panel), or the width gate.
             _ => rsx! {
@@ -712,9 +648,7 @@ pub(super) fn NumericContent(
                     }
                     let px = w.clamp(400.0, 4000.0) as u32;
                     let q = px.div_ceil(250) * 250;
-                    if *chart_px.peek() != q {
-                        chart_px.set(q);
-                    }
+                    set_if_changed(chart_px, q);
                 })));
             },
             {body}

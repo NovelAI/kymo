@@ -3,7 +3,7 @@
 //! The WIRE carries no filler (occupancy segments, strictly finite f32 values — kymo.proto); the client inflates every response into the dense MODEL ([`chart_delta::DenseChart`]: axis-length columns, NaN = no data) at receipt ([`inflate_response`]), and everything downstream — cache, splice, filter, render — works on the model. Three mechanisms keep a chart's traffic proportional to what changed:
 //!  - a run-SUBSET request (deselection) is answered from the cached superset model by [`filter_response`] — no query, and the superset entry stays so reselecting is also free;
 //!  - real queries echo the held response's opaque continuation state ([`echo_state`]); the server reconstructs what the client holds and answers with a delta that [`splice_response`] rebuilds — appends arrive as a small tail, "nothing changed" as an empty one, a newly-selected run's series complete while held series continue (full only when the bucket layout shifted or append-only didn't hold);
-//!  - runs that contributed no series to a complete linear response without custom X are dropped from the panel's version key ([`panel_version_key`]), so their steady ingest bumps stop reaching it (re-armed by that run's registry events or a resync epoch; range trims, log-axis filtering, and exact X/Y joins cannot prove a run silent).
+//!  - runs that contributed no series to a complete linear response without custom X are dropped from the panel's version key ([`panel_version_key`]), so their steady ingest bumps stop reaching it (re-armed by that run's registry events or a resync epoch; range trims, log-axis filtering, and exact X/Y joins cannot prove a run silent). A dropped run that later gains numbers without raising its registry type (numbers logged again after a legacy cdn_key overwrote the run's earlier ones under the same key, or numbers under a name registered as text) stays dropped until the chart refetches for another reason (another bound run's data, an option, a width or zoom change) or a resync. Neither matters in practice.
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -18,8 +18,10 @@ use crate::state::{stamp_covers, versions_key};
 #[derive(Clone)]
 pub struct ChartCacheEntry {
     /// The request answered, `cache_state` stripped (transport detail, not query identity).
-    pub request: ChartRequest,
+    pub request: Rc<ChartRequest>,
     pub response: Rc<DenseChart>,
+    /// The number of the server answer that put `response` here (metric_rect/numeric_content.rs NEXT_REPLY), which a cache hit passes on as UPlotChart's `reply`.
+    pub reply: u64,
     /// The change signals this response depended on, for [`Self::fresh_for`], over the request's runs: data versions ([`crate::state::answer_stamps`]); send-time registry counters; and the resync epoch.
     pub versions: Rc<HashMap<String, u64>>,
     pub metrics_gen: Rc<HashMap<String, u64>>,
@@ -36,12 +38,17 @@ impl ChartCacheEntry {
     /// included so tag-heavy and many-run entries are not treated as free.
     pub fn estimated_heap_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
+            .saturating_add(std::mem::size_of::<ChartRequest>())
+            .saturating_add(2 * std::mem::size_of::<usize>()) // Rc allocation header
             .saturating_add(self.request.encoded_len())
             .saturating_add(dense_chart_heap_bytes(&self.response))
             .saturating_add(string_map_heap_bytes(&self.versions))
             .saturating_add(string_map_heap_bytes(&self.metrics_gen))
             .saturating_add(string_map_heap_bytes(&self.frontiers))
-            .saturating_add(string_set_heap_bytes(&self.noncontrib))
+            .saturating_add(keys_heap_bytes::<String>(
+                self.noncontrib.capacity(),
+                self.noncontrib.iter(),
+            ))
     }
 
     /// Whether this entry still answers a query over `runs` — the one freshness rule behind both the exact-request and run-subset serves in metric_rect.rs. A contributing run's data version stamp must cover what the client knows ([`stamp_covers`]). A known non-contributing run has no data here, so only what could make it START contributing (its metrics_gen counter, the resync epoch) must be unchanged.
@@ -68,7 +75,7 @@ impl ChartCacheEntry {
     }
 }
 
-fn vec_heap_bytes<T>(values: &Vec<T>) -> usize {
+pub(crate) fn vec_heap_bytes<T>(values: &Vec<T>) -> usize {
     values.capacity().saturating_mul(std::mem::size_of::<T>())
 }
 
@@ -94,18 +101,14 @@ fn dense_chart_heap_bytes(chart: &DenseChart) -> usize {
 }
 
 pub(crate) fn string_map_heap_bytes<V>(map: &HashMap<String, V>) -> usize {
-    let bucket_bytes = std::mem::size_of::<(String, V)>().saturating_add(1);
-    map.capacity()
-        .saturating_mul(bucket_bytes)
-        .saturating_add(map.keys().map(|key| key.capacity()).sum::<usize>())
-        .saturating_add(2 * std::mem::size_of::<usize>()) // Rc allocation header
+    keys_heap_bytes::<(String, V)>(map.capacity(), map.keys())
 }
 
-fn string_set_heap_bytes(set: &HashSet<String>) -> usize {
-    let bucket_bytes = std::mem::size_of::<String>().saturating_add(1);
-    set.capacity()
-        .saturating_mul(bucket_bytes)
-        .saturating_add(set.iter().map(|key| key.capacity()).sum::<usize>())
+/// A string-keyed map's or set's heap, its buckets holding `Slot`s: each bucket's slot and control byte, the keys' buffers, and the Rc allocation header.
+fn keys_heap_bytes<'a, Slot>(capacity: usize, keys: impl Iterator<Item = &'a String>) -> usize {
+    capacity
+        .saturating_mul(std::mem::size_of::<Slot>().saturating_add(1))
+        .saturating_add(keys.map(String::capacity).sum::<usize>())
         .saturating_add(2 * std::mem::size_of::<usize>()) // Rc allocation header
 }
 
@@ -196,8 +199,8 @@ fn splice_pairable(held: &ChartRequest, new: &ChartRequest) -> bool {
         .eq(new.y_series.iter().filter(|s| held_keys.contains(&key(s))))
 }
 
-/// Rebuild the full model a delta continues: paired series splice onto cached ones at `from_col`; complete series (splice_from_cached -1) are adopted as shipped. None when the delta can't apply to `cached` — the caller refetches in full; a splice is never rendered on guesswork.
-pub fn splice_response(cached: &DenseChart, delta: &ChartResponse) -> Option<DenseChart> {
+/// Rebuild the full model a delta continues: paired series splice onto cached ones at `from_col`; complete series (splice_from_cached -1) are adopted as shipped. None when the delta can't apply to `cached` — the caller refetches in full; a splice is never rendered on guesswork. A delta that changes nothing (no new columns, and every series continues a cached one with no markers and the same label, run_id and xnan_count, the unhashed fields the splice adopts) returns `cached` itself, whose allocation UPlotChart keys data changes on (ChartModel), so identical data rebuilds no paths.
+pub fn splice_response(cached: &Rc<DenseChart>, delta: &ChartResponse) -> Option<Rc<DenseChart>> {
     let c = delta.from_col as usize;
     if !delta.delta
         || c == 0
@@ -240,10 +243,12 @@ pub fn splice_response(cached: &DenseChart, delta: &ChartResponse) -> Option<Den
         c,
     )?);
     let mut series = Vec::with_capacity(delta.series.len());
+    let mut unchanged = tail_len == 0 && c == cached.x_values.len();
     let mut prev: i32 = -1;
     for (new, &idx) in delta.series.iter().zip(&delta.splice_from_cached) {
         let w = wire(new);
         if idx < 0 {
+            unchanged = false;
             // A complete series spans the whole spliced axis.
             let env_dense = delta.banded && chart_delta::wire_has_content(&w);
             series.push(chart_delta::inflate_series(
@@ -269,6 +274,10 @@ pub fn splice_response(cached: &DenseChart, delta: &ChartResponse) -> Option<Den
             delta.banded && (!old.min_values.is_empty() || chart_delta::wire_has_content(&w));
         let raw_dense = !old.raw_values.is_empty() || !new.raw_values.is_empty();
         let tail = chart_delta::inflate_series(&w, tail_len, c, env_dense, raw_dense)?;
+        unchanged &= tail.nan_indices.is_empty()
+            && tail.label == old.label
+            && tail.run_id == old.run_id
+            && tail.xnan_count == old.xnan_count;
         series.push(chart_delta::splice_series(old, &tail, c));
     }
     // Every cached series consumed — a skipped one would silently drop a series the server believes this client still shows.
@@ -281,7 +290,7 @@ pub fn splice_response(cached: &DenseChart, delta: &ChartResponse) -> Option<Den
         xr_max,
         series,
     };
-    // The end-to-end content check, on every delta: the spliced result must hash to the full model the server computed (to_delta's result_x_hash/result_series_hashes — chart_delta.rs hash fns, shared verbatim). A mismatch means this rebuild does NOT reproduce the server's chart, whatever the cause — a planner bug the sampled audit missed, a membership edge, drift accumulated by an earlier splice — so it is never rendered: refuse, refetch in full, alert.
+    // The end-to-end content check, on every delta: the spliced result must hash to the model the server answered with (to_delta's result_x_hash/result_series_hashes — chart_delta.rs hash fns, shared verbatim). A mismatch means this rebuild does NOT reproduce that model, whatever the cause — a membership edge, drift accumulated by an earlier splice, or, against a fully built model, a planner bug the sampled audit missed — so it is never rendered: refuse, refetch in full, alert. It checks the splice, not the model: a model that held state's `on` mode advanced keeps the prefix this client also holds, so its hash confirms only that prefix, and only the server's sampled audit checks the advance.
     if delta.result_x_hash? != chart_delta::hash_axis(&out) {
         return None;
     }
@@ -294,7 +303,10 @@ pub fn splice_response(cached: &DenseChart, delta: &ChartResponse) -> Option<Den
     {
         return None;
     }
-    Some(out)
+    if unchanged {
+        return Some(cached.clone());
+    }
+    Some(Rc::new(out))
 }
 
 fn ref_key(s: &SeriesRef) -> (&str, &str, &str, &[String]) {
@@ -442,13 +454,14 @@ mod tests {
             })
             .collect();
         let entry = ChartCacheEntry {
-            request: ChartRequest::default(),
+            request: Rc::new(ChartRequest::default()),
             response: Rc::new(DenseChart {
                 x_values: vec![0.0; axis_len],
                 xr_min: vec![0.0; axis_len],
                 xr_max: vec![0.0; axis_len],
                 series,
             }),
+            reply: 1,
             versions: Rc::new(HashMap::new()),
             metrics_gen: Rc::new(HashMap::new()),
             epoch: 0,
@@ -762,7 +775,7 @@ mod tests {
 
     #[test]
     fn splice_rebuilds_the_full_model_and_refuses_violations() {
-        let cached = DenseChart {
+        let cached = Rc::new(DenseChart {
             x_values: vec![0.0, 1.0, 2.0],
             xr_min: vec![f64::NAN; 3],
             xr_max: vec![f64::NAN; 3],
@@ -770,7 +783,7 @@ mod tests {
                 dense("a", vec![1.0, 2.0, 3.0], vec![0], vec![1]),
                 dense("b", vec![4.0, 5.0, 6.0], vec![], vec![]),
             ],
-        };
+        });
         // The truth the delta reconstructs to: appended slot 3, a new complete series c interleaved in request order.
         let truth = DenseChart {
             x_values: vec![0.0, 1.0, 2.0, 2.5],
@@ -806,7 +819,7 @@ mod tests {
             |d| {
                 d.result_series_hashes[1] ^= 1;
             },
-            |d| d.result_x_hash = None, // hashes are mandatory now
+            |d| d.result_x_hash = None, // hashes are mandatory
             // A held series nothing continues: every cached series must be consumed.
             |d| {
                 d.series.pop();
@@ -819,6 +832,47 @@ mod tests {
             let mut d = delta.clone();
             breaker(&mut d);
             assert!(splice_response(&cached, &d).is_none());
+        }
+    }
+
+    #[test]
+    fn splice_returns_the_held_model_only_when_the_delta_changes_nothing() {
+        let held = Rc::new(DenseChart {
+            x_values: vec![0.0, 1.0, 2.0],
+            xr_min: vec![f64::NAN; 3],
+            xr_max: vec![f64::NAN; 3],
+            series: vec![
+                dense("a", vec![1.0, 2.0, 3.0], vec![0], vec![1]),
+                dense("b", vec![4.0, 5.0, 6.0], vec![], vec![]),
+            ],
+        });
+        let unchanged = delta_of(&held, 3, &[false, false]);
+        let out = splice_response(&held, &unchanged).unwrap();
+        assert!(Rc::ptr_eq(&out, &held));
+
+        // The splice adopts these unhashed fields, so it accepts the delta, but the chart shows something else.
+        for adopted in [
+            (|d: &mut ChartResponse| d.series[1].label = "b renamed".into())
+                as fn(&mut ChartResponse),
+            |d| d.series[1].run_id = "c".into(),
+            |d| d.series[1].xnan_count = 2,
+            |d| d.series[0].label = "a renamed".into(),
+        ] {
+            let mut d = unchanged.clone();
+            adopted(&mut d);
+            assert!(!Rc::ptr_eq(&splice_response(&held, &d).unwrap(), &held));
+        }
+        // New columns, a shorter axis, a full answer, a newly requested complete series, a marker past the held axis.
+        for changed in [
+            (|d: &mut ChartResponse| d.x_values = vec![3.0]) as fn(&mut ChartResponse),
+            |d| d.from_col = 2,
+            |d| d.delta = false,
+            |d| d.series.push(d.series[1].clone()),
+            |d| d.series[1].nan_indices = vec![3],
+        ] {
+            let mut d = unchanged.clone();
+            changed(&mut d);
+            assert!(splice_response(&held, &d).is_none_or(|out| !Rc::ptr_eq(&out, &held)));
         }
     }
 
@@ -870,7 +924,7 @@ mod tests {
             ],
         };
         let delta = delta_of(&truth, 3, &[false, false]);
-        let out = splice_response(&cached, &delta).unwrap();
+        let out = splice_response(&Rc::new(cached.clone()), &delta).unwrap();
         assert!(bits_eq(&out, &truth));
         assert!(out.series[0].min_values[..3].iter().all(|v| v.is_nan()));
         assert_eq!(out.series[0].min_values[3], 4.0);
@@ -886,7 +940,7 @@ mod tests {
         cached2.series[0].raw_values = vec![1.0, 2.0, 3.0];
         let mut d2 = delta_of(&truth, 3, &[false, false]);
         d2.series[0].raw_values = vec![];
-        assert!(splice_response(&cached2, &d2).is_none());
+        assert!(splice_response(&Rc::new(cached2), &d2).is_none());
     }
 
     #[test]
@@ -964,8 +1018,9 @@ mod tests {
         assert_eq!(counts, vec![3, 0]);
         assert!(out.series.iter().all(|s| s.nan_indices.is_empty()));
         let entry = ChartCacheEntry {
-            request: req(&["a", "b"], 500),
+            request: Rc::new(req(&["a", "b"], 500)),
             response: Rc::new(out),
+            reply: 1,
             versions: Rc::new(HashMap::new()),
             metrics_gen: Rc::new(HashMap::new()),
             epoch: 0,
@@ -978,11 +1033,12 @@ mod tests {
     #[test]
     fn echo_requires_shared_refs_in_shared_order() {
         let entry = ChartCacheEntry {
-            request: req(&["a", "b"], 500),
+            request: Rc::new(req(&["a", "b"], 500)),
             response: Rc::new(DenseChart {
                 x_values: vec![0.0, 1.0],
                 ..Default::default()
             }),
+            reply: 1,
             versions: Rc::new(HashMap::new()),
             metrics_gen: Rc::new(HashMap::new()),
             epoch: 0,
@@ -1058,8 +1114,9 @@ mod tests {
     #[test]
     fn fresh_for_distinguishes_contributing_from_noncontributing() {
         let entry = ChartCacheEntry {
-            request: req(&["a", "b"], 500),
+            request: Rc::new(req(&["a", "b"], 500)),
             response: Rc::new(DenseChart::default()),
+            reply: 1,
             versions: Rc::new([("a".into(), 3u64)].into()),
             metrics_gen: Rc::new([("b".into(), 2u64)].into()),
             epoch: 7,

@@ -3,7 +3,10 @@
 import base64
 import json
 import math
+import os
 import sys
+import time
+from pathlib import Path
 
 import grpc
 
@@ -11,9 +14,26 @@ from kymo._generated import kymo_pb2, kymo_pb2_grpc
 
 
 _METHODS = {
-    "InitRun": (kymo_pb2.InitRunRequest, "InitRun"),
-    "TerminateRun": (kymo_pb2.TerminateRunRequest, "TerminateRun"),
+    "InitRun": kymo_pb2.InitRunRequest,
+    "TerminateRun": kymo_pb2.TerminateRunRequest,
 }
+
+# _run_control_rpc starts `python -S -c BOOTSTRAP <timeout>` with group signals blocked for TerminateRun. Set SIGALRM to its default action, unblock it and arm it for ceil(timeout)+2 s before site.main() and kymo/grpc imports. This bounds site, import and RPC hangs (NFS, .pth files, sitecustomize). -S defers site processing; -m would import kymo/grpc before the alarm. Ignored dispositions and blocked masks survive exec.
+BOOTSTRAP = "import math, signal, sys; signal.signal(signal.SIGALRM, signal.SIG_DFL); signal.pthread_sigmask(signal.SIG_UNBLOCK, [signal.SIGALRM]); signal.alarm(math.ceil(float(sys.argv[1])) + 2); import site; site.main(); from kymo._control_rpc import main; sys.exit(main())"
+
+
+def _ended(pid: int) -> bool:
+    """Whether the process pid has ended: it no longer exists, or, on Linux, it is a zombie (state Z in /proc/<pid>/stat), as it is until its parent reaps it, and for good once that parent has exited under a PID 1 that never reaps. Off Linux a zombie reads as running, and anywhere so does a process that has since taken the pid: either holds the wait for it (after, in _dispatch) until the alarm. The client reads the upload worker its forkserver's death orphaned the same way (kymo.client._worker_alive)."""
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return True
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_bytes()
+    except OSError:
+        return False
+    # The state follows the name, which may itself hold spaces and parentheses.
+    return stat.rpartition(b")")[2].split()[:1] == [b"Z"]
 
 
 def _dispatch(payload: dict) -> bytes:
@@ -33,13 +53,15 @@ def _dispatch(payload: dict) -> bytes:
         or timeout <= 0
     ):
         raise ValueError("timeout must be a positive number")
+    after = payload.get("after")
+    if after is not None and (isinstance(after, bool) or not isinstance(after, int)):
+        raise ValueError("after must be a process id")
     encoded_request = payload.get("request")
     if not isinstance(encoded_request, str):
         raise ValueError("request must be base64 text")
     try:
         request_bytes = base64.b64decode(encoded_request, validate=True)
-        request_type, stub_method = _METHODS[method]
-        request = request_type.FromString(request_bytes)
+        request = _METHODS[method].FromString(request_bytes)
     except Exception as error:
         raise ValueError("request is not a valid protobuf") from error
 
@@ -52,9 +74,15 @@ def _dispatch(payload: dict) -> bytes:
         endpoint = endpoint_from_worker_config(local_config)
         channel = grpc_channel(endpoint)
 
+    if after is not None:
+        # after is the pid of a control process an earlier end of the run left running: send once it has ended (_ended), within the same deadline, so the server takes this code last (kymo.client._terminate_run). The alarm bounds the wait.
+        started = time.monotonic()
+        while not _ended(after):
+            time.sleep(0.01)
+        timeout = max(0.001, timeout - (time.monotonic() - started))
     with channel:
         stub = kymo_pb2_grpc.KymoStub(channel)
-        response = getattr(stub, stub_method)(request, timeout=float(timeout))
+        response = getattr(stub, method)(request, timeout=float(timeout))
     return response.SerializeToString()
 
 
@@ -72,7 +100,3 @@ def main() -> int:
         return 1
     sys.stdout.buffer.write(response)
     return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

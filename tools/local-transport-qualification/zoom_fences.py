@@ -6,14 +6,24 @@ envelope-to-raw refetch and shared single-click reset against ``seed_zoom_fixtur
 
 import argparse
 import math
+import re
+import struct
 import sys
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
+from kymo._generated import kymo_pb2 as pb
 from playwright.sync_api import Page, TimeoutError, sync_playwright
 
-from fences_common import drag_chart_height, fitted_box, render_turn as settle
+from fences_common import (
+    drag_chart_height,
+    encode_response,
+    fitted_box,
+    render_turn as settle,
+    request_frame,
+)
 
 
 SOURCE_TITLE = "zoom_a_source"
@@ -783,6 +793,115 @@ def client_zoom_fences(
             assert_close(state["max"], state["full_max"], "client reset maximum")
 
 
+def missing_chart_returns_at_an_unchanged_reply(page: Page) -> None:
+    """A chart whose uPlot instance went missing comes back at its next reply, even one that changes nothing (UPlotChart's reply check, uplot_chart.rs). A tab of its own routes its socket, destroys the peer chart, and pushes a version of the fixture run above any it has, as the server pushes when a run logs: each chart of the run polls once, and its reply keeps the held model, as the source chart's untouched instance shows."""
+    tab = page.context.new_page()
+    errors: list[str] = []
+    tab.on("pageerror", lambda error: errors.append(str(error)))
+    # Each chart's QueryChart requests as [request id, answered].
+    polls: dict[str, list[list]] = {SOURCE_TITLE: [], PEER_TITLE: []}
+    routes = []
+
+    def connect(ws) -> None:
+        server = ws.connect_to_server()
+        routes.append(ws)
+
+        def from_page(message) -> None:
+            if isinstance(message, bytes):
+                request_id, path, body = request_frame(message)
+                for title, sent in polls.items():
+                    if path == "/kymo.Kymo/QueryChart" and title.encode() in body:
+                        sent.append([request_id, False])
+            server.send(message)
+
+        def from_server(message) -> None:
+            if isinstance(message, bytes):
+                request_id = struct.unpack_from("<I", message)[0]
+                for sent in polls.values():
+                    for poll in sent:
+                        poll[1] |= poll[0] == request_id
+            ws.send(message)
+
+        ws.on_message(from_page)
+        server.on_message(from_server)
+
+    def wait_until(done, what: str, seconds: float) -> None:
+        deadline = time.monotonic() + seconds
+        while not done():
+            if time.monotonic() > deadline:
+                raise AssertionError(f"timed out waiting for {what}: {polls}")
+            tab.wait_for_timeout(50)
+
+    def answered() -> bool:
+        return all(done for sent in polls.values() for _, done in sent)
+
+    tab.route_web_socket(
+        re.compile(r"/(?:grpc-ws|trash/_kymo-grpc-ws-local-v1)"), connect
+    )
+    try:
+        started = time.monotonic()
+        tab.goto(page.url, wait_until="domcontentloaded")
+        for title in polls:
+            tab.wait_for_selector(
+                f".metric-rect:has(.rect-title-pop:text-is('{title}')) .u-over",
+                timeout=30_000,
+            )
+        source, peer = chart_id(tab, SOURCE_TITLE), chart_id(tab, PEER_TITLE)
+        # Quiet: every query answered, and none sent for a second.
+        sent = -1
+        while sent != sum(map(len, polls.values())) or not answered():
+            wait_until(answered, "the page's chart queries", 20)
+            sent = sum(map(len, polls.values()))
+            tab.wait_for_timeout(1_000)
+        tab.evaluate(
+            """([source, peer]) => {
+                const witness = window.__kymo_charts[source];
+                witness.__fence_sets = 0;
+                const setData = witness.setData;
+                witness.setData = function (...data) { this.__fence_sets++; return setData.apply(this, data); };
+                window.__kymo_charts[peer].destroy();
+                delete window.__kymo_charts[peer];
+            }""",
+            [source, peer],
+        )
+        before = {title: len(sent) for title, sent in polls.items()}
+        run_id = RUN_PATH.rsplit("/", 1)[1]
+        # Far above any version the fixture run reaches, so the page takes it as new.
+        push = pb.RunVersionsEvent(run_versions={run_id: 1 << 40}).SerializeToString()
+        routes[-1].send(encode_response(0, push))
+        wait_until(
+            lambda: all(
+                len(polls[t]) > before[t] and polls[t][before[t]][1] for t in polls
+            ),
+            "each chart's poll after the pushed version",
+            15,
+        )
+        try:
+            tab.wait_for_function(
+                "id => !!window.__kymo_charts[id]?.root?.isConnected",
+                arg=peer,
+                timeout=5_000,
+            )
+        except TimeoutError:
+            raise AssertionError(
+                f"the destroyed chart did not come back at its unchanged reply: {polls}"
+            ) from None
+        witness = tab.evaluate(
+            "id => window.__kymo_charts[id].__fence_sets ?? null", source
+        )
+        if any(len(polls[t]) != before[t] + 1 for t in polls) or witness != 0:
+            raise AssertionError(
+                f"expected one poll per chart, answered without new data (source setData: {witness}): {polls}"
+            )
+        if errors:
+            raise AssertionError(f"uncaught browser errors: {errors}")
+        print(
+            f"missing chart returned at its one unchanged reply, {time.monotonic() - started:.1f} s for the step"
+        )
+    finally:
+        tab.close()
+
+
 def run_fences(page: Page) -> None:
     page_errors = []
 
@@ -833,6 +952,7 @@ def run_fences(page: Page) -> None:
         client_peer = chart_snapshot(page, chart_id(page, CLIENT_PEER_TITLE))
         client_zoom_fences(page, client_source, client_peer)
         settle(page)
+        missing_chart_returns_at_an_unchanged_reply(page)
         if page_errors:
             raise AssertionError("uncaught browser errors")
     finally:
@@ -851,7 +971,8 @@ def main() -> None:
 
     with sync_playwright() as playwright:
         browser = getattr(playwright, args.browser).launch(headless=True)
-        page = browser.new_page(viewport=VIEWPORT, device_scale_factor=1)
+        # A context of its own: the missing-chart step opens a second tab, which Playwright refuses in a page's own context.
+        page = browser.new_context(viewport=VIEWPORT, device_scale_factor=1).new_page()
         try:
             page.goto(args.url, wait_until="domcontentloaded")
             run_fences(page)

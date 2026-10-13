@@ -253,6 +253,7 @@ impl Fixture {
     ) -> Result<()> {
         wait_past_receipt(*receipts.values().max().context("no receipts to drain")?).await?;
         self.no_event()?;
+        let logged_before = self.last_logged().await?;
         self.bumps.write_dirty(&self.pg, &self.events).await;
         ensure!(
             !self.bumps.state.lock().unwrap().has_pending_work(),
@@ -289,6 +290,13 @@ impl Fixture {
             "pushed project version differs from PollVersions"
         );
         ensure!(event.global.is_none());
+        // The push carries the project's Last-logged value exactly when the tick rolled it forward, and as ListProjects then serves it.
+        let logged = self.last_logged().await?;
+        let expected_logged = match logged {
+            Some(at) if logged != logged_before => vec![(self.project.clone(), at)],
+            _ => vec![],
+        };
+        assert_eq!(event.project_last_logged_at_ms, expected_logged);
         for (run, accepted) in receipts {
             assert_eq!(
                 self.listed(run).await?.last_ingested_at_ms,
@@ -310,6 +318,17 @@ impl Fixture {
         self.bumps.write_dirty(&self.pg, &self.events).await;
         self.no_event()?;
         Ok(())
+    }
+
+    /// The project's ListProjects Last-logged value.
+    async fn last_logged(&self) -> Result<Option<i64>> {
+        let listing = self
+            .query
+            .list_projects(Request::new(proto::ListProjectsRequest {}))
+            .await?
+            .into_inner();
+        ensure!(listing.project_ids.contains(&self.project));
+        Ok(listing.last_logged_at_ms.get(&self.project).copied())
     }
 
     async fn database_now(&self) -> Result<i64> {
@@ -566,7 +585,8 @@ async fn trash_before_drain(fixture: &mut Fixture, run: &str) -> Result<()> {
                 event.runs.is_empty()
                     && event.projects.is_empty()
                     && event.global.is_none()
-                    && !event.resync,
+                    && !event.resync
+                    && event.project_last_logged_at_ms.is_empty(),
                 "{run}: unexpected post-Trash refresh: {event:?}"
             ),
             Err(TryRecvError::Empty) => break,
@@ -681,7 +701,11 @@ async fn mixed_payload_reads(fixture: &mut Fixture, run: &str) -> Result<()> {
             .query_raw_any_cached(&project, run, metric, || None)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        Ok(rows.iter().map(|row| (row.step, row.value)).collect())
+        Ok(rows
+            .to_vec()
+            .iter()
+            .map(|row| (row.step, row.value))
+            .collect())
     };
     fixture
         .ingest(vec![
@@ -853,6 +877,74 @@ async fn cold_chart_batches_its_reads(fixture: &mut Fixture, run: &str) -> Resul
     Ok(())
 }
 
+/// A chart poll continuing from `held`, as the client echoes it.
+async fn chart_poll(
+    fixture: &Fixture,
+    request: &proto::ChartRequest,
+    held: Option<&proto::ChartResponse>,
+) -> Result<proto::ChartResponse> {
+    let mut request = request.clone();
+    request.cache_state = held.map(|held| proto::ChartCacheState {
+        frontiers: held.frontiers.clone(),
+        held_series: Some(held.series.len() as u32),
+    });
+    Ok(fixture
+        .query
+        .query_chart(Request::new(request))
+        .await?
+        .into_inner())
+}
+
+/// A chart reply served without a build (stage 1's memo; stage 3b's held state answers through the same step) echoes the versions its own poll read, as a built reply does, never those of the poll it was stored from.
+async fn served_charts_echo_their_polls_versions(fixture: &mut Fixture, run: &str) -> Result<()> {
+    fixture.init(run).await?;
+    let rows = (1..=3)
+        .map(|step| fixture.row(run, "loss", step, 1))
+        .collect();
+    let accepted = fixture.ingest(rows).await?;
+    fixture.drain_run(run, accepted, false).await?;
+    let request = proto::ChartRequest {
+        y_series: vec![proto::SeriesRef {
+            project_id: fixture.project.clone(),
+            run_id: run.to_string(),
+            metric_name: "loss".into(),
+            tags: vec![],
+        }],
+        ..Default::default()
+    };
+    let first = chart_poll(fixture, &request, None).await?;
+    // Built in full and classified unchanged: stored.
+    let stored = chart_poll(fixture, &request, Some(&first)).await?;
+    assert!(stored.delta && stored.x_values.is_empty(), "{stored:?}");
+    let before = fixture.versions(run).await?.run_versions;
+    assert_eq!(stored.run_versions, before);
+    // Another metric of the run moves its version; the loss chart's inputs stay, so the same poll is answered from the memo.
+    let accepted = fixture.ingest(vec![fixture.row(run, "acc", 1, 1)]).await?;
+    fixture.drain_run(run, accepted, false).await?;
+    let after = fixture.versions(run).await?.run_versions;
+    assert_ne!(after, before, "the run's version moved");
+    let served = chart_poll(fixture, &request, Some(&first)).await?;
+    assert_eq!(
+        proto::ChartResponse {
+            run_versions: Default::default(),
+            ..served.clone()
+        },
+        proto::ChartResponse {
+            run_versions: Default::default(),
+            ..stored
+        }
+    );
+    assert_eq!(served.run_versions, after);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL and KYMO_LIVE_TEST_CLICKHOUSE_URL"]
+async fn served_chart_replies_echo_their_polls_versions() -> Result<()> {
+    with_fixture(async |fixture, run| served_charts_echo_their_polls_versions(fixture, run).await)
+        .await
+}
+
 #[tokio::test]
 #[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL and KYMO_LIVE_TEST_CLICKHOUSE_URL"]
 async fn mixed_payload_metric_reads() -> Result<()> {
@@ -863,4 +955,89 @@ async fn mixed_payload_metric_reads() -> Result<()> {
 #[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL and KYMO_LIVE_TEST_CLICKHOUSE_URL"]
 async fn cold_chart_reads_its_runs_in_one_statement() -> Result<()> {
     with_fixture(async |fixture, run| cold_chart_batches_its_reads(fixture, run).await).await
+}
+
+/// A custom-x chart maps each run's points through that run's own x metric, read once per project, each run's x rows reaching its own series: two runs of the fixture's project and one of another, the projects interleaved in the request.
+async fn custom_x_chart_per_run(fixture: &mut Fixture, run: &str) -> Result<()> {
+    let home = fixture.project.clone();
+    let other = format!("{home}-other");
+    // (project, run, x per step): each run's x puts its points in columns of their own.
+    let runs: [(String, String, f32); 3] = [
+        (home.clone(), run.to_string(), 10.0),
+        (other.clone(), format!("{run}-other"), 100.0),
+        (home.clone(), format!("{run}-2"), 1_000.0),
+    ];
+    for (project, run, scale) in &runs {
+        fixture.project = project.clone();
+        fixture.init(run).await?;
+        let rows = (1..=3)
+            .flat_map(|step| {
+                [
+                    fixture.row(run, "loss", step, 1),
+                    MetricRow {
+                        value: Some(step as f32 * scale),
+                        ..fixture.row(run, "x", step, 1)
+                    },
+                ]
+            })
+            .collect();
+        fixture.ingest(rows).await?;
+    }
+    fixture.project = home;
+    let chart = fixture
+        .query
+        .query_chart(Request::new(proto::ChartRequest {
+            y_series: runs
+                .iter()
+                .map(|(project, run, _)| proto::SeriesRef {
+                    project_id: project.clone(),
+                    run_id: run.clone(),
+                    metric_name: "loss".into(),
+                    tags: vec![],
+                })
+                .collect(),
+            x_series: Some(proto::SeriesRef {
+                metric_name: "x".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+        .await;
+    fixture.ch.delete_live_project(&other).await?;
+    fixture
+        .pg
+        .delete_live_projects(std::slice::from_ref(&other))
+        .await?;
+    let response = chart?.into_inner();
+    assert_eq!(
+        response.x_values,
+        [10.0, 20.0, 30.0, 100.0, 200.0, 300.0, 1_000.0, 2_000.0, 3_000.0]
+    );
+    let series: Vec<_> = response
+        .series
+        .iter()
+        .map(|s| {
+            (
+                s.run_id.as_str(),
+                s.seg_starts.as_slice(),
+                s.seg_lens.as_slice(),
+                s.values.as_slice(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        series,
+        [
+            (runs[0].1.as_str(), &[0][..], &[3][..], &[1.0, 2.0, 3.0][..]),
+            (runs[1].1.as_str(), &[3][..], &[3][..], &[1.0, 2.0, 3.0][..]),
+            (runs[2].1.as_str(), &[6][..], &[3][..], &[1.0, 2.0, 3.0][..]),
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL and KYMO_LIVE_TEST_CLICKHOUSE_URL"]
+async fn custom_x_chart_reads_each_runs_own_x() -> Result<()> {
+    with_fixture(async |fixture, run| custom_x_chart_per_run(fixture, run).await).await
 }

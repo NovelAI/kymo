@@ -1,6 +1,6 @@
 """GPU-to-host reads for ``kymo.log()`` that do not wait for the GPU.
 
-``log()`` gathers a call's CUDA scalars with one kernel per device (or stacks them per dtype where no kernel builds) into a float64 buffer, copies it and each CUDA image to pinned host memory with ``non_blocking=True``, and records one event per device; later calls publish the values once the events have completed.
+``log()`` gathers a call's CUDA scalars with one kernel per device into a float64 buffer in pinned host memory (or stacks them per dtype where no kernel builds), copies each CUDA image to pinned host memory with ``non_blocking=True``, and records one event per device; later calls publish the values once the events have completed.
 Everything here runs on the thread that calls ``log()``, ``wait_for_upload()`` or ``finish()``: a CUDA call from a second thread can break a CUDA graph capture in its default "global" mode, and its first call creates a context on GPU 0.
 """
 
@@ -15,8 +15,8 @@ import time
 # The client's logger, without importing the package: chadfusion's tests load this file alone.
 _log = logging.getLogger("kymo")
 
-# CUDA objects that are never freed: freeing a pinned host copy or an event aborts the process after a CUDA error or in a fork child. A reference leaked here keeps them alive through interpreter shutdown.
-unfreeable: list = []
+# CUDA objects that must not be freed yet, or ever: each Reads, with its pinned buffers, events and source tensors, from just before its first copy until wait() sees its copies complete (torch's allocator does not know a gather kernel uses its pinned buffers), and for good if they never do, since freeing a pinned copy or an event after a CUDA error or in a fork child aborts the process. This leaked reference keeps them through interpreter shutdown.
+unfreeable: set = set()
 ctypes.pythonapi.Py_IncRef(ctypes.py_object(unfreeable))
 
 # The dtypes read asynchronously; a gather kernel reads a scalar of DTYPES[code].
@@ -36,6 +36,11 @@ DTYPES = (
 # A scalar of a null storage (autograd's efficient zero tensors, functional tensors, views of a freed storage) has no memory: its data_ptr() is its offset from address 0, storage_offset() * element_size(), where the kernel would fault.
 # The default allocator maps device memory above 2**46, which no offset within a tensor under 64 TiB reaches, so only smaller pointers are tested; expandable segments and cudaMallocAsync map it below.
 _NULL_OFFSET_BOUND = 1 << 46
+
+# CU_DEVICE_ATTRIBUTE_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM: the device can use a cudaHostRegister'd host pointer as is.
+_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM = 91
+# CUDA_ERROR_INVALID_CONTEXT: the calling thread has no current context, as on one that has not used CUDA through the runtime.
+_CUDA_ERROR_INVALID_CONTEXT = 201
 
 # Gathers n scalars, each addressed by a word (dtype code << 56 | address; addresses fit in 56 bits on x86-64 and arm64), into float64 as float() converts them.
 _CUDA_GATHER = r"""
@@ -81,6 +86,12 @@ def cuda_torch():
 
 
 @functools.cache
+def dtype_codes(torch) -> dict:
+    """Each of DTYPES' torch dtypes mapped to its code in a gather word."""
+    return {getattr(torch, name): code for code, name in enumerate(DTYPES)}
+
+
+@functools.cache
 def classifiers(torch):
     """Return ``(is_scalar, is_image)`` tests for the values read asynchronously.
 
@@ -114,22 +125,75 @@ def reads_asynchronously(value) -> bool:
 
 
 def nvrtc_gather(torch):
-    """The gather kernel compiled with NVRTC through torch, for the current device."""
+    """The gather kernel compiled with NVRTC through torch, for the current device; it reads its words from pinned host memory and writes the values there.
+
+    The kernel would fault on a pinned host pointer the device cannot use. Torch pins with cudaHostAlloc or cudaHostRegister, so this checks once that the device uses registered host pointers as they are and that a pinned probe is mapped at its host address.
+    It is launched with cuLaunchKernel directly: torch's launcher reloads the driver library and rebuilds its arguments on every call. A thread on which nothing has used CUDA through the runtime has no current context, where the driver's calls fail: one whose pinned buffers torch's allocator served from its cache, say, after another thread's. The kernel is built in the context current then, else the device's primary context, which torch uses, and a launch the driver refuses for want of a context makes that one current and launches again, so a launch costs nothing more.
+    Its private torch API (torch.cuda._compile_kernel, torch.cuda._utils._get_cuda_library, the compiled kernel's func) was verified against torch 2.14 (CUDA, on a B200); a torch without it builds the Triton kernel instead (gather).
+    """
+    if torch.version.hip:
+        raise ImportError("the direct launch is CUDA-only")
+    driver = torch.cuda._utils._get_cuda_library()
+    device, context = ctypes.c_int(), ctypes.c_void_p()
+    if driver.cuDeviceGet(ctypes.byref(device), torch.cuda.current_device()):
+        raise RuntimeError("the current device has no driver handle")
+    if (driver.cuCtxGetCurrent(ctypes.byref(context)) or not context.value) and (
+        driver.cuDevicePrimaryCtxRetain(ctypes.byref(context), device)
+        or driver.cuCtxSetCurrent(context)
+    ):
+        raise RuntimeError("the device's primary context cannot be made current")
     kernel = torch.cuda._compile_kernel(_CUDA_GATHER, "kymo_gather")
+    usable, mapped = ctypes.c_int(), ctypes.c_void_p()
+    probe = torch.empty(1, dtype=torch.float64, device="cpu", pin_memory=True)
+    if (
+        driver.cuDeviceGetAttribute(
+            ctypes.byref(usable), _CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM, device
+        )
+        or not usable.value
+        or driver.cuMemHostGetDevicePointer_v2(
+            ctypes.byref(mapped), ctypes.c_void_p(probe.data_ptr()), 0
+        )
+        or mapped.value != probe.data_ptr()
+    ):
+        raise RuntimeError("pinned host memory is not usable at its host address")
+    launch_kernel = ctypes.CFUNCTYPE(
+        ctypes.c_int,
+        ctypes.c_void_p,
+        *[ctypes.c_uint] * 7,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    )(("cuLaunchKernel", driver))
 
     def launch(words, out, n: int) -> None:
-        # torch passes a Python int as a 32-bit C int, the kernel's int n.
-        kernel(grid=((n + 255) // 256, 1, 1), block=(256, 1, 1), args=[words, out, n])
+        # Parameters per launch: a signal handler that logs can start another launch on this thread between these statements.
+        cells = (
+            ctypes.c_void_p(words.data_ptr()),
+            ctypes.c_void_p(out.data_ptr()),
+            ctypes.c_int(n),
+        )
+        params = (ctypes.c_void_p * 3)(*map(ctypes.addressof, cells))
+        stream = torch.cuda.current_stream().cuda_stream
+        args = (kernel.func, (n + 255) // 256, 1, 1, 256, 1, 1, 0, stream, params)
+        error = launch_kernel(*args, None)
+        if error == _CUDA_ERROR_INVALID_CONTEXT and not driver.cuCtxSetCurrent(context):
+            error = launch_kernel(*args, None)
+        if error:
+            raise RuntimeError(f"cuLaunchKernel failed with CUDA error {error}")
 
     return launch
 
 
 def triton_gather(torch):
-    """The gather kernel compiled with Triton, for the current device."""
+    """The gather kernel compiled with Triton, for the current device; its words and values are copied to and from the device."""
     from kymo._gpu_triton import kymo_gather
 
     def launch(words, out, n: int) -> None:
-        kymo_gather[((n + 1023) // 1024,)](words, out, n, BLOCK=1024)
+        values = torch.empty(n, dtype=torch.float64, device="cuda")
+        kymo_gather[((n + 1023) // 1024,)](
+            words.to("cuda", non_blocking=True), values, n, BLOCK=1024
+        )
+        out.copy_(values, non_blocking=True)
 
     return launch
 
@@ -160,21 +224,19 @@ def _same(read: float, expected: float) -> bool:
 
 
 def reads_exactly(torch, launch) -> bool:
-    """Whether launch reads SAMPLES as float() does. It runs on a stream of its own, so its synchronizing reads wait for none of the caller's GPU work, with sync debug mode off so they are not reported."""
+    """Whether launch, used by Reads as log() uses it, reads SAMPLES as float() does. It runs on a stream of its own, so its synchronizing reads wait for none of the caller's GPU work, with sync debug mode off so they are not reported."""
     mode = torch.cuda.get_sync_debug_mode()
     torch.cuda.set_sync_debug_mode(0)
     try:
         with torch.cuda.stream(torch.cuda.Stream()):
-            values, words = [], []
-            for name, value in SAMPLES:
-                tensor = torch.tensor(value, dtype=getattr(torch, name), device="cuda")
-                values.append(tensor)
-                words.append((DTYPES.index(name) << 56) | tensor.data_ptr())
-            out = torch.empty(len(words), dtype=torch.float64, device="cuda")
-            launch(
-                torch.tensor(words, dtype=torch.int64, device="cuda"), out, len(words)
-            )
-            return all(map(_same, out.tolist(), [float(t) for t in values]))
+            values = [
+                torch.tensor(value, dtype=getattr(torch, name), device="cuda")
+                for name, value in SAMPLES
+            ]
+            reads = Reads(torch, values, [], launch=launch)
+            reads.wait()
+            # A list, not a generator: Python 3.14 leaves the jump back of all()'s loop over one, where a handler may raise, outside the try (cpython#130279).
+            return all([_same(read, float(values[i])) for i, read in reads.scalars()])
     finally:
         torch.cuda.set_sync_debug_mode(mode)
 
@@ -192,7 +254,7 @@ def gather(torch, device: int):
                 return launch
             _log.warning("%s reads values incorrectly; not using it", build.__name__)
         except (AttributeError, ImportError) as error:
-            # No torch.cuda._compile_kernel, or no Triton.
+            # No torch.cuda._compile_kernel, a HIP torch, or no Triton.
             _log.debug("%s unavailable: %s", build.__name__, error)
         except Exception as error:
             _log.warning("%s failed; not using it: %s", build.__name__, error)
@@ -206,7 +268,8 @@ class Reads:
     Each scalar's memory stays referenced until the call is published, so memory freed on another stream cannot be reused before a copy reads it; a scalar that requires grad is held by its storage, which keeps its bytes but not its autograd graph.
     """
 
-    def __init__(self, torch, scalars: list, images: list):
+    def __init__(self, torch, scalars: list, images: list, launch=None):
+        """launch, if given, replaces every device's gather kernel; reads_exactly tests one this way."""
         self._parts = []
         self.images = []
         self._events = []
@@ -214,33 +277,36 @@ class Reads:
             tensor.untyped_storage() if tensor.requires_grad else tensor
             for tensor in scalars
         ]
+        groups = _by_device(torch, scalars)
+        # Every device the call reads from: each gets one event, and an out-of-memory error waits on each.
+        devices = {*groups, *(data.get_device() for data in images)}
+        # Before its first copy, and only then: a failure before it has made nothing to keep.
+        unfreeable.add(self)
         try:
-            groups = _by_device(torch, scalars)
             for device, (indices, tensors) in groups.items():
                 with torch.cuda.device(device):
-                    launch = gather(torch, device)
-                    if launch is None:
+                    kernel = gather(torch, device) if launch is None else launch
+                    if kernel is None:
                         self._stack(torch, indices, tensors)
                     else:
-                        self._gather(torch, device, launch, indices, tensors)
+                        self._gather(torch, kernel, indices, tensors)
             for data in images:
                 # A non-contiguous source would be staged through pageable memory, which waits for the GPU.
                 source = data.detach().contiguous()
                 self._sources.append(source)
                 self.images.append(source.to("cpu", non_blocking=True))
-            for device in {*groups, *(data.get_device() for data in images)}:
-                # Held before it is recorded: an event that fails to record with a CUDA error must go to unfreeable with Reads.
+            for device in devices:
+                # Held before it is recorded: an event that fails to record with a CUDA error must stay unfreeable with Reads.
                 self._events.append(torch.cuda.Event())
                 self._events[-1].record(torch.cuda.current_stream(device))
         except torch.cuda.OutOfMemoryError:
-            # CUDA still works, so what the call made is freed.
-            raise
-        except BaseException:
-            # Any other failure may be a CUDA error, after which freeing a host copy made before it would abort the process.
-            unfreeable.append(self)
+            # CUDA still works: let every kernel and copy the call started finish, then free what it made. After any other failure, which may be a CUDA error, freeing a host copy would abort the process, so Reads stays unfreeable.
+            for device in devices:
+                torch.cuda.current_stream(device).synchronize()
+            unfreeable.discard(self)
             raise
 
-    def _gather(self, torch, device: int, launch, indices, tensors) -> None:
+    def _gather(self, torch, launch, indices, tensors) -> None:
         """Copy the scalars of one device with one gather kernel; a scalar of a null storage (see _NULL_OFFSET_BOUND) is read with float()."""
         pointers = [t.data_ptr() for t in tensors]
         if min(pointers) < _NULL_OFFSET_BOUND:
@@ -261,18 +327,20 @@ class Reads:
                 pointers = [p for p, is_null in zip(pointers, null) if not is_null]
                 if not tensors:
                     return
-        codes = {getattr(torch, name): code for code, name in enumerate(DTYPES)}
+        codes = dtype_codes(torch)
+        # Each buffer is held by Reads as soon as it exists: torch's allocator does not know the kernel reads words and writes out, and freeing pinned memory after a CUDA error aborts the process.
         words = torch.tensor(
             [(codes[t.dtype] << 56) | p for t, p in zip(tensors, pointers)],
             dtype=torch.int64,
             device="cpu",
             pin_memory=True,
         )
-        # Freed with Reads, not here: freeing pinned memory after a CUDA error aborts the process, and Reads then goes to unfreeable.
         self._sources.append(words)
-        out = torch.empty(len(tensors), dtype=torch.float64, device=device)
-        launch(words.to(device, non_blocking=True), out, len(tensors))
-        self._parts.append((indices, out.to("cpu", non_blocking=True)))
+        out = torch.empty(
+            len(tensors), dtype=torch.float64, device="cpu", pin_memory=True
+        )
+        self._parts.append((indices, out))
+        launch(words, out, len(tensors))
 
     def _stack(self, torch, indices, tensors) -> None:
         """Copy the scalars of one device with one stack per dtype, for a torch that cannot build the gather kernel; under no_grad, so the host copies keep no autograd graph."""
@@ -294,18 +362,19 @@ class Reads:
         return all(event.query() for event in self._events)
 
     def wait(self, deadline=None) -> bool:
-        """Wait until the copies have completed, or until the ``time.monotonic()`` deadline; True once they have."""
+        """Wait until the copies have completed, or until the ``time.monotonic()`` deadline; True once they have, and Reads may then be freed."""
         if deadline is None:
             for event in self._events:
                 event.synchronize()
-            return True
-        pause = 0.001
-        while not self.done():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return False
-            time.sleep(min(pause, remaining))
-            pause = min(pause * 2, 0.05)
+        else:
+            pause = 0.001
+            while not self.done():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                time.sleep(min(pause, remaining))
+                pause = min(pause * 2, 0.05)
+        unfreeable.discard(self)
         return True
 
     def scalars(self):

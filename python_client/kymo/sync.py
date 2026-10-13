@@ -322,6 +322,7 @@ def _replay_cdn_record(
     run_id,
     record,
     replayed_keys: dict[tuple, str],
+    reduced_galleries: list[tuple[str, int]] | None = None,
 ) -> bool:
     kind, name, step = record[0], record[1], record[2]
     versioned = kind in _VERSIONED_RICH_KINDS
@@ -422,7 +423,7 @@ def _replay_cdn_record(
                 mutation_version = _reduced_mutation_version(
                     record[6] if kind == "cdn_batch_encoded_mutation_reserved" else None
                 )
-            return _publish_rich_mutation(
+            published = _publish_rich_mutation(
                 stub,
                 project_id,
                 run_id,
@@ -432,34 +433,41 @@ def _replay_cdn_record(
                 timestamp_ms,
                 mutation_version,
             )
+            if manifest_changed and reduced_galleries is not None:
+                reduced_galleries.append((name, step))
+            return published
 
         current = _current_cdn_key(stub, project_id, run_id, name, step)
         if current is None:
             return False
-        if current and not current.startswith("pending:"):
-            if current == manifest_id:
-                replayed_keys[storage_key] = current
-                return True
-            if replayed_keys.get(storage_key) != current:
+        # A manifest already there (an earlier attempt of this replay published it, say) counts as published, and is reported as one sent would be.
+        if current != manifest_id:
+            if (
+                current
+                and not current.startswith("pending:")
+                and replayed_keys.get(storage_key) != current
+            ):
                 print(
                     f"    {name} step {step}: server already has newer data — "
                     "record skipped"
                 )
                 return True
-        point = kymo_pb2.MetricPoint(
-            metric_name=name,
-            step=step,
-            cdn_key=manifest_id,
-            timestamp_ms=int(time.time() * 1000),
-        )
-        if not _send_unary_point(stub, project_id, run_id, point):
-            return False
+            point = kymo_pb2.MetricPoint(
+                metric_name=name,
+                step=step,
+                cdn_key=manifest_id,
+                timestamp_ms=int(time.time() * 1000),
+            )
+            if not _send_unary_point(stub, project_id, run_id, point):
+                return False
         replayed_keys[storage_key] = manifest_id
+        if manifest_changed and reduced_galleries is not None:
+            reduced_galleries.append((name, step))
         return True
     except (_TerminalRunError, _RichMutationDataLoss):
         raise
     except Exception as e:
-        if isinstance(e, grpc.RpcError) and _is_terminal_run_error(e):
+        if _is_terminal_run_error(e):
             raise _terminal_run_error(e) from e
         _log.error("failed to replay CDN record %s step %s: %s", name, step, e)
         return False
@@ -580,10 +588,13 @@ def replay_file(
     terminal_runs: set[tuple[str, str, str]] | None = None,
     quarantined_files: set[str] | None = None,
     *,
+    reduced_galleries: list[tuple[str, int]] | None = None,
     _writer_lock_held: bool = False,
     _local_endpoint=None,
 ) -> bool:
     """Replay one spool file; return False for pending or quarantined input.
+
+    ``reduced_galleries`` collects the (name, step) of each gallery it published without items the CDN rejected, once per gallery, two at one step included.
 
     ``_writer_lock_held`` is for the live worker's sealed-spool handoff only:
     that worker owns the still-open ``SpoolWriter`` descriptor, so external sync
@@ -811,6 +822,7 @@ def replay_file(
                     run_id,
                     record,
                     replayed_keys,
+                    reduced_galleries,
                 ):
                     sent += 1
                 else:

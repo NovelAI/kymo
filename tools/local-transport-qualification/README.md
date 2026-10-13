@@ -6,6 +6,8 @@ The ClickHouse version and hashes come from `../../shared/local-runtime-artifact
 
 The browser fixtures share `fences_common.py` for the frozen WebSocket envelope, a two-animation-frame barrier, a handle drag and a wait for a chart to take its container's width. It has no protobuf or Playwright imports: each fixture owns its generated messages, response behavior, and RPC waiting rules. New fixtures should reuse this module rather than introducing another framing implementation. Run its golden wire vectors with `python -m unittest -v test_fences_common`.
 
+Any Playwright `route_web_socket`, on the page or its context and whatever it matches, swaps in a mock for every socket the page opens. A socket the mock hands to a server that refuses it, unmatched or through `connect_to_server`, fires `error` while `readyState` is still 0; without the mock, Chromium, Firefox and WebKit report 3 there (bar a port WebKit blocks). gloo then waits for an `open` that never comes, so the dashboard's handshake wait (`open_socket` in `kymo-frontend/src/grpc/ws.rs`) runs its full 90 s before the next handshake, such as the fallback from a refused /grpc-ws2 to /grpc-ws. A socket the handler closes itself reports 3, as the fixtures' unexpected sockets do. Probes of the fallback or of server restarts should not route sockets at all.
+
 ## Frozen inputs
 
 - ClickHouse 25.3.14.14 LTS, matching the exact production server version when this harness was introduced.

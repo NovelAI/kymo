@@ -10,6 +10,7 @@ import json
 import struct
 import sys
 import traceback
+import zlib
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -86,15 +87,33 @@ class Fixture:
         )
 
     def websocket(self, socket):
-        if urlsplit(socket.url).path != "/grpc-ws":
+        # A routed socket always opens, so the probe answers /grpc-ws2 too.
+        if urlsplit(socket.url).path not in ("/grpc-ws", "/grpc-ws2"):
             # dx hot reload is unnecessary for a fixed-bundle probe.
             return
         socket.on_message(lambda frame: self.rpc(socket, frame))
 
     def rpc(self, socket, frame):
         request_id, length = struct.unpack_from("<IH", frame)
+        # /grpc-ws2 marks a zlib body with the length's top bit, and only there does the server read it; raw replies are valid there.
+        flag = 0x8000 if urlsplit(socket.url).path == "/grpc-ws2" else 0
+        deflated, length = length & flag, length & ~flag
+        if 6 + length > len(frame):
+            # The server drops a frame whose path runs past its end, as a flagged length does on /grpc-ws.
+            self.blocked.append("RPC frame: its path runs past its end")
+            return
         method = frame[6 : 6 + length].decode().rsplit("/", 1)[-1]
         payload = frame[6 + length :]
+        if deflated:
+            # Exactly one complete zlib stream, as the server requires (zlib.decompress accepts trailing bytes). Recorded as blocked: Playwright only logs an exception raised in a socket handler.
+            inflater = zlib.decompressobj()
+            try:
+                payload = inflater.decompress(payload)
+            except zlib.error:
+                payload = None
+            if payload is None or not inflater.eof or inflater.unused_data:
+                self.blocked.append(f"RPC {method}: not one complete zlib stream")
+                return
         pb = self.pb
         if method == "control":
             return
@@ -239,7 +258,8 @@ def char_point(target, offset):
             range.setStart(text, offset);
             range.setEnd(text, offset + 1);
             const rect = range.getBoundingClientRect();
-            return {x: rect.x + rect.width / 2, y: rect.y + rect.height / 2};
+            // Whole pixels, as a mouse at device scale 1 reports: Chromium selects nothing on a drag whose fractional press point truncates to the other side of a character's midpoint.
+            return {x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2)};
         }""",
         offset,
     )
@@ -248,9 +268,18 @@ def char_point(target, offset):
 def selection_checks(page, target):
     page.bring_to_front()
     page.locator(".metadata-key-cell").filter(has_text="original").click()
-    target.scroll_into_view_if_needed()
+    # Chromium autoscrolls a selection drag within 20px of a scroller's edge, where scroll_into_view_if_needed can leave the target.
+    target.evaluate("element => element.scrollIntoView({block: 'center'})")
     clear_selection(page)
     previous = copies(page)
+    # The drag's release is a click on the control, which must see the selection and not copy.
+    target.evaluate(
+        """element => {
+            copyProbe.clicks = 0;
+            copyProbe.countClick = () => copyProbe.clicks++;
+            element.addEventListener('click', copyProbe.countClick, true);
+        }"""
+    )
     start, end = char_point(target, 3), char_point(target, 14)
     page.mouse.move(**start)
     page.mouse.down()
@@ -258,50 +287,21 @@ def selection_checks(page, target):
     page.mouse.move(**end, steps=15)
     page.wait_for_timeout(100)
     page.mouse.up()
+    clicks = target.evaluate(
+        """element => {
+            element.removeEventListener('click', copyProbe.countClick, true);
+            return copyProbe.clicks;
+        }"""
+    )
     selected = page.evaluate("getSelection().toString()")
-    drag = "passed"
-    if selected:
-        assert copies(page) == previous, "drag selection overwrote clipboard"
-    else:
-        target.evaluate("""element => {
-            const plain = element.cloneNode(true), box = element.getBoundingClientRect();
-            const style = getComputedStyle(element);
-            for (const property of style) plain.style.setProperty(property, style.getPropertyValue(property));
-            for (const attribute of ['role', 'tabindex', 'data-dioxus-id']) plain.removeAttribute(attribute);
-            plain.dataset.probeSelectionControl = '';
-            Object.assign(plain.style, {position:'fixed', left:box.x+'px', top:box.y+'px',
-                width:box.width+'px', height:box.height+'px', zIndex:2147483647});
-            document.body.appendChild(plain);
-        }""")
-        plain = page.locator("[data-probe-selection-control]")
-        try:
-            clear_selection(page)
-            start, end = char_point(plain, 3), char_point(plain, 14)
-            for point in (start, end):
-                assert plain.evaluate(
-                    "(element, point) => element.contains(document.elementFromPoint(point.x, point.y))",
-                    point,
-                ), "plain-control drag coordinates miss its text"
-            page.mouse.move(**start)
-            page.mouse.down()
-            page.wait_for_timeout(100)
-            page.mouse.move(**end, steps=15)
-            page.mouse.up()
-            assert not page.evaluate("getSelection().toString()"), (
-                "copy control blocks native drag that works in the plain control"
-            )
-        finally:
-            plain.evaluate("element => element.remove()")
-        drag = "inconclusive: the plain span also failed native drag"
-    # A synthetic click checks the guard without relying on native drag support.
-    previous = copies(page)
-    select_range(target, 3, 14)
-    target.dispatch_event("click", {"detail": 1})
-    assert copies(page) == previous
-    assert page.evaluate("getSelection().toString()")
-    before = len(copies(page))
+    # Most of the 11 dragged characters: an engine's selection may start or end one character off.
+    assert len(selected) >= 9 and selected in target.text_content(), (
+        f"native drag selected {selected!r}"
+    )
+    assert clicks == 1, f"the drag ended in {clicks} clicks on the control"
+    assert copies(page) == previous, "drag selection overwrote clipboard"
     page.keyboard.press("ControlOrMeta+C")
-    assert len(copies(page)) == before + 1, "native selection copy did not fire"
+    assert len(copies(page)) == len(previous) + 1, "native selection copy did not fire"
     previous = copies(page)
     page.mouse.click(**char_point(target, 10))
     assert page.evaluate("getSelection().isCollapsed"), (
@@ -339,17 +339,14 @@ def selection_checks(page, target):
         "triple-click cleared the selection"
     )
     assert copies(page) == previous, "triple-click copied the whole value"
-    previous = copies(page)
     # Double-click selects a word; only its first click may copy.
     clear_selection(page)
-    word = char_point(target, 10)
     page.mouse.dblclick(**word)
     assert page.evaluate("getSelection().toString()").strip(), (
         "double-click selected nothing"
     )
     assert len(copies(page)) == len(previous) + 1
     clear_selection(page)
-    return drag
 
 
 def pointer_copy(page, target, value):
@@ -512,7 +509,6 @@ def caption_navigation(page):
 
 
 def run_checks(browser: Browser, args):
-    results = {}
     for mode in ("SelectIndex", "GroupByRun", "Interleaved"):
         page = browser.new_page(viewport={"width": 1440, "height": 1000})
         try:
@@ -526,12 +522,12 @@ def run_checks(browser: Browser, args):
             collision = metadata(page, "collision")
             expect(collision).to_have_text('"true"')
             pointer_copy(page, collision, "true")
-            metadata_drag = selection_checks(page, original)
+            selection_checks(page, original)
             caption = page.locator(".cdn-caption").first
             caption.scroll_into_view_if_needed()
             expect(caption).to_have_attribute("tabindex", "0")
             pointer_copy(page, caption, CAPTION)
-            caption_drag = selection_checks(page, caption)
+            selection_checks(page, caption)
             keyboard_checks(page, caption, CAPTION)
             caption.focus()
             page.keyboard.press("Shift+Tab")
@@ -553,22 +549,18 @@ def run_checks(browser: Browser, args):
                     "",
                 )
             fixture.assert_clean()
-            results[mode] = {
-                "metadata_native_drag": metadata_drag,
-                "caption_native_drag": caption_drag,
-            }
         finally:
             page.close()
     page = browser.new_page(viewport={"width": 1440, "height": 1000})
     try:
         fixture = Fixture(page, args)
         fixture.open(secure=True)
-        results["late_rejection"] = async_checks(page, metadata(page, "original"))
+        late_rejection = async_checks(page, metadata(page, "original"))
         sidebar_checks(page)
         fixture.assert_clean()
     finally:
         page.close()
-    return results
+    return late_rejection
 
 
 def main():
@@ -593,13 +585,9 @@ def main():
                     headless=not args.headed, timeout=30_000, proxy={"server": args.url}
                 )
                 try:
-                    result = run_checks(browser, args)
-                    print(
-                        json.dumps(
-                            {"engine": engine, "version": browser.version, **result}
-                        ),
-                        flush=True,
-                    )
+                    summary = {"engine": engine, "version": browser.version}
+                    summary["late_rejection"] = run_checks(browser, args)
+                    print(json.dumps(summary), flush=True)
                 finally:
                     browser.close()
             except (Error, AssertionError, OSError, ValueError) as error:

@@ -106,7 +106,7 @@ thread_local! {
     static FOCUS_PUSH: std::cell::RefCell<Option<Route>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Called by DashboardLayout on every render (it re-renders on each route change); any current route other than the recorded one invalidates the pop-on-dismiss record above.
+/// Called by ProjectDashboard on every render (it re-renders on each route change); any current route other than the recorded one invalidates the pop-on-dismiss record above.
 pub fn note_route(route: &Route) {
     FOCUS_PUSH.with_borrow_mut(|rec| {
         if rec.as_ref().is_some_and(|r| r != route) {
@@ -115,7 +115,7 @@ pub fn note_route(route: &Route) {
     });
 }
 
-/// Focus or unfocus a chart by rewriting the current URL's `?chart=` param — the maximize overlay's source of truth (synced by DashboardLayout) and a shareable link to the focused chart.
+/// Focus or unfocus a chart by rewriting the current URL's `?chart=` param — the maximize overlay's source of truth (synced by ProjectDashboard) and a shareable link to the focused chart.
 /// Focusing pushes, so Back dismisses the overlay; moving from one focused chart to another (←/→) rewrites that entry in place, so Back still dismisses rather than stepping back through charts. Dismissing pops the entry that push created when it's provably still the current one (see `FOCUS_PUSH`), so open→Esc leaves no duplicate entry for Back to eat; otherwise — direct chart link, or the URL moved under the overlay — it rewrites in place.
 pub fn focus_chart(chart: Option<String>) {
     let current: Route = router().current();

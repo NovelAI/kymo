@@ -12,7 +12,7 @@ use crate::state::layout_config::{
 };
 use crate::state::section_order::SectionGap;
 use crate::state::LayoutConfig;
-use crate::util::warn;
+use crate::util::{set_if_changed, warn};
 
 const DISPLAY_RUN_CACHE_CAP: usize = 2_048;
 
@@ -87,7 +87,7 @@ pub struct ChartFacts {
 
 /// Record what a chart body knows of `rect`'s content in `facts` (`DashboardState::reported_chart_facts` or `handed_over_chart_facts`), replacing what it held.
 pub fn set_chart_facts(
-    mut facts: Signal<Option<ChartFacts>>,
+    facts: Signal<Option<ChartFacts>>,
     rect: &RectConfig,
     cdn_class: Option<String>,
     display_type: Option<DisplayType>,
@@ -98,9 +98,7 @@ pub fn set_chart_facts(
         cdn_class,
         display_type,
     });
-    if *facts.peek() != next {
-        facts.set(next);
-    }
+    set_if_changed(facts, next);
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -288,14 +286,7 @@ pub struct DashboardState {
     pub reported_chart_facts: Signal<Option<ChartFacts>>,
     /// What the grid copy knew when Configure maximized it, filling in what the maximized copy hasn't learned yet.
     pub handed_over_chart_facts: Signal<Option<ChartFacts>>,
-    /// THE x-axis zoom for step-axis charts, as (step_min, step_max) —
-    /// the single pathway linking them. Every zoom gesture on any chart
-    /// (drag, reset click, axis pan, pinch) bubbles to the document-level
-    /// ZoomBridge (uplot_chart.rs) which writes it here, and every
-    /// step-axis chart's fetch subscribes to it, so zoom-out follows
-    /// to the whole group and panels mounting later (collapsed
-    /// sections, other pages, the maximize overlay) come up in the same
-    /// window. Time/custom-x charts zoom client-side and ignore it.
+    /// THE x-axis zoom for step-axis charts, as (step_min, step_max) — the single pathway linking them. Every zoom gesture on any chart (drag, reset click, axis pan, pinch) bubbles to the document-level ZoomBridge (uplot_chart.rs) which writes it here, and every step-axis chart's fetch subscribes to it, so zoom-out follows to the whole group (the uPlot cursor sync does not replay a reset-click zoom-out) and panels mounting later (collapsed sections, other pages, the maximize overlay) come up in the same window. Time/custom-x charts zoom client-side and ignore it.
     pub step_zoom: Signal<Option<(i64, i64)>>,
     /// Navbar "filter panels" text; empty = no filter. Transient view state like `step_zoom`/`maximized` — never persisted to the layout diff, but survives navigation. The grid hides panels whose label/metric names don't match.
     pub panel_filter: Signal<String>,
@@ -399,10 +390,7 @@ impl DashboardState {
     pub fn remember_display_runs(&self, runs: &[RunInfo]) {
         let mut next = self.display_run_cache.peek().clone();
         merge_display_runs(&mut next, runs);
-        let mut cache = self.display_run_cache;
-        if *cache.peek() != next {
-            cache.set(next);
-        }
+        set_if_changed(self.display_run_cache, next);
     }
 
     /// Record one settled explicit-binding lookup. Published per completion
@@ -550,7 +538,7 @@ impl DashboardState {
         }));
     }
 
-    /// Close the options panel (it returns focus to its opener as it goes), un-maximizing a chart Configure maximized in the same render: closing the panel first would widen the chart for a frame, a rebuild and maybe a refetch for a chart about to go. `DashboardLayout`'s `?chart=` effect then finds nothing left to do.
+    /// Close the options panel (it returns focus to its opener as it goes), un-maximizing a chart Configure maximized in the same render: closing the panel first would widen the chart for a frame, a rebuild and maybe a refetch for a chart about to go. `ProjectDashboard`'s `?chart=` effect then finds nothing left to do.
     pub fn close_options_panel(&self) {
         let mut open = self.options_panel;
         let Some(panel) = open.peek().clone() else {
@@ -626,8 +614,7 @@ impl DashboardState {
     /// Record `edit`'s [`LayoutDiff::edit_rect`]/[`LayoutDiff::edit_rect_options`] calls on rect `id` as one edit; `edit` returns what they return, false once the diff no longer shows the rect. A maximized chart that can't take the edit closes instead of pretending it applied; one that took it has its snapshot follow, which the overlay shows while the layout doesn't hold the chart (ahead of the sweep, or its runs hidden).
     pub fn edit_rect(&self, id: &str, edit: impl FnOnce(&mut LayoutDiff, &LayoutConfig) -> bool) {
         let applied = self.record_element_edit(&format!("rect {id}"), edit);
-        let mut maximized = self.maximized;
-        if !maximized.peek().as_ref().is_some_and(|m| m.id == id) {
+        if !self.maximized.peek().as_ref().is_some_and(|m| m.id == id) {
             return;
         }
         if !applied {
@@ -636,8 +623,8 @@ impl DashboardState {
         }
         // An edit can take the chart out of the layout (a sources edit, when a Specific source was what kept it there): the saved diff then resolves it as a chart link ahead of the sweep does.
         let fresh = self.fresh_rect(id);
-        if fresh.is_some() && *maximized.peek() != fresh {
-            maximized.set(fresh);
+        if fresh.is_some() {
+            set_if_changed(self.maximized, fresh);
         }
     }
 
@@ -743,9 +730,8 @@ impl DashboardState {
         layout.set(None);
         let mut base = self.base_layout;
         base.set(None);
-        let gen = *self.layout_generation.peek();
         let mut generation = self.layout_generation;
-        generation.set(gen + 1);
+        *generation.write() += 1;
     }
 }
 
@@ -879,10 +865,8 @@ mod refresh_floor_tests {
 }
 
 /// Clear a shared `loading` flag a dropped fetch left set: stuck true it strands the spinner and freezes the version bridge. Fetch bodies call it first; a render that mounts no leaf calls it because no leaf body will.
-pub fn heal_loading(mut loading: Signal<bool>) {
-    if *loading.peek() {
-        loading.set(false);
-    }
+pub fn heal_loading(loading: Signal<bool>) {
+    set_if_changed(loading, false);
 }
 
 /// Cancel-safe fetch keying: `version` reaches the returned signal only
@@ -902,7 +886,7 @@ pub fn use_version_bridge(
     loading: Signal<bool>,
     allowed: Memo<bool>,
 ) -> Signal<u64> {
-    let mut data_seq = use_signal(|| *version.peek());
+    let mut refresh = use_signal(|| *version.peek());
     let mut last_propagated_ms =
         use_signal(|| crate::state::trash::monotonic_now_ms() - MIN_REFRESH_MS);
     // Bumped by the trailing timer purely to re-run the effect; the effect re-reads the real state, so late/duplicate timers are no-ops.
@@ -913,7 +897,7 @@ pub fn use_version_bridge(
         let busy = *loading.read();
         let allowed = *allowed.read();
         let _ = *trail_gen.read();
-        if allowed && !busy && cur != *data_seq.peek() {
+        if allowed && !busy && cur != *refresh.peek() {
             let now = crate::state::trash::monotonic_now_ms();
             let last = *last_propagated_ms.peek();
             if let Some(wait) = refresh_floor_wait_ms(now, last) {
@@ -922,18 +906,17 @@ pub fn use_version_bridge(
                     spawn(async move {
                         gloo_timers::future::sleep(std::time::Duration::from_millis(wait)).await;
                         trail_pending.set(false);
-                        let g = *trail_gen.peek();
-                        trail_gen.set(g + 1);
+                        *trail_gen.write() += 1;
                     });
                 }
             } else {
                 trail_pending.set(false);
                 last_propagated_ms.set(now);
-                data_seq.set(cur);
+                refresh.set(cur);
             }
         }
     });
-    data_seq
+    refresh
 }
 
 /// Find a RunInfo by run_id (UUID).
@@ -941,26 +924,10 @@ pub fn find_run<'a>(runs: &'a [RunInfo], run_id: &str) -> Option<&'a RunInfo> {
     runs.iter().find(|r| r.run_id == run_id)
 }
 
-/// Resolve a run_id to its display name. Falls back to the UUID if unknown
-/// (e.g. for runs that haven't been fetched yet).
-pub fn run_name_for(runs: &[RunInfo], run_id: &str) -> String {
-    find_run(runs, run_id)
-        .map(|r| r.run_name.clone())
-        .unwrap_or_else(|| run_id.to_string())
-}
-
-/// Resolve a run_id to its ordinal (0 if unknown).
-pub fn run_ordinal_for(runs: &[RunInfo], run_id: &str) -> u64 {
-    find_run(runs, run_id).map(|r| r.ordinal).unwrap_or(0)
-}
-
-/// Rewrite a ChartSeries label from the server by replacing its owning run_id with the corresponding run_name.
-pub fn rewrite_label_with_run_name(label: &str, series_run_id: &str, runs: &[RunInfo]) -> String {
-    let run = runs.iter().find(|run| run.run_id == series_run_id);
-    match (run, label.strip_prefix(series_run_id)) {
-        (Some(run), Some(rest)) if rest.is_empty() || rest.starts_with('/') => {
-            format!("{}{rest}", run.run_name)
-        }
+/// Rewrite a ChartSeries label from the server by replacing its owning run's run_id with the run's name.
+pub fn rewrite_label_with_run_name(label: &str, run: &RunInfo) -> String {
+    match label.strip_prefix(run.run_id.as_str()) {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("{}{rest}", run.run_name),
         _ => label.to_string(),
     }
 }
@@ -989,19 +956,14 @@ mod display_precedence_tests {
         let mut nested = named("Nested");
         nested.run_id = "team/run".to_string();
         let runs = vec![short, nested];
+        let run = find_run(&runs, "team/run").unwrap();
 
         assert_eq!(
-            rewrite_label_with_run_name("team/run/loss", "team/run", &runs),
-            "Nested/loss",
+            rewrite_label_with_run_name("team/run/loss", run),
+            "Nested/loss"
         );
-        assert_eq!(
-            rewrite_label_with_run_name("team/run", "team/run", &runs),
-            "Nested",
-        );
-        assert_eq!(
-            rewrite_label_with_run_name("team", "team/run", &runs),
-            "team",
-        );
+        assert_eq!(rewrite_label_with_run_name("team/run", run), "Nested");
+        assert_eq!(rewrite_label_with_run_name("team", run), "team");
     }
 
     #[test]

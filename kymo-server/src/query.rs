@@ -1,3 +1,4 @@
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,12 +10,14 @@ use crate::chart;
 use crate::chart_delta::{
     self, SMOOTHING_STATE_SERIES_KEY, SMOOTHING_STATE_VERSION, SMOOTHING_STATE_VERSION_KEY,
 };
-use crate::clickhouse::{CdnKeyBatchRow, ChClient, RefreshDetach, VersionedRawPoint};
+#[cfg(test)]
+use crate::clickhouse::VersionedRawPoint;
+use crate::clickhouse::{CdnKeyBatchRow, ChClient, RefreshDetach};
 use crate::ingest::{
     is_reserved_project_id, storable_ident, BumpCoalescer, MAX_ID_BYTES, MAX_METRIC_NAME_BYTES,
     RESERVED_PROJECT_ID,
 };
-use crate::lifecycle::{LifecycleGates, RunKey};
+use crate::lifecycle::{LifecycleGates, ReadGuards, RunKey};
 use crate::liveness::{PRESUMED_DEAD_WINDOW_MS, RUNNING_WINDOW_MS};
 use crate::pg::{
     InitRunError, PgStore, RestoreMutationKind, RunAccessError, RunInfoRow, RunLifecycleClass,
@@ -25,7 +28,12 @@ use crate::proto;
 use crate::proto::smoothing_config::Algorithm;
 use crate::series_cache::{SeriesKey, SeriesSnapshot};
 
+#[cfg(test)]
+mod alloc_probe;
+mod budget;
+mod held;
 mod lineage;
+mod memo;
 use lineage::{inspect_lineages, stamp_lineages, VerifiedLineages};
 
 const LIFECYCLE_GATE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -34,26 +42,22 @@ const LIFECYCLE_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
 const LIST_TRASH_DEFAULT_PAGE_SIZE: usize = 100;
 const LIST_TRASH_MAX_PAGE_SIZE: usize = 250;
 const LIST_TRASH_MAX_FILTER_IDENTITIES: usize = 1_024;
+/// Most run ids (PollVersions, ListRunSetMetrics, TrashRuns), series refs (QueryCdnKeys) or metric names (QueryTextWindow) one request may list, checked before any other work on the list.
+/// Production's largest dashboard sends about 10k run ids per request, a tenth of this; a 4 MiB message holds about 110k 36-byte UUID run ids, so a dashboard of kymo-generated ids reaches the message cap first; the browser trashes 256 runs per request.
+/// Past it, 16 PollVersions of 2 million empty run ids in flight (4 KB each compressed) held about 85 MiB each through the query, and QueryCdnKeys of 2 million empty refs about 400 MiB each; at the bound, a PollVersions of short distinct ids holds about 6 MiB.
+const MAX_REQUEST_RUN_IDS: usize = 100_000;
 const MAX_RUN_NAME_BYTES: usize = 2_048;
 const MAX_TEXT_WINDOW_LINES: u32 = 2_000;
 const MAX_TEXT_WINDOW_METRICS: usize = 256;
 const MAX_TEXT_SEARCH_BYTES: usize = 512;
-/// Chart reads return whole raw series and retain their Arcs through response
-/// construction. Charge the exact request shape — Y refs (runs × bindings
-/// after frontend resolution) plus the distinct custom-X runs — against
-/// one process-wide budget held through response construction. Narrow panels
-/// therefore share the budget by their combined width; a request wider than
-/// the budget initially takes every permit.
-///
-/// Wide requests still need a separate hard shape bound because one exclusive
-/// request retains every result at once. 128 covers either two editor-max
-/// 64-run Y bindings or one such binding plus custom X; more bindings, and
-/// persisted max_runs=0, can exceed it and are deliberately rejected. This is
-/// a raw-read count, not a byte bound on a pathological individual series.
-/// Override the aggregate concurrency budget with
-/// KYMO_CHART_INFLIGHT_SERIES; the per-request bound stays stable.
+/// The process-wide count of concurrent chart scans (KYMO_CHART_INFLIGHT_SERIES). A request takes a unit per Y ref (runs × bindings after frontend resolution) and per distinct custom-X run, or every unit when it is wider; docs/chart-request-latency.md (stage 2, step 2) says when it returns them.
 const DEFAULT_CHART_INFLIGHT_SERIES: usize = 32;
+/// The per-request bound ([`ChartAdmission::check_width`]), independent of KYMO_CHART_INFLIGHT_SERIES, since a request wider than that count takes every unit and retains every result at once. 128 covers two editor-max 64-run Y bindings, or one plus custom X; more bindings, and persisted max_runs=0, are rejected. It counts raw reads, not bytes: the byte budget bounds a pathological series.
 const MAX_CHART_REQUEST_RAW_SERIES: usize = 128;
+/// A tagged ref forms at most this many series; [`prepare`] refuses a request whose ref selects more tag groups, so stage 2 prices such a ref at nothing ([`ChartPlan::prepared_rows`]).
+const MAX_TAG_GROUPS: usize = 64;
+/// The cells a log-ladder grid can hold beyond the resolution: its coarsest ladder has one cell per octave, of which f64 x span at most 1,524 (chart.rs `make_grid_from`; octaves from 2^-500 up).
+const LOG_GRID_OCTAVES: usize = 1_524;
 /// `acquire_many_owned` accepts a u32 count while Tokio's semaphore has its own
 /// platform limit. This is a primitive boundary, not a product safety cap.
 const MAX_CHART_INFLIGHT_SERIES: usize = if Semaphore::MAX_PERMITS < u32::MAX as usize {
@@ -62,12 +66,13 @@ const MAX_CHART_INFLIGHT_SERIES: usize = if Semaphore::MAX_PERMITS < u32::MAX as
     u32::MAX as usize
 };
 const MAX_CHART_FETCH_CONCURRENCY: usize = 16;
-/// Below the frontend's 60-second request deadline. Covers admission waiting
-/// and async database work, so a stalled SELECT cannot leave an unread dispatch
-/// monopolizing the process-wide gate. Synchronous response construction does
-/// not yield to Tokio's timer; the stable per-request ceiling bounds its
-/// fan-out.
+/// Below the frontend's 60-second request deadline. Covers admission waiting, async database work and the wait for a build, so a stalled SELECT cannot leave an unread dispatch monopolizing the process-wide gate. A build that has started finishes on its blocking thread even after the deadline; the stable per-request ceiling bounds its fan-out.
 const CHART_QUERY_TIMEOUT: Duration = Duration::from_secs(45);
+/// Stage 2's byte budget (KYMO_CHART_BYTE_BUDGET_MB): the pod's read-and-build envelope (about 1.75 GiB) less a 256 MiB reserve, divided by allocator slack of 2.
+const DEFAULT_CHART_BYTE_BUDGET_MB: usize = 768;
+/// Concurrent chart builds (KYMO_CHART_BUILD_SLOTS), each on a blocking thread.
+const DEFAULT_CHART_BUILD_SLOTS: usize = 4;
+const MAX_CHART_BUILD_SLOTS: usize = 64;
 
 fn canonicalize_chart_request(request: &mut proto::ChartRequest) -> Result<(), Status> {
     if request.use_timestamp_axis {
@@ -108,14 +113,13 @@ fn custom_x_runs(request: &proto::ChartRequest) -> Option<(&proto::SeriesRef, Ve
     Some((x_series, runs))
 }
 
-/// A chart's distinct series grouped by (project, metric), groups and members in first-appearance order.
+/// Distinct series `keys` grouped by (project, metric), groups and members in first-appearance order.
 fn series_groups(keys: &[SeriesKey]) -> Vec<Vec<SeriesKey>> {
     let mut groups: Vec<Vec<SeriesKey>> = Vec::new();
     for key in keys {
         match groups.iter_mut().find(|group| {
             group[0].project_id == key.project_id && group[0].metric_name == key.metric_name
         }) {
-            Some(group) if group.contains(key) => {}
             Some(group) => group.push(key.clone()),
             None => groups.push(vec![key.clone()]),
         }
@@ -124,27 +128,34 @@ fn series_groups(keys: &[SeriesKey]) -> Vec<Vec<SeriesKey>> {
 }
 
 fn chart_admission_weight(request: &proto::ChartRequest) -> usize {
+    // Its Y refs alone put the request past the per-chart ceiling, which refuses it: skip the distinct-run pass over an arbitrarily long list (the refusal then counts the Y refs alone).
+    if request.y_series.len() > MAX_CHART_REQUEST_RAW_SERIES {
+        return request.y_series.len();
+    }
     let x_series = custom_x_runs(request).map_or(0, |(_, runs)| runs.len());
-    request.y_series.len().saturating_add(x_series).max(1)
+    request.y_series.len() + x_series
 }
 
 struct ChartAdmission {
     slots: Arc<Semaphore>,
     limit: usize,
+    bytes: Arc<budget::ByteBudget>,
+    builds: budget::BuildSlots,
 }
 
 impl ChartAdmission {
-    fn new(limit: usize) -> Self {
-        let limit = limit.clamp(1, MAX_CHART_INFLIGHT_SERIES);
+    fn new(limit: usize, budget_bytes: u64, build_slots: usize) -> Self {
         metrics::gauge!("mkdb2_chart_inflight_series_limit").set(limit as f64);
         Self {
             slots: Arc::new(Semaphore::new(limit)),
             limit,
+            bytes: budget::ByteBudget::new(budget_bytes),
+            builds: budget::BuildSlots::new(build_slots),
         }
     }
 
-    async fn acquire(&self, requested_weight: usize) -> Result<ChartAdmissionPermit, Status> {
-        let requested_weight = requested_weight.max(1);
+    /// The per-request shape bound, decided at the request boundary before anything is planned or waited on: a plan costs a key per ref and a cache lookup per series.
+    fn check_width(requested_weight: usize) -> Result<(), Status> {
         if requested_weight > MAX_CHART_REQUEST_RAW_SERIES {
             metrics::counter!(
                 "mkdb2_chart_admission_rejections_total",
@@ -155,15 +166,19 @@ impl ChartAdmission {
                 "chart requires {requested_weight} raw-series reads; maximum per chart is {MAX_CHART_REQUEST_RAW_SERIES}"
             )));
         }
+        Ok(())
+    }
+
+    async fn acquire(&self, requested_weight: usize) -> ChartAdmissionPermit {
         let weight = requested_weight.min(self.limit) as u32;
         let wait_started = std::time::Instant::now();
-        let waiting = ChartAdmissionWaiter::new();
+        let waiting = budget::GaugeHold::new("mkdb2_chart_admission_waiters");
         let permit = self
             .slots
             .clone()
             .acquire_many_owned(weight)
             .await
-            .map_err(|_| Status::unavailable("chart scheduler shutting down"))?;
+            .expect("the scan units' semaphore is never closed");
         drop(waiting);
         metrics::histogram!("mkdb2_chart_admission_wait_duration_seconds")
             .record(wait_started.elapsed().as_secs_f64());
@@ -174,34 +189,34 @@ impl ChartAdmission {
         } else {
             0
         };
-        Ok(ChartAdmissionPermit {
+        ChartAdmissionPermit {
             permit: std::sync::Mutex::new(permit),
             inline_floor,
             raw_series,
-        })
+        }
     }
 
     fn fetch_concurrency(&self) -> usize {
         self.limit.min(MAX_CHART_FETCH_CONCURRENCY)
     }
 
+    /// Admit a request (its bytes, then its scan units) and run its work, all under `deadline`. The width check ran before it ([`Self::check_width`]).
     async fn run_with_timeout<T, W, F>(
         &self,
         requested_weight: usize,
+        charge: Vec<u64>,
         deadline: Duration,
         work: W,
     ) -> Result<T, Status>
     where
-        W: FnOnce(ChartAdmissionPermit) -> F,
+        W: FnOnce(Arc<budget::ChartCharge>, ChartAdmissionPermit) -> F,
         F: std::future::Future<Output = Result<T, Status>>,
     {
         match tokio::time::timeout(deadline, async {
-            // The work owns the weighted permit for the complete request,
-            // including response construction (detached refreshes split units
-            // off it). While the future is awaiting IO, a timeout drops the
-            // outstanding SELECTs before releasing the remainder.
-            let permit = self.acquire(requested_weight).await?;
-            work(permit).await
+            // Bytes before units, and neither while holding a lease, a run guard or a pinned snapshot. The work owns its units until its reads finish (detached refreshes split units off them) and its charge until its build does; while the future is awaiting IO, a timeout drops the outstanding SELECTs before releasing them.
+            let charge = self.bytes.reserve(charge).await;
+            let permit = self.acquire(requested_weight).await;
+            work(charge, permit).await
         })
         .await
         {
@@ -228,21 +243,6 @@ fn chart_fetch_status(e: crate::series_cache::RefreshError) -> Status {
     }
 }
 
-struct ChartAdmissionWaiter;
-
-impl ChartAdmissionWaiter {
-    fn new() -> Self {
-        metrics::gauge!("mkdb2_chart_admission_waiters").increment(1.0);
-        Self
-    }
-}
-
-impl Drop for ChartAdmissionWaiter {
-    fn drop(&mut self) {
-        metrics::gauge!("mkdb2_chart_admission_waiters").decrement(1.0);
-    }
-}
-
 struct ChartAdmissionPermit {
     /// Mutex so detached refreshes can split units off mid-request.
     permit: std::sync::Mutex<OwnedSemaphorePermit>,
@@ -250,16 +250,12 @@ struct ChartAdmissionPermit {
     /// [`Self::split_refresh_unit`]; full argument in
     /// docs/admission-control.md Stage R (a)).
     inline_floor: usize,
+    /// What the request still counts in `mkdb2_chart_inflight_series`: its requested weight, less the units [`Self::keep_for_reads`] returned.
     raw_series: u32,
 }
 
 impl ChartAdmissionPermit {
-    /// One unit of this request's admitted weight for a detached series
-    /// refresh. Completed tasks recycle their units to the shared gate, not
-    /// back to this permit, so splitting below `inline_floor` would leave the
-    /// request's remaining scans unweighted; `None` keeps the refresh inline,
-    /// request-bound. The inflight gauge still moves by the full request
-    /// weight at drop — detached tails run on transferred units, outside it.
+    /// One unit of this request's admitted weight for a detached series refresh. Completed tasks recycle their units to the shared gate, not back to this permit, so splitting below `inline_floor` would leave the request's remaining scans unweighted; `None` keeps the refresh inline, request-bound. The inflight gauge counts a split unit until the permit drops — detached tails run on transferred units, outside it.
     fn split_refresh_unit(&self) -> Option<OwnedSemaphorePermit> {
         let mut permit = self.permit.lock().unwrap();
         if permit.num_permits() <= self.inline_floor {
@@ -276,11 +272,332 @@ impl ChartAdmissionPermit {
             .num_permits()
             .saturating_sub(self.inline_floor)
     }
+
+    /// After the cache lookups: keep one unit for each read the request still dispatches (a distinct series that was not a fresh hit, and each custom-X run) and return the others, the fresh hits', to the gate, the inflight gauge dropping by them. A permit with a unit for every read lets each of them split its own, so it drops the inline floor; a request clamped below its reads keeps every unit and its floor (Stage R (a)).
+    fn keep_for_reads(&mut self, reads: usize) {
+        let permit = self.permit.get_mut().unwrap();
+        let held = permit.num_permits();
+        if reads <= held {
+            if held > reads {
+                drop(permit.split(held - reads));
+                let returned = (held - reads) as u32;
+                self.raw_series -= returned;
+                metrics::gauge!("mkdb2_chart_inflight_series").decrement(f64::from(returned));
+            }
+            self.inline_floor = 0;
+        }
+    }
+
+    #[cfg(test)]
+    fn units(&self) -> usize {
+        self.permit.lock().unwrap().num_permits()
+    }
 }
 
 impl Drop for ChartAdmissionPermit {
     fn drop(&mut self) {
         metrics::gauge!("mkdb2_chart_inflight_series").decrement(f64::from(self.raw_series));
+    }
+}
+
+/// What a chart request reads, itemized as its byte charge is: each distinct Y series in first-appearance order, then each distinct custom-X run, then the build's output.
+struct ChartPlan {
+    series: Vec<SeriesKey>,
+    /// Per series, the request indices of the refs naming it, whose tag filters ([`ChartParams::admits`]) and the step range `prepare` keeps decide the rows its transients are charged over ([`Self::prepared_rows`]).
+    refs: Vec<Vec<usize>>,
+    /// The request's parameters, its filter sets and axis geometry among them, which its builds take as planned ([`build_chart`]).
+    params: ChartParams,
+    x_runs: usize,
+    /// Stage 1's key for this poll, when it could be memo-served.
+    memo_key: Option<memo::MemoKey>,
+    /// Held state's key for this poll, unless held state is off or the chart has custom x (stage 3b). It and `memo_key` come from one hash of the request.
+    held_key: Option<held::RequestKey>,
+    /// Whether held state's advance may run beside a full build, holding a second model ([`Self::output_bound`]): in `shadow` mode, or for an audited poll in `on` mode, when the store held an entry of the request as the poll was planned. One held since is charged once the build reports its model ([`held::build`]).
+    beside: bool,
+    /// The poll's 1-in-67 audit draw ([`QueryService::draw_audit`]), taken when it is planned, only by a poll that can audit, and kept if it starts over: an audited poll always builds in full, so step 1 reserves its transients, and prices its output with the audit's model and second prepare if it has a prefix to check.
+    audit: bool,
+    /// Whether the poll's build holds the audit's reconstructed model and second prepare: an audited poll that echoes cache state on a standard axis, the only kind whose build has a prefix to check ([`build_chart`]'s `from_col`; custom x never continues).
+    audits_prefix: bool,
+    /// Whether step 1 reserves build transients: not when, unaudited, a memo is stored for the key, or (held state `on`) held state is stored for the request, since either usually answers without building; a poll that does build charges them first if they fit now, else starts over with them ([`Self::restart`]).
+    transients: bool,
+    /// Step 1 skipped the transients for held state (stage 3b), reserving what its advance holds beside its model's working copies ([`held::HeldStore::hints`]).
+    held_hint: Option<u64>,
+    /// Per series, its snapshot's bytes alone as step 1 priced it ([`Self::estimate`]): what a detached read of it keeps charged ([`budget::ChartCharge::split`]).
+    snapshots: Vec<u64>,
+    /// What a build that may build in full attempts ([`held::build`]): [`held::Advance::Try`], or [`held::Advance::Skip`] once the poll started over ([`Self::restart`]) after its expected advance fell back (and counted why).
+    attempt: held::Advance,
+    /// On the poll's first pass, whether corrections past its grant may be kept ahead of the waiters ([`budget::ChartCharge::overrun`]): where step 1 priced every series from the cache, a series' growth before its read is kept whenever it fits (within the budget, or alone in it); where it priced anything by estimate (a series the cache has never seen or evicted, a custom-X run), only if it fits with nobody waiting. `None` once the poll starts over, so it starts over at most once.
+    ahead: Option<bool>,
+    /// Once the poll starts over, the charge its first pass came to in full: step 1's floor ([`Self::estimate`]), so its next pass reserves the sizes it now knows.
+    known: Vec<u64>,
+}
+
+impl ChartPlan {
+    fn new(
+        req: &proto::ChartRequest,
+        chart_memo: &memo::ChartMemo,
+        chart_held: &held::HeldStore,
+        draw: impl FnOnce() -> bool,
+    ) -> Self {
+        let mut series: Vec<SeriesKey> = Vec::new();
+        let mut refs: Vec<Vec<usize>> = Vec::new();
+        let mut index: std::collections::HashMap<SeriesKey, usize> =
+            std::collections::HashMap::new();
+        for (request_index, s) in req.y_series.iter().enumerate() {
+            let key = SeriesKey::new(&s.project_id, &s.run_id, &s.metric_name);
+            match index.get(&key) {
+                Some(&i) => refs[i].push(request_index),
+                None => {
+                    index.insert(key.clone(), series.len());
+                    series.push(key);
+                    refs.push(vec![request_index]);
+                }
+            }
+        }
+        let memo_on = chart_memo.serves(req);
+        let held_mode = chart_held.mode();
+        let held_on = held_mode != held::HeldMode::Off && req.x_series.is_none();
+        let hash = (memo_on || held_on).then(|| memo::request_hash(req));
+        let memo_key = hash
+            .as_ref()
+            .filter(|_| memo_on)
+            .map(|hash| memo::memo_key(hash, req));
+        let held_key: Option<held::RequestKey> = hash
+            .filter(|_| held_on)
+            .map(|hash| sha2::Digest::finalize(hash).into());
+        let prefix = req.x_series.is_none() && echoed_frontiers(req).is_some();
+        let on = held_mode == held::HeldMode::On;
+        // Only a poll that can audit draws: one with a prefix, or in `on` mode one whose advance the audit can check, from an entry the store holds.
+        let audit = (prefix || held_key.is_some_and(|key| on && chart_held.holds(&key))) && draw();
+        let held_hint = held_key
+            .filter(|_| on && prefix && !audit)
+            .and_then(|key| chart_held.hints(&key));
+        let beside = held_key.is_some_and(|key| {
+            (held_mode == held::HeldMode::Shadow || audit) && chart_held.holds(&key)
+        });
+        Self {
+            series,
+            refs,
+            params: chart_params(req),
+            x_runs: custom_x_runs(req).map_or(0, |(_, runs)| runs.len()),
+            audit,
+            audits_prefix: audit && prefix,
+            transients: audit
+                || (!memo_key.is_some_and(|key| chart_memo.holds(&key)) && held_hint.is_none()),
+            held_hint,
+            memo_key,
+            held_key,
+            beside,
+            snapshots: Vec::new(),
+            attempt: held::Advance::Try,
+            ahead: None,
+            known: Vec::new(),
+        }
+    }
+
+    /// The poll starts over ([`budget::ChartCharge::try_recharge`] and [`budget::ChartCharge::overrun`] say when and why), building with `attempt` next, its first pass having come to `known`. Its plan keeps its audit draw; step 1 reserves its transients this time, at no less than `known`, and it expects no advance.
+    fn restart(&mut self, attempt: held::Advance, known: Vec<u64>) {
+        metrics::counter!("mkdb2_chart_budget_restarts_total").increment(1);
+        self.transients = true;
+        self.held_hint = None;
+        self.attempt = attempt;
+        self.known = known;
+    }
+
+    /// What a build holds beyond its series' transients ([`Self::transient_bytes`] over their prepared rows) once its dense model exists: the model and its wire copy, at a measured cost per cell (series × shared-axis columns), and its largest series' transients again (prepare's working copies, before the model); with the audit, a reconstructed model and a second prepare's transients alongside; and held state's further models and bytes.
+    fn output_bytes(shape: DenseShape, audit: bool) -> u64 {
+        let cells = shape.series as u64 * shape.columns as u64;
+        let model = cells * budget::DENSE_BYTES_PER_CELL;
+        let mut build = model + Self::transient_bytes(shape.largest_series);
+        if audit {
+            build += model + Self::transient_bytes(shape.prepared_rows + shape.largest_series);
+        }
+        build + model * (shape.models - 1) + shape.extra
+    }
+
+    /// Build transients over `rows` prepared rows.
+    fn transient_bytes(rows: usize) -> u64 {
+        rows as u64 * budget::BUILD_BYTES_PER_ROW
+    }
+
+    fn index_of(&self, key: &SeriesKey) -> usize {
+        self.series
+            .iter()
+            .position(|k| k == key)
+            .expect("every read series is planned")
+    }
+
+    /// The most a build of what it keeps holds beyond its series' transients before its model exists, reserved so: [`Self::output_bytes`] over the most columns its chart can have ([`columns_bound`]), corrected to the model's real shape once it exists.
+    fn output_bound(&self, kept: Kept) -> u64 {
+        Self::output_bytes(
+            DenseShape {
+                series: kept.series,
+                columns: columns_bound(self.params.spec, kept),
+                prepared_rows: kept.rows,
+                largest_series: kept.largest,
+                models: 1 + u64::from(self.beside),
+                extra: 0,
+            },
+            self.audits_prefix,
+        )
+    }
+
+    /// The bytes series `index`, in hand, pins and builds: its whole snapshot at the cache's accounting (a pin holds all of it) and, with `transients`, transients over the rows the request keeps of it ([`Self::prepared_rows`]), which it also returns.
+    fn pinned(&self, index: usize, rows: &SeriesSnapshot, transients: bool) -> (u64, Kept) {
+        let kept = if transients {
+            self.prepared_rows(index, rows)
+        } else {
+            Kept::NONE
+        };
+        (rows.bytes() as u64 + Self::transient_bytes(kept.rows), kept)
+    }
+
+    /// What `prepare` keeps of series `index` over every ref naming it: for each ref, the rows in the fetch range of the tag groups it selects ([`selected_groups`]), each group one series, and nothing of a ref selecting more than [`MAX_TAG_GROUPS`], since `prepare` refuses it before collecting any. Each tag's rows in range are found once, by a binary search over its chunks.
+    fn prepared_rows(&self, index: usize, rows: &SeriesSnapshot) -> Kept {
+        let (lo, hi) = (self.params.fetch_min, self.params.fetch_max);
+        let groups: Vec<(&str, Kept)> = rows
+            .tags()
+            .filter_map(|tag| {
+                let mut group = Kept {
+                    series: 1,
+                    ..Kept::NONE
+                };
+                for chunk in tag.between(lo, hi) {
+                    if let (Some(first), Some(last)) = (chunk.first(), chunk.last()) {
+                        group.rows += chunk.len();
+                        group.steps = (group.steps.0.min(first.step), last.step);
+                    }
+                }
+                group.largest = group.rows;
+                (group.rows > 0).then_some((tag.tag(), group))
+            })
+            .collect();
+        self.refs[index]
+            .iter()
+            .map(|&r| selected_groups(groups.iter().map(|&(tag, _)| tag), self.params.admits(r)).0)
+            .filter(|picked| picked.len() <= MAX_TAG_GROUPS)
+            .flatten()
+            .fold(Kept::NONE, |kept, i| kept.join(groups[i].1))
+    }
+
+    /// Step 1's charge, reserved before any lookup pins anything and priced outside the cache's lock from the snapshots `sizes` pinned (dropped before step 1 waits): a retained series at [`Self::pinned`]; an evicted one at the snapshot its recovery record's rows make (series only grow), its transients left to its read's correction, since how many rows a zoomed or filtered chart keeps is unknown until then; any other miss as the prod-average series, with transients over all its rows for every ref naming it (an upper bound on the rows a range keeps); custom-X runs at that series' points; the output at its bound over the priced series ([`Self::output_bound`]), or for a held hint at what the advance holds beside its working copies; once the poll started over, each item at no less than its first pass came to ([`Self::known`]). Records each series' snapshot bytes ([`Self::snapshots`]), and on a first pass whether its corrections may be kept ahead of the waiters ([`Self::ahead`]).
+    fn estimate(&mut self, sizes: &[crate::series_cache::CachedSize]) -> Vec<u64> {
+        use crate::series_cache::{snapshot_bytes, CachedSize};
+        self.snapshots = sizes
+            .iter()
+            .map(|size| match size {
+                CachedSize::Cached(rows) => rows.bytes() as u64,
+                CachedSize::Evicted { rows } => snapshot_bytes(*rows) as u64,
+                CachedSize::Unknown => snapshot_bytes(budget::MISS_ESTIMATE_ROWS as usize) as u64,
+            })
+            .collect();
+        let mut kept = Kept::NONE;
+        let mut items: Vec<u64> = sizes
+            .iter()
+            .zip(&self.snapshots)
+            .enumerate()
+            .map(|(index, (size, &snapshot))| {
+                let series = match size {
+                    CachedSize::Cached(rows) if self.transients => self.prepared_rows(index, rows),
+                    CachedSize::Unknown if self.transients => {
+                        let rows = budget::MISS_ESTIMATE_ROWS as usize;
+                        let refs = self.refs[index].len();
+                        Kept {
+                            rows: rows * refs,
+                            largest: rows,
+                            series: refs,
+                            steps: (i64::MIN, i64::MAX),
+                        }
+                    }
+                    _ => Kept::NONE,
+                };
+                kept = kept.join(series);
+                snapshot + Self::transient_bytes(series.rows)
+            })
+            .collect();
+        items.extend(std::iter::repeat_n(
+            budget::MISS_ESTIMATE_ROWS * budget::X_BYTES_PER_ROW,
+            self.x_runs,
+        ));
+        items.push(match self.held_hint {
+            _ if self.transients => self.output_bound(kept),
+            Some(advance) => advance,
+            None => 0,
+        });
+        for (item, &known) in items.iter_mut().zip(&self.known) {
+            *item = (*item).max(known);
+        }
+        let cached = sizes
+            .iter()
+            .all(|size| matches!(size, CachedSize::Cached(_)));
+        self.ahead = self.known.is_empty().then_some(self.x_runs == 0 && cached);
+        items
+    }
+}
+
+/// What `prepare` keeps of one or more series as stage 2 prices it ([`ChartPlan::prepared_rows`]): their rows, the most one series keeps, the series formed and the lowest and highest of their steps.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Kept {
+    rows: usize,
+    largest: usize,
+    series: usize,
+    steps: (i64, i64),
+}
+
+impl Kept {
+    const NONE: Self = Self {
+        rows: 0,
+        largest: 0,
+        series: 0,
+        steps: (i64::MAX, i64::MIN),
+    };
+
+    fn join(self, other: Self) -> Self {
+        Self {
+            rows: self.rows + other.rows,
+            largest: self.largest.max(other.largest),
+            series: self.series + other.series,
+            steps: (
+                self.steps.0.min(other.steps.0),
+                self.steps.1.max(other.steps.1),
+            ),
+        }
+    }
+}
+
+/// The most columns a chart can have over what its build keeps (chart.rs `shared_chart`): one per distinct x at most, so per row and, on a step axis, per step its rows span; and with a resolution, a chart that passes through holds at most the resolution's x, or on a linear step axis whose cells would be under four steps wide the steps of a span of at most twice the resolution, and one that downsamples at most three slots per cell (an envelope's one, or the up to three x of a cell short of an envelope), of at most the resolution's cells and two more at its edges, or on a log axis one cell per octave when that is more ([`LOG_GRID_OCTAVES`]).
+fn columns_bound(spec: chart::GridSpec, kept: Kept) -> usize {
+    let mut columns = kept.rows;
+    if spec.is_step_axis && kept.steps.0 <= kept.steps.1 {
+        let span = usize::try_from(kept.steps.1.abs_diff(kept.steps.0)).unwrap_or(usize::MAX);
+        columns = columns.min(span.saturating_add(1));
+    }
+    if spec.target > 0 {
+        let resolution = if spec.is_step_axis && !spec.log_buckets {
+            2 * spec.target + 2
+        } else if spec.log_buckets {
+            3 * (spec.target.max(LOG_GRID_OCTAVES) + 2)
+        } else {
+            3 * (spec.target + 2)
+        };
+        columns = columns.min(resolution);
+    }
+    columns
+}
+
+/// The tag groups that become a ref's series, given the tags of the groups with rows in range, ascending: with any tagged group, the tagged ones (they win over stray scalar rows) the ref's filter `admits`; else the scalar group. Their positions, and whether they are tagged.
+pub(super) fn selected_groups<'a>(
+    tags: impl Iterator<Item = &'a str>,
+    admits: impl Fn(&str) -> bool,
+) -> (Vec<usize>, bool) {
+    let tags: Vec<&str> = tags.collect();
+    if tags.last().is_some_and(|tag| !tag.is_empty()) {
+        let picked = (0..tags.len())
+            .filter(|&i| !tags[i].is_empty() && admits(tags[i]))
+            .collect();
+        (picked, true)
+    } else {
+        (tags.len().checked_sub(1).into_iter().collect(), false)
     }
 }
 
@@ -725,6 +1042,8 @@ fn require_import_timestamp(field: &'static str, value_ms: i64) -> Result<(), St
 }
 
 fn normalize_text_metric_names(mut metric_names: Vec<String>) -> Result<Vec<String>, Status> {
+    // Before the checks, sort and dedup below, whose cost grows with the list: the 256-metric cap counts distinct names.
+    require_run_id_count("metric_names", metric_names.len())?;
     if metric_names
         .iter()
         .any(|name| !storable_ident(name, MAX_METRIC_NAME_BYTES))
@@ -741,6 +1060,15 @@ fn normalize_text_metric_names(mut metric_names: Vec<String>) -> Result<Vec<Stri
         )));
     }
     Ok(metric_names)
+}
+
+fn require_run_id_count(field: &str, count: usize) -> Result<(), Status> {
+    if count > MAX_REQUEST_RUN_IDS {
+        return Err(Status::invalid_argument(format!(
+            "{field} lists {count} entries; a request may list at most {MAX_REQUEST_RUN_IDS}"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_text_search(search: &str) -> Result<&str, Status> {
@@ -823,6 +1151,18 @@ fn emit_full(chart: &DenseChart) -> proto::ChartResponse {
     }
 }
 
+/// The full answer for a dense model, flagged `audit_failed` (a sampled check found the answer it checked wrong), with `frontiers`, the stamps that answer carried: every reply starts with no frontiers, so they are exactly a full answer's.
+fn audit_failed_full(
+    chart: &DenseChart,
+    frontiers: std::collections::HashMap<String, i64>,
+) -> proto::ChartResponse {
+    proto::ChartResponse {
+        audit_failed: true,
+        frontiers,
+        ..emit_full(chart)
+    }
+}
+
 /// Exact output-determining smoothing state rides inside the otherwise opaque frontier map so even an already-deployed frontend echoes it verbatim. Real identifiers cannot contain NUL (ingest::storable_ident), which reserves this namespace. Each output series is one word: 0 = no global state, 1 = uniform index-space branch, otherwise positive-finite median f64 bits.
 fn smoothing_state_key(index: usize) -> String {
     format!("\0kymo:s:{index}")
@@ -861,7 +1201,10 @@ fn read_smoothing_state(
 }
 
 /// Request-derived knobs shared by the live build, the delta planner, and the audit reconstruction.
+#[derive(Clone)]
 struct ChartParams {
+    /// Each ref's tag filter as a set, by request index, when any ref lists tags ([`Self::admits`]): built once per poll ([`ChartPlan::new`]), so a ref costs one lookup per tag group whatever its filter's length, and shared with its builds.
+    filters: Option<Arc<[std::collections::HashSet<String>]>>,
     step_min: i64,
     step_max: i64,
     // With smoothing + a zoom range, fetch a margin past both zoom edges so the smoothed curve keeps its unzoomed shape (clipping the fetch at the zoom edge made windows clip there like a data edge), then trim back to [step_min, step_max] after smoothing. Warmup bounds, not exactness guarantees: they're in steps while windows are in samples, so a sparser-than-4x logger's windows clip early — same artifact as a real data edge, vanishingly small under the biweight taper. EMA needs left history only; 8 time constants decay the truncated mass to e⁻⁸.
@@ -882,6 +1225,14 @@ struct ChartParams {
     spec: chart::GridSpec,
     /// Conservative centered-smoother reach in samples; irregular plans also use the median-scaled x span. Causal influence and uniform SG block arithmetic are marked separately as suffixes before plotting filters.
     reach: usize,
+}
+
+impl ChartParams {
+    /// Whether the tag filter of the ref at `request_index` admits `tag`: every tag when it names none.
+    fn admits(&self, request_index: usize) -> impl Fn(&str) -> bool + '_ {
+        let filter = self.filters.as_ref().map(|filters| &filters[request_index]);
+        move |tag| filter.is_none_or(|filter| filter.is_empty() || filter.contains(tag))
+    }
 }
 
 fn chart_params(req: &proto::ChartRequest) -> ChartParams {
@@ -909,6 +1260,12 @@ fn chart_params(req: &proto::ChartRequest) -> ChartParams {
         }
     };
     ChartParams {
+        filters: req.y_series.iter().any(|s| !s.tags.is_empty()).then(|| {
+            req.y_series
+                .iter()
+                .map(|s| s.tags.iter().cloned().collect())
+                .collect()
+        }),
         step_min,
         step_max,
         fetch_min: if is_smoothed && req.step_min.is_some() {
@@ -1000,41 +1357,42 @@ struct PreparedSeries {
     continues: bool,
     /// The exact output-determining whole-series smoothing plan used for this response. `NoState` is explicit so margin-only series preserve positional alignment without computing or gating on discarded samples.
     smoothing_plan: chart::SmoothingPlan,
+    /// With [`prepare`]'s `checkpoints`: a causal smoother's recorded states (chart::smooth_run_with_plan), empty otherwise.
+    checkpoints: Vec<(usize, chart::CausalState)>,
 }
 
 /// A plan override is safe to consume only when the old-only reconstruction expands to exactly the identities that supplied it. A mismatch is client-controlled cache state, so it is a normal full-answer gate rather than an error.
 struct Preparation {
     series: Vec<PreparedSeries>,
     audit_plans_aligned: bool,
+    /// The rows collected, and those of the largest series: what stage 2 charges this build's transients over ([`DenseShape`]).
+    rows: usize,
+    largest: usize,
 }
 
-/// Compare current continuing series against the exact semantic smoothing plans stamped on the response the client actually holds. The caller has already proved the held and continuing counts equal; new complete series do not participate. Missing state safely forces one full answer, which seeds plans for subsequent deltas.
-fn smoothing_state_matches(
+/// Whether the client holds exactly the `continuing` series. Verified lineages and shared-ref order prove that continuing groups were held; the client's echoed series count still detects removed refs/tag groups and held groups that no longer continue, such as a margin-only group gaining in-range samples, and positional splicing requires that every held series is paired. With exact smoothing state, their plans must also equal the ones stamped on the response the client holds (new complete series do not participate); missing state safely forces one full answer, which seeds plans for subsequent deltas.
+fn continuing_series_match(
     req: &proto::ChartRequest,
     p: &ChartParams,
-    prepared: &[PreparedSeries],
+    continuing_plans: impl Iterator<Item = chart::SmoothingPlan>,
     continuing: usize,
 ) -> bool {
-    if !p.exact_smoothing_state {
-        return true;
-    }
     let Some(cache) = req.cache_state.as_ref() else {
         return false;
     };
-    let Some(held) = read_smoothing_state(&cache.frontiers, continuing) else {
-        return false;
-    };
-    prepared
-        .iter()
-        .filter(|ps| ps.continues)
-        .map(|ps| ps.smoothing_plan)
-        .eq(held)
+    cache
+        .held_series
+        .is_some_and(|held| held as usize == continuing)
+        && (!p.exact_smoothing_state
+            || read_smoothing_state(&cache.frontiers, continuing)
+                .is_some_and(|held| continuing_plans.eq(held)))
 }
 
+/// Stamp every output series' plan.
 fn stamp_smoothing_state(
     frontiers: &mut std::collections::HashMap<String, i64>,
     p: &ChartParams,
-    prepared: &[PreparedSeries],
+    plans: impl ExactSizeIterator<Item = chart::SmoothingPlan>,
 ) {
     if !p.exact_smoothing_state {
         return;
@@ -1043,15 +1401,9 @@ fn stamp_smoothing_state(
         SMOOTHING_STATE_VERSION_KEY.to_string(),
         SMOOTHING_STATE_VERSION,
     );
-    frontiers.insert(
-        SMOOTHING_STATE_SERIES_KEY.to_string(),
-        prepared.len() as i64,
-    );
-    for (index, ps) in prepared.iter().enumerate() {
-        frontiers.insert(
-            smoothing_state_key(index),
-            encode_smoothing_plan(ps.smoothing_plan),
-        );
+    frontiers.insert(SMOOTHING_STATE_SERIES_KEY.to_string(), plans.len() as i64);
+    for (index, plan) in plans.enumerate() {
+        frontiers.insert(smoothing_state_key(index), encode_smoothing_plan(plan));
     }
 }
 
@@ -1102,8 +1454,7 @@ fn flag_reach(xs: &[f64], age: &mut [u8], reach: usize, plan: chart::SmoothingPl
 fn flag_lerp_dependency(plot: &[f64], kinds: &[u8], age: &mut [u8]) {
     debug_assert_eq!(plot.len(), age.len());
     debug_assert_eq!(kinds.len(), age.len());
-    let Some(changing) = (0..plot.len())
-        .find(|&i| age[i] != chart::AGE_OLD && (plot[i].is_finite() || kinds[i] == 0))
+    let Some(changing) = (0..plot.len()).find(|&i| age[i] != chart::AGE_OLD && kinds[i] == 0)
     else {
         return;
     };
@@ -1113,7 +1464,7 @@ fn flag_lerp_dependency(plot: &[f64], kinds: &[u8], age: &mut [u8]) {
         nearest
     } else {
         // chart::lerp_at samples adjacent finite pairs for both interpolation and extrapolation. Its first pair supplies the slope for occupied smoother-only holes before either endpoint.
-        (0..changing).find(|&i| plot[i].is_finite() || kinds[i] == 0)
+        (0..changing).find(|&i| kinds[i] == 0)
     };
     if let Some(i) = dependency {
         // Every possible endpoint before `changing` is OLD by construction. Preserve NEW: it records absence from the held snapshot.
@@ -1122,21 +1473,22 @@ fn flag_lerp_dependency(plot: &[f64], kinds: &[u8], age: &mut [u8]) {
     }
 }
 
-/// Prepare chart inputs, smoothing and provenance from fetched rows. The caller supplies verified cutoffs from the cache-lineage proof; those cutoffs drive ages (an absent ref is all NEW). old_only keeps precisely the verified held versions for the audit oracle.
+/// Prepare chart inputs, smoothing and provenance from fetched rows. The caller supplies verified cutoffs from the cache-lineage proof; those cutoffs drive ages (an absent ref is all NEW). old_only keeps precisely the verified held versions for the audit oracle. With `checkpoints`, also records each causal smoother's checkpoints (held chart state, query/held.rs).
+#[allow(clippy::too_many_arguments)]
 fn prepare(
     req: &proto::ChartRequest,
     p: &ChartParams,
-    all_rows: &[&[VersionedRawPoint]],
+    all_rows: &[Arc<SeriesSnapshot>],
     x_maps: Option<&std::collections::HashMap<String, std::collections::HashMap<i64, f64>>>,
     held_rows: Option<&VerifiedLineages>,
     old_only: bool,
     smoothing_override: Option<&[(SeriesIdentity, chart::SmoothingPlan)]>,
+    checkpoints: bool,
 ) -> Result<Preparation, Status> {
     // (step, x_key, value, age) — x_key is the plot key (the step, or
     // timestamp_ms in time mode). The step rides along so range trims and
     // x-metric lookups always work in step space, whatever the chart plots.
     type RawPoint = (i64, i64, f64, u8);
-    type TagGroup = (String, Vec<RawPoint>);
     struct RawSeries {
         identity: SeriesIdentity,
         label: String,
@@ -1146,61 +1498,52 @@ fn prepare(
     let mut raw_series: Vec<RawSeries> = Vec::new();
     for (request_index, (s, rows)) in req.y_series.iter().zip(all_rows).enumerate() {
         let wm = held_rows.and_then(|held| held.cutoff(request_index));
-        // Rows are the FULL series from the cache, (tag, step)-ordered, so
-        // each tag forms one contiguous group and the scalar group ('') is
-        // first if present. Range-trim here (the SQL used to).
-        let mut tag_groups: Vec<TagGroup> = Vec::new();
-        for row in rows.iter() {
-            if row.step < p.fetch_min || row.step > p.fetch_max {
-                continue;
+        let (fetch_min, fetch_max, use_time) = (p.fetch_min, p.fetch_max, p.use_time);
+        let age = move |row: &crate::series_cache::CachedRow| match wm {
+            Some(w) if row.inserted_ms <= w => chart::AGE_OLD,
+            _ => chart::AGE_NEW,
+        };
+        // Rows are the FULL series from the cache, in tag order, so the scalar group ('') is first if present. A tag forms a group when it keeps a row: one in the fetch range, and under old_only a verified held one. Only the chosen groups are collected: a build allocates the rows it keeps, what stage 2 charges ([`ChartPlan::prepared_rows`]), never those of a group it drops.
+        let formed: Vec<_> = rows
+            .tags()
+            .filter(|tag| {
+                tag.between(fetch_min, fetch_max)
+                    .flatten()
+                    .any(|row| !(old_only && age(row) == chart::AGE_NEW))
+            })
+            .collect();
+        let (picked, tagged) =
+            selected_groups(formed.iter().map(|tag| tag.tag()), p.admits(request_index));
+        let mut groups = picked.iter().map(move |&i| {
+            let tag = &formed[i];
+            // Sized at the tag's rows in range (those it keeps, or under old_only at most those), so the build holds no growth slack.
+            let mut points: Vec<RawPoint> =
+                Vec::with_capacity(tag.rows_between(fetch_min, fetch_max));
+            // Extended chunk by chunk: this visits every row a build prepares, and a per-row `for` over these slices measured about 5% slower in full-range builds.
+            for rows in tag.between(fetch_min, fetch_max) {
+                points.extend(rows.iter().filter_map(|row| {
+                    let age = age(row);
+                    let xk = if use_time { row.timestamp_ms } else { row.step };
+                    let kept = !(old_only && age == chart::AGE_NEW);
+                    kept.then_some((row.step, xk, row.value as f64, age))
+                }));
             }
-            let age = match wm {
-                Some(w) if row.inserted_ms <= w => chart::AGE_OLD,
-                _ => chart::AGE_NEW,
-            };
-            if old_only && age == chart::AGE_NEW {
-                continue;
-            }
-            let xk = if p.use_time {
-                row.timestamp_ms
-            } else {
-                row.step
-            };
-            let pt = (row.step, xk, row.value as f64, age);
-            if let Some(last) = tag_groups.last_mut() {
-                if last.0 == row.tag {
-                    last.1.push(pt);
-                    continue;
-                }
-            }
-            tag_groups.push((row.tag.clone(), vec![pt]));
-        }
-
-        let has_tagged = tag_groups.last().is_some_and(|(t, _)| !t.is_empty());
-        if has_tagged {
-            // Tagged rows win over any stray scalar rows for the same
-            // metric (the old tagged-probe-first behavior).
-            if tag_groups.first().is_some_and(|(t, _)| t.is_empty()) {
-                tag_groups.remove(0);
-            }
-            if !s.tags.is_empty() {
-                tag_groups.retain(|(tag, _)| s.tags.contains(tag));
-            }
-            if tag_groups.len() > 64 {
+            (tag.tag().to_owned(), points)
+        });
+        if tagged {
+            if picked.len() > MAX_TAG_GROUPS {
                 return Err(Status::invalid_argument(format!(
-                    "Tagged metric '{}' has {} tags, max 64 per chart",
+                    "Tagged metric '{}' has {} tags, max {MAX_TAG_GROUPS} per chart",
                     s.metric_name,
-                    tag_groups.len()
+                    picked.len()
                 )));
             }
-            let single_run = p.all_same_run || req.y_series.len() == 1;
-            let single_metric = p.all_same_metric || req.y_series.len() == 1;
-            for (tag, points) in tag_groups {
-                let label = if single_run && single_metric {
+            for (tag, points) in groups {
+                let label = if p.all_same_run && p.all_same_metric {
                     tag.clone()
-                } else if single_metric {
+                } else if p.all_same_metric {
                     format!("{}/{}", s.run_id, tag)
-                } else if single_run {
+                } else if p.all_same_run {
                     format!("{}_{}", s.metric_name, tag)
                 } else {
                     format!("{}/{}_{}", s.run_id, s.metric_name, tag)
@@ -1212,14 +1555,12 @@ fn prepare(
                     points,
                 });
             }
-        } else if let Some((tag, points)) = tag_groups.pop() {
+        } else if let Some((tag, points)) = groups.next() {
             // Scalar metric (tag = '')
-            let label = if p.all_same_metric && !p.all_same_run {
+            let label = if p.all_same_metric {
                 s.run_id.clone()
-            } else if p.all_same_run && !p.all_same_metric {
+            } else if p.all_same_run {
                 s.metric_name.clone()
-            } else if p.all_same_metric && p.all_same_run {
-                s.run_id.clone()
             } else {
                 format!("{}/{}", s.run_id, s.metric_name)
             };
@@ -1232,6 +1573,12 @@ fn prepare(
         }
     }
 
+    let rows = raw_series.iter().map(|rs| rs.points.len()).sum();
+    let largest = raw_series
+        .iter()
+        .map(|rs| rs.points.len())
+        .max()
+        .unwrap_or(0);
     // `held_series` and smoothing-state counts are untrusted client bytes. Prove the whole positional override before smoothing: an extra old-only group could otherwise shift NoState onto Savitzky-Golay and panic, or overrun the plan slice and return a 500.
     if smoothing_override.is_some_and(|plans| {
         !raw_series
@@ -1242,6 +1589,8 @@ fn prepare(
         return Ok(Preparation {
             series: Vec::new(),
             audit_plans_aligned: false,
+            rows,
+            largest,
         });
     }
 
@@ -1268,11 +1617,14 @@ fn prepare(
     }
 
     let mut prepared: Vec<PreparedSeries> = Vec::with_capacity(raw_series.len());
-    for (series_index, rs) in raw_series.into_iter().enumerate() {
+    for (series_index, mut rs) in raw_series.into_iter().enumerate() {
+        let mut series_checkpoints = Vec::new();
         let steps_v: Vec<i64> = rs.points.iter().map(|&(s, ..)| s).collect();
         let xkeys_v: Vec<i64> = rs.points.iter().map(|&(_, x, ..)| x).collect();
         let raw_v: Vec<f64> = rs.points.iter().map(|&(_, _, v, ..)| v).collect();
         let mut age_v: Vec<u8> = rs.points.iter().map(|&(_, _, _, a)| a).collect();
+        // Nothing reads the points again: free them before this series' working copies are built.
+        drop(std::mem::take(&mut rs.points));
         // Trim the smoothing warmup back to the requested STEP range whatever the plot key is. The precheck exactly matches the later axis filter, so a margin-only/unplottable series can skip plan derivation and smoothing entirely.
         let in_range = |i: usize| steps_v[i] >= p.step_min && steps_v[i] <= p.step_max;
         // Resolve this run's custom-x map once for both the output precheck and emission.
@@ -1337,6 +1689,7 @@ fn prepare(
                     p.time_constant,
                     p.poly_order,
                     plan,
+                    checkpoints.then_some(&mut series_checkpoints),
                 ),
                 plan,
             )
@@ -1346,11 +1699,17 @@ fn prepare(
             (Vec::new(), chart::SmoothingPlan::NoState)
         };
 
-        let mut xs = Vec::with_capacity(steps_v.len());
-        let mut plot = Vec::with_capacity(xs.capacity());
-        let mut raw = Vec::with_capacity(if p.is_smoothed { xs.capacity() } else { 0 });
-        let mut kinds = Vec::with_capacity(xs.capacity());
-        let mut age = Vec::with_capacity(xs.capacity());
+        // The output columns, allocated once at their length: the fetched rows' on step and time axes, the plottable points' on custom x.
+        let columns = |n: usize| {
+            (
+                Vec::with_capacity(n),
+                Vec::with_capacity(n),
+                Vec::with_capacity(if p.is_smoothed { n } else { 0 }),
+                Vec::with_capacity(n),
+                Vec::with_capacity(n),
+            )
+        };
+        let (mut xs, mut plot, mut raw, mut kinds, mut age);
         let mut xnan_xs: Vec<f64> = Vec::new();
         let mut xnan_count = 0u32;
         let mut xnan_held = false;
@@ -1363,7 +1722,10 @@ fn prepare(
                 // plottable x seen in step order (leading ones attach to
                 // the first), as a kind-4 annotation. Custom-x charts never
                 // take the delta path, so ages need not survive this arm.
-                let mut pts: Vec<(f64, f64, f64, u8)> = Vec::new();
+                // Beyond its prepared rows, a series holds at most these points and their sort's buffer, which stage 2 charges as any series' working copies: the key copy is freed before they are collected (at most one per row in range), the other copies before the sort.
+                drop(xkeys_v);
+                let mut pts: Vec<(f64, f64, f64, u8)> =
+                    Vec::with_capacity((0..steps_v.len()).filter(|&i| in_range(i)).count());
                 let mut leading_gap = false;
                 for i in (0..steps_v.len()).filter(|&i| in_range(i)) {
                     let Some(&x) = xm.and_then(|m| m.get(&steps_v[i])) else {
@@ -1389,8 +1751,14 @@ fn prepare(
                 }
                 xnan_xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 xnan_xs.dedup();
+                drop((steps_v, raw_v, plot_v));
+                if !pts.is_empty() {
+                    // `continues` reads the fetched ages only when no point plots.
+                    age_v = Vec::new();
+                }
                 // uPlot needs ascending x; an x metric need not be monotonic
                 pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                (xs, plot, raw, kinds, age) = columns(pts.len());
                 for (x, pv, rv, k) in pts {
                     xs.push(x);
                     plot.push(pv);
@@ -1402,6 +1770,7 @@ fn prepare(
                 }
             }
             None => {
+                (xs, plot, raw, kinds, age) = columns(steps_v.len());
                 // On a log axis (ladder in log(x+1) here) a negative x can't render: it becomes an exceptional kind-4 marker, like a non-finite custom-x (docs/log-scale-buckets.md). Negatives lead the ascending keys, so they all carry to the first plottable x.
                 for i in 0..steps_v.len() {
                     if !in_range(i) {
@@ -1443,22 +1812,31 @@ fn prepare(
             age,
             continues,
             smoothing_plan,
+            checkpoints: series_checkpoints,
         });
     }
     Ok(Preparation {
         series: prepared,
         audit_plans_aligned: true,
+        rows,
+        largest,
     })
 }
 
 /// The FULL dense model for a prepared set — every chart, delta or not, is computed through here (the audit oracle reconstructs the held one). Every chart — step, timestamp, AND custom-x — is bucketed on ONE slot grid shared by all runs (docs/chart-shared-axis.md); `shared_chart` owns the grid, slot mixture, envelopes, and the marker channel. Y columns are rounded to wire precision HERE (chart_delta::round_y), so the model, the result hashes, and the client's inflated copy are bit-identical — and a smoother's non-finite overshoot is clamped back into the finite range the wire carries.
-fn respond(prepared: &[PreparedSeries], p: &ChartParams) -> DenseChart {
+///
+/// With `capture`, also returns the axis layout (held chart state, query/held.rs).
+fn respond(
+    prepared: &[PreparedSeries],
+    p: &ChartParams,
+    capture: bool,
+) -> (DenseChart, Option<chart::incremental::HeldAxis>) {
     let xs_s: Vec<&[f64]> = prepared.iter().map(|q| q.xs.as_slice()).collect();
     let plot_s: Vec<&[f64]> = prepared.iter().map(|q| q.plot.as_slice()).collect();
     let raw_s: Vec<&[f64]> = prepared.iter().map(|q| q.raw.as_slice()).collect();
     let kinds_s: Vec<&[u8]> = prepared.iter().map(|q| q.kinds.as_slice()).collect();
     let xnan_s: Vec<&[f64]> = prepared.iter().map(|q| q.xnan_xs.as_slice()).collect();
-    let mut chart = chart::shared_chart(
+    let (mut chart, axis) = chart::shared_chart(
         &xs_s,
         &plot_s,
         &raw_s,
@@ -1466,6 +1844,7 @@ fn respond(prepared: &[PreparedSeries], p: &ChartParams) -> DenseChart {
         &xnan_s,
         p.is_smoothed,
         p.spec,
+        capture,
     );
     for (s, ps) in chart.series.iter_mut().zip(prepared) {
         s.label = ps.label.clone();
@@ -1482,7 +1861,7 @@ fn respond(prepared: &[PreparedSeries], p: &ChartParams) -> DenseChart {
             }
         }
     }
-    chart
+    (chart, axis)
 }
 
 /// Relative-time offsets require an untrimmed request and timestamps monotone across the held boundary.
@@ -1490,7 +1869,7 @@ fn respond(prepared: &[PreparedSeries], p: &ChartParams) -> DenseChart {
 fn relative_offsets_stable(
     req: &proto::ChartRequest,
     p: &ChartParams,
-    all_rows: &[&[VersionedRawPoint]],
+    all_rows: &[Arc<SeriesSnapshot>],
     held_rows: &VerifiedLineages,
 ) -> bool {
     if req.step_min.is_some() || req.step_max.is_some() {
@@ -1500,22 +1879,16 @@ fn relative_offsets_stable(
         let Some(wm) = held_rows.cutoff(index) else {
             continue; // not held: the whole series ships complete
         };
-        let mut tag: Option<&str> = None;
-        let mut old_max_ts = i64::MIN;
-        for row in rows.iter() {
-            if row.step < p.fetch_min || row.step > p.fetch_max {
-                continue;
-            }
-            if tag != Some(row.tag.as_str()) {
-                tag = Some(row.tag.as_str());
-                old_max_ts = i64::MIN;
-            }
-            if row.inserted_ms > wm {
-                if row.timestamp_ms < old_max_ts {
-                    return false;
+        for tag in rows.tags() {
+            let mut old_max_ts = i64::MIN;
+            for row in tag.between(p.fetch_min, p.fetch_max).flatten() {
+                if row.inserted_ms > wm {
+                    if row.timestamp_ms < old_max_ts {
+                        return false;
+                    }
+                } else {
+                    old_max_ts = old_max_ts.max(row.timestamp_ms);
                 }
-            } else {
-                old_max_ts = old_max_ts.max(row.timestamp_ms);
             }
         }
     }
@@ -1570,11 +1943,11 @@ fn prefix_matches(
     })
 }
 
-/// Shrink the full model to the delta the client needs: continuing series (any held sample) become tails past from_col and name the held series they extend — held order is the request's refs expanded in order, a subsequence both sides share — while all-new series ship complete. Every delta carries content hashes of the full model it reconstructs to (result_x_hash/result_series_hashes): the client hashes its spliced result and refuses a mismatch before rendering — the end-to-end check only the client can run, on every delta.
+/// Shrink the full model to the delta the client needs: continuing series (any held sample) become tails past from_col and name the held series they extend — held order is the request's refs expanded in order, a subsequence both sides share — while all-new series ship complete. Every delta carries content hashes of the full model it reconstructs to (result_x_hash/result_series_hashes): the client hashes its spliced result and refuses a mismatch before rendering — the end-to-end check only the client can run, on every delta. It checks the splice, not the model: a memo-served reply replays the hashes its build stored, and held state's advance (stage 3b, `on`) hashes the advanced model, whose prefix it copied from the entry the client also holds, so a wrong advance or lineage hashes consistently, and a fresh tab's full answer from an advance carries no hashes; only the sampled audit checks those models.
 fn to_delta(
     full: &DenseChart,
     from_col: usize,
-    prepared: &[PreparedSeries],
+    continues: impl Iterator<Item = bool>,
 ) -> proto::ChartResponse {
     let result_x_hash = chart_delta::hash_axis(full);
     let result_series_hashes: Vec<u64> = full.series.iter().map(chart_delta::hash_series).collect();
@@ -1583,9 +1956,9 @@ fn to_delta(
     let series = full
         .series
         .iter()
-        .zip(prepared)
-        .map(|(s, ps)| {
-            if !ps.continues {
+        .zip(continues)
+        .map(|(s, continues)| {
+            if !continues {
                 splice_from_cached.push(-1);
                 emit_series(s, 0) // complete: full-axis columns, as computed
             } else {
@@ -1640,111 +2013,258 @@ fn plan_delta_from_col(prepared: &mut [PreparedSeries], p: &ChartParams) -> usiz
     chart::numeric_delta_from_col(&xs, &ages, p.spec)
 }
 
-/// Everything after the row fetches: build the full response, and shrink it to a frontier delta when the echoed cache state proves the client holds a prefix (anything unprovable answers in full). Pure — the wire tests drive it with fabricated rows; `audit` additionally reconstructs the held response outright and verifies the claimed prefix bit-for-bit ([`prefix_matches`]) — the sampled self-check; wire tests also exercise audit-off responses with independent full-model and hash checks. A failed audit answers in full with `audit_failed` stamped, which the client alerts on. (The end-to-end content check is the client's, on every delta: to_delta's result hashes.)
+#[cfg(test)]
 fn build_response(
     req: &proto::ChartRequest,
     snapshots: &[std::sync::Arc<SeriesSnapshot>],
     x_maps: Option<&std::collections::HashMap<String, std::collections::HashMap<i64, f64>>>,
     audit: bool,
 ) -> Result<proto::ChartResponse, Status> {
-    let p = chart_params(req);
-    let cache_frontiers = req
-        .cache_state
+    let built = build_chart(
+        req,
+        &chart_params(req),
+        snapshots,
+        x_maps,
+        audit,
+        None,
+        &|_| {},
+        false,
+    )?;
+    count_delta(built.kind);
+    Ok(built.response)
+}
+
+/// A build's dense model, reported as soon as it exists so stage 2 charges what it and the rest of the build hold ([`ChartPlan::output_bytes`]) in place of the bound reserved before it ([`ChartPlan::output_bound`]).
+#[derive(Clone, Copy, Debug)]
+struct DenseShape {
+    series: usize,
+    columns: usize,
+    /// The rows `prepare` kept ([`ChartPlan::prepared_rows`]), and those of its largest series.
+    prepared_rows: usize,
+    largest_series: usize,
+    /// Dense models live at once with their replies: 1 for a build; 2 while held state's advance sits beside a full build's (query/held.rs).
+    models: u64,
+    /// Held state's bytes beyond its models: a captured or advanced state's own, and an advance's axis step and working copies (query/held.rs).
+    extra: u64,
+}
+
+/// The frontier map a continuation poll echoes; none for a first paint.
+fn echoed_frontiers(req: &proto::ChartRequest) -> Option<&std::collections::HashMap<String, i64>> {
+    req.cache_state
         .as_ref()
         .map(|cs| &cs.frontiers)
-        .filter(|f| !f.is_empty());
-    let all_rows: Vec<&[VersionedRawPoint]> = snapshots.iter().map(|rows| &rows[..]).collect();
-    let lineages = inspect_lineages(req, snapshots, cache_frontiers);
-    let held_rows = lineages
-        .verification
-        .as_ref()
-        .and_then(|result| result.as_ref().ok());
-    let mut prepared = prepare(req, &p, &all_rows, x_maps, held_rows, false, None)?.series;
+        .filter(|f| !f.is_empty())
+}
+
+/// `mkdb2_chart_delta_total`: one count per answered chart poll, by how its answer was classified.
+fn count_delta(kind: Option<&'static str>) {
+    if let Some(kind) = kind {
+        metrics::counter!("mkdb2_chart_delta_total", "kind" => kind).increment(1);
+    }
+}
+
+/// A build's answer (a full build's, or held state's advance) and its [`count_delta`] classification, counted once the poll is answered.
+struct BuiltChart {
+    response: proto::ChartResponse,
+    kind: Option<&'static str>,
+    /// With a memoized reply under audit (stage 1): whether the build reproduced it; when not, it answered in full instead.
+    memo_audit: Option<bool>,
+    /// With [`build_chart`]'s `capture`: the held state of the answered chart (stage 3b), or why it has none.
+    held: Option<Result<held::HeldChart, held::Fallback>>,
+    /// Held state's advance answered, not a full build: stage 1 memoizes only full builds' replies, so an advance's fault trips held state's audit, never the memo's.
+    advanced: bool,
+    /// A full build's `unchanged` reply at maxima past the client's verified cutoffs, which rows its chart does not show moved: those cutoffs, which stage 1 keeps with its memo, so each tab the memo answers moves its viewer off held state's entry there ([`held::HeldStore::moved`]).
+    moved_from: Option<memo::MovedFrom>,
+}
+
+/// The reply to `req` over its full `model`, classified in `kind`: a delta from the planner's `from_col` (`None` when the poll cannot continue or the audit refused it) extending the series `continues` names, else in full. The bound turns a planner bug into a full answer, never a panic in to_delta's slice. Held state's advance replies through here too.
+fn reply(
+    model: &DenseChart,
+    req: &proto::ChartRequest,
+    from_col: Option<usize>,
+    continues: impl Iterator<Item = bool> + Clone,
+    kind: &mut Option<&'static str>,
+) -> proto::ChartResponse {
+    match from_col {
+        Some(from_col) if from_col > 0 && from_col <= model.x_values.len() => {
+            let unchanged = from_col == model.x_values.len() && continues.clone().all(|c| c);
+            *kind = Some(if unchanged { "unchanged" } else { "delta" });
+            to_delta(model, from_col, continues)
+        }
+        Some(from_col) => {
+            if from_col == 0 {
+                *kind = Some("miss");
+            }
+            emit_full(model)
+        }
+        None => {
+            if echoed_frontiers(req).is_some() {
+                kind.get_or_insert("gated");
+            }
+            emit_full(model)
+        }
+    }
+}
+
+/// Everything after the row fetches: the full response, shrunk to a frontier delta when the echoed cache state proves the client holds a prefix (anything unprovable answers in full). `audit`, the sampled self-check, reconstructs the held response and verifies the claimed prefix bit for bit ([`prefix_matches`]); `memo` is a memoized reply under audit (stage 1) that the build must reproduce. Either failing answers in full with `audit_failed` stamped, and classified so, which the client alerts on. `on_dense` hears the full model's shape as soon as it exists. End-to-end checks: the client's result hashes on every delta (to_delta), and wire tests of audit-off responses against independent full models and hashes.
+///
+/// With `capture`, also captures the answered chart's held state (stage 3b, query/held.rs). `p` holds the request's parameters as its poll planned them ([`ChartPlan::params`]).
+#[allow(clippy::too_many_arguments)]
+fn build_chart(
+    req: &proto::ChartRequest,
+    p: &ChartParams,
+    snapshots: &[std::sync::Arc<SeriesSnapshot>],
+    x_maps: Option<&std::collections::HashMap<String, std::collections::HashMap<i64, f64>>>,
+    audit: bool,
+    memo: Option<&proto::ChartResponse>,
+    on_dense: &dyn Fn(DenseShape),
+    capture: bool,
+) -> Result<BuiltChart, Status> {
+    let lineages = inspect_lineages(req, snapshots, echoed_frontiers(req));
+    let held_rows = lineages.verified();
+    let preparation = prepare(req, p, snapshots, x_maps, held_rows, false, None, capture)?;
+    let mut prepared = preparation.series;
     let mut kind = lineages.rejection().map(lineage::Rejection::label);
-    let full = respond(&prepared, &p);
-    let resp = if full.x_values.is_empty() {
+    let (full, axis) = respond(&prepared, p, capture);
+    on_dense(DenseShape {
+        series: full.series.len(),
+        columns: full.x_values.len(),
+        prepared_rows: preparation.rows,
+        largest_series: preparation.largest,
+        models: 1,
+        extra: 0,
+    });
+    let mut resp = if full.x_values.is_empty() {
         // No plottable point anywhere: series ship their unplottable counts over an empty axis, so the panel can say why it has nothing to draw, and nothing is stamped to continue from.
         emit_full(&full)
     } else {
         let continuing = prepared.iter().filter(|ps| ps.continues).count();
-        // Verified lineages and shared-ref order prove that continuing groups were held. The client's output-series count still detects removed refs/tag groups and held groups that no longer continue, such as a margin-only group gaining in-range samples. Positional splicing requires that every held series is paired.
-        let membership_matches = req
-            .cache_state
-            .as_ref()
-            .and_then(|cs| cs.held_series)
-            .is_some_and(|held| held as usize == continuing);
         // Appends can change a global smoothing plan even with verified held inputs; the audit reuses the exact matched plan.
         let deltable = held_rows
-            .is_some_and(|f| !p.relative || relative_offsets_stable(req, &p, &all_rows, f))
-            && membership_matches
-            && smoothing_state_matches(req, &p, &prepared, continuing);
-        let mut resp = if deltable {
-            let from_col = plan_delta_from_col(&mut prepared, &p);
-            // from_col ≤ the new axis by construction; the bound turns a planner bug into a full answer, never a panic in to_delta's slice.
-            let mut audit_bad = false;
-            let verified = from_col > 0
-                && from_col <= full.x_values.len()
-                && (!audit || {
-                    // The verified held reconstruction must not derive spacing because the exact gate proved the held/current plans equal. Pair each override with stable request/tag identity: `held_series` is client-controlled, so its count alone cannot prove that old-only and continuing groups align.
-                    let audit_plans: Vec<(SeriesIdentity, chart::SmoothingPlan)> = prepared
-                        .iter()
-                        .filter(|ps| ps.continues)
-                        .map(|ps| (ps.identity.clone(), ps.smoothing_plan))
-                        .collect();
-                    let old = prepare(
-                        req,
-                        &p,
-                        &all_rows,
-                        x_maps,
-                        held_rows,
-                        true,
-                        p.exact_smoothing_state.then_some(audit_plans.as_slice()),
-                    )?;
-                    if !old.audit_plans_aligned {
-                        kind = Some("gated");
-                        false
-                    } else {
-                        let ok =
-                            prefix_matches(&respond(&old.series, &p), &full, from_col, &prepared);
-                        if !ok {
-                            audit_bad = true;
-                            tracing::error!(
-                                from_col,
-                                "chart delta audit failed; answering in full"
-                            );
-                            kind = Some("audit_failed");
-                        }
-                        ok
-                    }
-                });
-            if verified {
-                let unchanged =
-                    from_col == full.x_values.len() && prepared.iter().all(|ps| ps.continues);
-                kind = Some(if unchanged { "unchanged" } else { "delta" });
-                to_delta(&full, from_col, &prepared)
-            } else {
-                if from_col == 0 {
-                    kind = Some("miss");
-                }
-                proto::ChartResponse {
-                    audit_failed: audit_bad,
-                    ..emit_full(&full)
-                }
+            .is_some_and(|f| !p.relative || relative_offsets_stable(req, p, snapshots, f))
+            && continuing_series_match(
+                req,
+                p,
+                prepared
+                    .iter()
+                    .filter(|ps| ps.continues)
+                    .map(|ps| ps.smoothing_plan),
+                continuing,
+            );
+        let mut from_col = deltable.then(|| plan_delta_from_col(&mut prepared, p));
+        let mut audit_bad = false;
+        if let Some(col) = from_col.filter(|&col| audit && col > 0 && col <= full.x_values.len()) {
+            // The verified held reconstruction must not derive spacing because the exact gate proved the held/current plans equal. Pair each override with stable request/tag identity: `held_series` is client-controlled, so its count alone cannot prove that old-only and continuing groups align.
+            let audit_plans: Vec<(SeriesIdentity, chart::SmoothingPlan)> = prepared
+                .iter()
+                .filter(|ps| ps.continues)
+                .map(|ps| (ps.identity.clone(), ps.smoothing_plan))
+                .collect();
+            let old = prepare(
+                req,
+                p,
+                snapshots,
+                x_maps,
+                held_rows,
+                true,
+                p.exact_smoothing_state.then_some(audit_plans.as_slice()),
+                false,
+            )?;
+            if !old.audit_plans_aligned {
+                kind = Some("gated");
+                from_col = None;
+            } else if !prefix_matches(&respond(&old.series, p, false).0, &full, col, &prepared) {
+                tracing::error!(
+                    from_col = col,
+                    "chart delta audit failed; answering in full"
+                );
+                kind = Some("audit_failed");
+                audit_bad = true;
+                from_col = None;
             }
-        } else {
-            if cache_frontiers.is_some() {
-                kind.get_or_insert("gated");
-            }
-            emit_full(&full)
-        };
+        }
+        let continues = prepared.iter().map(|ps| ps.continues);
+        let mut resp = reply(&full, req, from_col, continues, &mut kind);
+        resp.audit_failed = audit_bad;
         stamp_lineages(&mut resp.frontiers, &lineages);
-        stamp_smoothing_state(&mut resp.frontiers, &p, &prepared);
+        stamp_smoothing_state(
+            &mut resp.frontiers,
+            p,
+            prepared.iter().map(|ps| ps.smoothing_plan),
+        );
         resp
     };
-    if let Some(kind) = kind {
-        metrics::counter!("mkdb2_chart_delta_total", "kind" => kind).increment(1);
+    // The memo is compared with the reply as it would ship; a mismatch answers in full with the same stamps.
+    let memo_audit = memo.map(|memo| *memo == resp);
+    if memo_audit == Some(false) {
+        // `built` is how the full build classified its own answer: `gated` when the audit's old-only reconstruction did not align with the request, a gate rather than the memo's reply.
+        tracing::error!(
+            empty = full.x_values.is_empty(),
+            built = kind,
+            "memoized unchanged chart reply disagreed with the full build; answering in full and disabling the memo"
+        );
+        kind = Some("audit_failed");
+        resp = audit_failed_full(&full, std::mem::take(&mut resp.frontiers));
     }
-    Ok(resp)
+    let held = capture.then(|| held::capture(req, p, snapshots, &mut prepared, full, axis));
+    Ok(BuiltChart {
+        response: resp,
+        kind,
+        memo_audit,
+        held,
+        advanced: false,
+        moved_from: None,
+    })
+}
+
+/// Looks up the poll's memo key ([`ChartPlan::memo_key`]) on the snapshots its reads produced. Break with a served reply, else continue to a full build with the matching memo for its audit, if any ([`settle_memo`]). `held` is held state's store and the poll's key there ([`ChartPlan::held_key`]), unless held state is off.
+fn probe_memo(
+    chart_memo: &memo::ChartMemo,
+    key: Option<memo::MemoKey>,
+    snapshots: &[Arc<SeriesSnapshot>],
+    audit: bool,
+    held: Option<(&held::HeldStore, held::RequestKey)>,
+) -> ControlFlow<proto::ChartResponse, Option<proto::ChartResponse>> {
+    let Some(key) = key else {
+        return ControlFlow::Continue(None);
+    };
+    match chart_memo.lookup(&key, snapshots) {
+        Some((reply, moved_from)) if !audit => {
+            memo::count("hit");
+            // What the full build would have counted.
+            count_delta(Some("unchanged"));
+            // The reply moved the client past its cutoffs: so does its viewer in held state, as a built answer would have.
+            if let (Some((store, request)), Some(from)) = (held, moved_from) {
+                store.moved(&request, snapshots, &from);
+            }
+            ControlFlow::Break(reply)
+        }
+        // A hit the audit builds behind, or a miss: counted once the poll builds ([`settle_memo`]), so a poll that starts over counts once.
+        hit => ControlFlow::Continue(hit.map(|(reply, _)| reply)),
+    }
+}
+
+/// Stage 1 after a build: counts the poll's outcome (an audited hit, or a candidate's miss); a memo the audit's build disagreed with turns stage 1 off until restart; a build classified `unchanged` is memoized.
+fn settle_memo(
+    chart_memo: &memo::ChartMemo,
+    key: Option<memo::MemoKey>,
+    snapshots: &[Arc<SeriesSnapshot>],
+    built: &BuiltChart,
+) {
+    match built.memo_audit {
+        Some(false) => {
+            memo::count("audit_failed");
+            chart_memo.disable();
+            return;
+        }
+        Some(true) => memo::count("hit"),
+        None if key.is_some() => memo::count("miss"),
+        None => {}
+    }
+    // Only a full build's reply is recorded (an advance's fault must trip held state's audit, not replay from the memo), and never an audit_failed one, which is classified so, never `unchanged`.
+    if let (Some(key), Some("unchanged"), false) = (key, built.kind, built.advanced) {
+        chart_memo.record(key, snapshots, &built.response, built.moved_from.clone());
+    }
 }
 
 /// Registry row (name, type-string) → wire MetricInfo. One string→enum
@@ -1872,15 +2392,33 @@ pub fn spawn_status_watcher(pg: Arc<PgStore>, events: crate::events::EventSender
 #[cfg(test)]
 mod frontier_delta_tests {
     use super::*;
+    use held::same_model as eq;
     use lineage::{lineage_id, parse_lineages, LINEAGE_PREFIX, LINEAGE_VERSION_KEY};
 
     use crate::series_cache::LineageOrigin;
+    use crate::Rng;
     use lineage::Rejection;
     use std::sync::Arc;
 
+    /// [`super::build_chart`] over the request's parameters as its poll plans them ([`chart_params`]).
+    pub(super) fn build_chart(
+        req: &proto::ChartRequest,
+        snapshots: &[Arc<SeriesSnapshot>],
+        x_maps: Option<&std::collections::HashMap<String, std::collections::HashMap<i64, f64>>>,
+        audit: bool,
+        memo: Option<&proto::ChartResponse>,
+        on_dense: &dyn Fn(DenseShape),
+        capture: bool,
+    ) -> Result<BuiltChart, Status> {
+        let p = chart_params(req);
+        super::build_chart(req, &p, snapshots, x_maps, audit, memo, on_dense, capture)
+    }
+
     mod bench;
+    mod held_tests;
     mod lineage_tests;
     mod marker_delta_tests;
+    mod memo_tests;
     mod smoother_hole_tests;
 
     const ALGORITHMS: [Algorithm; 4] = [
@@ -1925,6 +2463,13 @@ mod frontier_delta_tests {
         }
     }
 
+    /// `rows` in (tag, step) order, as ClickHouse returns them.
+    fn sorted(rows: &[VersionedRawPoint]) -> Vec<VersionedRawPoint> {
+        let mut rows = rows.to_vec();
+        rows.sort_by(|a, b| (&a.tag, a.step).cmp(&(&b.tag, b.step)));
+        rows
+    }
+
     /// Rows for one scalar series: steps 0..n, inserted far enough apart that the verified cutoffs distinguish successive appends. `f(step)` gives the value, so tests can rewrite history.
     fn rows_with(n: i64, f: impl Fn(i64) -> f32) -> Arc<Vec<VersionedRawPoint>> {
         Arc::new((0..n).map(|step| scalar_row(step, f(step))).collect())
@@ -1941,6 +2486,21 @@ mod frontier_delta_tests {
                 .map(|&(step, value)| scalar_row(step, value))
                 .collect(),
         )
+    }
+
+    /// Refresh a cached series by `rows`, as a poll after its run's bump does.
+    pub(super) fn cache_append(
+        cache: &crate::series_cache::SeriesCache,
+        key: &crate::series_cache::SeriesKey,
+        rows: Vec<VersionedRawPoint>,
+    ) -> Arc<SeriesSnapshot> {
+        cache.note_bumps(std::iter::once(key.run_id.as_str()));
+        let crate::series_cache::Lookup::Stale { base, .. } = cache.lookup(key) else {
+            panic!("bumped fixture must refresh its retained snapshot");
+        };
+        cache
+            .apply_increment(key, rows, std::time::Instant::now(), &base)
+            .unwrap()
     }
 
     #[test]
@@ -1972,6 +2532,21 @@ mod frontier_delta_tests {
         );
     }
 
+    /// `algorithm` with these parameters; none for [`Algorithm::None`].
+    fn smoothing(
+        algorithm: Algorithm,
+        window_size: u32,
+        time_constant: f64,
+        poly_order: u32,
+    ) -> Option<proto::SmoothingConfig> {
+        (algorithm != Algorithm::None).then_some(proto::SmoothingConfig {
+            algorithm: algorithm as i32,
+            window_size,
+            time_constant,
+            poly_order,
+        })
+    }
+
     fn req(runs: &[&str], target: u32) -> proto::ChartRequest {
         proto::ChartRequest {
             y_series: runs
@@ -1986,6 +2561,42 @@ mod frontier_delta_tests {
             target_resolution: target,
             ..Default::default()
         }
+    }
+
+    /// A tag forms a group only when it keeps a row: under `old_only`, a tag holding only new rows forms none, so the scalar rows its group suppresses in the full build are the held reconstruction's series.
+    #[test]
+    fn old_only_groups_form_from_held_rows_alone() {
+        let request = req(&["a"], 300);
+        let held = build(&request, &[rows(20, 3)]);
+        let tagged = (20..25).map(|step| VersionedRawPoint {
+            tag: "t".into(),
+            ..scalar_row(step, step as f32)
+        });
+        let grown = Arc::new(rows(20, 3).iter().cloned().chain(tagged).collect());
+        let grown = std::slice::from_ref(&grown);
+        let continued = continuation(&request, &held);
+        let verified = verified_inputs(&continued, grown, &held.frontiers).expect("held rows");
+        let p = chart_params(&continued);
+        let snapshots = fixture_snapshots(&continued, grown);
+        let groups = |old_only| -> Vec<String> {
+            prepare(
+                &continued,
+                &p,
+                &snapshots,
+                None,
+                Some(&verified),
+                old_only,
+                None,
+                false,
+            )
+            .unwrap()
+            .series
+            .into_iter()
+            .map(|ps| ps.identity.tag)
+            .collect()
+        };
+        assert_eq!(groups(false), ["t"]);
+        assert_eq!(groups(true), [""]);
     }
 
     #[test]
@@ -2011,8 +2622,7 @@ mod frontier_delta_tests {
         let held_rows = rows_shaped(3_000, |i| i, |i| 1_000_000 + 10 * i);
         let held = build(&request, std::slice::from_ref(&held_rows));
         let grown_rows = rows_shaped(3_080, |i| i, |i| 1_000_000 + 10 * i);
-        let mut continued = request.clone();
-        continued.cache_state = echo(&held);
+        let continued = continuation(&request, &held);
         let delta = build(&continued, std::slice::from_ref(&grown_rows));
         assert!(delta.delta);
         assert!(eq(
@@ -2092,8 +2702,19 @@ mod frontier_delta_tests {
             .all(|age| *age == chart::AGE_REACH));
     }
 
+    /// `request` continued from `held`, as the client polls it next.
+    pub(super) fn continuation(
+        request: &proto::ChartRequest,
+        held: &proto::ChartResponse,
+    ) -> proto::ChartRequest {
+        proto::ChartRequest {
+            cache_state: echo(held),
+            ..request.clone()
+        }
+    }
+
     /// What the client does: echo the held response's frontiers and series count (chart_sync::echo_state).
-    fn echo(held: &proto::ChartResponse) -> Option<proto::ChartCacheState> {
+    pub(super) fn echo(held: &proto::ChartResponse) -> Option<proto::ChartCacheState> {
         (!held.frontiers.is_empty()).then(|| proto::ChartCacheState {
             frontiers: held.frontiers.clone(),
             held_series: Some(held.series.len() as u32),
@@ -2196,26 +2817,6 @@ mod frontier_delta_tests {
             .unwrap()
     }
 
-    /// Bit-level model equality.
-    fn eq(a: &DenseChart, b: &DenseChart) -> bool {
-        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-        bits(&a.x_values) == bits(&b.x_values)
-            && bits(&a.xr_min) == bits(&b.xr_min)
-            && bits(&a.xr_max) == bits(&b.xr_max)
-            && a.series.len() == b.series.len()
-            && a.series.iter().zip(&b.series).all(|(s, t)| {
-                s.label == t.label
-                    && s.run_id == t.run_id
-                    && bits(&s.values) == bits(&t.values)
-                    && bits(&s.raw_values) == bits(&t.raw_values)
-                    && bits(&s.min_values) == bits(&t.min_values)
-                    && bits(&s.max_values) == bits(&t.max_values)
-                    && s.nan_indices == t.nan_indices
-                    && s.nan_kinds == t.nan_kinds
-                    && s.xnan_count == t.xnan_count
-            })
-    }
-
     /// Verify the actual client splice and its result hashes even when the server's sampled reconstruction audit is disabled.
     fn checked_delta(
         request: &proto::ChartRequest,
@@ -2223,8 +2824,7 @@ mod frontier_delta_tests {
         current: &[Arc<Vec<VersionedRawPoint>>],
         audit: bool,
     ) -> FixtureResponse {
-        let mut continued = request.clone();
-        continued.cache_state = echo(held);
+        let continued = continuation(request, held);
         let out = build_response(&continued, current, None, audit).unwrap();
         assert!(!out.audit_failed, "audit={audit}: planner lost a prefix");
         assert!(
@@ -2242,8 +2842,7 @@ mod frontier_delta_tests {
         current: &[Arc<Vec<VersionedRawPoint>>],
         expected_rejection: Option<Rejection>,
     ) -> [FixtureResponse; 2] {
-        let mut continued = request.clone();
-        continued.cache_state = echo(held);
+        let continued = continuation(request, held);
         let proof = inspect_lineages(
             &continued,
             &fixture_snapshots(&continued, current),
@@ -2317,14 +2916,7 @@ mod frontier_delta_tests {
                                 )
                         });
                     match old {
-                        Some(old) => {
-                            let next = old.refreshed_fixture(rows);
-                            if next.lineage() == old.lineage() && next.maximum() == old.maximum() {
-                                old
-                            } else {
-                                Arc::new(next)
-                            }
-                        }
+                        Some(old) => old.refreshed_fixture(rows),
                         None => Arc::new(SeriesSnapshot::full(rows.as_ref().clone())),
                     }
                 })
@@ -2337,8 +2929,18 @@ mod frontier_delta_tests {
         x_maps: Option<&std::collections::HashMap<String, std::collections::HashMap<i64, f64>>>,
         audit: bool,
     ) -> Result<FixtureResponse, Status> {
+        respond_with(req, rows, |snapshots| {
+            super::build_response(req, snapshots, x_maps, audit)
+        })
+    }
+    /// Answer `req` over fixture snapshots with `answer`, keeping the snapshots its stamps name echoable.
+    fn respond_with(
+        req: &proto::ChartRequest,
+        rows: &[Arc<Vec<VersionedRawPoint>>],
+        answer: impl FnOnce(&[Arc<SeriesSnapshot>]) -> Result<proto::ChartResponse, Status>,
+    ) -> Result<FixtureResponse, Status> {
         let mut snapshots = fixture_snapshots(req, rows);
-        let response = super::build_response(req, &snapshots, x_maps, audit)?;
+        let response = answer(&snapshots)?;
         FIXTURE_SNAPSHOTS.with(|index| {
             let mut index = index.borrow_mut();
             if let Some(stamps) = parse_lineages(&response.frontiers) {
@@ -2420,8 +3022,7 @@ mod frontier_delta_tests {
         assert!(!held.delta && !held.frontiers.is_empty());
 
         let grown = [rows(2100, 3), rows(1700, 7)];
-        let mut r2 = r.clone();
-        r2.cache_state = echo(&held);
+        let r2 = continuation(&r, &held);
         let out = build(&r2, &grown);
         assert!(out.delta);
         let truth = build(&r, &grown);
@@ -2459,8 +3060,7 @@ mod frontier_delta_tests {
         );
         assert_eq!(merged.len(), source.len());
 
-        let mut continued = r.clone();
-        continued.cache_state = echo(&held);
+        let continued = continuation(&r, &held);
         let out = build(&continued, std::slice::from_ref(&merged));
         assert!(out.delta, "boundary append should remain incremental");
         assert_eq!(out.from_col, 300, "the boundary cell itself is dirty");
@@ -2479,8 +3079,7 @@ mod frontier_delta_tests {
         });
         let held = build(&r, &[rows(3000, 5)]);
         let grown = [rows(3080, 5)];
-        let mut r2 = r.clone();
-        r2.cache_state = echo(&held);
+        let r2 = continuation(&r, &held);
         let out = build(&r2, &grown);
         assert!(out.delta, "smoothed append should still delta");
         assert!(eq(
@@ -2511,8 +3110,7 @@ mod frontier_delta_tests {
             let held = build(&r, &[held_a.clone(), b.clone()]);
             assert_eq!(inflate_full(&held).x_values, vec![3.5, 11.5, 19.5, 27.5]);
 
-            let mut continued = r.clone();
-            continued.cache_state = echo(&held);
+            let continued = continuation(&r, &held);
             let out = build(&continued, &[grown_a.clone(), b.clone()]);
             assert!(!out.audit_failed, "{algorithm:?}: planner lost a prefix");
             assert!(out.delta, "{algorithm:?}: stable grid should still delta");
@@ -2552,8 +3150,7 @@ mod frontier_delta_tests {
             ..Default::default()
         });
         let held = build(&r, &[held_a.clone(), b.clone()]);
-        let mut continued = r.clone();
-        continued.cache_state = echo(&held);
+        let continued = continuation(&r, &held);
         let out = build(&continued, &[grown_a.clone(), b.clone()]);
         assert!(!out.audit_failed, "planner lost a prefix");
         assert!(out.delta, "stable grid should still delta");
@@ -2574,18 +3171,12 @@ mod frontier_delta_tests {
             let mut r = req(&["a", "b"], 4);
             r.use_timestamp_axis = true;
             r.log_buckets = true;
-            r.smoothing = (algorithm != Algorithm::None).then_some(proto::SmoothingConfig {
-                algorithm: algorithm as i32,
-                window_size: 10,
-                time_constant: std::f64::consts::LOG2_E,
-                poly_order: 1,
-            });
+            r.smoothing = smoothing(algorithm, 10, std::f64::consts::LOG2_E, 1);
             let held = build(&r, &[held_a.clone(), b.clone()]);
             let held_model = inflate_full(&held);
             assert!(held_model.series[0].nan_indices.is_empty());
 
-            let mut continued = r.clone();
-            continued.cache_state = echo(&held);
+            let continued = continuation(&r, &held);
             let out = build(&continued, &[grown_a.clone(), b.clone()]);
             let truth = inflate_full(&build(&r, &[grown_a.clone(), b.clone()]));
             assert_eq!(
@@ -2628,8 +3219,7 @@ mod frontier_delta_tests {
         assert_eq!(held_model.series[0].nan_kinds, vec![4]);
         assert_eq!(held_model.series[0].nan_indices, vec![0]);
 
-        let mut continued = r.clone();
-        continued.cache_state = echo(&held);
+        let continued = continuation(&r, &held);
         let out = build(&continued, std::slice::from_ref(&grown_rows));
         let truth = inflate_full(&build(&r, std::slice::from_ref(&grown_rows)));
         assert!(out.delta, "the settled negative step marker is stable");
@@ -2647,8 +3237,7 @@ mod frontier_delta_tests {
         r.log_buckets = true;
 
         let held = build(&r, std::slice::from_ref(&held_rows));
-        let mut continued = r.clone();
-        continued.cache_state = echo(&held);
+        let continued = continuation(&r, &held);
         let out = build(&continued, std::slice::from_ref(&grown_rows));
         assert!(
             out.delta,
@@ -2709,8 +3298,7 @@ mod frontier_delta_tests {
                 })
                 .collect::<Vec<_>>(),
         );
-        let mut r2 = r.clone();
-        r2.cache_state = echo(&held);
+        let r2 = continuation(&r, &held);
         let out = build(&r2, std::slice::from_ref(&rewritten));
         assert!(!out.delta, "a rewrite must gate to a full answer");
         assert!(eq(
@@ -2731,8 +3319,7 @@ mod frontier_delta_tests {
         let removed = req(&["a"], 300);
         assert_full_response(&removed, &held, &current[..1], None);
         // Keep every ref so missing count, rather than membership loss, is the only refusal.
-        let mut continued = request.clone();
-        continued.cache_state = echo(&held);
+        let mut continued = continuation(&request, &held);
         continued.cache_state.as_mut().unwrap().held_series = None;
         assert!(verified_inputs(&continued, &current, &held.frontiers).is_some());
         let truth = inflate_full(&held);
@@ -2748,8 +3335,7 @@ mod frontier_delta_tests {
         // The appended span doubles the bucket width: every boundary moved.
         let r = req(&["a"], 500);
         let held = build(&r, &[rows(3000, 3)]);
-        let mut r2 = r.clone();
-        r2.cache_state = echo(&held);
+        let r2 = continuation(&r, &held);
         let out = build(&r2, &[rows(9000, 3)]);
         assert!(!out.delta);
         assert!(eq(
@@ -2800,12 +3386,7 @@ mod frontier_delta_tests {
         for (algorithm, use_time, uniform, expected) in cases {
             let mut r = req(&["a"], 100);
             r.use_timestamp_axis = use_time;
-            r.smoothing = (algorithm != Algorithm::None).then_some(proto::SmoothingConfig {
-                algorithm: algorithm as i32,
-                window_size: 9,
-                time_constant: std::f64::consts::LOG2_E,
-                poly_order: 1,
-            });
+            r.smoothing = smoothing(algorithm, 9, std::f64::consts::LOG2_E, 1);
             let out = counted(expected, || {
                 build_response(&r, &[shaped(uniform)], None, false).unwrap()
             });
@@ -2845,8 +3426,7 @@ mod frontier_delta_tests {
             let held = build(&step_req, &[step_shape(8)]);
             assert!(!held.frontiers.contains_key(SMOOTHING_STATE_VERSION_KEY));
             let grown = [step_shape(20)];
-            let mut continued = step_req.clone();
-            continued.cache_state = echo(&held);
+            let continued = continuation(&step_req, &held);
             let out = counted((0, 0), || build(&continued, &grown));
             assert!(out.delta, "{algorithm:?}: step cadence has no global state");
             assert!(eq(
@@ -2870,8 +3450,7 @@ mod frontier_delta_tests {
             };
             let held = build(&time_req, &[time_shape(20)]);
             let grown = [time_shape(22)];
-            let mut continued = time_req.clone();
-            continued.cache_state = echo(&held);
+            let continued = continuation(&time_req, &held);
             let out = counted((0, 1), || build(&continued, &grown));
             assert!(
                 out.delta,
@@ -2928,8 +3507,7 @@ mod frontier_delta_tests {
         r.use_timestamp_axis = true;
         let held = build(&r, &[rows_shaped(2001, |i| i, ts)]);
         let grown = [rows_shaped(2041, |i| i, ts)];
-        let mut r2 = r.clone();
-        r2.cache_state = echo(&held);
+        let r2 = continuation(&r, &held);
         for audit in [false, true] {
             let out = build_response(&r2, &grown, None, audit).unwrap();
             assert!(!out.delta, "median shift must gate to full (audit={audit})");
@@ -2946,8 +3524,7 @@ mod frontier_delta_tests {
         let held = build(&r, &[rows_shaped(2000, |i| i, |i| 1_000_000 + i)]);
         let stride = |i: i64| i.min(2000) + 3 * (i - 2000).max(0);
         let grown = [rows_shaped(2060, stride, |i| 1_000_000 + i)];
-        let mut r2 = r.clone();
-        r2.cache_state = echo(&held);
+        let r2 = continuation(&r, &held);
         let out = build(&r2, &grown);
         assert!(!out.delta, "a uniform-spacing flip must gate to full");
         assert!(eq(&inflate_full(&out), &inflate_full(&build(&r, &grown))));
@@ -3022,8 +3599,7 @@ mod frontier_delta_tests {
                     &[""],
                 ),
             ];
-            let mut continued = r.clone();
-            continued.cache_state = echo(&held);
+            let continued = continuation(&r, &held);
             let out = build(&continued, &grown); // sampled audit forced on
             assert!(
                 !out.delta,
@@ -3050,8 +3626,7 @@ mod frontier_delta_tests {
             r.use_timestamp_axis = true;
             let held = build(&r, &[rows_shaped(3000, |i| i, ts)]);
             let grown = [rows_shaped(3080, |i| i, ts)];
-            let mut r2 = r.clone();
-            r2.cache_state = echo(&held);
+            let r2 = continuation(&r, &held);
             let out = build(&r2, &grown);
             assert!(
                 out.delta,
@@ -3127,8 +3702,7 @@ mod frontier_delta_tests {
                 &[0, 2, 4, 6, 7, 8, 9, 10, 11],
                 &[0, 1000, 2000, 3000, 4000, 4500, 4750, 5000, 5500],
             )];
-            let mut continued = r.clone();
-            continued.cache_state = echo(&held);
+            let continued = continuation(&r, &held);
             let truth = inflate_full(&build(&r, &grown));
             for audit in [false, true] {
                 let expected = if matches!(algorithm, Algorithm::Ema | Algorithm::Triangular) {
@@ -3154,8 +3728,7 @@ mod frontier_delta_tests {
         let r = req(&["a"], 300);
         let all = [rows(2000, 3)];
         let held = build(&r, &all);
-        let mut r2 = r.clone();
-        r2.cache_state = echo(&held);
+        let r2 = continuation(&r, &held);
         let out = build(&r2, &all);
         assert!(out.delta);
         assert!(out.x_values.is_empty());
@@ -3182,8 +3755,7 @@ mod frontier_delta_tests {
 
         let burst_grown = |s: i64| if s < 1500 { 0 } else { 100 };
         let grown = [a_rows(1550, burst_grown), rows(2100, 7)];
-        let mut r2 = r.clone();
-        r2.cache_state = echo(&held);
+        let r2 = continuation(&r, &held);
         let out = build(&r2, &grown);
         assert!(out.delta, "the verified lineage proves both held inputs");
         assert_eq!(out.splice_from_cached, vec![0, 1]);
@@ -3235,8 +3807,7 @@ mod frontier_delta_tests {
         assert_eq!(held.frontiers.get(&smoothing_state_key(1)), Some(&0));
 
         let grown = [rows(950, 3), b(60)];
-        let mut r2 = r.clone();
-        r2.cache_state = echo(&held);
+        let r2 = continuation(&r, &held);
         let out = counted((1, 0), || build(&r2, &grown));
         assert!(out.delta, "a margin-only series must not cost the delta");
         assert_eq!(out.splice_from_cached, vec![0, 1]);
@@ -3247,8 +3818,7 @@ mod frontier_delta_tests {
 
         // A margin-only run the held response never saw (no echoed frontier, nothing provably held) ships COMPLETE — all-NaN over the full axis — inside a normal delta.
         let held_a = build(&zoomed(&["a"]), &[rows(900, 3)]);
-        let mut r3 = r.clone();
-        r3.cache_state = echo(&held_a);
+        let r3 = continuation(&r, &held_a);
         let out = build(&r3, &[rows(900, 3), b(40)]);
         assert!(out.delta);
         assert_eq!(out.splice_from_cached, vec![0, -1]);
@@ -3284,8 +3854,7 @@ mod frontier_delta_tests {
         // Target well past the step count: every view is passthrough, isolating held-input verification.
         let r = req(&["a"], 10_000);
         let held = build_response(&r, std::slice::from_ref(&held_rows), None, true).unwrap();
-        let mut r2 = r.clone();
-        r2.cache_state = echo(&held);
+        let mut r2 = continuation(&r, &held);
         let out = build_response(&r2, std::slice::from_ref(&grown_rows), None, true).unwrap();
         let truth = build_response(&r, std::slice::from_ref(&grown_rows), None, true).unwrap();
         assert!(!out.delta, "late visibility changed the verified input set");
@@ -3307,8 +3876,7 @@ mod frontier_delta_tests {
         let r = req(&["a"], 300);
         let held = build(&r, &[rows(280, 3)]); // 280 distinct ≤ 300: passthrough
         assert!(!held.banded);
-        let mut r2 = r.clone();
-        r2.cache_state = echo(&held);
+        let r2 = continuation(&r, &held);
         let grown = [rows(1000, 3)]; // 1000 > 300 at width 4: a real grid
         let out = build(&r2, &grown);
         let truth = build(&r, &grown);
@@ -3337,8 +3905,7 @@ mod frontier_delta_tests {
         );
 
         let grown = [rows(2100, 3), nan_then_finite(1600)];
-        let mut r2 = r.clone();
-        r2.cache_state = echo(&held);
+        let r2 = continuation(&r, &held);
         let out = build(&r2, &grown);
         assert!(out.delta, "the transition must not cost the delta");
         let truth = inflate_full(&build(&r, &grown));
@@ -3415,8 +3982,7 @@ mod frontier_delta_tests {
         );
 
         let grown = [finite(320), markers(210, true)];
-        let mut r2 = r.clone();
-        r2.cache_state = echo(&held);
+        let r2 = continuation(&r, &held);
         let out = counted((1, 0), || build(&r2, &grown));
         assert!(
             out.delta,
@@ -3522,13 +4088,7 @@ mod frontier_delta_tests {
     /// Randomized grow-and-splice sweep with the audit oracle forced on: whatever the planner claims for arbitrary mixes of axis kind, log ladders, smoothing, markers, and run growth, the audited delta must splice back to the full truth bit-for-bit (the splice mirror also verifies the shipped result hashes). Catches planner unsoundness the hand-written shapes miss.
     #[test]
     fn randomized_growth_splices_bitexactly() {
-        let mut state = 0x9E3779B97F4A7C15u64;
-        let mut rng = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
+        let mut rng = Rng(0x9E3779B97F4A7C15);
         let algorithms = [
             proto::smoothing_config::Algorithm::Ema as i32,
             proto::smoothing_config::Algorithm::Triangular as i32,
@@ -3542,7 +4102,7 @@ mod frontier_delta_tests {
             let use_time = (case / 3) % 2 == 1;
             let log = (case / 6) % 2 == 1;
             let target = [120u32, 400][(case as usize) % 2];
-            let nruns = 1 + (rng() % 3) as usize;
+            let nruns = 1 + (rng.next() % 3) as usize;
             // Zero-less cases exercise the plain-log arm of the conditional +1 shift under the delta oracle.
             let start = if case % 4 == 3 { 5 } else { 0 };
             // Negative x: step cases lead with two negative-step sentinels (always held: a lower-step backfill fails the lineage proof); time cases use absolute timestamps, some negative, logged throughout or (every fifth case) only by growth. On log axes they become kind-4 markers. Deltas here carry settled ones: the appearing ones anchor on column 0 and answer in full, so marker_delta_tests covers appearance deltas.
@@ -3582,8 +4142,10 @@ mod frontier_delta_tests {
                         .collect(),
                 )
             };
-            let seeds: Vec<u64> = (0..nruns).map(|_| rng()).collect();
-            let lens: Vec<i64> = (0..nruns).map(|_| 200 + (rng() % 2200) as i64).collect();
+            let seeds: Vec<u64> = (0..nruns).map(|_| rng.next()).collect();
+            let lens: Vec<i64> = (0..nruns)
+                .map(|_| 200 + (rng.next() % 2200) as i64)
+                .collect();
             let neg_from = |n: i64| if appearing { n } else { 0 };
             let held_rows: Vec<Arc<Vec<VersionedRawPoint>>> = seeds
                 .iter()
@@ -3614,8 +4176,7 @@ mod frontier_delta_tests {
                 });
             }
             let held = build(&r, &held_rows);
-            let mut r2 = r.clone();
-            r2.cache_state = echo(&held);
+            let r2 = continuation(&r, &held);
             let out = build(&r2, &grown_rows); // audit oracle ON inside build()
             let truth = inflate_full(&build(&r, &grown_rows));
             if out.delta {
@@ -3665,8 +4226,12 @@ pub struct QueryService {
     // Push bus: lifecycle version bumps (run added / terminated / project
     // created) go out to connected dashboards from here.
     events: crate::events::EventSender,
-    // Rolls the 1-in-67 sampled delta audit (see build_response). Prime, so the round-robin can't phase-lock with a dashboard's periodic panel count and audit the same panels every cycle while never touching others.
+    // Rolls the 1-in-67 sampled audit (see build_chart), which also covers the memo's and held state's answers. Prime, so the round-robin can't phase-lock with a dashboard's periodic panel count and audit the same panels every cycle while never touching others.
     delta_audit: std::sync::atomic::AtomicU64,
+    // Stage 1 of docs/chart-request-latency.md: memoized `unchanged` replies. KYMO_CHART_MEMO=0 turns it off.
+    chart_memo: Arc<memo::ChartMemo>,
+    // Stage 3b: held chart state that append polls advance (KYMO_CHART_HELD_STATE, off by default).
+    chart_held: Arc<held::HeldStore>,
 }
 
 impl QueryService {
@@ -3685,16 +4250,55 @@ impl QueryService {
             MAX_CHART_INFLIGHT_SERIES,
         )
         .expect("invalid kymo chart-admission environment");
-        tracing::info!(chart_limit, "chart read admission configured");
+        let chart_budget_mb = crate::env::required_bounded_usize(
+            "KYMO_CHART_BYTE_BUDGET_MB",
+            DEFAULT_CHART_BYTE_BUDGET_MB,
+            1,
+            (u64::MAX >> 20) as usize,
+        )
+        .expect("invalid kymo chart-admission environment");
+        let chart_build_slots = crate::env::required_bounded_usize(
+            "KYMO_CHART_BUILD_SLOTS",
+            DEFAULT_CHART_BUILD_SLOTS,
+            1,
+            MAX_CHART_BUILD_SLOTS,
+        )
+        .expect("invalid kymo chart-admission environment");
+        tracing::info!(
+            chart_limit,
+            chart_budget_mb,
+            chart_build_slots,
+            "chart read admission configured"
+        );
+        let chart_memo = crate::env::required_bool("KYMO_CHART_MEMO", true)
+            .expect("invalid kymo chart-memo environment");
+        tracing::info!(chart_memo, "unchanged-chart memo configured");
+        let held_raw = crate::env::required_string_or("KYMO_CHART_HELD_STATE", "off")
+            .expect("invalid kymo held-chart environment");
+        let held_mode = held::HeldMode::parse(&held_raw).unwrap_or_else(|| {
+            panic!("KYMO_CHART_HELD_STATE must be off, shadow or on; got {held_raw:?}")
+        });
+        let held_budget = crate::env::required_mebibytes(
+            "KYMO_CHART_HELD_STATE_MB",
+            held::DEFAULT_HELD_BUDGET_MB,
+        )
+        .expect("invalid kymo held-chart environment");
+        tracing::info!(?held_mode, held_budget, "held chart state configured");
         Self {
             ch,
             pg,
             bumps,
             gates,
-            chart_admission: ChartAdmission::new(chart_limit),
+            chart_admission: ChartAdmission::new(
+                chart_limit,
+                (chart_budget_mb as u64) << 20,
+                chart_build_slots,
+            ),
             notifier,
             events,
             delta_audit: std::sync::atomic::AtomicU64::new(0),
+            chart_memo: Arc::new(memo::ChartMemo::new(chart_memo)),
+            chart_held: Arc::new(held::HeldStore::new(held_mode, held_budget)),
         }
     }
 
@@ -3711,17 +4315,11 @@ impl QueryService {
         });
     }
 
-    /// Read guards for `keys`, plus the data versions `ensure_runs_readable` read for them, by run_id: read before any of a reply's data, they are its echo (docs/first-mount-refresh.md).
+    /// Take each run's read guard ([`LifecycleGates::read_many`]) and read its version before any of its data; versions are keyed by run_id. The versions are lower bounds on the reply's data and become its echoes (docs/first-mount-refresh.md): inserts commit, notify the series cache, then bump the version; cached rows serve only if fetched after the last notification (`series_cache.rs` `is_fresh`).
     async fn readable_guards(
         &self,
         keys: &[RunKey],
-    ) -> Result<
-        (
-            Vec<tokio::sync::OwnedRwLockReadGuard<()>>,
-            std::collections::HashMap<String, u64>,
-        ),
-        Status,
-    > {
+    ) -> Result<(ReadGuards, std::collections::HashMap<String, u64>), Status> {
         let guards = self.gates.read_many(keys.iter().cloned()).await;
         let versions = self
             .pg
@@ -4028,13 +4626,7 @@ impl QueryService {
             );
         }
 
-        // Evict the run's cache entries BEFORE the terminal commit exposes the
-        // new version: entries fetched mid-import may be missing rows buried
-        // below their watermark and only a full rebuild recovers them. The
-        // write gate makes this terminal — every store path holds the run's
-        // read gate across fetch AND store (read_many_keyed / RefreshDetach in
-        // query_chart_admitted), so nothing can re-install a pre-eviction
-        // snapshot; same gate-claim-then-purge shape as the deletion reaper.
+        // Evict the run's cache entries BEFORE the terminal commit exposes the new version: entries fetched mid-import may be missing rows buried below their watermark and only a full rebuild recovers them. The write gate makes this terminal — every store path holds the run's read gate across fetch AND store (readable_guards in query_chart_admitted, RefreshDetach in read_and_build_pass), so nothing can re-install a pre-eviction snapshot; same gate-claim-then-purge shape as the deletion reaper.
         self.ch
             .purge_run_caches(&[(req.project_id.as_str(), req.run_id.as_str())]);
 
@@ -4068,7 +4660,7 @@ impl QueryService {
 
     // --- Reversible run deletion ---
 
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     pub async fn trash_runs(
         &self,
         request: Request<proto::TrashRunsRequest>,
@@ -4079,6 +4671,7 @@ impl QueryService {
         if req.project_id.is_empty() {
             return Err(Status::invalid_argument("project_id is required"));
         }
+        require_run_id_count("run_ids", req.run_ids.len())?;
         if !storable_ident(&req.project_id, MAX_ID_BYTES)
             || req
                 .run_ids
@@ -4146,10 +4739,7 @@ impl QueryService {
                             ..Default::default()
                         });
                     }
-                    // The watchdog reconciles Trash as absence from its
-                    // authoritative ListRuns poll. Per-run hints here would let
-                    // one uncapped bulk request crowd Started/Terminated/Restored
-                    // events out of the shared bounded notifier queue.
+                    // The watchdog reconciles Trash as absence from its authoritative ListRuns poll. Per-run hints here would let one bulk request (up to MAX_REQUEST_RUN_IDS runs) crowd Started/Terminated/Restored events out of the shared bounded notifier queue.
                     for result in outcome.results {
                         let outcome = match result.kind {
                             TrashMutationKind::Trashed => proto::TrashRunOutcome::Trashed,
@@ -4280,7 +4870,7 @@ impl QueryService {
         }))
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     pub async fn list_trash(
         &self,
         request: Request<proto::ListTrashRequest>,
@@ -4411,12 +5001,13 @@ impl QueryService {
         }))
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     pub async fn list_run_set_metrics(
         &self,
         request: Request<proto::ListRunSetMetricsRequest>,
     ) -> Result<Response<proto::ListMetricsResponse>, Status> {
         let req = request.into_inner();
+        require_run_id_count("run_ids", req.run_ids.len())?;
         if req.run_ids.is_empty() {
             return Ok(Response::new(proto::ListMetricsResponse {
                 metrics: Vec::new(),
@@ -4441,63 +5032,138 @@ impl QueryService {
 
     // --- Chart queries ---
 
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     pub async fn query_chart(
         &self,
         request: Request<proto::ChartRequest>,
     ) -> Result<Response<proto::ChartResponse>, Status> {
         let mut req = request.into_inner();
         canonicalize_chart_request(&mut req)?;
+        let requested_weight = chart_admission_weight(&req);
+        ChartAdmission::check_width(requested_weight)?;
         if req.y_series.is_empty() {
             return Ok(Response::new(proto::ChartResponse::default()));
         }
-        let requested_weight = chart_admission_weight(&req);
+        let mut plan = ChartPlan::new(&req, &self.chart_memo, &self.chart_held, || {
+            self.draw_audit()
+        });
+        let estimate = plan.estimate(&self.ch.series_cache().sizes(&plan.series));
+        let req = Arc::new(req);
         let response = self
             .chart_admission
-            .run_with_timeout(requested_weight, CHART_QUERY_TIMEOUT, |permit| {
-                self.query_chart_admitted(&req, permit)
-            })
+            .run_with_timeout(
+                requested_weight,
+                estimate,
+                CHART_QUERY_TIMEOUT,
+                |charge, permit| {
+                    self.query_chart_admitted(&req, &mut plan, requested_weight, charge, permit)
+                },
+            )
             .await?;
         Ok(Response::new(response))
     }
 
+    /// 1 in 67 of the chart polls that can audit (the only ones that draw, [`ChartPlan::new`]) audits its answer: a delta against a brute-force reconstruction of the held response (build_chart), and a memo's or held state's answer against a full build ([`ChartPlan::audit`]).
+    fn draw_audit(&self) -> bool {
+        self.delta_audit
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .is_multiple_of(67)
+    }
+
+    /// Everything after admission: the run guards and Postgres's lifecycle check, then [`Self::read_and_build_pass`]. A poll that starts over ([`ChartPlan::restart`]) is admitted again, under the same deadline, and takes its run guards and Postgres's lifecycle check again before its next reads: the run versions read before its first pass's data still bound its reply's. Nothing that answers (the memo, held state or a build) stores run versions: these stamp it.
     async fn query_chart_admitted(
         &self,
-        req: &proto::ChartRequest,
-        permit: ChartAdmissionPermit,
+        req: &Arc<proto::ChartRequest>,
+        plan: &mut ChartPlan,
+        requested_weight: usize,
+        charge: Arc<budget::ChartCharge>,
+        mut permit: ChartAdmissionPermit,
     ) -> Result<proto::ChartResponse, Status> {
-        let series_keys: Vec<_> = req
+        let runs: Vec<_> = req
             .y_series
             .iter()
-            .map(|s| SeriesKey::new(&s.project_id, &s.run_id, &s.metric_name))
+            .map(|s| RunKey::new(&s.project_id, &s.run_id))
             .collect();
-        let runs: Vec<_> = series_keys
-            .iter()
-            .map(|key| RunKey::new(&key.project_id, &key.run_id))
-            .collect();
-        // Keyed so each detached refresh co-owns exactly its runs' guards — a purge of run A waits for the scans reading A (a batched scan reads several runs), never for run B's own.
-        let guards = self.gates.read_many_keyed(runs.iter().cloned()).await;
-        // Read before any series data, so each version is a lower bound on what this answer holds: an insert commits, is noted in the series cache, and only then is counted by a version bump; cached rows serve only if fetched after the run's last note (series_cache.rs is_fresh). A version read after the data could count rows the answer lacks.
-        let run_versions = self
-            .pg
-            .ensure_runs_readable(&runs)
-            .await
-            .map_err(lifecycle_access_status)?;
+        let (mut guards, run_versions) = self.readable_guards(&runs).await?;
+        loop {
+            match self
+                .read_and_build_pass(req, plan, &charge, permit, guards)
+                .await?
+            {
+                ControlFlow::Break(response) => {
+                    return Ok(proto::ChartResponse {
+                        run_versions,
+                        ..response
+                    })
+                }
+                ControlFlow::Continue((attempt, known)) => {
+                    plan.restart(attempt, known);
+                    // Its charge becomes step 1's estimate with its transients, waited for holding nothing ([`budget::ChartCharge::recharge`]), then its scan units. Priced in its own statement: the sizes pin snapshots, which must go before the wait.
+                    let estimate = plan.estimate(&self.ch.series_cache().sizes(&plan.series));
+                    charge.recharge(estimate).await;
+                    permit = self.chart_admission.acquire(requested_weight).await;
+                    guards = self.readable_guards(&runs).await?.0;
+                }
+            }
+        }
+    }
 
+    /// One pass of lookups, reads, stage 1, and the build. Releases the scan units as reads finish and the run guards before waiting for a build slot. `Continue` with what its next build attempts and the charge this pass came to in full when the poll starts over ([`ChartPlan::restart`]), holding nothing once this returns.
+    async fn read_and_build_pass(
+        &self,
+        req: &Arc<proto::ChartRequest>,
+        plan: &ChartPlan,
+        charge: &Arc<budget::ChartCharge>,
+        mut permit: ChartAdmissionPermit,
+        guards: ReadGuards,
+    ) -> Result<ControlFlow<proto::ChartResponse, (held::Advance, Vec<u64>)>, Status> {
         use futures::stream::{self, StreamExt, TryStreamExt};
+        use futures::FutureExt;
+
+        // Once a series' rows are in hand, its charge is their real size; a correction never waits. With transients, it counts what the request keeps of the series, over which a full build's output is bounded ([`ChartPlan::output_bound`]).
+        let kept_in_hand = std::sync::Mutex::new(Kept::NONE);
+        let correct = |key: &SeriesKey, rows: &SeriesSnapshot| {
+            let index = plan.index_of(key);
+            let (bytes, kept) = plan.pinned(index, rows, plan.transients);
+            let mut in_hand = kept_in_hand.lock().unwrap();
+            *in_hand = in_hand.join(kept);
+            charge.correct(index, bytes);
+        };
+        // Fresh hits are judged once, on the snapshots pinned here: each is served as pinned, charged at its real size, and needs no read.
+        let mut pinned: std::collections::HashMap<&SeriesKey, Arc<SeriesSnapshot>> =
+            std::collections::HashMap::new();
+        for key in &plan.series {
+            if let Some(rows) = self.ch.series_cache().lookup_fresh(key) {
+                correct(key, &rows);
+                pinned.insert(key, rows);
+            }
+        }
+        // Their units go back to the gate; each remaining read keeps one.
+        permit.keep_for_reads(plan.series.len() - pinned.len() + plan.x_runs);
+        let read_keys: Vec<SeriesKey> = plan
+            .series
+            .iter()
+            .filter(|key| !pinned.contains_key(key))
+            .cloned()
+            .collect();
+
         let fetch_concurrency = self.chart_admission.fetch_concurrency();
-        // Split lazily at election time: a unit leaves the request only when a detached refresh actually spawns, so cache-hit series cost nothing and protection lands on the series that scan.
+        // Split lazily at election time: a unit leaves the request only when a detached refresh actually spawns, so protection lands on the series that scan. The refresh also holds its series' snapshot bytes, split off the request's charge, until it ends.
         let detach_for = |key: &SeriesKey| {
-            permit.split_refresh_unit().map(|unit| RefreshDetach {
-                _permit: unit,
-                _run_guard: Arc::clone(&guards[&RunKey::new(&key.project_id, &key.run_id)]),
+            permit.split_refresh_unit().map(|unit| {
+                let index = plan.index_of(key);
+                RefreshDetach {
+                    _permit: unit,
+                    _run_guard: Arc::clone(&guards[&RunKey::new(&key.project_id, &key.run_id)]),
+                    _charge: Box::new(charge.split(index, plan.snapshots[index])),
+                }
             })
         };
 
         // Distinct series grouped by (project, metric); a group's cache misses share one full read (clickhouse.rs fetch_full_many).
         // Election and unit splits run in this synchronous pass, before any per-series fetch below can split units or take slots; each batch is backed by one unit per series and spawns its detached tasks here.
         // A group of one distinct series keeps its own read (a larger group still elects a one-series batch when its other series are cached or busy), and batches take at most half of the request's `fetch_concurrency` reads, leaving the rest to the per-series stream below.
-        let mut groups = series_groups(&series_keys);
+        let mut groups = series_groups(&read_keys);
         let mut batches = Vec::new();
         for group in &mut groups {
             if batches.len() >= fetch_concurrency / 2 {
@@ -4517,23 +5183,37 @@ impl QueryService {
                 .iter()
                 .map(|miss| detach_for(&miss.key).expect("counted as spare"))
                 .collect();
-            batches.push(self.ch.spawn_full_read_batch(elected, ctx));
+            batches.push(self.ch.spawn_full_read_batch(elected, ctx).map(|batch| {
+                if let Ok(rows) = &batch {
+                    for (key, rows) in rows {
+                        correct(key, rows);
+                    }
+                }
+                batch
+            }));
         }
         let per_series_concurrency = fetch_concurrency - batches.len();
         // The first failed batch fails the request at once, as a failed per-series read does; the other batches' tasks finish detached.
         let batched_rows = futures::future::try_join_all(batches);
 
-        // Every other series: its own cached read (fresh, attached, incremental, or a full read of its own), concurrently, sharing the request's read bound with the batches.
+        // Every other series: its own cached read (attached, incremental, or a full read of its own), concurrently, sharing the request's read bound with the batches.
         let per_series_keys: Vec<_> = groups.iter().flatten().collect();
         let fetches: Vec<_> = per_series_keys
             .iter()
             .map(|&key| {
-                self.ch.query_raw_any_cached(
-                    &key.project_id,
-                    &key.run_id,
-                    &key.metric_name,
-                    move || detach_for(key),
-                )
+                self.ch
+                    .query_raw_any_cached(
+                        &key.project_id,
+                        &key.run_id,
+                        &key.metric_name,
+                        move || detach_for(key),
+                    )
+                    .map(move |outcome| {
+                        if let Ok(rows) = &outcome {
+                            correct(key, rows);
+                        }
+                        outcome
+                    })
             })
             .collect();
         let per_series = stream::iter(fetches)
@@ -4546,11 +5226,15 @@ impl QueryService {
             .flatten()
             .map(|(key, rows)| (key, rows))
             .chain(per_series_keys.into_iter().zip(&per_series))
+            .chain(pinned.iter().map(|(&key, rows)| (key, rows)))
             .collect();
-        let all_rows: Vec<_> = series_keys
+        let all_rows: Arc<[Arc<SeriesSnapshot>]> = req
+            .y_series
             .iter()
-            .map(|key| Arc::clone(rows[key]))
+            .map(|s| Arc::clone(rows[&SeriesKey::new(&s.project_id, &s.run_id, &s.metric_name)]))
             .collect();
+        // The Y reads are done: keep only the custom-X phase's units.
+        permit.keep_for_reads(plan.x_runs);
 
         // Custom x-axis: map each run's points through THAT run's x metric.
         // The request's x_series names the metric; its run_id is ignored
@@ -4561,19 +5245,29 @@ impl QueryService {
             Some((x_ref, run_refs)) => {
                 let step_min = req.step_min.unwrap_or(i64::MIN);
                 let step_max = req.step_max.unwrap_or(i64::MAX);
-                // One read per project covers all of its runs.
-                let mut projects: Vec<(&str, Vec<String>)> = Vec::new();
-                for (pid, rid) in run_refs {
-                    match projects.iter_mut().find(|(project, _)| *project == pid) {
-                        Some((_, runs)) => runs.push(rid.to_string()),
-                        None => projects.push((pid, vec![rid.to_string()])),
+                // One read per project covers all of its runs; each run is charged as its own item, after the Y series.
+                let mut projects: Vec<(&str, Vec<String>, Vec<usize>)> = Vec::new();
+                for (item, (pid, rid)) in run_refs.into_iter().enumerate() {
+                    let item = plan.series.len() + item;
+                    match projects.iter_mut().find(|(project, ..)| *project == pid) {
+                        Some((_, runs, items)) => {
+                            runs.push(rid.to_string());
+                            items.push(item);
+                        }
+                        None => projects.push((pid, vec![rid.to_string()], vec![item])),
                     }
                 }
                 let x_fetches: Vec<_> = projects
                     .iter()
-                    .map(|(pid, runs)| {
-                        self.ch
+                    .map(|(pid, runs, items)| async move {
+                        let series = self
+                            .ch
                             .query_raw_many(pid, runs, &x_ref.metric_name, step_min, step_max)
+                            .await?;
+                        for (&item, points) in items.iter().zip(&series) {
+                            charge.correct(item, points.len() as u64 * budget::X_BYTES_PER_ROW);
+                        }
+                        anyhow::Ok(series)
                     })
                     .collect();
                 let fetched: Vec<_> = stream::iter(x_fetches)
@@ -4582,7 +5276,7 @@ impl QueryService {
                     .await
                     .map_err(|e| Status::internal(format!("x-axis query failed: {e}")))?;
                 let mut maps = std::collections::HashMap::new();
-                for ((_, runs), series) in projects.into_iter().zip(fetched) {
+                for ((_, runs, _), series) in projects.into_iter().zip(fetched) {
                     for (rid, rows) in runs.into_iter().zip(series) {
                         maps.insert(rid, rows.into_iter().collect());
                     }
@@ -4591,25 +5285,104 @@ impl QueryService {
             }
             _ => None,
         };
+        // Every read is done: return the remaining units, then the run guards, before waiting for a build slot.
+        drop(permit);
+        drop(guards);
 
-        // 1 in 67 chart queries audits its answer — when it is a delta — against a brute-force reconstruction of the held response (build_response).
-        let audit = self
-            .delta_audit
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            .is_multiple_of(67);
-        let mut response = build_response(req, &all_rows, x_maps.as_ref(), audit)?;
-        response.run_versions = run_versions;
-        Ok(response)
+        let (audit, audits_prefix) = (plan.audit, plan.audits_prefix);
+        let held = plan.held_key.map(|key| (&*self.chart_held, key));
+        let memo = match probe_memo(&self.chart_memo, plan.memo_key, &all_rows, audit, held) {
+            ControlFlow::Break(reply) => return Ok(ControlFlow::Break(reply)),
+            ControlFlow::Continue(memo) => memo,
+        };
+        // The output's charge item follows the series' and custom-X runs' ([`ChartPlan`]).
+        let output = plan.series.len() + plan.x_runs;
+        let (memo_key, held_key) = (plan.memo_key, plan.held_key);
+        let (x_maps, memo) = (x_maps.map(Arc::new), memo.map(Arc::new));
+        let build = |attempt| {
+            let (charge, all_rows, x_maps, memo) = (
+                charge.clone(),
+                all_rows.clone(),
+                x_maps.clone(),
+                memo.clone(),
+            );
+            let (req, params, chart_memo, chart_held) = (
+                Arc::clone(req),
+                plan.params.clone(),
+                Arc::clone(&self.chart_memo),
+                Arc::clone(&self.chart_held),
+            );
+            self.chart_admission.builds.run(move || {
+                // Its output is charged as soon as the model exists ([`budget::BuildSlots::run`] keeps the charge and snapshots until the build ends).
+                let charge_output =
+                    |shape| charge.correct(output, ChartPlan::output_bytes(shape, audits_prefix));
+                let built = held::build(
+                    &chart_held,
+                    &req,
+                    &params,
+                    held_key,
+                    &all_rows,
+                    x_maps.as_deref(),
+                    audit,
+                    memo.as_deref(),
+                    &charge_output,
+                    attempt,
+                )?;
+                Ok::<_, Status>(built.map(|built| {
+                    count_delta(built.kind);
+                    settle_memo(&chart_memo, memo_key, &all_rows, &built);
+                    built.response
+                }))
+            })
+        };
+        // An unaudited poll whose request has held state (`on`) tries the advance first, which step 1 reserved beside its working copies, charged once it has run; should it fall back, it builds in full in a slot taken again.
+        let attempt = if plan.held_hint.is_some() {
+            match build(held::Advance::Only).await?? {
+                Some(response) => return Ok(ControlFlow::Break(response)),
+                None => held::Advance::Skip,
+            }
+        } else {
+            plan.attempt
+        };
+        // A full build's charge before its slot wait: each series with its transients, and the output at its bound ([`ChartPlan::output_bound`]), reserved before it is allocated. If step 1 charged transients, the corrections counted it, and on a first pass ([`ChartPlan::ahead`]) what they came to past its grant must fit now ([`budget::ChartCharge::overrun`]); else (a memo or held state was stored) it is counted here and must fit now ([`budget::ChartCharge::try_recharge`]). Without room the poll starts over at the sizes it now knows: a storm of first reads, reads during a bulk write, a run's appends or a lineage rotation make many polls build at once, and keeping what each came to would pin them all past the budget while they wait for build slots.
+        if plan.transients {
+            let kept = kept_in_hand.into_inner().unwrap();
+            charge.correct(output, plan.output_bound(kept));
+            if let Some(known) = plan.ahead.and_then(|ahead| charge.overrun(ahead)) {
+                return Ok(ControlFlow::Continue((attempt, known)));
+            }
+        } else {
+            // Every item of the charge: neither the memo nor held state serves custom x, so such a poll reads no x.
+            let mut kept = Kept::NONE;
+            let mut full: Vec<u64> = plan
+                .series
+                .iter()
+                .enumerate()
+                .map(|(index, key)| {
+                    let (bytes, series) = plan.pinned(index, rows[key], true);
+                    kept = kept.join(series);
+                    bytes
+                })
+                .collect();
+            full.push(plan.output_bound(kept));
+            if !charge.try_recharge(&full) {
+                return Ok(ControlFlow::Continue((attempt, full)));
+            }
+        }
+        Ok(ControlFlow::Break(build(attempt).await??.expect(
+            "only an Advance::Only call answers without building",
+        )))
     }
 
     // --- CDN queries ---
 
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     pub async fn query_cdn_keys(
         &self,
         request: Request<proto::QueryCdnKeysRequest>,
     ) -> Result<Response<proto::QueryCdnKeysResponse>, Status> {
         let req = request.into_inner();
+        require_run_id_count("refs", req.refs.len())?;
 
         let step_min = req.step_min.unwrap_or(i64::MIN);
         let step_max = req.step_max.unwrap_or(i64::MAX);
@@ -4713,6 +5486,7 @@ impl QueryService {
         request: Request<proto::PollVersionsRequest>,
     ) -> Result<Response<proto::PollVersionsResponse>, Status> {
         let req = request.into_inner();
+        require_run_id_count("run_ids", req.run_ids.len())?;
         let result = self
             .pg
             .poll_versions(req.project_id.as_deref(), &req.run_ids)
@@ -4723,6 +5497,140 @@ impl QueryService {
             project_version: result.project_version,
             run_versions: result.run_versions,
         }))
+    }
+}
+
+#[cfg(test)]
+mod request_list_bound_tests {
+    use super::*;
+
+    /// The real service with unreachable databases (nothing listens on port 1, and the test Postgres pool connects lazily): every refusal below comes before either is touched.
+    fn service() -> QueryService {
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        QueryService::new(
+            Arc::new(ChClient::new("http://127.0.0.1:1").unwrap()),
+            Arc::new(PgStore::test_store()),
+            BumpCoalescer::empty_for_test(),
+            LifecycleGates::new(),
+            None,
+            events,
+        )
+    }
+
+    fn ids(count: usize) -> Vec<String> {
+        (0..count).map(|i| i.to_string()).collect()
+    }
+
+    fn refs(count: usize) -> Vec<proto::SeriesRef> {
+        ids(count)
+            .into_iter()
+            .map(|run_id| proto::SeriesRef {
+                project_id: "p".to_string(),
+                run_id,
+                metric_name: "m".to_string(),
+                tags: Vec::new(),
+            })
+            .collect()
+    }
+
+    fn assert_refused<T: std::fmt::Debug>(result: Result<T, Status>, field: &str) {
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+        assert_eq!(
+            status.message(),
+            format!("{field} lists 100001 entries; a request may list at most 100000")
+        );
+    }
+
+    #[test]
+    fn the_bound_admits_its_limit_and_refuses_one_more() {
+        assert!(require_run_id_count("run_ids", 0).is_ok());
+        assert!(require_run_id_count("run_ids", MAX_REQUEST_RUN_IDS).is_ok());
+        assert_refused(
+            require_run_id_count("run_ids", MAX_REQUEST_RUN_IDS + 1),
+            "run_ids",
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_versions_refuses_a_list_past_the_bound() {
+        let request = proto::PollVersionsRequest {
+            project_id: Some("p".to_string()),
+            run_ids: ids(MAX_REQUEST_RUN_IDS + 1),
+        };
+        assert_refused(
+            service().poll_versions(Request::new(request)).await,
+            "run_ids",
+        );
+    }
+
+    #[tokio::test]
+    async fn list_run_set_metrics_refuses_a_list_past_the_bound() {
+        let request = proto::ListRunSetMetricsRequest {
+            project_id: "p".to_string(),
+            run_ids: ids(MAX_REQUEST_RUN_IDS + 1),
+        };
+        assert_refused(
+            service().list_run_set_metrics(Request::new(request)).await,
+            "run_ids",
+        );
+    }
+
+    #[tokio::test]
+    async fn trash_runs_refuses_a_list_past_the_bound() {
+        let request = proto::TrashRunsRequest {
+            project_id: "p".to_string(),
+            run_ids: ids(MAX_REQUEST_RUN_IDS + 1),
+        };
+        assert_refused(service().trash_runs(Request::new(request)).await, "run_ids");
+    }
+
+    #[tokio::test]
+    async fn query_cdn_keys_refuses_refs_past_the_bound() {
+        let request = proto::QueryCdnKeysRequest {
+            refs: refs(MAX_REQUEST_RUN_IDS + 1),
+            ..Default::default()
+        };
+        assert_refused(
+            service().query_cdn_keys(Request::new(request)).await,
+            "refs",
+        );
+    }
+
+    #[tokio::test]
+    async fn query_text_window_refuses_metric_names_past_the_bound_before_their_dedup() {
+        let request = proto::QueryTextWindowRequest {
+            project_id: "p".to_string(),
+            run_id: "r".to_string(),
+            metric_names: vec!["m".to_string(); MAX_REQUEST_RUN_IDS + 1],
+            ..Default::default()
+        };
+        assert_refused(
+            service().query_text_window(Request::new(request)).await,
+            "metric_names",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chart_past_the_ceiling_is_refused_on_its_y_refs_alone() {
+        let request = proto::ChartRequest {
+            y_series: refs(MAX_CHART_REQUEST_RAW_SERIES + 1),
+            x_series: refs(1).pop(),
+            ..Default::default()
+        };
+        assert_eq!(
+            chart_admission_weight(&request),
+            MAX_CHART_REQUEST_RAW_SERIES + 1
+        );
+        let status = service()
+            .query_chart(Request::new(request))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+        assert_eq!(
+            status.message(),
+            "chart requires 129 raw-series reads; maximum per chart is 128"
+        );
     }
 }
 
@@ -4777,7 +5685,12 @@ mod cdn_series_tests {
 
 #[cfg(test)]
 mod chart_admission_tests {
+    use super::frontier_delta_tests::{build_chart, continuation};
     use super::*;
+
+    fn admission(limit: usize) -> ChartAdmission {
+        ChartAdmission::new(limit, 1 << 30, DEFAULT_CHART_BUILD_SLOTS)
+    }
 
     fn series(run_id: &str) -> proto::SeriesRef {
         proto::SeriesRef {
@@ -4788,8 +5701,20 @@ mod chart_admission_tests {
         }
     }
 
+    /// A numeric row of `tag` at `step`, timestamped at its step.
+    fn point(tag: &str, step: i64, value: f32, inserted_ms: i64) -> VersionedRawPoint {
+        VersionedRawPoint {
+            tag: tag.to_string(),
+            step,
+            timestamp_ms: step,
+            value,
+            is_value: 1,
+            inserted_ms,
+        }
+    }
+
     #[test]
-    fn series_groups_dedupe_and_keep_first_appearance_order() {
+    fn series_groups_keep_first_appearance_order() {
         let key = |project, run, metric| SeriesKey::new(project, run, metric);
         assert_eq!(
             series_groups(&[
@@ -4797,7 +5722,6 @@ mod chart_admission_tests {
                 key("p", "b", "acc"),
                 key("q", "a", "loss"),
                 key("p", "b", "loss"),
-                key("p", "a", "loss"),
             ]),
             [
                 vec![key("p", "a", "loss"), key("p", "b", "loss")],
@@ -4818,23 +5742,21 @@ mod chart_admission_tests {
 
         request.use_timestamp_axis = true;
         assert_eq!(chart_admission_weight(&request), 3);
-        request.y_series.clear();
-        assert_eq!(chart_admission_weight(&request), 1);
     }
 
     #[test]
     fn chart_fetch_concurrency_respects_small_admission_limits() {
-        let small = ChartAdmission::new(2);
+        let small = admission(2);
         assert_eq!(small.fetch_concurrency(), 2);
 
-        let large = ChartAdmission::new(64);
+        let large = admission(64);
         assert_eq!(large.fetch_concurrency(), MAX_CHART_FETCH_CONCURRENCY);
     }
 
     #[tokio::test]
     async fn narrow_request_splits_down_to_its_last_unit() {
-        let admission = ChartAdmission::new(32);
-        let permit = admission.acquire(3).await.unwrap();
+        let admission = admission(32);
+        let permit = admission.acquire(3).await;
         let units: Vec<_> = std::iter::from_fn(|| permit.split_refresh_unit())
             .take(8)
             .collect();
@@ -4844,11 +5766,8 @@ mod chart_admission_tests {
     #[tokio::test]
     async fn clamped_request_stops_splitting_at_the_inline_floor() {
         let limit = MAX_CHART_FETCH_CONCURRENCY * 2;
-        let admission = ChartAdmission::new(limit);
-        let permit = admission
-            .acquire(MAX_CHART_REQUEST_RAW_SERIES)
-            .await
-            .unwrap();
+        let admission = admission(limit);
+        let permit = admission.acquire(MAX_CHART_REQUEST_RAW_SERIES).await;
         let units: Vec<_> = std::iter::from_fn(|| permit.split_refresh_unit())
             .take(limit * 2)
             .collect();
@@ -4863,8 +5782,8 @@ mod chart_admission_tests {
 
     #[tokio::test]
     async fn degenerate_limit_clamped_request_never_splits() {
-        let admission = ChartAdmission::new(1);
-        let permit = admission.acquire(2).await.unwrap();
+        let admission = admission(1);
+        let permit = admission.acquire(2).await;
         assert!(permit.split_refresh_unit().is_none());
     }
 
@@ -4883,14 +5802,14 @@ mod chart_admission_tests {
 
     #[tokio::test]
     async fn chart_admission_sums_request_width_across_inflight_charts() {
-        let admission = Arc::new(ChartAdmission::new(4));
-        let held = admission.acquire(3).await.unwrap();
+        let admission = Arc::new(admission(4));
+        let held = admission.acquire(3).await;
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel();
         let waiter_admission = admission.clone();
         let waiter = tokio::spawn(async move {
             ready_tx.send(()).unwrap();
-            let permit = waiter_admission.acquire(2).await.unwrap();
+            let permit = waiter_admission.acquire(2).await;
             acquired_tx.send(()).unwrap();
             drop(permit);
         });
@@ -4912,13 +5831,13 @@ mod chart_admission_tests {
 
     #[tokio::test]
     async fn wide_request_initially_takes_the_full_gate() {
-        let admission = Arc::new(ChartAdmission::new(DEFAULT_CHART_INFLIGHT_SERIES));
+        let admission = Arc::new(admission(DEFAULT_CHART_INFLIGHT_SERIES));
         // Three bindings at the editor's default 12 runs require 36 reads.
-        let wide = admission.acquire(36).await.unwrap();
+        let wide = admission.acquire(36).await;
         assert_eq!(admission.slots.available_permits(), 0);
 
         let waiter_admission = admission.clone();
-        let mut waiter = tokio::spawn(async move { waiter_admission.acquire(1).await.unwrap() });
+        let mut waiter = tokio::spawn(async move { waiter_admission.acquire(1).await });
         assert!(tokio::time::timeout(Duration::from_millis(20), &mut waiter)
             .await
             .is_err());
@@ -4931,40 +5850,1802 @@ mod chart_admission_tests {
 
     #[tokio::test]
     async fn chart_admission_rejects_only_past_the_stable_request_bound() {
-        let admission = ChartAdmission::new(2);
-        let _largest = admission
-            .acquire(MAX_CHART_REQUEST_RAW_SERIES)
-            .await
-            .expect("lower concurrency must not shrink the request shape limit");
-        drop(_largest);
-        let error = admission
-            .run_with_timeout(
-                MAX_CHART_REQUEST_RAW_SERIES + 1,
-                Duration::from_secs(1),
-                |_permit| std::future::ready(Ok::<_, Status>(())),
-            )
+        let admission = admission(2);
+        // Lower concurrency clamps the widest request instead of shrinking the request shape limit.
+        drop(admission.acquire(MAX_CHART_REQUEST_RAW_SERIES).await);
+        // The request boundary rejects a wider chart before it plans, reserves or reads anything.
+        let service = chart_service("http://127.0.0.1:9", admission);
+        let error = service
+            .query_chart(Request::new(proto::ChartRequest {
+                y_series: (0..=MAX_CHART_REQUEST_RAW_SERIES)
+                    .map(|i| series(&format!("run-{i}")))
+                    .collect(),
+                ..Default::default()
+            }))
             .await
             .expect_err("a request cannot exceed the stable shape bound");
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
-        assert!(error.message().contains("maximum per chart is 128"));
-        assert_eq!(admission.slots.available_permits(), 2);
+        assert_eq!(
+            error.message(),
+            "chart requires 129 raw-series reads; maximum per chart is 128"
+        );
+        assert_eq!(service.chart_admission.slots.available_permits(), 2);
+        assert_eq!(
+            service.chart_admission.bytes.in_use(),
+            0,
+            "rejected before any byte is reserved"
+        );
     }
 
     #[tokio::test]
     async fn chart_deadline_cancels_work_and_releases_its_full_weight() {
-        let admission = ChartAdmission::new(2);
+        let admission = admission(2);
         let error = admission
-            .run_with_timeout(2, Duration::from_millis(20), |_permit| {
-                std::future::pending::<Result<(), Status>>()
-            })
+            .run_with_timeout(
+                2,
+                vec![1_000],
+                Duration::from_millis(20),
+                |_charge, _permit| std::future::pending::<Result<(), Status>>(),
+            )
             .await
             .expect_err("pending work must hit the server deadline");
         assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
         assert_eq!(admission.slots.available_permits(), 2);
+        assert_eq!(admission.bytes.in_use(), 0);
         let _next = tokio::time::timeout(Duration::from_secs(1), admission.acquire(2))
             .await
-            .expect("the deadline must un-wedge the gate")
+            .expect("the deadline must un-wedge the gate");
+    }
+
+    /// `runs` refs whose series each carry `tags` tags of `points` rows; tag `t` of run `r` sits at its own steps, so the shared axis gets about as many columns as the target allows.
+    pub(super) fn tagged_chart(
+        runs: usize,
+        tags: usize,
+        points: i64,
+        grown: i64,
+    ) -> (proto::ChartRequest, Vec<Vec<VersionedRawPoint>>) {
+        let request = proto::ChartRequest {
+            y_series: (0..runs).map(|r| series(&format!("run-{r}"))).collect(),
+            target_resolution: 1000,
+            ..Default::default()
+        };
+        let rows = (0..runs)
+            .map(|r| {
+                (0..tags)
+                    .flat_map(|t| {
+                        let lane = (r * tags + t) as i64;
+                        (0..points + grown).map(move |i| VersionedRawPoint {
+                            tag: format!("t{t:03}"),
+                            step: lane * 4 + i * 4 * (runs * tags) as i64,
+                            timestamp_ms: lane + i,
+                            value: (lane + i) as f32,
+                            is_value: 1,
+                            inserted_ms: 1 + i,
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
+        (request, rows)
+    }
+
+    /// A plan with the memo and held state off.
+    fn plan_off(request: &proto::ChartRequest) -> ChartPlan {
+        plan_audited(request, false)
+    }
+
+    /// A plan with the memo and held state off, audited if `audit` and the poll can audit.
+    fn plan_audited(request: &proto::ChartRequest, audit: bool) -> ChartPlan {
+        ChartPlan::new(
+            request,
+            &memo::ChartMemo::new(false),
+            &held::HeldStore::new(held::HeldMode::Off, 0),
+            || audit,
+        )
+    }
+
+    /// Peak bytes a build holds, the bytes stage 2 charges it, and those it reserved before its model existed: transients over the rows its refs prepare, as step 1 counts them ([`ChartPlan::prepared_rows`]), plus its output once the model's shape is known (the largest series' transients again among them, which step 1 counts as the build does), reserved at its bound ([`ChartPlan::output_bound`]).
+    fn measured_build(
+        request: &proto::ChartRequest,
+        snapshots: &[Arc<SeriesSnapshot>],
+        x_maps: Option<&std::collections::HashMap<String, std::collections::HashMap<i64, f64>>>,
+        audit: bool,
+    ) -> (proto::ChartResponse, u64, u64, u64, DenseShape) {
+        let plan = plan_audited(request, audit);
+        let kept = plan
+            .series
+            .iter()
+            .enumerate()
+            .map(|(index, key)| {
+                let at = request
+                    .y_series
+                    .iter()
+                    .position(|s| SeriesKey::new(&s.project_id, &s.run_id, &s.metric_name) == *key)
+                    .expect("every planned series has a ref");
+                plan.prepared_rows(index, &snapshots[at])
+            })
+            .fold(Kept::NONE, Kept::join);
+        let shape = std::cell::Cell::new(None);
+        let (built, peak, _) = alloc_probe::peak_and_live_bytes(|| {
+            super::build_chart(
+                request,
+                &plan.params,
+                snapshots,
+                x_maps,
+                audit,
+                None,
+                &|s| shape.set(Some(s)),
+                false,
+            )
+            .unwrap()
+        });
+        let shape: DenseShape = shape.get().expect("the build reports its model");
+        assert_eq!(
+            (shape.prepared_rows, shape.largest_series, shape.series),
+            (kept.rows, kept.largest, kept.series),
+            "step 1 counts what the build prepares"
+        );
+        assert!(
+            shape.columns <= columns_bound(plan.params.spec, kept),
+            "{shape:?}"
+        );
+        let transients = ChartPlan::transient_bytes(kept.rows);
+        let charged = transients + ChartPlan::output_bytes(shape, audit);
+        let reserved = transients + plan.output_bound(kept);
+        (built.response, peak, charged, reserved, shape)
+    }
+
+    #[test]
+    fn build_charges_cover_measured_peaks() {
+        let snapshots = |rows: &[Vec<VersionedRawPoint>]| -> Vec<Arc<SeriesSnapshot>> {
+            rows.iter()
+                .map(|rows| Arc::new(SeriesSnapshot::full(rows.clone())))
+                .collect()
+        };
+        let mut cases: Vec<(&str, proto::ChartRequest, Vec<Arc<SeriesSnapshot>>, bool)> =
+            Vec::new();
+        // Many expanded series over few rows: the dense model dwarfs the rows' transients.
+        let (wide, rows) = tagged_chart(16, 64, 2, 0);
+        cases.push(("16x64 tags", wide.clone(), snapshots(&rows), false));
+        let mut smoothed = wide.clone();
+        smoothed.target_resolution = 10_000;
+        smoothed.smoothing = Some(proto::SmoothingConfig {
+            algorithm: Algorithm::Ema as i32,
+            time_constant: 4.0,
+            ..Default::default()
+        });
+        cases.push((
+            "16x64 tags smoothed passthrough",
+            smoothed.clone(),
+            snapshots(&rows),
+            false,
+        ));
+        let mut banded = wide.clone();
+        banded.use_timestamp_axis = true;
+        banded.target_resolution = 10_000;
+        let duplicated: Vec<Vec<VersionedRawPoint>> = rows
+            .iter()
+            .map(|rows| {
+                rows.iter()
+                    .map(|row| VersionedRawPoint {
+                        timestamp_ms: row.timestamp_ms / 2,
+                        ..row.clone()
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut banded_smoothed = banded.clone();
+        banded_smoothed.smoothing = smoothed.smoothing;
+        cases.push((
+            "16x64 tags banded passthrough",
+            banded,
+            snapshots(&duplicated),
+            false,
+        ));
+        cases.push((
+            "16x64 tags banded smoothed passthrough",
+            banded_smoothed,
+            snapshots(&duplicated),
+            false,
+        ));
+        let mut downsampled_smoothed = wide.clone();
+        downsampled_smoothed.smoothing = Some(proto::SmoothingConfig {
+            algorithm: Algorithm::SavitzkyGolay as i32,
+            window_size: 5,
+            poly_order: 1,
+            ..Default::default()
+        });
+        cases.push((
+            "16x64 tags smoothed grid",
+            downsampled_smoothed,
+            snapshots(&rows),
+            false,
+        ));
+        // The prod-average chart: transients dominate.
+        let average = proto::ChartRequest {
+            y_series: (0..12).map(|r| series(&format!("run-{r}"))).collect(),
+            target_resolution: 500,
+            ..Default::default()
+        };
+        let average_rows: Vec<Vec<VersionedRawPoint>> = (0..12)
+            .map(|r| {
+                (0..26_000)
+                    .map(|step| point("", step, ((step * (r + 3)) % 97) as f32, 1 + step))
+                    .collect()
+            })
+            .collect();
+        cases.push(("12x26k", average, snapshots(&average_rows), false));
+        // 1, 2, 4 and 8 equal series: the fewer, the larger the share of one series' working copies (or a time axis's sort buffer) beside the rows.
+        let short: Vec<Vec<VersionedRawPoint>> = average_rows[..8]
+            .iter()
+            .map(|rows| {
+                rows[..20_000]
+                    .iter()
+                    .map(|row| VersionedRawPoint {
+                        timestamp_ms: row.step * 1_000 + (row.step * 7_919) % 13 * 400,
+                        ..row.clone()
+                    })
+                    .collect()
+            })
+            .collect();
+        for (name, runs, smoothing, time) in [
+            ("1x20k smoothed", 1, true, false),
+            ("1x20k", 1, false, false),
+            ("2x20k", 2, false, false),
+            ("4x20k", 4, false, false),
+            ("8x20k", 8, false, false),
+            ("1x20k time", 1, false, true),
+            ("2x20k time smoothed", 2, true, true),
+            ("8x20k time", 8, false, true),
+        ] {
+            let request = proto::ChartRequest {
+                y_series: (0..runs).map(|r| series(&format!("run-{r}"))).collect(),
+                target_resolution: 1000,
+                use_timestamp_axis: time,
+                smoothing: smoothing.then_some(proto::SmoothingConfig {
+                    algorithm: Algorithm::Ema as i32,
+                    time_constant: 4.0,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            cases.push((name, request, snapshots(&short[..runs]), false));
+        }
+        // Unequal series: one long run's working copies beside short ones, first or last.
+        let unequal = proto::ChartRequest {
+            y_series: (0..8).map(|r| series(&format!("run-{r}"))).collect(),
+            target_resolution: 1000,
+            ..Default::default()
+        };
+        let mut long_first = vec![short[0].clone()];
+        long_first.extend(short[1..].iter().map(|rows| rows[..2_000].to_vec()));
+        let mut long_last: Vec<Vec<VersionedRawPoint>> = short[..7]
+            .iter()
+            .map(|rows| rows[..2_000].to_vec())
+            .collect();
+        long_last.push(short[7].clone());
+        cases.push((
+            "20k then 7x2k",
+            unequal.clone(),
+            snapshots(&long_first),
+            false,
+        ));
+        cases.push(("7x2k then 20k", unequal, snapshots(&long_last), false));
+        // Rows of groups no ref selects are charged nothing, and allocated nothing: 8 runs, each picking one of 32 tags by its filter, or each holding scalar rows that a tagged group suppresses. (The runs share one snapshot.)
+        let group = |tag: &str, rows: i64| -> Vec<VersionedRawPoint> {
+            (0..rows)
+                .map(|step| point(tag, step, (step % 89) as f32, 1 + step))
+                .collect()
+        };
+        let eight = |rows: Vec<VersionedRawPoint>| -> Vec<Arc<SeriesSnapshot>> {
+            std::iter::repeat_n(Arc::new(SeriesSnapshot::full(rows)), 8).collect()
+        };
+        let filtered = proto::ChartRequest {
+            y_series: (0..8)
+                .map(|r| proto::SeriesRef {
+                    tags: vec![format!("t{r:03}")],
+                    ..series(&format!("run-{r}"))
+                })
+                .collect(),
+            target_resolution: 1000,
+            ..Default::default()
+        };
+        let tags = (0..32)
+            .flat_map(|t| group(&format!("t{t:03}"), 20_000))
+            .collect();
+        cases.push(("8 runs, 1 of 32 tags each", filtered, eight(tags), false));
+        let suppressed = proto::ChartRequest {
+            y_series: (0..8).map(|r| series(&format!("run-{r}"))).collect(),
+            target_resolution: 1000,
+            ..Default::default()
+        };
+        let scalar_and_tag = [group("", 640_000), group("t", 20_000)].concat();
+        cases.push((
+            "8 runs, scalar suppressed by a tag",
+            suppressed,
+            eight(scalar_and_tag),
+            false,
+        ));
+        // The audited delta: a reconstructed held model and its prepared rows sit beside the full one.
+        let (_, grown_rows) = tagged_chart(16, 64, 2, 1);
+        let held_snapshots = snapshots(&rows);
+        let held = build_chart(&wide, &held_snapshots, None, false, None, &|_| {}, false)
+            .unwrap()
+            .response;
+        let grown: Vec<Arc<SeriesSnapshot>> = held_snapshots
+            .iter()
+            .zip(&grown_rows)
+            .map(|(held, rows)| held.refreshed_fixture(rows))
+            .collect();
+        let continued = continuation(&wide, &held);
+        cases.push(("16x64 tags audited delta", continued, grown, true));
+
+        // Custom x: each run's points through its x map (built outside the probe, as the request's x reads charge it), monotone or not, smoothed or not.
+        let custom = |runs: usize, smoothing: bool, x_series: bool| proto::ChartRequest {
+            y_series: (0..runs).map(|r| series(&format!("run-{r}"))).collect(),
+            x_series: x_series.then(|| proto::SeriesRef {
+                metric_name: "x".to_string(),
+                ..series("run-0")
+            }),
+            target_resolution: 1000,
+            smoothing: smoothing.then_some(proto::SmoothingConfig {
+                algorithm: Algorithm::Ema as i32,
+                time_constant: 4.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let x_maps = |runs: usize, shuffled: bool| {
+            (0..runs)
+                .map(|r| {
+                    let map: std::collections::HashMap<i64, f64> = (0..20_000i64)
+                        .map(|step| {
+                            let jitter = if shuffled { (step * 7_919) % 13 } else { 0 };
+                            (step, step as f64 * 0.5 + jitter as f64)
+                        })
+                        .collect();
+                    (format!("run-{r}"), map)
+                })
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let mut custom_cases = Vec::new();
+        for (name, runs, smoothing, shuffled) in [
+            ("1x20k custom x", 1, false, false),
+            ("1x20k custom x shuffled", 1, false, true),
+            ("1x20k custom x smoothed shuffled", 1, true, true),
+            ("4x20k custom x shuffled", 4, false, true),
+        ] {
+            custom_cases.push((
+                name,
+                custom(runs, smoothing, true),
+                snapshots(&short[..runs]),
+                Some(x_maps(runs, shuffled)),
+            ));
+        }
+
+        let cases = cases
+            .into_iter()
+            .map(|(name, request, snapshots, audit)| (name, request, snapshots, None, audit))
+            .chain(
+                custom_cases
+                    .into_iter()
+                    .map(|(name, request, snapshots, maps)| {
+                        (name, request, snapshots, maps, false)
+                    }),
+            );
+        for (name, request, snapshots, maps, audit) in cases {
+            let (response, peak, charged, reserved, shape) =
+                measured_build(&request, &snapshots, maps.as_ref(), audit);
+            let rows = shape.prepared_rows as u64;
+            let cells = shape.series as u64 * shape.columns as u64;
+            let models = if audit { 2 } else { 1 };
+            // `--nocapture` shows the per-cell figure DENSE_BYTES_PER_CELL is set from, and the per-row one BUILD_BYTES_PER_ROW is.
+            eprintln!(
+                "PROBE {name}: series={} columns={} rows={rows} largest={} delta={} peak={peak} charged={charged} reserved={reserved} bytes_per_cell={:.1} bytes_per_row={:.1}",
+                shape.series,
+                shape.columns,
+                shape.largest_series,
+                response.delta,
+                (peak as f64 - (rows * models * budget::BUILD_BYTES_PER_ROW) as f64)
+                    / (cells * models) as f64,
+                (peak as f64 - (cells * models * budget::DENSE_BYTES_PER_CELL) as f64)
+                    / rows as f64,
+            );
+            assert_eq!(response.delta, audit, "{name}: the intended path");
+            assert!(
+                peak <= charged,
+                "{name}: the build held {peak} bytes, charged {charged}"
+            );
+            // Its output was reserved at its bound before its model existed.
+            assert!(
+                peak <= reserved && charged <= reserved,
+                "{name}: the build held {peak} bytes, charged {charged}, reserved {reserved} before its model"
+            );
+            // Where the model dominates, the charge stays within a small factor of what the build holds; where the rows do, within half again (unequal series hold less than the largest one's working copies beside every row).
+            if cells * budget::DENSE_BYTES_PER_CELL > rows * budget::BUILD_BYTES_PER_ROW {
+                assert!(
+                    charged <= 3 * peak,
+                    "{name}: charged {charged} for a {peak}-byte build"
+                );
+            } else {
+                assert!(
+                    2 * charged <= 3 * peak,
+                    "{name}: charged {charged} for a {peak}-byte build"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_hit_units_return_to_the_gate_after_the_lookups() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let rendered = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
+        let inflight = || {
+            rendered
+                .render()
+                .lines()
+                .find_map(|line| line.strip_prefix("mkdb2_chart_inflight_series "))
+                .map(|value| value.parse::<f64>().unwrap())
+        };
+        let admission = admission(32);
+        let mut permit = admission.acquire(12).await;
+        assert_eq!(admission.slots.available_permits(), 20);
+        assert_eq!(inflight(), Some(12.0));
+        // 9 of 12 distinct series were fresh hits: 3 reads keep one unit each, and the gauge counts only those.
+        permit.keep_for_reads(3);
+        assert_eq!(permit.units(), 3);
+        assert_eq!(admission.slots.available_permits(), 29);
+        assert_eq!(inflight(), Some(3.0));
+        let units: Vec<_> = std::iter::from_fn(|| permit.split_refresh_unit())
+            .take(8)
+            .collect();
+        assert_eq!(
+            units.len(),
+            3,
+            "every remaining read detaches on its own unit"
+        );
+        drop(units);
+        assert_eq!(admission.slots.available_permits(), 32);
+        drop(permit);
+        assert_eq!(inflight(), Some(0.0));
+    }
+
+    #[tokio::test]
+    async fn a_clamped_request_returns_only_units_its_reads_do_not_need() {
+        let admission = admission(32);
+        let floor = admission.fetch_concurrency();
+        // More reads than units: everything and the inline floor stay (Stage R (a)).
+        let mut permit = admission.acquire(MAX_CHART_REQUEST_RAW_SERIES).await;
+        permit.keep_for_reads(40);
+        assert_eq!(permit.units(), 32);
+        let units: Vec<_> = std::iter::from_fn(|| permit.split_refresh_unit())
+            .take(64)
+            .collect();
+        assert_eq!(units.len(), 32 - floor);
+        drop((units, permit));
+        // Fewer reads than units: the rest go back and every read can split its own.
+        let mut permit = admission.acquire(MAX_CHART_REQUEST_RAW_SERIES).await;
+        permit.keep_for_reads(10);
+        assert_eq!(admission.slots.available_permits(), 22);
+        let units: Vec<_> = std::iter::from_fn(|| permit.split_refresh_unit())
+            .take(64)
+            .collect();
+        assert_eq!(units.len(), 10);
+        drop(units);
+        // The custom-X phase keeps only its own units.
+        let mut permit = admission.acquire(12).await;
+        permit.keep_for_reads(5);
+        permit.keep_for_reads(2);
+        assert_eq!(permit.units(), 2);
+        assert_eq!(admission.slots.available_permits(), 30);
+    }
+
+    /// Transients are charged over the rows `prepare` keeps: in the fetch range, of the tag groups each ref selects (tagged groups over the scalar one, the ref's filter), for every ref naming a series.
+    #[test]
+    fn prepared_rows_count_what_prepare_keeps() {
+        let rows = |tags: &[(&str, i64)]| {
+            Arc::new(SeriesSnapshot::full(
+                tags.iter()
+                    .flat_map(|&(tag, steps)| {
+                        (0..steps).map(move |step| point(tag, step, step as f32, 1))
+                    })
+                    .collect(),
+            ))
+        };
+        // Run a: scalar rows beside tagged ones (the tagged win); run b: scalar only.
+        let a = rows(&[("", 100), ("x", 50), ("y", 70)]);
+        let b = rows(&[("", 200)]);
+        let tagged = |run: &str, tags: &[&str]| proto::SeriesRef {
+            tags: tags.iter().map(|tag| tag.to_string()).collect(),
+            ..series(run)
+        };
+        let zoomed =
+            |refs: Vec<proto::SeriesRef>, min: Option<i64>, max: Option<i64>| proto::ChartRequest {
+                y_series: refs,
+                step_min: min,
+                step_max: max,
+                target_resolution: 300,
+                ..Default::default()
+            };
+        let requests = [
+            zoomed(vec![series("a"), series("b")], None, None),
+            zoomed(vec![tagged("a", &["y"]), series("b")], Some(10), Some(30)),
+            zoomed(
+                vec![series("a"), tagged("a", &["x"]), series("b"), series("b")],
+                Some(40),
+                None,
+            ),
+            zoomed(vec![tagged("a", &["z"]), series("b")], None, Some(-1)),
+        ];
+        for mut request in requests {
+            canonicalize_chart_request(&mut request).unwrap();
+            let plan = plan_off(&request);
+            let snapshots: Vec<Arc<SeriesSnapshot>> = request
+                .y_series
+                .iter()
+                .map(|s| Arc::clone(if s.run_id == "a" { &a } else { &b }))
+                .collect();
+            let Kept {
+                rows: charged,
+                largest,
+                series,
+                ..
+            } = plan
+                .series
+                .iter()
+                .enumerate()
+                .map(|(index, key)| {
+                    plan.prepared_rows(index, if key.run_id == "a" { &a } else { &b })
+                })
+                .fold(Kept::NONE, Kept::join);
+            let p = chart_params(&request);
+            let prepared =
+                prepare(&request, &p, &snapshots, None, None, false, None, false).unwrap();
+            let kept: usize = prepared.series.iter().map(|ps| ps.xs.len()).sum();
+            assert_eq!(charged, kept, "{request:?}");
+            assert_eq!(series, prepared.series.len(), "{request:?}");
+            assert_eq!(
+                (prepared.rows, prepared.largest),
+                (kept, largest),
+                "{request:?}"
+            );
+            assert_eq!(
+                largest,
+                prepared
+                    .series
+                    .iter()
+                    .map(|ps| ps.xs.len())
+                    .max()
+                    .unwrap_or(0),
+                "{request:?}"
+            );
+        }
+    }
+
+    /// A ref selecting more tag groups than `prepare` accepts is priced at nothing: `prepare` refuses the request before collecting any of them, so step 1 reserves only the snapshot it pins. At the limit, every group is priced.
+    #[test]
+    fn refs_past_the_tag_group_limit_are_priced_at_nothing() {
+        let wide = |tags: usize| {
+            Arc::new(SeriesSnapshot::full(
+                (0..tags)
+                    .flat_map(|t| {
+                        (0..100).map(move |step| point(&format!("t{t:03}"), step, 1.0, 1))
+                    })
+                    .collect(),
+            ))
+        };
+        let request = proto::ChartRequest {
+            y_series: vec![series("a")],
+            target_resolution: 300,
+            ..Default::default()
+        };
+        let p = chart_params(&request);
+        for tags in [MAX_TAG_GROUPS, MAX_TAG_GROUPS + 1] {
+            let rows = wide(tags);
+            let mut plan = plan_off(&request);
+            let kept = plan.prepared_rows(0, &rows);
+            let estimate = plan.estimate(&[crate::series_cache::CachedSize::Cached(rows.clone())]);
+            let prepared = prepare(
+                &request,
+                &p,
+                std::slice::from_ref(&rows),
+                None,
+                None,
+                false,
+                None,
+                false,
+            );
+            if tags > MAX_TAG_GROUPS {
+                assert_eq!(prepared.err().unwrap().code(), tonic::Code::InvalidArgument);
+                assert_eq!(kept, Kept::NONE);
+                assert_eq!(estimate, vec![rows.bytes() as u64, 0]);
+            } else {
+                assert_eq!((kept.rows, kept.series), (prepared.unwrap().rows, tags));
+                assert!(
+                    estimate.iter().sum::<u64>()
+                        > rows.bytes() as u64 + ChartPlan::transient_bytes(kept.rows)
+                );
+            }
+        }
+    }
+
+    /// A zoomed chart over heavy series is charged the rows it keeps, so it stays within the budget rather than running alone.
+    #[tokio::test]
+    async fn a_zoomed_heavy_chart_shares_the_budget() {
+        const BUDGET: u64 = 10 << 20;
+        let service = chart_service("http://127.0.0.1:9", ChartAdmission::new(32, BUDGET, 1));
+        let (_, whole) = cached_chart(&service, 8, 20_000);
+        let zoomed = proto::ChartRequest {
+            step_min: Some(5_000),
+            step_max: Some(5_999),
+            ..whole.clone()
+        };
+        let cache = service.ch.series_cache();
+        let estimate = |request: &proto::ChartRequest| {
+            let mut plan =
+                ChartPlan::new(request, &service.chart_memo, &service.chart_held, || false);
+            plan.estimate(&cache.sizes(&plan.series))
+                .iter()
+                .sum::<u64>()
+        };
+        let pins = 8 * crate::series_cache::snapshot_bytes(20_000) as u64;
+        let per_row = budget::BUILD_BYTES_PER_ROW;
+        // Every series' prepared rows, the largest series' once more, and the model's bound.
+        assert_eq!(
+            estimate(&whole),
+            pins + 8 * 20_000 * per_row + output_bound(8, 20_000)
+        );
+        assert!(estimate(&whole) > BUDGET, "the whole chart runs alone");
+        assert_eq!(
+            estimate(&zoomed),
+            pins + 8 * 1_000 * per_row + output_bound(8, 1_000)
+        );
+
+        // Another request holds part of the budget: the zoomed chart is admitted beside it, as the whole one is not.
+        let bytes = &service.chart_admission.bytes;
+        let other = bytes.reserve(vec![BUDGET / 4]).await;
+        let (answer, _, charge) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            admitted_with_charge(&service, zoomed),
+        )
+        .await
+        .expect("admitted beside the other charge");
+        answer.await.unwrap();
+        assert_eq!(
+            charge.items()[..8].iter().sum::<u64>(),
+            pins + 8 * 1_000 * per_row,
+            "corrected to the rows it prepared"
+        );
+        drop(charge);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                bytes.reserve(vec![estimate(&whole)])
+            )
+            .await
+            .is_err(),
+            "the whole chart waits for the budget to drain"
+        );
+        drop(other);
+    }
+
+    #[test]
+    fn charges_are_estimated_from_the_cache_records_and_corrected_to_real_sizes() {
+        use crate::series_cache::CachedSize;
+        let mut request = proto::ChartRequest {
+            y_series: vec![series("a"), series("b"), series("a"), series("c")],
+            x_series: Some(series("x")),
+            ..Default::default()
+        };
+        let mut plan = plan_off(&request);
+        assert_eq!(
+            plan.series
+                .iter()
+                .zip(&plan.refs)
+                .map(|(key, refs)| (key.run_id.as_str(), refs.len()))
+                .collect::<Vec<_>>(),
+            [("a", 2), ("b", 1), ("c", 1)]
+        );
+        assert_eq!(plan.x_runs, 3);
+        let cached = Arc::new(SeriesSnapshot::full(
+            (0..100).map(|step| point("", step, 1.0, 1)).collect(),
+        ));
+        let estimate = plan.estimate(&[
+            CachedSize::Cached(cached.clone()),
+            CachedSize::Evicted { rows: 1_000 },
+            CachedSize::Unknown,
+        ]);
+        let per_row = budget::BUILD_BYTES_PER_ROW;
+        let snapshot = |rows| crate::series_cache::snapshot_bytes(rows) as u64;
+        assert_eq!(
+            plan.snapshots,
+            [
+                cached.bytes() as u64,
+                snapshot(1_000),
+                snapshot(budget::MISS_ESTIMATE_ROWS as usize)
+            ],
+            "what a detached read of each keeps charged"
+        );
+        assert_eq!(
+            estimate,
+            [
+                // Both refs of the cached series prepare its 100 rows.
+                cached.bytes() as u64 + 100 * 2 * per_row,
+                // An evicted series' transients wait for its read: how many of its rows a zoomed or filtered chart keeps is unknown until then.
+                crate::series_cache::snapshot_bytes(1_000) as u64,
+                series_bytes(budget::MISS_ESTIMATE_ROWS as usize),
+                budget::MISS_ESTIMATE_ROWS * budget::X_BYTES_PER_ROW,
+                budget::MISS_ESTIMATE_ROWS * budget::X_BYTES_PER_ROW,
+                budget::MISS_ESTIMATE_ROWS * budget::X_BYTES_PER_ROW,
+                // The largest series' working copies (the prod-average miss's), and a model of its three series with a column per row, its most without a resolution.
+                budget::MISS_ESTIMATE_ROWS * per_row
+                    + 3 * (200 + budget::MISS_ESTIMATE_ROWS) * budget::DENSE_BYTES_PER_CELL,
+            ]
+        );
+        // A long tag filter is looked up as a set: only the tags it names are prepared.
+        let tagged = Arc::new(SeriesSnapshot::full(
+            (0..30)
+                .map(|i| VersionedRawPoint {
+                    tag: format!("t{}", i / 10),
+                    step: i % 10,
+                    timestamp_ms: i,
+                    value: 1.0,
+                    is_value: 1,
+                    inserted_ms: 1,
+                })
+                .collect(),
+        ));
+        let filtered = proto::ChartRequest {
+            y_series: vec![proto::SeriesRef {
+                tags: (0..4_000).map(|i| format!("t{}", i % 2)).collect(),
+                ..series("a")
+            }],
+            ..Default::default()
+        };
+        let plan = plan_off(&filtered);
+        assert_eq!(plan.params.filters.as_ref().unwrap()[0].len(), 2);
+        let kept = plan.prepared_rows(0, &tagged);
+        assert_eq!((kept.rows, kept.largest, kept.series), (20, 10, 2));
+        request.use_timestamp_axis = true;
+        assert_eq!(plan_off(&request).x_runs, 0, "timestamp charts read no x");
+    }
+
+    /// What step 1 charges a series of `rows` rows that one ref prepares in full: its snapshot and its transients.
+    fn series_bytes(rows: usize) -> u64 {
+        crate::series_cache::snapshot_bytes(rows) as u64 + ChartPlan::transient_bytes(rows)
+    }
+
+    /// What step 1 reserves for the output of `series` series, the largest of `largest` rows, on a 300-column step chart spanning more than twice that: the largest series' working copies and a model of the most columns the chart can have (602, [`columns_bound`]).
+    fn output_bound(series: u64, largest: usize) -> u64 {
+        ChartPlan::transient_bytes(largest) + series * 602 * budget::DENSE_BYTES_PER_CELL
+    }
+
+    /// The bound step 1 reserves for 12 series of 1,000 rows on a 300-column step chart: one model of their most columns ([`output_bound`]), nothing else held.
+    const BOUND_12X1K: DenseShape = DenseShape {
+        series: 12,
+        columns: 602,
+        prepared_rows: 12_000,
+        largest_series: 1_000,
+        models: 1,
+        extra: 0,
+    };
+
+    fn chart_service(endpoint: &str, admission: ChartAdmission) -> Arc<QueryService> {
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        let mut service = QueryService::new(
+            Arc::new(ChClient::new(endpoint).unwrap()),
+            Arc::new(PgStore::test_store()),
+            crate::ingest::BumpCoalescer::empty_for_test(),
+            LifecycleGates::new(),
+            None,
+            events,
+        );
+        service.chart_admission = admission;
+        // A fresh service audits its first draw: a test's polls are unaudited until it sets the draw counter.
+        service.delta_audit = std::sync::atomic::AtomicU64::new(1);
+        Arc::new(service)
+    }
+
+    /// [`chart_service`] with the memo off and held state in `mode`.
+    fn held_service(mode: held::HeldMode, admission: ChartAdmission) -> Arc<QueryService> {
+        let mut service = chart_service("http://127.0.0.1:9", admission);
+        let unshared = Arc::get_mut(&mut service).expect("not yet shared");
+        unshared.chart_memo = Arc::new(memo::ChartMemo::new(false));
+        unshared.chart_held = Arc::new(held::HeldStore::new(mode, usize::MAX));
+        service
+    }
+
+    /// `runs` cached series of `rows` rows each, and a 300-column chart of them.
+    fn cached_chart(
+        service: &QueryService,
+        runs: usize,
+        rows: i64,
+    ) -> (Vec<String>, proto::ChartRequest) {
+        let runs: Vec<String> = (0..runs).map(|i| format!("run-{i}")).collect();
+        for run in &runs {
+            cache_rows(service, run, rows);
+        }
+        let request = proto::ChartRequest {
+            y_series: runs.iter().map(|run| series(run)).collect(),
+            target_resolution: 300,
+            ..Default::default()
+        };
+        (runs, request)
+    }
+
+    fn cache_rows(service: &QueryService, run_id: &str, rows: i64) {
+        service.ch.series_cache().insert_full(
+            SeriesKey::new("project", run_id, "loss"),
+            (0..rows)
+                .map(|step| point("", step, step as f32, 1))
+                .collect(),
+            std::time::Instant::now(),
+        );
+    }
+
+    /// Admit a request as `run_with_timeout` does, then answer it as `query_chart` does ([`QueryService::query_chart_admitted`], the test store answering the lifecycle checks); also the step-1 estimate and a handle on the request's charge (it keeps the charge's items readable after the request ends).
+    async fn admitted_with_charge(
+        service: &Arc<QueryService>,
+        request: proto::ChartRequest,
+    ) -> (
+        impl std::future::Future<Output = Result<proto::ChartResponse, Status>> + Send + 'static,
+        Vec<u64>,
+        Arc<budget::ChartCharge>,
+    ) {
+        let mut plan = ChartPlan::new(&request, &service.chart_memo, &service.chart_held, || {
+            service.draw_audit()
+        });
+        let estimate = plan.estimate(&service.ch.series_cache().sizes(&plan.series));
+        let admission = &service.chart_admission;
+        let charge = admission.bytes.reserve(estimate.clone()).await;
+        let handle = charge.clone();
+        let weight = chart_admission_weight(&request);
+        let permit = admission.acquire(weight).await;
+        let (service, request) = (service.clone(), Arc::new(request));
+        (
+            async move {
+                let admitted =
+                    service.query_chart_admitted(&request, &mut plan, weight, charge, permit);
+                admitted.await
+            },
+            estimate,
+            handle,
+        )
+    }
+
+    #[tokio::test]
+    async fn memo_held_polls_reserve_no_transients_and_a_build_charges_them_first() {
+        let service = chart_service("http://127.0.0.1:9", ChartAdmission::new(32, 1 << 30, 1));
+        let (_, request) = cached_chart(&service, 12, 1_000);
+        let admission = &service.chart_admission;
+        let pins = |rows: &[usize]| -> u64 {
+            rows.iter()
+                .map(|&rows| crate::series_cache::snapshot_bytes(rows) as u64)
+                .sum()
+        };
+        let (first, _, _) = admitted_with_charge(&service, request.clone()).await;
+        let first = first.await.unwrap();
+        let polled = continuation(&request, &first);
+        // No memo for the key yet: the poll reserves its transients, builds, and leaves a memo.
+        let (unchanged, estimate, _) = admitted_with_charge(&service, polled.clone()).await;
+        assert_eq!(
+            estimate.iter().sum::<u64>(),
+            12 * series_bytes(1_000) + output_bound(12, 1_000)
+        );
+        let unchanged = unchanged.await.unwrap();
+        assert!(unchanged.delta && unchanged.x_values.is_empty());
+
+        // Audited, the poll builds in full behind the memo: step 1 reserves its transients and its output's bound with the audit's model and second prepare.
+        service
+            .delta_audit
+            .store(67 * 1_000, std::sync::atomic::Ordering::Relaxed);
+        let (audited, estimate, _) = admitted_with_charge(&service, polled.clone()).await;
+        let audited_output = ChartPlan::output_bytes(BOUND_12X1K, true);
+        assert_eq!(
+            estimate.iter().sum::<u64>(),
+            12 * series_bytes(1_000) + audited_output
+        );
+        assert_eq!(audited.await.unwrap(), unchanged);
+
+        // A memo is held for the key: only the pins are reserved, and the memo answers without a build slot.
+        let blocker = admission.builds.hold().await;
+        let (served, estimate, _) = admitted_with_charge(&service, polled.clone()).await;
+        assert_eq!(estimate.iter().sum::<u64>(), pins(&[1_000; 12]));
+        assert_eq!(served.await.unwrap(), unchanged);
+        assert_eq!(admission.bytes.in_use(), 0);
+
+        // The key still holds a memo, but a series moved on: the poll builds, and with no room for its transients it starts over, waiting for room for them with its bytes given back meanwhile.
+        cache_rows(&service, "run-0", 1_001);
+        let mut rows = vec![1_000; 12];
+        rows[0] = 1_001;
+        let (rebuilt, estimate, charge) = admitted_with_charge(&service, polled).await;
+        assert_eq!(estimate.iter().sum::<u64>(), pins(&rows));
+        let full = (1 << 30) - pins(&rows);
+        let other = admission.bytes.reserve(vec![full]).await;
+        let rebuilt = tokio::spawn(rebuilt);
+        crate::wait_until(|| admission.bytes.in_use() == full).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(admission.bytes.in_use(), full, "waiting, not overdrawing");
+        assert!(!rebuilt.is_finished());
+        drop(other);
+        let with_transients: u64 = rows.iter().map(|&rows| series_bytes(rows)).sum();
+        crate::wait_until(|| admission.bytes.in_use() == with_transients + output_bound(12, 1_001))
+            .await;
+        drop(blocker);
+        let rebuilt = rebuilt.await.unwrap().unwrap();
+        assert!(!rebuilt.delta, "a new lineage answers in full");
+        assert_eq!(
+            admission.bytes.in_use(),
+            with_transients + charge.items()[12]
+        );
+        let output = ChartPlan::output_bytes(
+            DenseShape {
+                columns: rebuilt.x_values.len(),
+                prepared_rows: rows.iter().sum(),
+                largest_series: 1_001,
+                ..BOUND_12X1K
+            },
+            false,
+        );
+        assert_eq!(
+            charge.items()[12],
+            output,
+            "the build charged its dense output"
+        );
+        drop(charge);
+        assert_eq!(admission.bytes.in_use(), 0);
+    }
+
+    /// Polls that skipped their transients (a memo was held for each) and build after all, with no room for them, start over ([`ChartPlan::restart`]): while they wait, none holds a snapshot, a byte, a scan unit or a run guard, and each checks its run's lifecycle again before it reads again.
+    #[tokio::test]
+    async fn polls_starting_over_wait_holding_no_snapshot() {
+        let limit = 1 << 30;
+        let service = chart_service("http://127.0.0.1:9", ChartAdmission::new(32, limit, 1));
+        let runs: Vec<String> = (0..8).map(|i| format!("run-{i}")).collect();
+        let mut polls = Vec::new();
+        for run in &runs {
+            cache_rows(&service, run, 1_000);
+            let request = proto::ChartRequest {
+                y_series: vec![series(run)],
+                target_resolution: 300,
+                ..Default::default()
+            };
+            let first = admitted_with_charge(&service, request.clone()).await.0;
+            let polled = continuation(&request, &first.await.unwrap());
+            let unchanged = admitted_with_charge(&service, polled.clone()).await.0;
+            assert!(unchanged.await.unwrap().delta, "memoized");
+            polls.push(polled);
+        }
+        // Every run moves on: each poll reserves only its pins, misses its memo and builds.
+        for run in &runs {
+            cache_rows(&service, run, 1_001);
+        }
+        let pinned: Vec<std::sync::Weak<SeriesSnapshot>> = runs
+            .iter()
+            .map(|run| {
+                let key = SeriesKey::new("project", run, "loss");
+                Arc::downgrade(&service.ch.series_cache().lookup_fresh(&key).unwrap())
+            })
+            .collect();
+        let admission = &service.chart_admission;
+        let mut admitted = Vec::new();
+        for polled in polls {
+            let (poll, estimate, _) = admitted_with_charge(&service, polled).await;
+            assert_eq!(
+                estimate.iter().sum::<u64>(),
+                crate::series_cache::snapshot_bytes(1_001) as u64
+            );
+            admitted.push(poll);
+        }
+        // A request ahead of their transients: first come, first served, so none fits now.
+        let mut ahead = Box::pin(admission.bytes.reserve(vec![limit]));
+        assert!(futures::FutureExt::now_or_never(&mut ahead).is_none());
+        let admitted: Vec<_> = admitted.into_iter().map(tokio::spawn).collect();
+        // Once every poll gave its pins' bytes back, the request ahead holds the whole budget and the polls wait behind it.
+        crate::wait_until(|| {
+            admission.bytes.in_use() == limit && admission.bytes.waiters() == runs.len()
+        })
+        .await;
+        // The series cache lets go of the snapshots the polls read.
+        for run in &runs {
+            cache_rows(&service, run, 1_002);
+        }
+        let uncounted: usize = pinned
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .map(|rows| rows.bytes())
+            .sum();
+        assert_eq!(uncounted, 0, "a waiting poll pins snapshots nothing counts");
+        assert_eq!(admission.slots.available_permits(), 32, "nor scan units");
+        let writers = tokio::time::timeout(
+            Duration::from_secs(1),
+            service
+                .gates
+                .write_many(runs.iter().map(|run| RunKey::new("project", run))),
+        )
+        .await
+        .expect("nor run guards");
+        // Meanwhile the first run starts purging.
+        let purging = RunKey::new("project", &runs[0]);
+        service
+            .pg
+            .set_test_lifecycle(purging, RunLifecycleClass::Purging);
+        drop(writers);
+        // The request ahead ends: each poll is admitted again with its transients, reads the cache's snapshots and answers in full, except the purging run's, which its lifecycle check refuses.
+        drop(ahead);
+        for (index, poll) in admitted.into_iter().enumerate() {
+            let answer = poll.await.unwrap();
+            if index == 0 {
+                let status = answer.expect_err("the purging run's poll is refused");
+                assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status}");
+            } else {
+                assert!(!answer.unwrap().delta, "a new lineage answers in full");
+            }
+        }
+        assert_eq!(admission.bytes.in_use(), 0);
+        assert_eq!(admission.bytes.waiters(), 0);
+    }
+
+    /// A first read larger than step 1 priced it (a series the cache has never seen, priced as the prod average, or a cached one that grew before the poll read it) overdraws the budget only until the poll's reads are done. With no room for it then, the poll starts over, holding none of its bytes or pins while it waits for room at the size it read, then reserves that size (the series a fresh hit now) and builds within it. With room but an earlier request waiting, a cached series' growth is kept ahead of the waiter, since the budget's use stays within its limit, and the poll builds; a read past the prod-average estimate starts over behind the waiter.
+    #[tokio::test]
+    async fn a_first_read_past_its_price_starts_over_at_its_size_unless_it_may_keep_it() {
+        for room in [false, true] {
+            for cached in [false, true] {
+                first_read_past_its_price(cached, room).await;
+            }
+        }
+    }
+
+    async fn first_read_past_its_price(cached: bool, room: bool) {
+        #[derive(serde::Serialize, ::clickhouse::Row)]
+        struct Encoded {
+            run_id: String,
+            tag: String,
+            step: i64,
+            timestamp_ms: i64,
+            value: f32,
+            inserted_ms: i64,
+        }
+        const ROWS: usize = 40_000;
+        const LIMIT: u64 = 64 << 20;
+        let mut mock = ::clickhouse::test::Mock::new();
+        // One full read: the poll that starts over finds the series cached.
+        mock.add(::clickhouse::test::handlers::provide((0..ROWS as i64).map(
+            |step| Encoded {
+                run_id: "run-0".into(),
+                tag: String::new(),
+                step,
+                timestamp_ms: step,
+                value: step as f32,
+                inserted_ms: 1,
+            },
+        )));
+        let service = chart_service(mock.url(), ChartAdmission::new(32, LIMIT, 1));
+        let admission = &service.chart_admission;
+        let priced = if cached {
+            // Read from the cache instead.
+            mock.non_exhaustive();
+            cache_rows(&service, "run-0", 1_000);
+            1_000
+        } else {
+            budget::MISS_ESTIMATE_ROWS as usize
+        };
+        let request = proto::ChartRequest {
+            y_series: vec![series("run-0")],
+            target_resolution: 300,
+            ..Default::default()
+        };
+        let (poll, estimate, charge) = admitted_with_charge(&service, request).await;
+        let reserved = estimate.iter().sum::<u64>();
+        assert_eq!(reserved, series_bytes(priced) + output_bound(1, priced));
+        // Priced, the cached series grows before the poll reads it.
+        let grown = cached.then(|| {
+            cache_rows(&service, "run-0", ROWS as i64);
+            let key = SeriesKey::new("project", "run-0", "loss");
+            service.ch.series_cache().lookup_fresh(&key).unwrap()
+        });
+        let read = [series_bytes(ROWS), output_bound(1, ROWS)];
+        if room {
+            let other = admission.bytes.reserve(vec![LIMIT / 2]).await;
+            let mut earlier = Box::pin(admission.bytes.reserve(vec![LIMIT]));
+            assert!(futures::FutureExt::now_or_never(earlier.as_mut()).is_none());
+            let blocker = admission.builds.hold().await;
+            let poll = tokio::spawn(poll);
+            let (items, waiters) = if cached {
+                (read.to_vec(), 1)
+            } else {
+                (vec![0, 0], 2)
+            };
+            crate::wait_until(|| charge.items() == items && admission.bytes.waiters() == waiters)
+                .await;
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                (charge.items(), admission.bytes.waiters()),
+                (items, waiters),
+                "cached {cached}"
+            );
+            drop((blocker, other, charge));
+            let (answer, ()) = futures::join!(poll, futures::FutureExt::map(earlier, drop));
+            assert!(!answer.unwrap().unwrap().delta);
+            assert_eq!(admission.bytes.in_use(), 0);
+            return;
+        }
+        let other = admission.bytes.reserve(vec![LIMIT - reserved]).await;
+        let poll = tokio::spawn(poll);
+        crate::wait_until(|| admission.bytes.waiters() == 1).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            (admission.bytes.in_use(), charge.items()),
+            (LIMIT - reserved, vec![0, 0]),
+            "waiting, holding nothing"
+        );
+        if let Some(grown) = &grown {
+            assert_eq!(
+                Arc::strong_count(grown),
+                2,
+                "no pin: the cache's and this test's"
+            );
+        }
+        assert!(!poll.is_finished());
+        // Room again: it reserves the size it read, its build's output at its bound, and builds within it.
+        let blocker = admission.builds.hold().await;
+        drop(other);
+        crate::wait_until(|| charge.items()[0] > 0).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            (charge.items(), admission.bytes.in_use()),
+            (read.to_vec(), read.iter().sum())
+        );
+        drop(blocker);
+        assert!(!poll.await.unwrap().unwrap().delta);
+        drop(charge);
+        assert_eq!(admission.bytes.in_use(), 0);
+    }
+
+    /// A first pass keeps a cached series' growth ahead of the waiters, an estimate's overrun only with nobody waiting; once the poll starts over, step 1 prices each item at no less than its first pass came to, and it starts over no more.
+    #[test]
+    fn a_poll_starting_over_reserves_at_least_what_its_first_pass_came_to() {
+        use crate::series_cache::CachedSize;
+        let request = proto::ChartRequest {
+            y_series: vec![series("a"), series("b")],
+            target_resolution: 300,
+            ..Default::default()
+        };
+        let mut plan = plan_off(&request);
+        let cached = Arc::new(SeriesSnapshot::full(
+            (0..1_000).map(|step| point("", step, 1.0, 1)).collect(),
+        ));
+        plan.estimate(&[
+            CachedSize::Cached(cached.clone()),
+            CachedSize::Cached(cached.clone()),
+        ]);
+        assert_eq!(plan.ahead, Some(true), "priced from the cache");
+        let sizes = [
+            CachedSize::Cached(cached.clone()),
+            CachedSize::Evicted { rows: 40_000 },
+        ];
+        let first = plan.estimate(&sizes);
+        assert_eq!(plan.ahead, Some(false), "priced by estimate");
+        let known = vec![first[0] - 1, first[1] + 5_000_000, first[2] + 7];
+        plan.restart(held::Advance::Try, known.clone());
+        assert_eq!(
+            plan.estimate(&sizes),
+            [first[0], known[1], known[2]],
+            "each item at least what the first pass came to"
+        );
+        assert_eq!(plan.ahead, None, "it starts over no more");
+    }
+
+    /// Append rows to a cached series as a poll's refresh does, keeping its lineage.
+    fn append_rows(
+        service: &QueryService,
+        run_id: &str,
+        steps: std::ops::Range<i64>,
+        inserted_ms: i64,
+    ) {
+        super::frontier_delta_tests::cache_append(
+            service.ch.series_cache(),
+            &SeriesKey::new("project", run_id, "loss"),
+            steps
+                .map(|step| point("", step, step as f32, inserted_ms))
+                .collect(),
+        );
+    }
+
+    /// Only a poll that can audit draws the audit: one whose build has a prefix to check, or in `on` mode one whose advance from a held entry the audit checks. A first paint otherwise draws nothing and reserves exactly what it does unaudited; an audited continuation reserves the audit's model and second prepare; a fresh tab's paint of a held chart in `on` mode reserves, unaudited, what a first paint does (it expects no advance) and, audited, the advance's model beside its own, and no audit model.
+    #[tokio::test]
+    async fn only_polls_that_can_audit_draw_and_reserve_the_audit() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let service = held_service(held::HeldMode::On, ChartAdmission::new(32, 1 << 30, 4));
+        let (_, request) = cached_chart(&service, 12, 1_000);
+        let draws = || service.delta_audit.load(Relaxed);
+        // A first paint of a chart the store does not hold draws nothing.
+        let (_, unaudited, _) = admitted_with_charge(&service, request.clone()).await;
+        service.delta_audit.store(67, Relaxed);
+        let (first, estimate, _) = admitted_with_charge(&service, request.clone()).await;
+        assert_eq!(
+            draws(),
+            67,
+            "a first paint with nothing to audit draws nothing"
+        );
+        assert_eq!(estimate, unaudited);
+        assert_eq!(estimate[12], output_bound(12, 1_000));
+        // A continuation draws the audit and reserves its model and second prepare.
+        let polled = continuation(&request, &first.await.unwrap());
+        let (continued, estimate, _) = admitted_with_charge(&service, polled).await;
+        assert_eq!(draws(), 68);
+        assert_eq!(estimate[12], ChartPlan::output_bytes(BOUND_12X1K, true));
+        continued.await.unwrap();
+        assert_eq!(service.chart_held.len_and_bytes().0, 1);
+        // Held, the chart's fresh tab draws. Unaudited, it expects no advance, since a first paint answers in full: it reserves what it did with nothing held.
+        let (_, estimate, _) = admitted_with_charge(&service, request.clone()).await;
+        assert_eq!(draws(), 69);
+        assert_eq!(estimate, unaudited);
+        // Audited, it reserves the advance's model beside its own, not the audit's.
+        service.delta_audit.store(67 * 2, Relaxed);
+        let (_, estimate, _) = admitted_with_charge(&service, request).await;
+        assert_eq!(draws(), 67 * 2 + 1);
+        assert_eq!(
+            estimate[12],
+            output_bound(12, 1_000) + 12 * 602 * budget::DENSE_BYTES_PER_CELL
+        );
+    }
+
+    /// In `shadow` mode step 1 reserves the advance's model beside a full build only while the store holds an entry of the request: with nothing held, a first paint and a continuation reserve one model; once it is held, a continuation and a fresh tab's first paint reserve two. A poll planned before the entry was held takes it and charges both models once its model exists.
+    #[tokio::test]
+    async fn shadow_polls_reserve_the_advance_model_only_for_a_held_request() {
+        let service = held_service(held::HeldMode::Shadow, ChartAdmission::new(32, 1 << 30, 4));
+        let (_, request) = cached_chart(&service, 12, 1_000);
+        let one = output_bound(12, 1_000);
+        let two = one + 12 * 602 * budget::DENSE_BYTES_PER_CELL;
+        // A tab's first paint, planned while nothing is held, waits to run.
+        let (late, estimate, charge) = admitted_with_charge(&service, request.clone()).await;
+        assert_eq!(estimate[12], one);
+        // Another tab paints and continues, each reserving one model; its continuation's state is held.
+        let (first, estimate, _) = admitted_with_charge(&service, request.clone()).await;
+        assert_eq!(estimate[12], one);
+        let polled = continuation(&request, &first.await.unwrap());
+        let (continued, estimate, _) = admitted_with_charge(&service, polled).await;
+        assert_eq!(estimate[12], one);
+        let continued = continued.await.unwrap();
+        assert_eq!(service.chart_held.len_and_bytes().0, 1);
+        let next = continuation(&request, &continued);
+        for poll in [next, request] {
+            let (_, estimate, _) = admitted_with_charge(&service, poll).await;
+            assert_eq!(estimate[12], two);
+        }
+        // The waiting paint takes the entry, advancing it beside its full build: the model's shape corrects its charge to both models.
+        let reply = late.await.unwrap();
+        let both = ChartPlan::output_bytes(
+            DenseShape {
+                columns: reply.x_values.len(),
+                models: 2,
+                ..BOUND_12X1K
+            },
+            false,
+        );
+        assert!(
+            charge.items()[12] >= both,
+            "{} charged for {both}",
+            charge.items()[12]
+        );
+    }
+
+    /// Stage 3b's hint: a poll whose request has held state reserves no transients at step 1; an advance never charges them, only what it held once it has run; an audited poll charges them before its slot wait.
+    #[tokio::test]
+    async fn held_polls_reserve_no_transients_and_a_full_build_charges_them_first() {
+        let service = held_service(held::HeldMode::On, ChartAdmission::new(32, 1 << 30, 1));
+        let (runs, request) = cached_chart(&service, 12, 1_000);
+        let transients = |rows: &[usize]| -> u64 {
+            rows.iter()
+                .map(|&rows| rows as u64 * budget::BUILD_BYTES_PER_ROW)
+                .sum()
+        };
+        let keys: Vec<SeriesKey> = runs
+            .iter()
+            .map(|run| SeriesKey::new("project", run, "loss"))
+            .collect();
+        // What the cached snapshots weigh (appends add chunks).
+        let pins = || -> u64 {
+            service
+                .ch
+                .series_cache()
+                .sizes(&keys)
+                .iter()
+                .map(|size| match size {
+                    crate::series_cache::CachedSize::Cached(rows) => rows.bytes() as u64,
+                    _ => panic!("every series is cached"),
+                })
+                .sum()
+        };
+        let (first, _, _) = admitted_with_charge(&service, request.clone()).await;
+        let first = first.await.unwrap();
+        let polled = continuation(&request, &first);
+        // Nothing held for the request yet: the poll reserves its transients and its output's bound, builds in full and holds its state.
+        let (held, estimate, _) = admitted_with_charge(&service, polled.clone()).await;
+        assert_eq!(
+            estimate.iter().sum::<u64>(),
+            pins() + transients(&[1_000; 12]) + output_bound(12, 1_000)
+        );
+        // The client holds the latest answer: its advance drops the entry it came from.
+        let mut held = held.await.unwrap();
+
+        // Held: step 1 reserves the pins and what the advance holds beside its working copies, and the advance answers without charging transients.
+        let mut rows = vec![1_000; 12];
+        for (poll, run) in [None, Some(0), Some(5)].into_iter().enumerate() {
+            if let Some(run) = run {
+                let step = 1_000 + poll as i64;
+                append_rows(&service, &runs[run], step..step + 1, 2 + poll as i64);
+                rows[run] += 1;
+            }
+            let next = continuation(&request, &held);
+            let (served, estimate, charge) = admitted_with_charge(&service, next).await;
+            assert_eq!(estimate[..12].iter().sum::<u64>(), pins());
+            assert!(
+                estimate[12] > 12 * 300 * budget::DENSE_BYTES_PER_CELL,
+                "poll {poll}: the advance's model is reserved"
+            );
+            let served = served.await.unwrap();
+            assert!(served.delta, "poll {poll}: {served:?}");
+            assert_eq!(
+                charge.items()[..12].iter().sum::<u64>(),
+                pins(),
+                "poll {poll}: an advance charges no transients"
+            );
+            assert!(
+                charge.items()[12] > 0,
+                "poll {poll}: the advance charged its model"
+            );
+            held = served;
+        }
+
+        // An audited poll builds in full though its entry is held: it charges its transients and its output's bound (its largest series' working copies, its model, the audit's model and second prepare, and the advance's model beside it) before it waits for a slot.
+        append_rows(&service, "run-1", 1_003..1_004, 6);
+        rows[1] += 1;
+        let next = continuation(&request, &held);
+        service
+            .delta_audit
+            .store(67 * 1_000, std::sync::atomic::Ordering::Relaxed);
+        let blocker = service.chart_admission.builds.hold().await;
+        let (audited, _, _) = admitted_with_charge(&service, next).await;
+        let audited = tokio::spawn(audited);
+        let output = || {
+            ChartPlan::output_bytes(
+                DenseShape {
+                    prepared_rows: rows.iter().sum(),
+                    largest_series: *rows.iter().max().unwrap(),
+                    models: 2,
+                    ..BOUND_12X1K
+                },
+                true,
+            )
+        };
+        crate::wait_until(|| {
+            service.chart_admission.bytes.in_use() == pins() + transients(&rows) + output()
+        })
+        .await;
+        drop(blocker);
+        audited.await.unwrap().unwrap();
+    }
+
+    /// An `on`-mode poll whose advance falls back, which it learns only in its build slot, leaves the slot and, with no room for its transients, starts over, holding none of its bytes while it waits for room for them; its next pass builds in full without advancing again ([`held::Advance::Skip`]) and charges them: its fallback is counted once, and it answers as the full build does.
+    #[test]
+    fn a_poll_starting_over_after_its_advance_fell_back_counts_the_fallback_once() {
+        const LIMIT: u64 = 1 << 30;
+        // Builds run on the runtime's blocking threads: every thread counts into this recorder.
+        let recorder: &'static metrics_exporter_prometheus::PrometheusRecorder = Box::leak(
+            Box::new(metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder()),
+        );
+        let rendered = recorder.handle();
+        let _local = metrics::set_default_local_recorder(recorder);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .on_thread_start(|| std::mem::forget(metrics::set_default_local_recorder(recorder)))
+            .build()
             .unwrap();
+        let fallbacks = || -> std::collections::BTreeMap<String, u64> {
+            rendered
+                .render()
+                .lines()
+                .filter_map(|line| line.strip_prefix("mkdb2_chart_held_fallback_total{reason=\""))
+                .map(|line| {
+                    let (reason, count) = line.split_once("\"} ").unwrap();
+                    (reason.to_string(), count.parse().unwrap())
+                })
+                .collect()
+        };
+        runtime.block_on(async {
+            let service = held_service(held::HeldMode::On, ChartAdmission::new(32, LIMIT, 1));
+            let (runs, request) = cached_chart(&service, 2, 1_000);
+            let (first, _, _) = admitted_with_charge(&service, request.clone()).await;
+            let polled = continuation(&request, &first.await.unwrap());
+            // Nothing held yet: the continuation builds in full and holds its state.
+            let (continued, _, _) = admitted_with_charge(&service, polled).await;
+            let continued = continued.await.unwrap();
+
+            // A step past the integers f64 holds exactly: step 1 expects an advance, which falls back in the build slot; the rest of the budget is taken, so the full build's transients do not fit and the poll starts over.
+            append_rows(&service, &runs[0], (1 << 53) + 5..(1 << 53) + 6, 10);
+            let next = continuation(&request, &continued);
+            let before = fallbacks();
+            let admission = &service.chart_admission;
+            let blocker = admission.builds.hold().await;
+            let (poll, estimate, charge) = admitted_with_charge(&service, next.clone()).await;
+            let poll = tokio::spawn(poll);
+            let reserved = estimate.iter().sum::<u64>();
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(admission.bytes.in_use(), reserved);
+            let other = admission.bytes.reserve(vec![LIMIT - reserved]).await;
+            drop(blocker);
+            crate::wait_until(|| admission.bytes.in_use() == LIMIT - reserved).await;
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                admission.bytes.in_use(),
+                LIMIT - reserved,
+                "waiting, not overdrawing"
+            );
+            assert_eq!(admission.builds.available(), 1, "outside the slot");
+            assert!(!poll.is_finished());
+            drop(other);
+            let reply = poll.await.unwrap().unwrap();
+
+            assert!(
+                rendered
+                    .render()
+                    .lines()
+                    .any(|line| line == "mkdb2_chart_budget_restarts_total 1"),
+                "the poll started over"
+            );
+            let counted: std::collections::BTreeMap<String, u64> = fallbacks()
+                .into_iter()
+                .map(|(reason, count)| {
+                    let earlier = before.get(&reason).copied().unwrap_or(0);
+                    (reason, count - earlier)
+                })
+                .filter(|&(_, count)| count > 0)
+                .collect();
+            assert_eq!(counted, [("inexact_x".to_string(), 1)].into());
+            let snapshots: Vec<Arc<SeriesSnapshot>> = runs
+                .iter()
+                .map(|run| {
+                    let key = SeriesKey::new("project", run, "loss");
+                    service.ch.series_cache().lookup_fresh(&key).unwrap()
+                })
+                .collect();
+            let pins: u64 = snapshots.iter().map(|rows| rows.bytes() as u64).sum();
+            assert_eq!(
+                charge.items()[..2].iter().sum::<u64>(),
+                pins + ChartPlan::transient_bytes(2_001),
+                "the full build charged its transients"
+            );
+            let full = build_chart(&next, &snapshots, None, false, None, &|_| {}, false).unwrap();
+            assert_eq!(
+                reply,
+                proto::ChartResponse {
+                    run_versions: reply.run_versions.clone(),
+                    ..full.response
+                }
+            );
+        });
+    }
+
+    /// Four cached charts of 16 runs × 64 tags, whose dense models dwarf their rows: each reserves its output's bound at step 1, so the budget admits only what it can build at once, never four charts that each allocate their model unreserved in four build slots.
+    #[tokio::test]
+    async fn wide_charts_reserve_their_output_before_building() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        const LIMIT: u64 = 16 << 20;
+        let service = chart_service("http://127.0.0.1:9", ChartAdmission::new(32, LIMIT, 4));
+        let (request, rows) = tagged_chart(16, 64, 2, 0);
+        let snapshots: Vec<Arc<SeriesSnapshot>> = request
+            .y_series
+            .iter()
+            .zip(rows)
+            .map(|(s, rows)| {
+                let key = SeriesKey::new(&s.project_id, &s.run_id, &s.metric_name);
+                service
+                    .ch
+                    .series_cache()
+                    .insert_full(key, rows, std::time::Instant::now())
+            })
+            .collect();
+        let (_, peak, _, _, _) = measured_build(&request, &snapshots, None, false);
+        let mut slots = Vec::new();
+        for _ in 0..4 {
+            slots.push(service.chart_admission.builds.hold().await);
+        }
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let polls: Vec<_> = (0..4)
+            .map(|_| {
+                let (service, request) = (service.clone(), request.clone());
+                let admitted = admitted.clone();
+                tokio::spawn(async move {
+                    let (poll, _, _) = admitted_with_charge(&service, request).await;
+                    admitted.fetch_add(1, Relaxed);
+                    poll.await
+                })
+            })
+            .collect();
+        let bytes = &service.chart_admission.bytes;
+        crate::wait_until(|| admitted.load(Relaxed) + bytes.waiters() == 4).await;
+        let admitted = admitted.load(Relaxed) as u64;
+        assert!(
+            bytes.in_use() >= admitted * peak,
+            "{admitted} charts admitted with {} bytes reserved; each build holds {peak}",
+            bytes.in_use()
+        );
+        drop(slots);
+        for poll in polls {
+            assert_eq!(poll.await.unwrap().unwrap().series.len(), 16 * 64);
+        }
+        crate::wait_until(|| bytes.in_use() == 0).await;
+    }
+
+    #[tokio::test]
+    async fn fresh_hits_release_units_and_guards_but_keep_bytes_while_the_build_waits() {
+        let service = chart_service("http://127.0.0.1:9", ChartAdmission::new(32, 1 << 30, 1));
+        let (runs, request) = cached_chart(&service, 12, 1_000);
+        let admission = &service.chart_admission;
+        let blocker = admission.builds.hold().await;
+        let chart = tokio::spawn(admitted_with_charge(&service, request).await.0);
+        // Parked on the build slot: every unit is back and the run guards are gone, but the bytes stay.
+        crate::wait_until(|| admission.slots.available_permits() == 32).await;
+        let writers = tokio::time::timeout(
+            Duration::from_secs(1),
+            service
+                .gates
+                .write_many(runs.iter().map(|run| RunKey::new("project", run))),
+        )
+        .await
+        .expect("run guards are released before the build-slot wait");
+        drop(writers);
+        assert_eq!(
+            admission.bytes.in_use(),
+            12 * series_bytes(1_000) + output_bound(12, 1_000)
+        );
+        assert!(!chart.is_finished());
+        drop(blocker);
+        let response = chart.await.unwrap().unwrap();
+        assert_eq!(response.series.len(), 12);
+        assert_eq!(admission.bytes.in_use(), 0);
+        assert_eq!(admission.builds.available(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_request_keeps_only_its_detached_reads_charged_until_they_end() {
+        // A ClickHouse that accepts the read and never answers until told to hang up.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (hang_up, mut hung_up) = tokio::sync::oneshot::channel::<()>();
+        let (accepted_tx, mut accepted) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                tokio::select! {
+                    conn = listener.accept() => {
+                        held.push(conn.unwrap().0);
+                        let _ = accepted_tx.send(());
+                    }
+                    _ = &mut hung_up => break,
+                }
+            }
+            drop(held);
+        });
+        let service = chart_service(&endpoint, ChartAdmission::new(32, 1 << 30, 4));
+        cache_rows(&service, "cached", 1_000);
+        let request = proto::ChartRequest {
+            y_series: vec![series("cached"), series("missing")],
+            target_resolution: 300,
+            ..Default::default()
+        };
+        let admission = &service.chart_admission;
+        let chart = tokio::spawn(admitted_with_charge(&service, request).await.0);
+        accepted.recv().await.unwrap();
+        // The fresh hit's unit is back; the miss's unit and its snapshot's bytes ride its detached read.
+        assert_eq!(admission.slots.available_permits(), 31);
+        let charged = admission.bytes.in_use();
+        assert_eq!(
+            charged,
+            series_bytes(1_000)
+                + series_bytes(budget::MISS_ESTIMATE_ROWS as usize)
+                + output_bound(2, budget::MISS_ESTIMATE_ROWS as usize)
+        );
+        chart.abort();
+        assert!(chart.await.unwrap_err().is_cancelled());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            admission.bytes.in_use(),
+            crate::series_cache::snapshot_bytes(budget::MISS_ESTIMATE_ROWS as usize) as u64,
+            "only the cancelled request's read stays charged, at its snapshot's bytes"
+        );
+        assert_eq!(
+            admission.slots.available_permits(),
+            31,
+            "and still holds its scan unit"
+        );
+        hang_up.send(()).unwrap();
+        crate::wait_until(|| {
+            admission.bytes.in_use() == 0 && admission.slots.available_permits() == 32
+        })
+        .await;
+    }
+
+    /// Randomized: tabs poll random charts (memo on or off, held state off, `shadow` or `on`, audits, cancellations, small budgets, few build slots and scan units) while a writer appends; every byte, scan unit and build slot comes back, nothing deadlocks and no audit fails. `KYMO_ADMISSION_FUZZ_CASES` lengthens it and `KYMO_ADMISSION_FUZZ_SEED` reseeds it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn randomized_polls_return_every_byte_unit_and_slot() {
+        let env = |name: &str, default: u64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
+        let (cases, seed) = (
+            env("KYMO_ADMISSION_FUZZ_CASES", 40),
+            env("KYMO_ADMISSION_FUZZ_SEED", 1),
+        );
+        let mut tally = std::collections::BTreeMap::<String, usize>::new();
+        for case in 0..cases {
+            let mut rng = crate::Rng(
+                seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    ^ (case + 1).wrapping_mul(0xD1B5_4A32_D192_ED03)
+                    | 1,
+            );
+            let mode = rng.pick(&[
+                held::HeldMode::Off,
+                held::HeldMode::Shadow,
+                held::HeldMode::On,
+            ]);
+            let memo_on = rng.chance(70);
+            let budget_bytes = rng.pick(&[60_000u64, 150_000, 400_000, 2_000_000, 1 << 30]);
+            let slots = rng.pick(&[1usize, 2, 4]);
+            let units = rng.pick(&[1usize, 3, 32]);
+            let held_budget = rng.pick(&[0usize, 50_000, usize::MAX]);
+            let mut service = chart_service(
+                "http://127.0.0.1:9",
+                ChartAdmission::new(units, budget_bytes, slots),
+            );
+            let unshared = Arc::get_mut(&mut service).expect("not yet shared");
+            unshared.chart_memo = Arc::new(memo::ChartMemo::new(memo_on));
+            unshared.chart_held = Arc::new(held::HeldStore::new(mode, held_budget));
+            let runs: Vec<String> = (0..5).map(|i| format!("run-{i}")).collect();
+            let mut next = Vec::new();
+            for run in &runs {
+                let rows = 50 + rng.below(400) as i64;
+                cache_rows(&service, run, rows);
+                next.push((rows, 2i64));
+            }
+            // The writer: appends to random runs, one refresh at a time (the polls' own refreshes fail: no ClickHouse answers).
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let writer = {
+                let (service, runs, stop) = (service.clone(), runs.clone(), stop.clone());
+                let mut rng = crate::Rng(rng.next() | 1);
+                tokio::spawn(async move {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let r = rng.below(runs.len() as u64) as usize;
+                        let (step, stamp) = &mut next[r];
+                        let n = 1 + rng.below(20) as i64;
+                        append_rows(&service, &runs[r], *step..*step + n, *stamp);
+                        (*step, *stamp) = (*step + n, *stamp + 1);
+                        tokio::time::sleep(Duration::from_micros(200 + rng.below(2_000))).await;
+                    }
+                })
+            };
+            let mut tabs = Vec::new();
+            for _ in 0..2 + rng.below(8) {
+                let (service, runs) = (service.clone(), runs.clone());
+                let mut rng = crate::Rng(rng.next() | 1);
+                tabs.push(tokio::spawn(async move {
+                    let mut outcomes = std::collections::BTreeMap::<String, usize>::new();
+                    let smoothing = match rng.below(4) {
+                        0 => Some(proto::SmoothingConfig {
+                            algorithm: Algorithm::Ema as i32,
+                            time_constant: 5.0,
+                            ..Default::default()
+                        }),
+                        1 => Some(proto::SmoothingConfig {
+                            algorithm: Algorithm::SavitzkyGolay as i32,
+                            window_size: 9,
+                            poly_order: 2,
+                            ..Default::default()
+                        }),
+                        _ => None,
+                    };
+                    let base = proto::ChartRequest {
+                        y_series: (0..1 + rng.below(4))
+                            .map(|_| series(&runs[rng.below(runs.len() as u64) as usize]))
+                            .collect(),
+                        target_resolution: rng.pick(&[0u32, 50, 300]),
+                        smoothing,
+                        use_timestamp_axis: rng.chance(30),
+                        ..Default::default()
+                    };
+                    let mut held: Option<proto::ChartResponse> = None;
+                    for _ in 0..5 + rng.below(25) {
+                        let request = match &held {
+                            Some(held) if !rng.chance(10) => continuation(&base, held),
+                            _ => base.clone(),
+                        };
+                        if rng.chance(5) {
+                            let draws = &service.delta_audit;
+                            let n = draws.load(std::sync::atomic::Ordering::Relaxed);
+                            draws.store(
+                                n.next_multiple_of(67),
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
+                        let call = service.query_chart(Request::new(request));
+                        let result = if rng.chance(25) {
+                            tokio::time::timeout(Duration::from_micros(rng.below(4_000)), call)
+                                .await
+                                .ok()
+                        } else {
+                            Some(call.await)
+                        };
+                        let label = match result {
+                            None => "cancelled".to_string(),
+                            Some(Ok(reply)) => {
+                                let reply = reply.into_inner();
+                                assert!(!reply.audit_failed, "an audit failed");
+                                let label = if reply.delta { "delta" } else { "full" };
+                                match &mut held {
+                                    // A splice keeps the held series; the frontiers come from the reply.
+                                    Some(held) if reply.delta => held.frontiers = reply.frontiers,
+                                    _ => held = Some(reply),
+                                }
+                                label.to_string()
+                            }
+                            Some(Err(status)) => format!("{:?}", status.code()),
+                        };
+                        *outcomes.entry(label).or_default() += 1;
+                    }
+                    outcomes
+                }));
+            }
+            let finished = tokio::time::timeout(Duration::from_secs(120), async {
+                let mut all = Vec::new();
+                for tab in tabs {
+                    all.push(tab.await.expect("a tab panicked"));
+                }
+                all
+            })
+            .await
+            .unwrap_or_else(|_| panic!("case {case}: tabs did not finish within 120 s"));
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            writer.await.unwrap();
+            for (label, count) in finished.into_iter().flatten() {
+                *tally.entry(label).or_default() += count;
+            }
+            let admission = &service.chart_admission;
+            // Builds of cancelled polls finish on their blocking threads.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while admission.bytes.in_use() != 0
+                || admission.bytes.waiters() != 0
+                || admission.slots.available_permits() != units
+                || admission.builds.available() != slots
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "case {case} ({mode:?}, memo {memo_on}, budget {budget_bytes}, slots {slots}, units {units}): in_use {} waiters {} units {}/{units} builds {}/{slots}",
+                    admission.bytes.in_use(),
+                    admission.bytes.waiters(),
+                    admission.slots.available_permits(),
+                    admission.builds.available(),
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        eprintln!("ADMISSION FUZZ cases: {cases}, seed: {seed}, outcomes: {tally:?}");
     }
 }
 
@@ -5105,29 +7786,23 @@ mod emit_inflate_roundtrip {
     /// THE wire invariant everything else rests on: for any chart the pipeline can produce, inflate(emit_full(model)) reproduces the model bit-for-bit — same bits the result hashes pin, so any gap here would surface as delta-refusal loops in production. Seeded pseudo-random sweep over axis kinds, log ladders, smoothing, NaN/inf markers, negative steps, duplicate timestamps, and short/long runs.
     #[test]
     fn randomized_models_roundtrip_bitexactly() {
-        let mut state = 0x243F6A8885A308D3u64;
-        let mut rng = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
+        let mut rng = crate::Rng(0x243F6A8885A308D3);
         for case in 0..60u32 {
             let use_time = case % 3 == 1;
             let log = case % 2 == 0;
             let smoothed = case % 5 < 2;
             let target = [50u32, 300, 1000][(case as usize / 3) % 3];
-            let nruns = 1 + (rng() % 4) as usize;
+            let nruns = 1 + rng.below(4) as usize;
             // Some cases start past step 0: the log ladder must take its plain-log arm (the +1 shift engages only when the chart contains zero).
             let start = if case % 5 == 4 { 7 } else { 0 };
             let rows: Vec<Arc<Vec<crate::clickhouse::VersionedRawPoint>>> = (0..nruns)
                 .map(|_| {
-                    let n = 30 + (rng() % 2500) as i64;
-                    let neg = (rng() % 4 == 0) as i64 * 3; // sometimes a few negative steps
+                    let n = 30 + rng.below(2500) as i64;
+                    let neg = (rng.below(4) == 0) as i64 * 3; // sometimes a few negative steps
                     Arc::new(
                         (0..n)
                             .map(|s| {
-                                let r = rng();
+                                let r = rng.next();
                                 let value = match r % 50 {
                                     0 => f32::NAN,
                                     1 => f32::INFINITY,
@@ -5139,7 +7814,7 @@ mod emit_inflate_roundtrip {
                                     step: s - neg + start,
                                     // duplicate timestamps sometimes (time-axis dup-x path)
                                     timestamp_ms: 1_000_000 + (s - neg + start) * 10
-                                        - ((r % 7 == 0) as i64) * 10,
+                                        - (r.is_multiple_of(7) as i64) * 10,
                                     value,
                                     is_value: 1,
                                     inserted_ms: s,
@@ -5177,15 +7852,19 @@ mod emit_inflate_roundtrip {
             let prepared = prepare(
                 &req,
                 &p,
-                &rows.iter().map(|rows| rows.as_slice()).collect::<Vec<_>>(),
+                &rows
+                    .iter()
+                    .map(|rows| Arc::new(SeriesSnapshot::full(rows.to_vec())))
+                    .collect::<Vec<_>>(),
                 None,
                 None,
                 false,
                 None,
+                false,
             )
             .unwrap()
             .series;
-            let model = respond(&prepared, &p);
+            let model = respond(&prepared, &p, false).0;
             let wire = emit_full(&model);
             // No filler on the wire: every value entry is finite.
             for s in &wire.series {

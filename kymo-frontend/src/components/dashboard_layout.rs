@@ -15,23 +15,18 @@ use crate::route::{focus_chart, Route};
 use crate::state::app_state::{request_refresh, ExplicitRunKey, ExplicitRunMetadata};
 use crate::state::layout_config::RunRef;
 use crate::state::push::PushBridge;
-use crate::state::visibility::{
-    is_terminal_run_status, retry_visible, retry_visible_run, visible_attempt,
-};
+use crate::state::visibility::{retry_cannot_heal, retry_visible, retry_visible_run, RETRY_WAIT};
 use crate::state::zones::{ZoneBridge, ZoneRegistry};
 use crate::state::{
     load_diff_or_route, DashboardState, DirectRunLoad, DirectRunView, LayoutConfig, OpenPanel,
     PanelTarget,
 };
 use crate::util::{
-    focus_is_within, focus_on_mount, js_bridge::js_string, primary, MAXIMIZE_OVERLAY_ID,
-    OPTIONS_PANEL_ID, TOP_LAYER_SELECTOR,
+    focus_is_within, focus_on_mount, js_bridge::js_string, primary, set_if_changed,
+    MAXIMIZE_OVERLAY_ID, OPTIONS_PANEL_ID, TOP_LAYER_SELECTOR,
 };
 
 const EXPLICIT_METADATA_CONCURRENCY: usize = 16;
-/// Backoff between retry passes over keys whose lookup failed transiently.
-/// Matches `retry_visible_while`'s interval — same failure, same patience.
-const EXPLICIT_METADATA_RETRY: Duration = Duration::from_secs(5);
 
 /// Writes `.main-wrap`'s height less the font-sized chrome as `--kymo-chart-height` on the box-less `.maximize-height` wrapper around the overlay, so a write restyles only the overlay, never the whole main column. Written at once for the first measurement (a `?chart=` link opens maximized) and while nothing is maximized, so a maximized panel starts at the window's height (a log plans its first request for it); debounced 100 ms while one is, so a window drag settles before the panel follows (each change resizes its chart and moves a log's request window). Mounted through the js_bridge registry so an unmounted layout never leaves an observer and its timer alive.
 const MAXIMIZE_RESIZE_JS: &str = r#"(()=>{
@@ -140,26 +135,23 @@ fn pending_metadata_lookups(
             let settled = store
                 .get(&key)
                 .is_some_and(|entry| entry.generation() == project_version);
-            (!settled).then(|| (project_id.clone(), run_id.clone(), project_version))
+            (!settled).then_some((key.0, key.1, project_version))
         })
         .collect()
 }
 
-/// Whether a failed lookup SETTLES the key for this generation rather than
-/// being worth another attempt. `NotFound`/`FailedPrecondition` are the run
-/// lifecycle's terminal states; `InvalidArgument` is the binding itself being
-/// unaskable — a saved layout can carry a key this server will never accept,
-/// and retrying it forever would spin until the generation moves.
-///
-/// Deliberately NOT folded into `is_terminal_run_status`: that predicate
-/// answers a question about the run's lifecycle, and an unaskable request is
-/// not a lifecycle state.
-fn metadata_lookup_settles(status: &tonic::Status) -> bool {
-    is_terminal_run_status(status) || status.code() == tonic::Code::InvalidArgument
+/// The project routes' layout: one `ProjectDashboard` per project, remounted when the project changes. A history jump from one project straight to another (A, the projects page, B, then back to A from the history menu) keeps the layout instance, and the dashboard's state is created once per mount, so without the remount A's URL would show B's runs and layout and save edits under B. A one-item keyed list, because Dioxus 0.7.9 ignores `key:` on a lone root or on a component nested in elements; `remount_tests` pins this.
+#[component]
+pub fn DashboardLayout(project_id: String) -> Element {
+    rsx! {
+        for pid in std::iter::once(project_id) {
+            ProjectDashboard { key: "{pid}", project_id: pid }
+        }
+    }
 }
 
 #[component]
-pub fn DashboardLayout(project_id: String) -> Element {
+fn ProjectDashboard(project_id: String) -> Element {
     let mut state = use_context_provider(|| DashboardState::new(project_id.clone()));
     // Slot zone signals, fed by ZoneBridge below; MetricRect slots register here.
     use_context_provider(ZoneRegistry::default);
@@ -176,10 +168,7 @@ pub fn DashboardLayout(project_id: String) -> Element {
         _ => None,
     };
     // Panels resolve `RunRef::Selected` through `current_run`, so it follows the route from the first render.
-    let mut current_run = state.current_run;
-    if *current_run.peek() != scope_run {
-        current_run.set(scope_run);
-    }
+    set_if_changed(state.current_run, scope_run);
 
     // A run page's layout gates on its run's readability alone, so a GetRun refresh that leaves the run readable does not re-list its metrics.
     let scope_readable = use_memo({
@@ -207,20 +196,16 @@ pub fn DashboardLayout(project_id: String) -> Element {
 
     // Connection resync bootstraps the list; other invalidations use runs_refresh.
     let _runs_fetch = use_resource({
-        let grpc = state.grpc;
         let project_id = project_id.clone();
-        let mut runs_signal = state.runs;
-        let mut runs_loaded = state.runs_loaded;
-        let runs_refresh = state.runs_refresh;
         move || {
             let project_id = project_id.clone();
-            let _requested_refresh = *runs_refresh.read();
+            let _requested_refresh = *state.runs_refresh.read();
             let resync_gen = *state.resync_gen.read();
             async move {
                 if resync_gen == 0 {
                     return;
                 }
-                if !*runs_loaded.peek() && state.current_run.peek().is_some() {
+                if !*state.runs_loaded.peek() && state.current_run.peek().is_some() {
                     let now = crate::state::trash::monotonic_now_ms;
                     let deadline = *list_hold_until.write().get_or_insert(now() + 3_000.0);
                     // Peeked, so leaving the run page ends the wait instead of restarting it.
@@ -238,13 +223,12 @@ pub fn DashboardLayout(project_id: String) -> Element {
                     }
                     crate::state::visibility::wait_for_visible_idle(deadline, on_run_page).await;
                 }
-                let grpc = grpc.read().clone();
+                let grpc = state.grpc.read().clone();
                 let snapshot =
                     retry_visible("list_runs", async || grpc.list_runs(&project_id).await).await;
                 let new_runs = snapshot.runs;
-                // peek: this resource writes runs_signal, and async-body
-                // reads subscribe — a read would rerun it per refresh.
-                let old_runs = runs_signal.peek().clone();
+                // peek: this resource writes `state.runs`, and async-body reads subscribe — a read would rerun it per refresh.
+                let old_runs = state.runs.peek().clone();
                 // RunInfo derives PartialEq via prost, so this catches any
                 // field change — including liveness `status`.
                 if old_runs != new_runs {
@@ -264,16 +248,12 @@ pub fn DashboardLayout(project_id: String) -> Element {
                     let mut next_selected = state.selected_runs.peek().clone();
                     next_selected.retain(|run_id| new_ids.contains(run_id));
                     next_selected.extend(new_ids.difference(&old_ids).cloned());
-                    if *state.selected_runs.peek() != next_selected {
-                        state.selected_runs.set(next_selected);
-                    }
-                    runs_signal.set(new_runs);
+                    set_if_changed(state.selected_runs, next_selected);
+                    state.runs.set(new_runs);
                 }
                 // Coverage certifies these rows; a legacy response must clear earlier certification.
                 state.runs_project_version.set(snapshot.project_version);
-                if !*runs_loaded.peek() {
-                    runs_loaded.set(true);
-                }
+                set_if_changed(state.runs_loaded, true);
             }
         }
     });
@@ -290,10 +270,7 @@ pub fn DashboardLayout(project_id: String) -> Element {
             let resync_gen = *state.resync_gen.read();
             async move {
                 let Some(run_id) = run_id else {
-                    let mut direct = state.direct_run;
-                    if !matches!(&*direct.peek(), DirectRunLoad::Idle) {
-                        direct.set(DirectRunLoad::Idle);
-                    }
+                    set_if_changed(state.direct_run, DirectRunLoad::Idle);
                     return;
                 };
 
@@ -332,22 +309,19 @@ pub fn DashboardLayout(project_id: String) -> Element {
                         )),
                         None => direct.set(DirectRunLoad::NotFound),
                     },
-                    Err(status) if crate::state::visibility::is_terminal_run_status(&status) => {
-                        direct.set(DirectRunLoad::NotFound)
-                    }
-                    Err(_) => unreachable!("retry_visible_run returns only lifecycle errors"),
+                    // A terminal run status: the only error retry_visible_run returns.
+                    Err(_) => direct.set(DirectRunLoad::NotFound),
                 }
             }
         }
     });
 
-    let selected_runs = state.selected_runs;
     let visible_run_ids = use_memo(move || match state.current_run.read().clone() {
         Some(rid) => vec![rid],
         None => {
             // Sorted so equal selections compare equal (HashSet iteration
             // order is arbitrary and a memo dedups by value).
-            let mut ids: Vec<String> = selected_runs.read().iter().cloned().collect();
+            let mut ids: Vec<String> = state.selected_runs.read().iter().cloned().collect();
             ids.sort_unstable();
             ids
         }
@@ -358,9 +332,7 @@ pub fn DashboardLayout(project_id: String) -> Element {
         let mut maximized = state.maximized;
         match param {
             None => {
-                if maximized.peek().is_some() {
-                    maximized.set(None);
-                }
+                set_if_changed(maximized, None);
                 // However the chart was un-maximized (its Close, Esc, Back, a reset), or a Configure's maximize never landed (pressed again while the close's history pop was pending), the chart panel closes, and any other panel forgets the maximize it was to undo.
                 let mut panel = state.options_panel;
                 let open = panel.peek().clone();
@@ -405,30 +377,23 @@ pub fn DashboardLayout(project_id: String) -> Element {
     // invalidates everything. Data landing on known metrics moves
     // run_versions, not this; unselected runs' registry events don't matter
     // until selection changes visible_run_ids itself.
-    let metrics_gen_signal = state.metrics_gen;
-    let resync_gen_signal = state.resync_gen;
     let metrics_key = use_memo(move || {
         crate::state::versions_key(
-            *resync_gen_signal.read(),
+            *state.resync_gen.read(),
             visible_run_ids.read().iter().map(String::as_str),
-            &metrics_gen_signal.read(),
+            &state.metrics_gen.read(),
         )
     });
 
     let _layout_fetch = use_resource({
-        let grpc = state.grpc;
         let project_id = project_id.clone();
-        let runs_loaded = state.runs_loaded;
-        let mut layout = state.layout_config;
-        let mut base_layout = state.base_layout;
-        let layout_gen = state.layout_generation;
         move || {
             let project_id = project_id.clone();
             let visible = visible_run_ids.read().clone();
             let _mk = *metrics_key.read();
             // The short-circuit keeps a run page unsubscribed, so the run list landing never re-runs this fetch there.
-            let scope_known = state.current_run.read().is_some() || *runs_loaded.read();
-            let _gen = *layout_gen.read();
+            let scope_known = state.current_run.read().is_some() || *state.runs_loaded.read();
+            let _gen = *state.layout_generation.read();
             let scope_readable = *scope_readable.read();
             async move {
                 if !scope_readable {
@@ -444,7 +409,7 @@ pub fn DashboardLayout(project_id: String) -> Element {
                 if !scope_known {
                     return;
                 }
-                let grpc = grpc.read().clone();
+                let grpc = state.grpc.read().clone();
                 // One aggregated registry query for the visible run set;
                 // reloads are event-driven (visible set, registry pushes,
                 // resyncs restart the resource).
@@ -459,13 +424,10 @@ pub fn DashboardLayout(project_id: String) -> Element {
                     .await
                     {
                         Ok(metrics) => metrics,
-                        Err(status)
-                            if crate::state::visibility::is_terminal_run_status(&status) =>
-                        {
+                        Err(_) => {
                             request_refresh(state.direct_run_refresh);
                             return;
                         }
-                        Err(_) => unreachable!("retry_visible_run returns only lifecycle errors"),
                     }
                 } else {
                     retry_visible("layout metrics", async || {
@@ -485,14 +447,8 @@ pub fn DashboardLayout(project_id: String) -> Element {
                 // add UI instead of a dead "Loading..." screen.
                 let base = LayoutConfig::auto_generate(&all_metrics);
                 let shown = diff.apply(&base);
-                // Skip no-op sets: Signal::set notifies subscribers even
-                // for equal values.
-                if base_layout.peek().as_ref() != Some(&base) {
-                    base_layout.set(Some(base));
-                }
-                if layout.peek().as_ref() != Some(&shown) {
-                    layout.set(Some(shown));
-                }
+                set_if_changed(state.base_layout, Some(base));
+                set_if_changed(state.layout_config, Some(shown));
             }
         }
     });
@@ -529,7 +485,7 @@ pub fn DashboardLayout(project_id: String) -> Element {
     // The resource is keyed on the PLAN and only ever peeks the store it
     // writes, so publishing a completed lookup cannot cancel the lookups still
     // in flight beside it. That is what lets each name appear as it arrives:
-    // one key that keeps failing no longer withholds every key that succeeded.
+    // one key that keeps failing does not withhold every key that succeeded.
     // Retries live inside the pass for the same reason — restarting the
     // resource to retry would re-issue the whole plan.
     let _explicit_metadata_fetch = use_resource(move || {
@@ -554,12 +510,9 @@ pub fn DashboardLayout(project_id: String) -> Element {
                         // hidden: buffer_unordered admits requests as slots
                         // free, so gating the pass as a whole would let a late
                         // request fire into a backgrounded tab.
-                        let result = visible_attempt(async || {
-                            grpc.get_run(&bound_project, &run_id).await
-                        })
-                        .await;
+                        crate::grpc::wait_until_page_visible().await;
                         let key = (bound_project.clone(), run_id.clone());
-                        match result {
+                        match grpc.get_run(&bound_project, &run_id).await {
                             Ok(response) => {
                                 let run = response.run.and_then(|record| record.run);
                                 // A server answering with someone else's run is
@@ -576,7 +529,8 @@ pub fn DashboardLayout(project_id: String) -> Element {
                                 };
                                 (key, Some(entry))
                             }
-                            Err(status) if metadata_lookup_settles(&status) => {
+                            // Settled for this generation: a saved layout can carry a key this server never accepts, and a retry would spin until the generation moves.
+                            Err(status) if retry_cannot_heal(&status) => {
                                 (key, Some(ExplicitRunMetadata::Absent { generation }))
                             }
                             // Transient: leave the key unknown so this pass
@@ -607,7 +561,7 @@ pub fn DashboardLayout(project_id: String) -> Element {
                 if !transient {
                     return;
                 }
-                sleep(EXPLICIT_METADATA_RETRY).await;
+                sleep(RETRY_WAIT).await;
             }
         }
     });
@@ -678,7 +632,6 @@ pub fn DashboardLayout(project_id: String) -> Element {
 #[component]
 fn MaximizeOverlay() -> Element {
     let state = use_context::<DashboardState>();
-    let maximized_signal = state.maximized;
 
     let keys_bridge = crate::util::js_bridge::use_bridge("maximize_keys");
     use_future(move || {
@@ -688,7 +641,7 @@ fn MaximizeOverlay() -> Element {
         async move {
             let mut eval = document::eval(&js);
             while let Ok(dir) = eval.recv::<i32>().await {
-                let Some(id) = maximized_signal.peek().as_ref().map(|m| m.id.clone()) else {
+                let Some(id) = state.maximized.peek().as_ref().map(|m| m.id.clone()) else {
                     continue;
                 };
                 if dir == 0 {
@@ -757,8 +710,7 @@ mod tests {
     use std::collections::{BTreeMap, HashMap, HashSet};
 
     use super::{
-        explicit_metadata_plan, explicit_run_keys, metadata_lookup_settles,
-        pending_metadata_lookups, ExplicitRunMetadata,
+        explicit_metadata_plan, explicit_run_keys, pending_metadata_lookups, ExplicitRunMetadata,
     };
     use crate::grpc::proto::RunInfo;
     use crate::state::layout_config::{
@@ -909,21 +861,92 @@ mod tests {
             ]
         );
     }
+}
+
+/// Pins the Dioxus behavior DashboardLayout relies on, on a copy of its project routes, since the real dashboard needs a browser: under the parameterized layout, a one-item keyed list remounts its component when the project changes, and only then. A Dioxus or router-fork upgrade that changes this fails here.
+#[cfg(test)]
+mod remount_tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use dioxus::history::{History, MemoryHistory};
+    use dioxus::prelude::*;
+    use dioxus::router::root_router;
+
+    use crate::route::ChartQuery;
+
+    thread_local! {
+        /// The project each dashboard mount was created for, in order.
+        static MOUNTS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    #[derive(Routable, Clone, PartialEq, Debug)]
+    enum Route {
+        #[nest("/:project_id")]
+        #[layout(Layout)]
+        #[route("/?:..chart")]
+        ProjectPage {
+            project_id: String,
+            chart: ChartQuery,
+        },
+        #[route("/:run_id?:..chart")]
+        RunPage {
+            project_id: String,
+            run_id: String,
+            chart: ChartQuery,
+        },
+    }
+
+    /// DashboardLayout's form.
+    #[component]
+    fn Layout(project_id: String) -> Element {
+        rsx! {
+            for pid in std::iter::once(project_id) {
+                Dashboard { key: "{pid}", project_id: pid }
+            }
+        }
+    }
+
+    #[component]
+    fn Dashboard(project_id: String) -> Element {
+        use_hook(|| MOUNTS.with_borrow_mut(|mounts| mounts.push(project_id)));
+        rsx! { Outlet::<Route> {} }
+    }
+
+    #[component]
+    fn ProjectPage(project_id: String, chart: ChartQuery) -> Element {
+        rsx! {}
+    }
+
+    #[component]
+    fn RunPage(project_id: String, run_id: String, chart: ChartQuery) -> Element {
+        rsx! {}
+    }
+
+    /// Pushes `path`, or goes back without one, renders, and returns the mounts so far.
+    fn visit(vdom: &mut VirtualDom, path: Option<&str>) -> Vec<String> {
+        vdom.in_scope(ScopeId::ROOT, || {
+            let router = root_router().unwrap();
+            match path {
+                Some(path) => _ = router.push(path.parse::<Route>().unwrap()),
+                None => router.go_back(),
+            }
+        });
+        vdom.render_immediate(&mut dioxus::dioxus_core::NoOpMutations);
+        MOUNTS.with_borrow(Vec::clone)
+    }
 
     #[test]
-    fn only_unaskable_and_terminal_lookups_settle_a_generation() {
-        assert!(metadata_lookup_settles(&tonic::Status::not_found("purged")));
-        assert!(metadata_lookup_settles(
-            &tonic::Status::failed_precondition("expired")
-        ));
-        // A saved layout can carry a key this server will never accept.
-        // Retrying it would spin until the project generation moved.
-        assert!(metadata_lookup_settles(&tonic::Status::invalid_argument(
-            "run_id too long"
-        )));
-        assert!(!metadata_lookup_settles(&tonic::Status::unavailable(
-            "retry"
-        )));
-        assert!(!metadata_lookup_settles(&tonic::Status::internal("retry")));
+    fn a_history_jump_to_another_project_remounts_the_dashboard() {
+        let history = Rc::new(MemoryHistory::with_initial_path("/A/"));
+        let mut vdom = VirtualDom::new(|| rsx! { Router::<Route> {} })
+            .with_root_context(history as Rc<dyn History>);
+        vdom.rebuild_in_place();
+        // Within a project, the run page and a ?chart= link keep the instance.
+        visit(&mut vdom, Some("/A/r1"));
+        assert_eq!(visit(&mut vdom, Some("/A/r1?chart=loss")), ["A"]);
+        assert_eq!(visit(&mut vdom, Some("/B/")), ["A", "B"]);
+        // B straight back to A's run page, as from the browser's history menu.
+        assert_eq!(visit(&mut vdom, None), ["A", "B", "A"]);
     }
 }

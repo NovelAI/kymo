@@ -48,7 +48,7 @@ kymo.init(mode="local")              kymo open [project [run]]
                                   + local WebSocket         content files
 ```
 
-Hosted mode remains the default. Its `/grpc-ws` framing, CDN upload/read behavior, Postgres path, and Kubernetes environment contract do not change.
+Hosted mode remains the default. Its `/grpc-ws` and `/grpc-ws2` framing, CDN upload/read behavior, Postgres path, and Kubernetes environment contract do not change. The local WebSocket uses the uncompressed `/grpc-ws` framing: compression gains nothing on loopback.
 
 Local mode uses:
 
@@ -76,7 +76,7 @@ Dashboard customization remains browser-local.
 
 The local dashboard must make zero external requests. uPlot, Source Sans Pro, Source Code Pro, CSS, JavaScript, WASM, and generated wrapper files are vendored or produced by the release bundle. CI rejects external `src`, `href`, `url()`, and `@import` resources and rejects the hosted service hostname in the local WASM.
 
-At runtime the server injects the local WebSocket path and persisted CDN origin as inert JSON in each embedded SPA shell response. This adds no configuration route or request. Embedded files use hosted nginx's existing exact-asset-then-SPA precedence: a project/run pair whose path exactly equals a generated asset path is the inherited route-collision edge. The local build validates the numeric-loopback CDN origin, derives the WebSocket origin from `window.location`, and never contains a hosted endpoint in its reachable configuration. Hosted builds retain their existing fixed endpoint contract. The shell is `no-store`; other embedded files carry a content-hash ETag and revalidate, so reopening the dashboard does not re-download and recompile the WASM.
+At runtime the server injects the persisted CDN origin as inert JSON in each embedded SPA shell response. This adds no configuration route or request. Embedded files use hosted nginx's existing exact-asset-then-SPA precedence: a project/run pair whose path exactly equals a generated asset path is the inherited route-collision edge. The local build validates the numeric-loopback CDN origin, opens its WebSocket at `/trash/_kymo-grpc-ws-local-v1` on `window.location`'s origin, and never contains a hosted endpoint in its reachable configuration. Hosted builds retain their existing fixed endpoint contract. The shell is `no-store`; other embedded files carry a content-hash ETag and revalidate, so reopening the dashboard does not re-download and recompile the WASM.
 
 CDN content stays on the second origin, matching hosted isolation. Local CDN reads are `private, no-store` and `nosniff`; hosted reads retain `public, immutable`. Local CDN upload has no browser TCP route and remains on the authenticated private Unix socket. Raw resource IDs remain hosted-compatible lowercase `SHA256.ext` values with the append-only extension allowlist.
 
@@ -194,7 +194,7 @@ Required automated or release-qualification coverage:
 5. `run_url()` remains unchanged across restart and does not wake a stopped stack. `open_run()` wakes it, checks the installation UUID, returns the URL, and its timed hold prevents shutdown during browser launch.
 6. An open frontend WebSocket prevents idle shutdown; once it closes and runs are inactive, the complete stack stops a full idle timeout later. Empty streams and quiet workers neither hold nor wake it. `kymo stop` waits out a launch; `kymo stop --hold` keeps a waking client out.
 7. Local dashboard/CDN/server listeners are loopback-only and refuse other Host names. Browser CDN serves media and `GET /alerts`, plus the media-cleanup answers (`POST` delete or keep, which need the dashboard's `Origin`), but no upload or WebSocket route; upload remains authenticated on its Unix socket.
-8. Local release bundle contains all fonts/scripts/styles/WASM, makes zero external requests with network disabled, and contains no hosted service endpoint. Hosted `/grpc-ws` framing and unauthenticated hosted upload remain unchanged.
+8. Local release bundle contains all fonts/scripts/styles/WASM, makes zero external requests with network disabled, and contains no hosted service endpoint. Hosted `/grpc-ws` and `/grpc-ws2` framing and unauthenticated hosted upload remain unchanged.
 9. Numeric, tagged, text, image, resource, metadata, Trash restore, purge, dashboard, spool replay, mutation ordering, and DATA_LOSS quarantine work locally.
 10. Legacy hosted clients that omit the additive writer/mutation fields retain legacy behavior. Checked-in Python protobuf stubs match the source.
 11. A newer compatible launcher/server/frontend cannot be downgraded by an older environment once it has started the stack (the version is recorded at start, so a running older generation keeps serving until its next start). Another build of the catalog's PostgreSQL major release is replaced at the next start that can install, with data, UUID, and ports intact; any other PostgreSQL, ClickHouse, or data-schema-generation change is refused before database startup.

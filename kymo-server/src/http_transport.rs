@@ -18,11 +18,12 @@ use crate::local_proto::local_runtime_control_server::LocalRuntimeControlServer;
 use crate::proto::kymo_server::KymoServer;
 use crate::transport;
 use crate::ws_proxy;
+use crate::ws_rpc::LOCAL_WS_PATH;
 use crate::KymoService;
 
 const HOSTED_WS_PATH: &str = "/grpc-ws";
-// `trash` is the one project ID the shared server already reserves; nesting local transport there steals no hosted-valid project/run URL.
-const LOCAL_WS_PATH: &str = "/trash/_kymo-grpc-ws-local-v1";
+// The same socket with per-frame compression (ws_proxy.rs). Local mode has no counterpart: loopback gains nothing from it.
+const HOSTED_WS2_PATH: &str = "/grpc-ws2";
 const CDN_UPLOAD_PATH: &str = "/cdn/upload";
 const CDN_RESOURCE_PATH: &str = "/cdn/{key}";
 
@@ -191,12 +192,18 @@ fn hosted_cdn_router(
         cdn_state.collector_status.clone(),
         browser_origins,
     );
-    let app = hosted_cdn_routes(cdn_state).merge(
-        Router::new()
-            .route(HOSTED_WS_PATH, get(ws_proxy::ws_handler))
-            .with_state(ws_state),
-    );
+    let app = hosted_cdn_routes(cdn_state).merge(hosted_ws_routes(ws_state));
     app.merge(alerts)
+}
+
+pub(crate) fn hosted_ws_routes(ws_state: ws_proxy::WsState) -> Router {
+    Router::new()
+        .route(HOSTED_WS_PATH, get(ws_proxy::ws_handler))
+        .route(
+            HOSTED_WS2_PATH,
+            get(ws_proxy::ws_handler).with_state(ws_state.deflating()),
+        )
+        .with_state(ws_state)
 }
 
 fn hosted_cdn_routes(cdn_state: Arc<cdn::CdnState>) -> Router {
@@ -229,10 +236,9 @@ fn local_dashboard_router(
         ))
         .layer(axum::Extension(activity))
         .layer(axum::Extension(
-            crate::embedded_frontend::LocalBrowserConfig::new(
-                LOCAL_WS_PATH,
-                format!("http://{cdn_addr}"),
-            ),
+            crate::embedded_frontend::LocalBrowserConfig {
+                cdn_origin: format!("http://{cdn_addr}"),
+            },
         ))
         .layer(axum::middleware::from_fn_with_state(
             loopback_hosts(dashboard_addr),
@@ -402,6 +408,14 @@ mod tests {
         app.oneshot(request).await.unwrap()
     }
 
+    /// The stored resource of a successful upload.
+    async fn uploaded(response: http::Response<Body>) -> String {
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let reply: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        reply["resource_id"].as_str().unwrap().to_owned()
+    }
+
     async fn observed_upload_work(
         State(activity): State<Arc<crate::activity::ActivityTracker>>,
         _body: axum::body::Bytes,
@@ -434,14 +448,7 @@ mod tests {
     async fn hosted_cdn_keeps_unauthenticated_upload_and_public_reads() {
         let temporary = tempfile::tempdir().unwrap();
         let app = hosted_cdn_routes(cdn_state(temporary.path()));
-        let response = upload(app.clone(), None).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), 1024).await.unwrap();
-        let resource_id = serde_json::from_slice::<serde_json::Value>(&body).unwrap()
-            ["resource_id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
+        let resource_id = uploaded(upload(app.clone(), None).await).await;
 
         let response = app
             .oneshot(
@@ -470,14 +477,7 @@ mod tests {
             upload(upload_app.clone(), None).await.status(),
             StatusCode::UNAUTHORIZED
         );
-        let response = upload(upload_app, Some(SERVER_TOKEN)).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), 1024).await.unwrap();
-        let resource_id = serde_json::from_slice::<serde_json::Value>(&body).unwrap()
-            ["resource_id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
+        let resource_id = uploaded(upload(upload_app, Some(SERVER_TOKEN)).await).await;
 
         let app = with_cdn_host(local_cdn(state));
         for (origin, token, expected) in [
@@ -561,6 +561,7 @@ mod tests {
         for (method, path) in [
             (Method::POST, CDN_UPLOAD_PATH),
             (Method::GET, HOSTED_WS_PATH),
+            (Method::GET, HOSTED_WS2_PATH),
             (Method::GET, LOCAL_WS_PATH),
         ] {
             let response = app

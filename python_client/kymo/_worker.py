@@ -1,12 +1,18 @@
 """Background upload process for kymo."""
 
+import math
 import multiprocessing
+import multiprocessing.queues
 import os
 import queue
 import random
+import select
+import signal
+import struct
 import sys
 import threading
 import time
+from multiprocessing.reduction import ForkingPickler
 from typing import Optional
 
 import grpc
@@ -14,9 +20,9 @@ import grpc
 from kymo._cdn import metadata_manifest
 from kymo._env import integer as _env_integer
 from kymo._env import number as _env_number
-from kymo._generated import kymo_pb2_grpc
+from kymo._generated import kymo_pb2, kymo_pb2_grpc
 from kymo._log import logger as _log
-from kymo.spool import replay_command
+from kymo.spool import SpoolWriteCut, replay_command
 
 
 class _ReplayQuarantined(RuntimeError):
@@ -47,6 +53,177 @@ def _encoded_entry(entry: tuple, items) -> tuple:
 _LIVE, _TO_DISK, _DRAINING = "live", "to disk", "draining"
 
 
+# When the worker stops delivering, and when it stops spilling to close its spool and exit by itself before SIGALRM's default action kills it (time.monotonic(), inf = never). A signal kymo owns or the parent's handoff sets them (_own_signals); they only come forward, and the parent's writes cannot move them.
+_signal_deadline = math.inf
+_spill_by = math.inf
+# The parent's handoff cap (kymo.client._handoff) as _own_signals got it: once set, no salvage of the parent's follows the worker.
+_handoff = None
+# Once the parent has died, a Ctrl-C the worker saw may bound it as a handoff would (_own_signals); None without the worker's signal policy.
+_hand_off_after_ctrl_c = None
+
+
+class _QueueReads:
+    """The worker's reads of its producer queue, each bounded by the time it is given and resumed across calls.
+
+    Queue.get can block forever once the parent's feeder dies partway through a message. So a message's frame (a 4-byte length, 8 more past 2 GiB, then the pickle) is read as far as it has arrived, and unpickled only once whole. The reader lock stays held while a frame is partial, even after a read fails: if the worker exits then, the parent's salvage finds it held and skips the queue rather than read the rest as a new frame. An idle queue is polled without the lock, so a worker killed there cannot strand it. A source without that framing (a test's queue.Queue) is read with its own get.
+    """
+
+    def __init__(self, source):
+        self.source = source
+        self.reader = None
+        if isinstance(source, multiprocessing.queues.Queue):
+            self.reader = source._reader
+            self.poller = select.poll()
+            self.poller.register(self.reader.fileno(), select.POLLIN)
+        # The message read so far, frame header included; this holds the queue's reader lock while it is not empty.
+        self.frame = bytearray()
+
+    def get(self, timeout: float = 0.0):
+        """The next item, waiting at most timeout seconds; queue.Empty if no whole message has arrived by then."""
+        if self.reader is None:
+            return self.source.get(timeout=timeout)
+        source = self.source
+        end = time.monotonic() + timeout
+        if not self.frame and not (
+            self.poller.poll(timeout * 1000)
+            and source._rlock.acquire(timeout > 0, max(0.0, end - time.monotonic()))
+        ):
+            raise queue.Empty
+        try:
+            payload = self._read(end)
+            source._sem.release()
+        finally:
+            # A message read in part, by a read that timed out or failed, keeps its frame and the lock: the next read goes on from there, and the worker reports it if it exits with it.
+            if not self.frame:
+                source._rlock.release()
+        try:
+            return ForkingPickler.loads(payload)
+        except Exception as error:
+            raise OSError("malformed upload queue message") from error
+
+    def _read(self, end: float) -> memoryview:
+        """Read the current message's frame until it is whole, returning its pickle, or until end (time.monotonic()) passes (queue.Empty), never reading past it."""
+        self._fill(4, end)
+        header, (size,) = 4, struct.unpack_from("!i", self.frame)
+        if size == -1:
+            header = 12
+            self._fill(header, end)
+            (size,) = struct.unpack_from("!Q", self.frame, 4)
+        elif size < 0:
+            raise OSError(f"malformed upload queue message length {size}")
+        self._fill(header + size, end)
+        frame, self.frame = self.frame, bytearray()
+        return memoryview(frame)[header:]
+
+    def _fill(self, length: int, end: float) -> None:
+        """Read until the frame holds length bytes, or until end passes (queue.Empty): checked after each read, since a pipe that stays readable never makes the poll wait."""
+        while len(self.frame) < length:
+            if not self.poller.poll(max(0.0, end - time.monotonic()) * 1000):
+                raise queue.Empty
+            # Never at end of file: the worker holds a write end of the pipe itself.
+            self.frame += os.read(self.reader.fileno(), length - len(self.frame))
+            if len(self.frame) < length and time.monotonic() >= end:
+                raise queue.Empty
+
+
+def _worker_process(*args, handoff, owned, started, interrupted, exited):
+    """The upload worker process: it marks itself started, before it reads the queue (kymo.client._kill_unstarted_worker), then kymo's signal policy (_own_signals), then the worker (_upload_worker, with args). As it ends it publishes the status it exits with in exited, which the parent reads where multiprocessing no longer sees it (kymo.client._worker_alive)."""
+    started.value = 1
+    status = 1
+    try:
+        _own_signals(handoff, owned, interrupted)
+        _upload_worker(*args)
+        status = 0
+    except SystemExit as error:
+        # As multiprocessing's bootstrap turns it into the exit code.
+        status = (
+            error.code if isinstance(error.code, int) else int(error.code is not None)
+        )
+        raise
+    finally:
+        exited.value = status
+
+
+def _own_signals(handoff, owned, interrupted) -> None:
+    """Install the worker's signal policy, then unblock the shutdown signals and the other group signals (kymo.client._GROUP_SIGNALS), which the parent blocks across Process.start() under fork and spawn so none arrives first; the worker ignores the latter.
+
+    A Ctrl-C, which reaches the whole group and the parent handles, the worker only notes in interrupted (time.monotonic()) and carries on, unless the program ignores SIGINT (as a shell's background job starts), when kymo installs no handler either and the worker ignores it too. The parent reads the note for a Ctrl-C a handler installed after init() kept from kymo's (kymo.client._ctrl_c_at); once the parent has died (SIGINT's default action, say), a Ctrl-C within the handoff's cap bounds the worker by that cap, as a handoff would (_hand_off_after_ctrl_c). A SIGTERM or SIGQUIT kymo owns (owned, kymo.client._owned_signals) finishes it within the signal budget (finish_by): it delivers until _signal_deadline, spills until _spill_by and exits, SIGALRM's default action killing it at the budget's end only if a system call wedged it; one the program ignores or handles leaves it running, and the program's exit stops it as usual. A handoff puts the worker's end in handoff, which replaces the budget's, then sends a SIGTERM, which the worker obeys whoever owns SIGTERM (kymo.client._Shutdown.hand_off).
+
+    A signal can land while finish_by handles another, on the main thread between its bytecodes even with the signals blocked there, since another thread then receives them: the updates run one at a time (updating), and one that lands during another has that one run again, so the deadlines and the alarm only ever come forward.
+    """
+    from kymo.client import (
+        _CLEANUP_RESERVE_MIN,
+        _GROUP_SIGNALS,
+        _INTERRUPT_FLUSH_TIMEOUT,
+        _TERMINATION_SIGNALS,
+        _signal_budget,
+        _worker_window,
+    )
+
+    global _handoff, _hand_off_after_ctrl_c
+    _handoff = handoff
+    budget = _signal_budget()
+    updating = threading.Lock()
+    # Non-empty while an update is owed: a signal landing while update() runs has it run again.
+    owed = []
+
+    def finish_by(signum, frame) -> None:
+        if not handoff.value and signum not in owned:
+            return
+        owed.append(signum)
+        while owed and updating.acquire(blocking=False):
+            try:
+                owed.clear()
+                update()
+            finally:
+                updating.release()
+
+    def update() -> None:
+        global _signal_deadline, _spill_by
+        now = time.monotonic()
+        end = handoff.value or now + budget
+        # As the parent's shutdown plans it (kymo.client._Shutdown.plan_worker).
+        deliver_by, spill_by, *_ = _worker_window(now, end)
+        _signal_deadline = min(_signal_deadline, deliver_by)
+        _spill_by = min(_spill_by, spill_by)
+        armed = signal.getitimer(signal.ITIMER_REAL)[0]
+        if not 0.0 < armed <= end - now:
+            signal.setitimer(signal.ITIMER_REAL, max(end - now, 1e-3))
+
+    def note_ctrl_c(signum, frame) -> None:
+        interrupted.value = time.monotonic()
+
+    def hand_off_after_ctrl_c() -> None:
+        """Once the parent has died: if a Ctrl-C came within the handoff's cap (kymo.client._interrupt_budget), hand the worker the run's remaining delivery as the parent's handoff would, by that cap but never one already past, and arm it."""
+        cap = min(_INTERRUPT_FLUSH_TIMEOUT, budget)
+        now = time.monotonic()
+        if interrupted.value and interrupted.value + cap > now:
+            end = max(interrupted.value + cap, now + _CLEANUP_RESERVE_MIN)
+            if not handoff.value or end < handoff.value:
+                handoff.value = end
+            finish_by(signal.SIGTERM, None)
+            _log.warning(
+                "parent process exited after a Ctrl-C — delivering what it can "
+                "within %.1fs, then spooling the rest",
+                max(0.0, handoff.value - time.monotonic()),
+            )
+
+    _hand_off_after_ctrl_c = hand_off_after_ctrl_c
+    for signum in _TERMINATION_SIGNALS:
+        if signum != signal.SIGINT:
+            signal.signal(signum, finish_by)
+        elif signal.getsignal(signum) is not signal.SIG_IGN:
+            signal.signal(signum, note_ctrl_c)
+    # A handler a fork inherited from the trainer must not catch the alarm, nor a mask the trainer blocked it in, which fork and spawn pass on, hold it.
+    signal.signal(signal.SIGALRM, signal.SIG_DFL)
+    # Nor may a group's SIGUSR1, SIGUSR2 or SIGHUP, which the trainer may handle, kill the worker or run that handler here; one sent before this policy is discarded.
+    for signum in _GROUP_SIGNALS:
+        signal.signal(signum, signal.SIG_IGN)
+    signal.pthread_sigmask(
+        signal.SIG_UNBLOCK, (*_TERMINATION_SIGNALS, *_GROUP_SIGNALS, signal.SIGALRM)
+    )
+
+
 def _upload_worker(
     server_address: str,
     project_id: str,
@@ -65,6 +242,7 @@ def _upload_worker(
     local_endpoint_config: Optional[dict] = None,
     galleries_released=None,
     lanes_on_disk=None,
+    spill_deadline=None,
 ):
     """Runs in a child process, streaming metrics over one long-lived
     IngestMetricsBidi call: feed a bounded in-flight window, free points as the
@@ -82,7 +260,8 @@ def _upload_worker(
     3. shutdown deadline — past it, the stream is cancelled and everything
        undelivered spills, bounding exit latency;
     4. orphan watch — a parent that dies without draining us becomes a shutdown
-       with a 30s deadline instead of retrying forever.
+       with a 30s deadline instead of retrying forever, or by the handoff's cap
+       of a Ctrl-C the worker saw (_hand_off_after_ctrl_c).
     """
     # Import owner-side machinery only when the child begins executing. Keeping
     # this module importable without importing client.py is what lets the spawn
@@ -101,6 +280,7 @@ def _upload_worker(
         _DEFAULT_MAX_BUFFER_BYTES,
         _DEFAULT_MAX_BUFFER_POINTS,
         _DRAIN_MAX_ITEMS_PER_CYCLE,
+        _QUEUE_DRAIN_SILENCE,
         _EncodedItems,
         _FEED_Q_CAP,
         _IDLE_POLL_TIMEOUT,
@@ -109,40 +289,33 @@ def _upload_worker(
         _MAX_UNACKED_POINTS,
         _NUMERIC_OUTAGE_FAILOVER,
         _ORDERED_CDN_KINDS,
-        _PermanentPointError,
+        _GALLERY_KINDS,
         _RECOVERY_MAX_BUFFER_BYTES,
         _RECOVERY_MAX_BUFFER_POINTS,
         _RetainedLane,
-        _RichMutationDataLoss,
         _SERIALIZED_RICH_QUEUE_ITEM,
         _STATUS_LOCK_TIMEOUT,
-        _TerminalRunError,
         _ThreadAttempt,
         _WORKER_EXIT_DATA_LOSS,
+        _WORKER_GALLERY_CUT_SHORT,
         _WORKER_EXIT_DRAIN_INCOMPLETE,
         _WORKER_EXIT_RUN_DELETED,
         _WORKER_EXIT_SPOOL_FAILED,
         _cdn_retry_delay,
-        _connect,
         _decode_queue_item,
-        _drain_worker_queue,
         _encode_cdn_items,
         _equal_jitter_delay,
         _estimate_tuple_bytes,
-        _is_terminal_run_error,
         _merged_worker_failure,
-        _next_batch,
         _next_connect_retry_delay,
         _process_cdn_batch,
         _publish_manifest_point,
         _publish_rich_mutation,
         _queue_item_size,
-        _raw_shared,
         _recovery_retry_delay,
         _retire_rejected_worker_spools,
         _spill_tuple,
         _spool_header,
-        _terminal_run_error,
         _upload_to_cdn,
         _validated_ack_delta,
         SpoolWriter,
@@ -150,9 +323,15 @@ def _upload_worker(
     )
     from kymo._wire import (
         _MAX_POINTS_PER_MSG,
+        _PermanentPointError,
+        _RichMutationDataLoss,
         _SEND_INITIAL_DELAY,
         _SEND_MAX_DELAY,
         _SEND_MAX_RETRIES,
+        _TerminalRunError,
+        _chunk_tuples,
+        _is_terminal_run_error,
+        _terminal_run_error,
     )
 
     if local_endpoint_config is not None:
@@ -194,22 +373,35 @@ def _upload_worker(
     # A non-positive setting is ignored, so a typo cannot turn the watchdog off.
     ack_progress_timeout = configured if configured > 0 else _ACK_PROGRESS_TIMEOUT
 
-    spool = SpoolWriter(
-        spool_path or make_spool_path(project_id, run_id, "worker", session=session),
-        header=_spool_header(
-            server_address,
-            project_id,
-            run_id,
-            run_name,
-            cdn_url,
-            session,
-            local_installation_uuid,
-        ),
+    def spill_end() -> float:
+        """When spilling stops, to close the spool and exit by itself before it is killed: a signal's or the handoff's end (_spill_by), or the parent's shutdown's (spill_deadline, 0.0 = none), whichever is sooner. Either can come forward, so it is read again at every step."""
+        parent = spill_deadline.value if spill_deadline is not None else 0.0
+        return min(_spill_by, parent) if parent > 0.0 else _spill_by
+
+    def new_spool(path: str) -> SpoolWriter:
+        """A spool segment at path, whose writer cuts off whole a record the spill end catches being written."""
+        return SpoolWriter(
+            path,
+            header=_spool_header(
+                server_address,
+                project_id,
+                run_id,
+                run_name,
+                cdn_url,
+                session,
+                local_installation_uuid,
+            ),
+            until=spill_end,
+        )
+
+    spool = new_spool(
+        spool_path or make_spool_path(project_id, run_id, "worker", session=session)
     )
     spool_directory = os.path.dirname(os.path.abspath(spool.path))
     recovery_rng = random.Random((os.getpid() << 64) ^ time.time_ns())
     orphan_deadline = 0.0
     creator_pid = owner_pid if owner_pid is not None else os.getppid()
+    queue_reads = _QueueReads(metric_queue)
     process_parent = multiprocessing.parent_process()
 
     def owner_alive() -> bool:
@@ -239,10 +431,23 @@ def _upload_worker(
             return False
         if orphan_deadline and time.monotonic() >= orphan_deadline:
             return True
+        if _signal_deadline <= time.monotonic():
+            return True
         if shutdown_deadline is None:
             return False
         d = shutdown_deadline.value
         return d > 0.0 and time.monotonic() >= d
+
+    def await_attempt(attempt: _ThreadAttempt) -> Optional[tuple]:
+        """A helper's outcome (succeeded, result), waited for in steps until the spill end (spill_end()); None once that has passed."""
+        while True:
+            remaining = spill_end() - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                return attempt.events.get(timeout=min(remaining, _ACTIVE_POLL_TIMEOUT))
+            except queue.Empty:
+                pass
 
     # Readiness attempts span owner-loop cycles, but each poll is non-blocking.
     # The sole mp.Queue consumer therefore keeps draining and bounding its
@@ -269,6 +474,8 @@ def _upload_worker(
     # Consecutive failed catch-ups of whichever circuit owns the disk FIFO.
     recovery_failures = 0
     replay_segment: Optional[SpoolWriter] = None
+    # The segment the deadline spill sealed ahead of its first rich record, which gets one of its own (spill), closed and reported at exit.
+    sealed_spools: list[SpoolWriter] = []
     replay_attempt: Optional[_ThreadAttempt] = None
     # The newest disk-circuit event was a delivered sealed-segment replay: set then, cleared by a failed replay or numeric reconnect and by a lane failing over from live (a broken live circuit is not proof).
     # Lanes drain only while it holds, and the shutdown tail replays only on it.
@@ -285,11 +492,15 @@ def _upload_worker(
     unversioned_rich = False
     shutdown = False
     input_closed = False  # the explicit queue sentinel was consumed
+    queue_lost = False  # the queue can no longer be read (read_queue)
     total_sent = 0
     spilled = 0
     spool_failed = 0  # points lost to a failed spool write; nonzero also stops spill() from writing again
+    cut = 0  # points left unspilled once the spill end passed (spill_end())
     undecodable = 0  # queued points dropped because their snapshot would not unpickle; kept out of spool_failed, which also stops spill() from writing
     unencodable = 0  # points dropped because their spool record could not be built (a gallery too large to encode); the spool itself is still sound
+    # Galleries published without items their encode dropped or the CDN rejected.
+    cut_short = 0
     drain_incomplete = False
     terminal_rejected = False
     terminal_reason = ""
@@ -306,6 +517,8 @@ def _upload_worker(
     abandoned_upload: Optional[_ThreadAttempt] = None
     # Encodes the oldest queued gallery that is still Image/Resource objects, so the rich cap counts encoded bytes.
     encode_attempt: Optional[_ThreadAttempt] = None
+    # Encodes a rich failover did not wait for (failover_rich): one that fails counts its gallery as no longer raw only once this loop sees it fail.
+    abandoned_encodes: list[_ThreadAttempt] = []
     # Consecutive failures encoding that gallery, and the earliest time to retry it, as for the CDN head.
     encode_fails = 0
     encode_backoff_until = 0.0
@@ -437,13 +650,13 @@ def _upload_worker(
                 )
         try:
             if spooled is not None and upload_spooled is not None:
-                _raw_shared(upload_spooled).value = int(spooled)
+                upload_spooled.get_obj().value = int(spooled)
             if failure and upload_failure is not None:
-                raw_failure = _raw_shared(upload_failure)
+                raw_failure = upload_failure.get_obj()
                 raw_failure.value = _merged_worker_failure(raw_failure.value, failure)
             if terminal and upload_terminal is not None:
-                _raw_shared(upload_terminal).value = 1
-            _raw_shared(queue_status).value -= n
+                upload_terminal.get_obj().value = 1
+            queue_status.get_obj().value -= n
         finally:
             if acquired:
                 lock.release()
@@ -474,23 +687,75 @@ def _upload_worker(
             cdn_channel = None
         cdn_stub = None
 
-    def spill(tuples: list[tuple]) -> int:
-        nonlocal spilled, spool_failed, unencodable
+    def spill(tuples: list[tuple], encoding: Optional[tuple] = None) -> int:
+        """Spool tuples, returning how many it wrote, which it adds to spilled. encoding is a gallery the encoder helper still encodes, which counts itself as no longer raw once its encode ends. A gallery it writes without items its encode dropped is cut short, as one published so would be."""
+        nonlocal spilled, spool_failed, unencodable, cut, cut_short
         if not tuples:
             return 0
-        # Written, unencodable or lost: none of them stays raw in this worker.
-        raw_galleries = sum(map(counted_raw, tuples))
-        spooled_now = 0
+        if (
+            tuples[0][0] in _ORDERED_CDN_KINDS
+            and spool.count
+            and not sealed_spools
+            and past_deadline()
+        ):
+            # The deadline spill's first rich record behind others, from the rich lane or the producer queue, starts a segment of its own: a kill the spill end cannot foresee (the container's, an OOM kill, SIGALRM behind a wedged system call) that tears one then costs only that segment, never the records sealed before it, which kymo.sync would quarantine with it.
+            try:
+                sealed_spools.append(rotate_spool())
+            except OSError as error:
+                _log.error("failed to seal upload spool %s: %s", spool.path, error)
+        # Written, unencodable, cut or lost: none of them stays raw in this worker.
+        raw_galleries = sum(map(counted_raw, tuples)) - (
+            encoding is not None and counted_raw(encoding)
+        )
+        spooled_now = cut_now = reduced = 0
         if spool_failed:
             spool_failed += len(tuples)
         else:
             held = spool.count
             unwritten = 0
             error = None
-            for t in tuples:
+            for index, t in enumerate(tuples):
+                gallery = t[0] in _GALLERY_KINDS
+                # Checked before each gallery and every 512th point, and only a gallery is asked whether it awaits encoding or was cut short: those checks on every point made a numeric spill take 17% longer. The writer still cuts a record the end catches it sending (SpoolWriter.until), so what goes out past the end stays within the megabyte it buffers.
+                if (gallery or not index & 511) and spill_end() <= time.monotonic():
+                    # The spill end has passed: leave the rest charged and lost, and exit by itself.
+                    cut_now = len(tuples) - index
+                    break
                 try:
+                    if gallery and awaits_encoding(t):
+                        if index:
+                            # What this spill wrote reaches the file before a slow encode, so a kill during it loses none of it.
+                            spool.flush()
+                        if spill_end() < math.inf:
+                            # Encoded on a helper, waited for until the spill end, so that end cuts this gallery and the rest rather than a kill cutting a record short.
+                            outcome = await_attempt(
+                                _ThreadAttempt(
+                                    t,
+                                    lambda t=t: _encode_cdn_items(t[1], t[2], t[3]),
+                                    name="kymo-spill-encode",
+                                )
+                            )
+                            if outcome is None:
+                                cut_now = len(tuples) - index
+                                break
+                            succeeded, result = outcome
+                            if not succeeded:
+                                _log.error(
+                                    "could not encode %r for the spool — 1 point LOST: %r",
+                                    t[:3],
+                                    result,
+                                )
+                                unwritten += 1
+                                continue
+                            t = _encoded_entry(t, result)
                     if not _spill_tuple(spool, t):
                         unwritten += 1
+                    elif gallery and spooled_cut_short(t):
+                        reduced += 1
+                except SpoolWriteCut:
+                    # The spill end passed as it wrote this record, which the writer cut off.
+                    cut_now = len(tuples) - index
+                    break
                 except Exception as e:
                     # A write failure is normally disk-wide (full, read-only, broken mount): stop touching it after the first failure; the removed suffix is still resolved below.
                     error = e
@@ -505,14 +770,21 @@ def _upload_worker(
             # A failed write or flush cuts the file back to its last whole record, so the writer's count says what spooled.
             spooled_now = spool.count - held
             unencodable += unwritten
-            lost = len(tuples) - spooled_now - unwritten
+            cut += cut_now
+            cut_short += reduced
+            lost = len(tuples) - cut_now - spooled_now - unwritten
             if lost:
                 _log.warning("failed to spool %d point(s): %s", lost, error)
                 spool_failed += lost
+        # Those cut stay charged: the worker exits with them reported lost.
         resolve_points(
-            len(tuples),
+            len(tuples) - cut_now,
             spooled=True if spooled_now else None,
-            failure=_WORKER_EXIT_SPOOL_FAILED if spool_failed or unencodable else 0,
+            failure=_WORKER_EXIT_SPOOL_FAILED
+            if spool_failed or unencodable
+            else _WORKER_GALLERY_CUT_SHORT
+            if reduced
+            else 0,
         )
         release_raw_galleries(raw_galleries)
         spilled += spooled_now
@@ -532,12 +804,30 @@ def _upload_worker(
             _log.error("failed to close upload spool %s: %s", writer.path, error)
             return writer.path
 
+    def rotate_spool() -> SpoolWriter:
+        """Seal the active spool, keeping its writer lock, and write on to a new segment; return the sealed one. OSError if sealing failed, writing on to the active spool."""
+        nonlocal spool
+        spool.seal()
+        sealed, spool = (
+            spool,
+            new_spool(
+                make_spool_path(
+                    project_id,
+                    run_id,
+                    "worker",
+                    spool_dir=spool_directory,
+                    session=session,
+                )
+            ),
+        )
+        return sealed
+
     def start_spool_replay() -> bool:
         """Replay the oldest sealed segment in a daemon helper while producers spool, first rotating the active spool into the single FIFO replay slot if that slot is empty.
 
         False means nothing started: delivery may not start (see may_start_transport), nothing is spooled, or sealing failed and the next attempt waits out a backoff.
         """
-        nonlocal spool, replay_segment, replay_attempt, replay_can_prove
+        nonlocal replay_segment, replay_attempt, replay_can_prove
         nonlocal numeric_lane, rich_lane
         if not may_start_transport():
             return False
@@ -545,7 +835,7 @@ def _upload_worker(
             if spool.count == 0:
                 return False
             try:
-                spool.seal()
+                replay_segment = rotate_spool()
             except OSError as error:
                 # The unflushed tail is gone, and its accounting was already released
                 # as spooled — record the loss, but keep this worker draining its
@@ -554,28 +844,9 @@ def _upload_worker(
                 resolve_points(0, failure=_WORKER_EXIT_SPOOL_FAILED)
                 schedule_recovery_retry()
                 return False
-            replay_segment = spool
-            spool = SpoolWriter(
-                make_spool_path(
-                    project_id,
-                    run_id,
-                    "worker",
-                    spool_dir=spool_directory,
-                    session=session,
-                ),
-                header=_spool_header(
-                    server_address,
-                    project_id,
-                    run_id,
-                    run_name,
-                    cdn_url,
-                    session,
-                    local_installation_uuid,
-                ),
-            )
         segment = replay_segment
 
-        def replay() -> bool:
+        def replay() -> tuple[bool, int]:
             # Lazy import avoids client <-> sync module initialization recursion.
             from kymo.sync import replay_file
 
@@ -590,6 +861,7 @@ def _upload_worker(
                 )
             terminal_runs: set[tuple[str, str, str]] = set()
             quarantined_files: set[str] = set()
+            reduced_galleries: list[tuple[str, int]] = []
             try:
                 # Delete consumed segments: their records were delivered, superseded, or on an old server skipped as older than the server's.
                 delivered = replay_file(
@@ -598,6 +870,7 @@ def _upload_worker(
                     replayed_keys=replayed_cdn_keys,
                     terminal_runs=terminal_runs,
                     quarantined_files=quarantined_files,
+                    reduced_galleries=reduced_galleries,
                     _writer_lock_held=True,
                     _local_endpoint=local_endpoint,
                 )
@@ -619,7 +892,8 @@ def _upload_worker(
                 raise _TerminalRunError("run is no longer writable during spool replay")
             if quarantined_files:
                 raise _ReplayQuarantined(next(iter(quarantined_files)))
-            return delivered
+            # Whether it delivered the segment, and how many galleries it published without items the CDN rejected.
+            return delivered, len(reduced_galleries)
 
         replay_attempt = _ThreadAttempt(segment, replay, name="kymo-spool-replay")
         replay_can_prove = True
@@ -633,13 +907,16 @@ def _upload_worker(
         return True
 
     def awaits_encoding(entry: tuple) -> bool:
-        return entry[0] in ("cdn_batch", "cdn_batch_mutation") and not isinstance(
-            entry[3], _EncodedItems
-        )
+        return entry[0] in _GALLERY_KINDS and not isinstance(entry[3], _EncodedItems)
 
     def counted_raw(entry: tuple) -> bool:
         """A gallery still raw that the initializing process counted: one log()'s encoder wait waits on, unlike a fork child's."""
         return awaits_encoding(entry) and not isinstance(entry[3], _ChildGalleryItems)
+
+    def spooled_cut_short(entry: tuple) -> bool:
+        """Whether entry, a gallery just spooled, was written without items its encode dropped: the encoder's _EncodedItems says so, and a spool record's encode replaces a dropped item with None in place (_encode_cdn_items)."""
+        items = entry[3]
+        return items.dropped if isinstance(items, _EncodedItems) else None in items
 
     def enforce_rich_caps() -> None:
         if (
@@ -719,6 +996,8 @@ def _upload_worker(
                 failure=_WORKER_EXIT_RUN_DELETED,
             )
             return
+        # A serialized envelope holds exactly one rich point, which is charged its size.
+        serialized = isinstance(item, tuple) and item[0] == _SERIALIZED_RICH_QUEUE_ITEM
         try:
             point_tuples = _decode_queue_item(item)
         except Exception as error:
@@ -726,24 +1005,18 @@ def _upload_worker(
             count = _queue_item_size(item)
             if not undecodable:
                 _log.error(
-                    "failed to decode a queued rich item — dropping %d point(s); later decode losses are summarized at exit: %s",
+                    "failed to decode a queued item — dropping %d point(s); later decode losses are summarized at exit: %s",
                     count,
                     error,
                 )
             undecodable += count
             resolve_points(count, failure=_WORKER_EXIT_SPOOL_FAILED)
-            # Only a rich snapshot can fail to decode, and only a gallery's can hold a tensor. If it was metadata or a fork child's gallery, this release was never counted, which only lets a later log() wait less.
-            release_raw_galleries(1)
+            if serialized:
+                # A rich snapshot that will not unpickle may be a gallery's, the only kind that holds a tensor. If it was metadata or a fork child's gallery, this release was never counted, which only lets a later log() wait less. A numeric batch whose lists are out of step (zip strict) holds none.
+                release_raw_galleries(1)
             return
         pending_spill: list[tuple] = []
-        # A serialized envelope holds exactly one rich point, which is charged its size.
-        serialized_bytes = (
-            len(item[2])
-            if isinstance(item, tuple)
-            and len(item) == 3
-            and item[0] == _SERIALIZED_RICH_QUEUE_ITEM
-            else 0
-        )
+        serialized_bytes = len(item[1]) if serialized else 0
         for point_tuple in point_tuples:
             is_rich = point_tuple[0] in _ORDERED_CDN_KINDS
             unversioned_rich |= point_tuple[0] in ("cdn_batch", "metadata_batch")
@@ -793,8 +1066,8 @@ def _upload_worker(
         if pending_spill:
             spill(pending_spill)
 
-    def process_cdn_entry(entry: tuple, *, first_attempt: bool) -> bool:
-        """Complete one CDN head entry; the owner loop applies its result."""
+    def process_cdn_entry(entry: tuple, *, first_attempt: bool) -> bool | int:
+        """Complete one CDN head entry; the owner loop applies its result (_process_cdn_batch's for a gallery)."""
         kind, name, step, payload, *versions = entry
         # Legacy entries carry no versions; a direct key and metadata carry no reduced one.
         timestamp_ms, mutation_version, reduced_mutation_version = (
@@ -811,7 +1084,7 @@ def _upload_worker(
                 timestamp_ms,
                 mutation_version,
             )
-        if kind in ("cdn_batch", "cdn_batch_mutation"):
+        if kind in _GALLERY_KINDS:
             return _process_cdn_batch(
                 cdn_stub,
                 http_client,
@@ -986,7 +1259,7 @@ def _upload_worker(
         cdn_backoff_until = 0.0
         encode_fails = 0
         encode_backoff_until = 0.0
-        # Spool the encoded entries ahead of an encode in flight, then wait for that encode rather than repeat it on this thread, unless the spool has failed and would write nothing.
+        # Spool the encoded entries ahead of an encode in flight, then wait for that encode rather than repeat it on this thread, never past the spill end, unless the spool has failed and would write nothing.
         # The encoder encodes in place, so spilling that gallery only resumes an encode that raised.
         if encode_attempt is None:
             count = spill(cdn_queue.items)
@@ -996,13 +1269,17 @@ def _upload_worker(
             )
             count = spill(cdn_queue.items[:index])
             remaining = cdn_queue.items[index:]
-            if not spool_failed:
-                succeeded, result = encode_attempt.events.get()
-                # Its helper counted it as no longer raw, so spill the encoded form, which spill does not count again. With a failed spool it is not waited for, and its helper's late count is a second one: a later log() only waits less.
-                if succeeded:
-                    remaining[0] = _encoded_entry(remaining[0], result)
+            outcome = None if spool_failed else await_attempt(encode_attempt)
+            if outcome is None:
+                # Still encoding, it counts itself once its encode succeeds, and the loop counts it once its encode fails, which its helper never counts.
+                abandoned_encodes.append(encode_attempt)
+            elif outcome[0]:
+                # Its helper counted it as no longer raw, so spill the encoded form, which spill does not count again.
+                remaining[0] = _encoded_entry(remaining[0], outcome[1])
             encode_attempt = None
-            count += spill(remaining)
+            count += spill(
+                remaining, encoding=remaining[0] if outcome is None else None
+            )
         cdn_queue.clear()
         return count
 
@@ -1033,16 +1310,21 @@ def _upload_worker(
                 error,
             )
 
-    def accept_next(timeout: float) -> bool:
-        """Accept one queue item, waiting up to timeout seconds (0: not at all); False if none came. Only this frame holds the item, so a quiet queue keeps no large serialized gallery alive."""
-        nonlocal shutdown, input_closed
+    def read_queue(timeout: float) -> bool:
+        """Take the next queue item, waiting at most timeout; False if none came. Only this frame holds the item, so a quiet queue keeps no large serialized gallery alive. Once the queue can no longer be read (a message malformed or that will not unpickle), the worker reads it no more, delivers what it holds and exits as from a drain cut short, leaving the queue to the parent's salvage, and reports a message it holds in part (_QueueReads)."""
+        nonlocal shutdown, input_closed, queue_lost, drain_incomplete
+        if queue_lost:
+            time.sleep(timeout)
+            return False
         try:
-            item = (
-                metric_queue.get(timeout=timeout)
-                if timeout
-                else metric_queue.get_nowait()
-            )
+            item = queue_reads.get(timeout)
         except queue.Empty:
+            return False
+        except OSError as error:
+            _log.error("upload queue can no longer be read: %r", error)
+            queue_lost = shutdown = True
+            if not orphan_deadline:
+                drain_incomplete = True
             return False
         if item is None:
             shutdown = input_closed = True
@@ -1059,13 +1341,17 @@ def _upload_worker(
         # owner-fenced salvage cannot reach.
         failover_numeric()
         failover_rich()
-        saw_parent_close = _drain_worker_queue(
-            metric_queue, retain_queue_item, input_closed=input_closed
-        )
-        # Silence is an expected close only after the parent has died. In a
-        # normal shutdown, missing None means delivery is unproven; exit
-        # nonzero so the parent performs its exact fenced salvage.
-        if not saw_parent_close and not orphan_deadline:
+        # Drain through the parent's shutdown sentinel, never publishing a marker of the worker's own, until the queue stays silent for _QUEUE_DRAIN_SILENCE or the spill end passes, which bounds that silence too: the worker must release the queue's reader lock and exit by itself. A message still arriving (queue_reads.frame grows) is no silence, nor is the time a group's spill takes.
+        silent_by = time.monotonic() + _QUEUE_DRAIN_SILENCE
+        while not input_closed and not queue_lost:
+            remaining = min(silent_by, spill_end()) - time.monotonic()
+            if remaining <= 0:
+                break
+            arrived = len(queue_reads.frame)
+            if read_queue(min(0.25, remaining)) or len(queue_reads.frame) > arrived:
+                silent_by = time.monotonic() + _QUEUE_DRAIN_SILENCE
+        # Silence is an expected close only after the parent has died. In a normal shutdown, missing None means delivery is unproven; exit nonzero so the parent performs its exact fenced salvage.
+        if not input_closed and not orphan_deadline:
             drain_incomplete = True
 
     while True:
@@ -1092,15 +1378,12 @@ def _upload_worker(
             poll_timeout = _ACTIVE_POLL_TIMEOUT if buffer else _CONNECT_POLL_TIMEOUT
         else:
             poll_timeout = _IDLE_POLL_TIMEOUT
-        if accept_next(poll_timeout):
+        if read_queue(poll_timeout):
             drained_items = 1
         else:
             drained_to_empty = True
-        if past_deadline():
-            drain_to_spool_after_deadline()
-            break
         while drained_items < _DRAIN_MAX_ITEMS_PER_CYCLE and not past_deadline():
-            if not accept_next(0.0):
+            if not read_queue(0.0):
                 drained_to_empty = True
                 break
             drained_items += 1
@@ -1114,9 +1397,13 @@ def _upload_worker(
 
         # ---- orphan watch: parent died without draining us ----
         if not orphan_deadline and not owner_alive():
-            _log.warning(
-                "parent process died — flushing for 30s, then spooling the rest"
-            )
+            # After a handoff or a signal, which bound the worker sooner, the parent's exit is expected, as it is after a Ctrl-C, which bounds it now.
+            if _hand_off_after_ctrl_c is not None:
+                _hand_off_after_ctrl_c()
+            if _signal_deadline == math.inf:
+                _log.warning(
+                    "parent process died — flushing for 30s, then spooling the rest"
+                )
             orphan_deadline = time.monotonic() + 30.0
             shutdown = True
 
@@ -1191,8 +1478,16 @@ def _upload_worker(
                 error = None
                 if not replay_succeeded:
                     error = replay_result
-                elif not replay_result:
-                    error = RuntimeError("spool replay did not complete")
+                else:
+                    delivered, reduced = replay_result
+                    if reduced:
+                        # Recorded before an empty disk prefix clears the spooled flag below, so delivery never reads complete without it.
+                        resolve_points(0, failure=_WORKER_GALLERY_CUT_SHORT)
+                    if delivered:
+                        # Counted by the replay that delivers the segment: one that fails is retried, and cuts the same galleries again.
+                        cut_short += reduced
+                    else:
+                        error = RuntimeError("spool replay did not complete")
                 # The helper has released a segment it finished with; only a failed replay keeps it for the retry.
                 if isinstance(error, _TerminalRunError):
                     replay_segment = None
@@ -1279,16 +1574,9 @@ def _upload_worker(
             and time.monotonic()
             >= (stream_retry_at if numeric_lane == _LIVE else recovery_retry_at)
         ):
-            if local_endpoint is None:
-                # Preserve the hosted call contract exactly; local endpoint
-                # material is meaningful only to the private UDS connector.
-                connect_attempt = _connect(server_address, deadline_fn=past_deadline)
-            else:
-                connect_attempt = _connect(
-                    server_address,
-                    deadline_fn=past_deadline,
-                    local_endpoint=local_endpoint,
-                )
+            connect_attempt = _ConnectionAttempt(
+                server_address, local_endpoint=local_endpoint
+            )
         connect_result = (
             connect_attempt.poll(deadline_fn=past_deadline)
             if connect_attempt is not None
@@ -1354,9 +1642,7 @@ def _upload_worker(
         if stream is not None:
             for kind, payload in stream.poll_acks():
                 if kind == "ack":
-                    # Cumulative: delta = cum - last. Delete that many off the buffer
-                    # front, shrink the prefix, decrement queue_status ONCE (spill is
-                    # the only other decrementer).
+                    # Cumulative: the delta = cum - last points at the buffer's front are delivered, each resolved once.
                     cumulative = int(payload)
                     try:
                         delta = _validated_ack_delta(
@@ -1416,8 +1702,14 @@ def _upload_worker(
             handle_break(RuntimeError(f"no ack progress for {ack_progress_timeout:g}s"))
         # A live lane that holds points and gets no ACK for this long goes to disk, as over the RAM cap.
         # A draining lane is exempt: its points wait for the replay ahead of them, so the catch-up converges.
-        # So are shutdown, which has its own deadline, and a failed spool, where spill() would only count the points lost.
-        if numeric_lane != _LIVE or shutdown or spool_failed or not buffer:
+        # So are shutdown, which has its own deadline, from the parent's sentinel or once a signal, the handoff or the parent's shutdown has set the spill end, and a failed spool, where spill() would only count the points lost.
+        if (
+            numeric_lane != _LIVE
+            or shutdown
+            or spool_failed
+            or not buffer
+            or spill_end() < math.inf
+        ):
             numeric_waiting_since = None
         elif numeric_waiting_since is None:
             numeric_waiting_since = now
@@ -1472,11 +1764,12 @@ def _upload_worker(
                 if take <= 0:
                     break
                 try:
-                    batch, n = _next_batch(
-                        project_id,
-                        run_id,
-                        buffer.items[inflight_n : inflight_n + take],
-                        buffer.sizes[inflight_n : inflight_n + take],
+                    # The first chunk: fewer than take points when a text point trips the byte cap.
+                    points = next(
+                        _chunk_tuples(
+                            buffer.items[inflight_n : inflight_n + take],
+                            buffer.sizes[inflight_n : inflight_n + take],
+                        )
                     )
                 except _PermanentPointError as error:
                     # Unreachable for live points — log_cdn size-checks keys, text truncates, numerics are tiny — but if a future buffered kind is ever permanently unencodable, degrade instead of crashing: fail the whole numeric lane over to disk (as the RAM cap does) so sync quarantines the offending record, rather than the worker dying with its buffer unspilled.
@@ -1487,11 +1780,15 @@ def _upload_worker(
                     failover_numeric()
                     break
                 # A full feed queue: retry next cycle.
-                if not stream.feed(batch):
+                if not stream.feed(
+                    kymo_pb2.MetricsBatch(
+                        project_id=project_id, run_id=run_id, points=points
+                    )
+                ):
                     break
                 if inflight_n == 0:
                     ack_progress_at = time.monotonic()
-                inflight_n += n
+                inflight_n += len(points)
 
         # Request EOF is what makes the server final-flush a partial tail. Do
         # not wait for ACKs (buffer empty) first: an EOF-flush server would then
@@ -1548,7 +1845,12 @@ def _upload_worker(
                     cdn_fails = 0
                     cdn_backoff_until = 0.0
                     cdn_queue.discard_prefix(1)
-                    resolve_points(1)
+                    if result == _WORKER_GALLERY_CUT_SHORT:
+                        # Delivered, but not whole: delivery is incomplete, its failure recorded with the point's resolution.
+                        cut_short += 1
+                        resolve_points(1, failure=_WORKER_GALLERY_CUT_SHORT)
+                    else:
+                        resolve_points(1)
                 elif not past_deadline():
                     if local_endpoint is not None:
                         close_rich_transport()
@@ -1570,6 +1872,10 @@ def _upload_worker(
 
         if abandoned_upload is not None and not abandoned_upload.events.empty():
             abandoned_upload = None
+        for attempt in [a for a in abandoned_encodes if not a.events.empty()]:
+            abandoned_encodes.remove(attempt)
+            if not attempt.events.get()[0]:
+                release_raw_galleries(int(counted_raw(attempt.item)))
         if (
             cdn_attempt is None
             and abandoned_upload is None
@@ -1608,10 +1914,9 @@ def _upload_worker(
     # Close the bidi channel and anything else still open; a clean exit has already ended the stream.
     drop_numeric_transport()
     close_rich_transport()
-    pending_spool_files = []
-    spool_file = close_spool(spool)
-    if spool_file:
-        pending_spool_files.append(spool_file)
+    pending_spool_files = [
+        path for path in map(close_spool, [*sealed_spools, spool]) if path
+    ]
     if replay_segment is not None:
         # A running daemon replay owns the sealed descriptor until this worker
         # process exits. If it already finished, release the lock explicitly.
@@ -1659,21 +1964,47 @@ def _upload_worker(
             "their delivery is unknown: %s",
             ", ".join(vanished_spool_paths),
         )
-    if spool_failed or undecodable or unencodable:
+    if queue_reads.frame:
+        # Its producer died writing it (_QueueReads): the rest never comes.
+        _log.error(
+            "a queued group arrived only in part (%d bytes) and could not be "
+            "decoded — its points are LOST",
+            len(queue_reads.frame),
+        )
+        if not orphan_deadline:
+            drain_incomplete = True
+    # Points still charged but those cut: groups the worker never read (queued, held in part, or in the parent's feeder) or that the parent holds back. No salvage follows a parent that has exited or handed the run off; otherwise the parent's salvage spools what the queue holds.
+    unread = max(0, queue_status.get_obj().value - cut)
+    handed_off = _handoff is not None and _handoff.value > 0
+    salvaged = not (orphan_deadline or handed_off) and owner_alive()
+    unread_lost = 0 if salvaged else unread
+    if drain_incomplete:
+        _log.error(
+            "upload queue drain ended before the parent shutdown sentinel with %d "
+            "point(s) unread; %s",
+            unread,
+            "parent salvage is required" if salvaged else "no salvage follows",
+        )
+    if cut_short:
+        _log.error(
+            "%d gallery(ies) were published or spooled without items that could "
+            "not be encoded or that the CDN rejected",
+            cut_short,
+        )
+    if spool_failed or undecodable or unencodable or cut or unread_lost:
         _log.error(
             "%d points reached neither the server nor the spool (%d unspoolable "
-            "(disk full?), %d unencodable, %d undecodable) — LOST",
-            spool_failed + unencodable + undecodable,
+            "(disk full?), %d unencodable, %d undecodable, %d past the spill "
+            "deadline, %d never read) — LOST",
+            spool_failed + unencodable + undecodable + cut + unread_lost,
             spool_failed,
             unencodable,
             undecodable,
+            cut,
+            unread_lost,
         )
         sys.exit(_WORKER_EXIT_SPOOL_FAILED)
     if terminal_rejected:
         sys.exit(_WORKER_EXIT_RUN_DELETED)
     if drain_incomplete:
-        _log.error(
-            "upload queue drain ended before the parent shutdown sentinel; "
-            "parent salvage is required"
-        )
         sys.exit(_WORKER_EXIT_DRAIN_INCOMPLETE)

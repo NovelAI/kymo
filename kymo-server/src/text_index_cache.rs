@@ -8,7 +8,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 use serde::Deserialize;
@@ -189,7 +189,7 @@ fn row_key_cmp(left: &TextIndexRow, right: &TextIndexRow) -> Ordering {
 
 /// Sort into display order and retain the newest version of every table key.
 /// Incremental reads deliberately omit FINAL so the inserted_at skip index can prune old granules; overlap can therefore return several row versions.
-/// None when a key's newest `inserted_ms` holds versions whose index fields disagree: ReplacingMergeTree FINAL keeps one of them and nothing in a non-FINAL read says which, so the caller needs a FINAL read (the numeric cache's rule in `merge_increment_tracked`).
+/// None when a key's newest `inserted_ms` holds versions whose index fields disagree: ReplacingMergeTree FINAL keeps one of them and nothing in a non-FINAL read says which, so the caller needs a FINAL read (the numeric cache's rule in `SeriesSnapshot::merge`).
 /// Agreeing versions at that stamp are the overlap re-reading a row; a newer stamp is a legitimate replacement.
 fn latest_rows(mut rows: Vec<TextIndexRow>) -> Option<Vec<TextIndexRow>> {
     // Newest first within each key, so dedup keeps it and compares every older version against it.
@@ -228,7 +228,6 @@ fn index_bytes(index: &TextStreamIndex) -> usize {
 struct Entry {
     index: Arc<TextStreamIndex>,
     started: Instant,
-    generation: u64,
     last_access: Instant,
     bytes: usize,
 }
@@ -269,12 +268,14 @@ pub type TextRefreshLocks = crate::refresh_locks::RefreshLocks<TextIndexKey, ()>
 struct Inner {
     entries: HashMap<TextIndexKey, Entry>,
     total_bytes: usize,
-    next_generation: u64,
 }
 
 pub enum Lookup {
     Fresh(Arc<TextStreamIndex>),
-    Stale { watermark_ms: i64, generation: u64 },
+    Stale {
+        watermark_ms: i64,
+        base: Weak<TextStreamIndex>,
+    },
     Miss,
 }
 
@@ -312,7 +313,7 @@ impl TextIndexCache {
                             .index
                             .max_inserted_ms
                             .saturating_sub(WATERMARK_OVERLAP_MS),
-                        generation: entry.generation,
+                        base: Arc::downgrade(&entry.index),
                     }
                 }
             }
@@ -346,29 +347,26 @@ impl TextIndexCache {
         )
     }
 
-    /// Fold an increment into the cached index; `Err(())` sends the caller to a full FINAL read, because the base changed generation or the increment holds versions only FINAL can order (see [`latest_rows`]).
+    /// Fold an increment into `base`, the [`Lookup::Stale`] index its watermark came from; `Err(())` sends the caller to a full FINAL read, because the entry no longer holds `base` or the increment holds versions only FINAL can order (see [`latest_rows`]).
     pub fn apply_increment(
         &self,
         key: &TextIndexKey,
         increment: Vec<TextIndexRow>,
         fetch_started: Instant,
-        generation: u64,
+        base: &Weak<TextStreamIndex>,
     ) -> Result<Arc<TextStreamIndex>, ()> {
-        let base = {
+        let holds_base =
+            |entry: &&mut Entry| std::ptr::eq(Arc::as_ptr(&entry.index), base.as_ptr());
+        let held = {
             let mut inner = self.inner.lock().unwrap();
-            let Some(entry) = inner.entries.get_mut(key) else {
-                return Err(());
-            };
-            if entry.generation != generation {
-                return Err(());
-            }
+            let entry = inner.entries.get_mut(key).filter(holds_base).ok_or(())?;
             if increment.is_empty() {
                 entry.started = entry.started.max(fetch_started);
                 return Ok(entry.index.clone());
             }
             entry.index.clone()
         };
-        let rows = base
+        let rows = held
             .chunks
             .iter()
             .cloned()
@@ -377,13 +375,7 @@ impl TextIndexCache {
             .collect();
         let index = TextStreamIndex::from_rows(rows).ok_or(())?;
         let mut inner = self.inner.lock().unwrap();
-        if inner
-            .entries
-            .get(key)
-            .is_none_or(|entry| entry.generation != generation)
-        {
-            return Err(());
-        }
+        inner.entries.get_mut(key).filter(holds_base).ok_or(())?;
         Ok(store_locked(
             &mut inner,
             key.clone(),
@@ -428,20 +420,16 @@ fn store_locked(
     if let Some(old) = inner.entries.remove(&key) {
         inner.total_bytes = inner.total_bytes.saturating_sub(old.bytes);
     }
-    if bytes > budget_bytes || budget_bytes == 0 {
-        settle(inner, budget_bytes);
+    if bytes > budget_bytes {
         metrics::counter!("mkdb2_text_index_cache_oversized_total").increment(1);
         return index;
     }
-    let generation = inner.next_generation;
-    inner.next_generation = inner.next_generation.wrapping_add(1);
     inner.total_bytes = inner.total_bytes.saturating_add(bytes);
     inner.entries.insert(
         key,
         Entry {
             index: index.clone(),
             started: fetch_started,
-            generation,
             last_access: Instant::now(),
             bytes,
         },
@@ -548,7 +536,7 @@ mod tests {
     fn incremental_replacement_recomputes_following_offsets() {
         let cache = TextIndexCache::with_budget(usize::MAX);
         let key = key("p", "r", &["stdout"]);
-        cache.insert_full(
+        let base = Arc::downgrade(&cache.insert_full(
             key.clone(),
             vec![
                 row(1, "stdout", "", "one\n", 1),
@@ -556,14 +544,13 @@ mod tests {
             ],
             0,
             Instant::now(),
-        );
-        let generation = cache.inner.lock().unwrap().entries[&key].generation;
+        ));
         let index = cache
             .apply_increment(
                 &key,
                 vec![row(1, "stdout", "", "one\nextra\n", 2)],
                 Instant::now(),
-                generation,
+                &base,
             )
             .unwrap();
         assert_eq!(index.total_lines, 3);
@@ -574,13 +561,12 @@ mod tests {
     fn equal_timestamp_versions_that_disagree_need_a_final_read() {
         let cache = TextIndexCache::with_budget(usize::MAX);
         let key = key("p", "r", &["stdout"]);
-        cache.insert_full(
+        let base = Arc::downgrade(&cache.insert_full(
             key.clone(),
             vec![row(1, "stdout", "", "old\n", 1)],
             0,
             Instant::now(),
-        );
-        let generation = cache.inner.lock().unwrap().entries[&key].generation;
+        ));
 
         // Against the cached row, and between two increment rows.
         for increment in [
@@ -591,7 +577,7 @@ mod tests {
             ],
         ] {
             assert!(cache
-                .apply_increment(&key, increment, Instant::now(), generation)
+                .apply_increment(&key, increment, Instant::now(), &base)
                 .is_err());
         }
 
@@ -606,7 +592,7 @@ mod tests {
                     row(2, "stdout", "", "d\ne\nf\n", 4),
                 ],
                 Instant::now(),
-                generation,
+                &base,
             )
             .unwrap();
         assert_eq!(index.total_lines, 4);
@@ -617,7 +603,7 @@ mod tests {
     fn non_text_replacement_removes_a_cached_chunk() {
         let cache = TextIndexCache::with_budget(usize::MAX);
         let key = key("p", "r", &["stdout"]);
-        cache.insert_full(
+        let base = Arc::downgrade(&cache.insert_full(
             key.clone(),
             vec![
                 row(1, "stdout", "", "one\n", 1),
@@ -625,12 +611,11 @@ mod tests {
             ],
             0,
             Instant::now(),
-        );
-        let generation = cache.inner.lock().unwrap().entries[&key].generation;
+        ));
         let mut replacement = row(1, "stdout", "", "", 2);
         replacement.is_text = 0;
         let index = cache
-            .apply_increment(&key, vec![replacement], Instant::now(), generation)
+            .apply_increment(&key, vec![replacement], Instant::now(), &base)
             .unwrap();
         assert_eq!(index.total_lines, 1);
         assert_eq!(index.chunks.len(), 1);
@@ -639,16 +624,15 @@ mod tests {
     }
 
     #[test]
-    fn stale_generation_cannot_replace_a_newer_index() {
+    fn stale_base_cannot_replace_a_newer_index() {
         let cache = TextIndexCache::with_budget(usize::MAX);
         let key = key("p", "r", &["stdout"]);
-        cache.insert_full(
+        let stale_base = Arc::downgrade(&cache.insert_full(
             key.clone(),
             vec![row(1, "stdout", "", "old\n", 1)],
             0,
             Instant::now(),
-        );
-        let stale_generation = cache.inner.lock().unwrap().entries[&key].generation;
+        ));
         cache.insert_full(
             key.clone(),
             vec![row(2, "stdout", "", "new\n", 2)],
@@ -660,7 +644,7 @@ mod tests {
                 &key,
                 vec![row(3, "stdout", "", "stale\n", 3)],
                 Instant::now(),
-                stale_generation,
+                &stale_base,
             )
             .is_err());
         let inner = cache.inner.lock().unwrap();
@@ -738,14 +722,12 @@ mod tests {
         let observed = watermark_cap(Instant::now());
         let expected = observed - slow.as_millis() as i64;
         let rows = vec![row(1, "stdout", "", "old\n", 100)];
-        let wm = cache
-            .insert_full(key.clone(), rows, observed, started)
-            .max_inserted_ms;
+        let base = cache.insert_full(key.clone(), rows, observed, started);
+        let wm = base.max_inserted_ms;
         assert!(wm.abs_diff(expected) < 1_000, "{wm} vs {expected}");
-        let generation = cache.inner.lock().unwrap().entries[&key].generation;
         let rows = vec![row(2, "stdout", "", "new\n", observed)];
         let wm = cache
-            .apply_increment(&key, rows, started, generation)
+            .apply_increment(&key, rows, started, &Arc::downgrade(&base))
             .unwrap()
             .max_inserted_ms;
         assert!(wm.abs_diff(expected) < 1_000, "{wm} vs {expected}");
@@ -774,13 +756,13 @@ mod tests {
                 let lock = locks.lease_for(&key);
                 barrier.wait().await;
                 let _guard = lock.lock().await;
-                let generation = cache.inner.lock().unwrap().entries[&key].generation;
+                let base = Arc::downgrade(&cache.inner.lock().unwrap().entries[&key].index);
                 cache
                     .apply_increment(
                         &key,
                         vec![row(step, "stdout", "", text, step)],
                         Instant::now(),
-                        generation,
+                        &base,
                     )
                     .unwrap();
             }));

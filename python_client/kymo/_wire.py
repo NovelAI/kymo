@@ -273,12 +273,8 @@ def _truncate_text_tuple(point_tuple: tuple) -> tuple[tuple, int]:
 
 def _chunk_tuples(tuples: list[tuple], tuple_sizes: Optional[list[int]] = None):
     """Yield count- and byte-capped encoded point chunks."""
-    if tuple_sizes is not None and len(tuple_sizes) != len(tuples):
-        raise ValueError("tuple_sizes must correspond one-to-one with tuples")
-
     points: list = []
     chunk_bytes = 0
-    count = 0
     for index, point_tuple in enumerate(tuples):
         try:
             point_bytes = (
@@ -313,13 +309,12 @@ def _chunk_tuples(tuples: list[tuple], tuple_sizes: Optional[list[int]] = None):
             len(points) >= _MAX_POINTS_PER_MSG
             or chunk_bytes + point_bytes > _MAX_BYTES_PER_MSG
         ):
-            yield points, count
-            points, chunk_bytes, count = [], 0, 0
+            yield points
+            points, chunk_bytes = [], 0
         points.append(point)
         chunk_bytes += point_bytes
-        count += 1
     if points:
-        yield points, count
+        yield points
 
 
 def _send_tuples(stub, project_id: str, run_id: str, tuples: list[tuple]) -> bool:
@@ -329,7 +324,7 @@ def _send_tuples(stub, project_id: str, run_id: str, tuples: list[tuple]) -> boo
 
     batches = [
         kymo_pb2.MetricsBatch(project_id=project_id, run_id=run_id, points=points)
-        for points, _ in _chunk_tuples(tuples)
+        for points in _chunk_tuples(tuples)
     ]
     delay = _SEND_INITIAL_DELAY
     for attempt in range(1, _SEND_MAX_RETRIES + 1):

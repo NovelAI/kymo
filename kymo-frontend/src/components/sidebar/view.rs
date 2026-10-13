@@ -107,7 +107,7 @@ pub fn Sidebar() -> Element {
         async move {
             let mut eval = document::eval(&js);
             while let Ok(action) = eval.recv::<String>().await {
-                end_paint_if_active(paint);
+                set_if_changed(paint, None);
                 if action == "cancel" && trash_pick.peek().is_some() && !*trash_busy.peek() {
                     trash_feedback.set(String::new());
                     close_trash_picker(trash_pick, paint);
@@ -215,7 +215,7 @@ pub fn Sidebar() -> Element {
         let picked = pending_trash.len();
         pending_trash.retain(|run_id| active_ids.contains(run_id.as_str()));
         if pending_trash.len() < picked {
-            end_paint_if_active(paint);
+            set_if_changed(paint, None);
             trash_pick.set(Some(pending_trash.clone()));
         }
     }
@@ -269,14 +269,14 @@ pub fn Sidebar() -> Element {
             } else {
                 "sidebar"
             },
-            onmouseleave: move |_| end_paint_if_active(paint),
+            onmouseleave: move |_| set_if_changed(paint, None),
             div { class: "sidebar-actions",
                 button {
                     class: "btn-link",
                     disabled: (active_selected_count == 0 && filtered_run_ids.is_empty())
                         || (in_trash_mode && *trash_busy.read()),
                     onmousedown: primary(move |_| {
-                        end_paint_if_active(paint);
+                        set_if_changed(paint, None);
                         let listed_run_ids = &listed.read().run_ids;
                         if in_trash_mode {
                             if let Some(pick) = trash_pick.write().as_mut() {
@@ -320,7 +320,7 @@ pub fn Sidebar() -> Element {
                                     return;
                                 }
                                 trash_feedback.set(String::new());
-                                end_paint_if_active(paint);
+                                set_if_changed(paint, None);
                                 trash_pick.set(Some(HashSet::new()));
                             }),
                             TrashIcon {}
@@ -336,14 +336,14 @@ pub fn Sidebar() -> Element {
                     disabled: in_trash_mode && *trash_busy.read(),
                     value: "{filter}",
                     oninput: move |e: Event<FormData>| {
-                        end_paint_if_active(paint);
+                        set_if_changed(paint, None);
                         filter.set(e.value());
                     },
                     // Esc clears, like the navbar filter.
                     onkeydown: move |e: Event<KeyboardData>| {
                         if is_app_escape(&e) && !filter.peek().is_empty() {
                             e.prevent_default();
-                            end_paint_if_active(paint);
+                            set_if_changed(paint, None);
                             filter.set(String::new());
                         }
                     },
@@ -610,7 +610,7 @@ fn RunRow(
                         || e.key() == Key::Character(" ".to_string()))
                 {
                     e.prevent_default();
-                    end_paint_if_active(paint);
+                    set_if_changed(paint, None);
                     let mut trash = trash_pick.write();
                     let Some(pick) = trash.as_mut() else {
                         return;
@@ -625,7 +625,7 @@ fn RunRow(
                     || paint.peek().is_none()
                 {
                     // The window bridge delivers release asynchronously; hover without a held primary button clears stale paint.
-                    end_paint_if_active(paint);
+                    set_if_changed(paint, None);
                 } else if in_trash_mode {
                     if let Some(pick) = trash_pick.write().as_mut() {
                         continue_selection_paint(

@@ -383,7 +383,7 @@ class BulkStream:
                 raise RuntimeError(failure) from self.error
             time.sleep(self.POLL_SECONDS)
 
-    def feed(self, points, count: int):
+    def feed(self, points):
         self._wait(
             lambda: self.sent - self.acked < self.window and self.stream.feed_has_room()
         )
@@ -392,7 +392,7 @@ class BulkStream:
                 project_id=self.project_id, run_id=self.run_id, points=points
             )
         )
-        self.sent += count
+        self.sent += len(points)
 
     def finish(self):
         """Half-close and wait for the final ack covering every sent point."""
@@ -600,10 +600,10 @@ class Sender:
             )
         if (self.bulk.project_id, self.bulk.run_id) != (project_id, run_id):
             raise RuntimeError("bulk stream crossed runs without finish_data()")
-        for points, n in _chunk_tuples(batch):
+        for points in _chunk_tuples(batch):
             if self._limiter:
-                self._limiter.consume(n)
-            self.bulk.feed(points, n)
+                self._limiter.consume(len(points))
+            self.bulk.feed(points)
 
     # ---- CDN
     def _upload_bytes(self, data: bytes, ext: str) -> str:

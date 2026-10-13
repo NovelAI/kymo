@@ -326,6 +326,7 @@ u.over.appendChild(hotpt);
 // refreshed per-instance metadata. That avoids listeners closing over stale
 // columns when a structural config change rebuilds the uPlot instance.
 u.__kymo_copy={xLabel:'__KYMO_X_LABEL__',lineBase:lineBase,seriesCount:labels.length,nanBase:nanBase,nanCols:nanCols,xShift:readoutXShift};
+// Also read by chart_alive (uplot_chart.rs): a chart missing here is recreated at its next reply, even one that changes nothing.
 window.__kymo_charts['__KYMO_ID__']=u;
 u.__kymo_cfghash='__KYMO_CFG_HASH__';
 // Dynamic metadata read by the once-installed gesture listeners. Keep it on

@@ -1,23 +1,13 @@
-//! In-memory cache of full raw series, kept fresh by append-only
-//! incremental ClickHouse reads.
+//! In-memory raw series: each entry holds a series' complete rows, (tag, step)-sorted, in immutable per-tag chunks.
 //!
-//! The chart path used to re-read every point of every series from
-//! ClickHouse on every refetch — during training that's a full scan per
-//! chart per poll tick. Metrics are append-only in the common case, so
-//! each entry holds a series' complete (tag, step)-sorted rows plus an
-//! `inserted_at` watermark; a refresh reads only rows newer than the
-//! watermark (ClickHouse skips the granules of already-cached history via
-//! the `idx_inserted_at` minmax index) and splices them in. A resumed run
-//! that re-logs an
-//! existing step is detected by the merge and triggers a full rebuild of
-//! that one entry. Rows are handed out as `Arc` clones — refreshes build
-//! a new vector instead of mutating, so readers never block on a splice.
+//! A refresh reads only rows stamped after the entry's `inserted_at` watermark, re-reading a short overlap ([`WATERMARK_OVERLAP_MS`]); ClickHouse's `idx_inserted_at` minmax index skips the cached history. Re-read rows identical to held ones keep their original stamps. New rows must extend their tag past its highest step; a rewrite, deletion or backfill below it refuses the merge, and the caller reads the series in full.
 //!
-//! INVARIANT: only RAW points are cached; every request recomputes smoothing, bucketing, and resampling from scratch.
-//! The derived mean/envelope aggregates are cell-local; a smoothed envelope's center value additionally depends on the adjacent finite curve segment. An append can therefore change: the buckets its points land in (including a still-filling bucket's center), the preceding occupied bucket when a finite interpolation endpoint is added or changes, held points within the smoother's bounded reach, and the whole grid when its span outgrows stable_grid's width. The delta planner bounds each dependency, including markers on unplottable absolute log-x values, and answers full when the bound reaches column zero.
+//! Readers clone a snapshot's `Arc`, and later snapshots share its chunks: a refresh adds each tag's new rows as a chunk outside the cache's lock, so readers never block on a merge. Compaction ([`COMPACT_ROWS`]) keeps an append a few times its own rows amortized, copying fewer than 64k held rows per tag it extends.
+//!
+//! Only raw rows are cached; derived chart state and its append dependencies belong to `query/held.rs` and `query.rs`'s delta planner.
 
 use std::collections::{HashMap, HashSet};
-use std::hash::BuildHasher;
+use std::hash::{BuildHasher, Hash};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -30,25 +20,231 @@ pub(crate) enum LineageOrigin {
     Late,
 }
 
-fn row_content(row: &VersionedRawPoint) -> u64 {
+/// `v` at exactly its length, so a charge that follows capacity follows its contents: moved into a new allocation rather than shrunk in place, since an allocator may keep the larger block.
+fn exact_vec<T>(v: Vec<T>) -> Vec<T> {
+    if v.capacity() == v.len() {
+        return v;
+    }
+    let mut exact = Vec::with_capacity(v.len());
+    exact.extend(v);
+    exact
+}
+
+/// One cached point; its tag lives on its [`Chunk`]. Full reads and merged increments only ever hold numeric rows, so no row carries the numeric flag.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CachedRow {
+    pub(crate) step: i64,
+    pub(crate) timestamp_ms: i64,
+    pub(crate) inserted_ms: i64,
+    pub(crate) value: f32,
+}
+
+impl CachedRow {
+    fn of(row: &VersionedRawPoint) -> Self {
+        Self {
+            step: row.step,
+            timestamp_ms: row.timestamp_ms,
+            inserted_ms: row.inserted_ms,
+            value: row.value,
+        }
+    }
+}
+
+/// A row's content hash: its tag, step, timestamp, value bits and stamp.
+fn row_content(tag: &str, row: &CachedRow) -> u64 {
     static KEY: OnceLock<std::collections::hash_map::RandomState> = OnceLock::new();
-    let VersionedRawPoint {
-        tag,
+    let CachedRow {
         step,
         timestamp_ms,
-        value,
-        is_value,
         inserted_ms,
+        value,
     } = row;
     KEY.get_or_init(std::collections::hash_map::RandomState::new)
-        .hash_one((
-            tag,
-            step,
-            timestamp_ms,
-            value.to_bits(),
-            is_value,
-            inserted_ms,
-        ))
+        .hash_one((tag, step, timestamp_ms, value.to_bits(), inserted_ms))
+}
+
+/// A run of one tag's rows in step order, immutable and shared by every snapshot that holds it.
+#[derive(Clone, Debug)]
+struct Chunk {
+    /// One allocation per tag, shared by the tag's chunks (counted once in [`SeriesSnapshot::bytes`]).
+    tag: Arc<str>,
+    /// Never empty, and never reallocated once built: [`SeriesSnapshot::bytes`] charges its capacity.
+    rows: Arc<Vec<CachedRow>>,
+}
+
+/// Chunk size. A full read fills chunks of this many rows. On a refresh, a tag's new rows absorb its trailing chunks, in one copy, while each holds fewer than this many rows and at most twice the rows gathered so far (the new rows and the chunks absorbed).
+/// Chunks below it therefore more than halve from one to the next, so a tag holds at most `rows / COMPACT_ROWS + 15` chunks (15 = log2 of this). A held row is copied only into a chunk at least 1.5 times its own, so at most about log1.5(COMPACT_ROWS / its append's rows) times, and a refresh copies fewer than `2 * COMPACT_ROWS` held rows (2 MiB) per tag it extends, besides its own rows: up to T times that for a refresh extending T tags. The copy runs outside the cache's lock ([`SeriesCache::apply_increment`]).
+const COMPACT_ROWS: usize = 1 << 15;
+
+/// Upper bound on what the allocator holds for one live allocation of `bytes` (none for an empty buffer, which allocates nothing): glibc's on Linux (the pod, local mode's manylinux wheel), macOS's on macOS (local mode, development).
+pub(crate) const fn buffer_bytes(bytes: usize) -> usize {
+    if bytes == 0 {
+        0
+    } else if cfg!(target_os = "macos") {
+        macos_allocation_bytes(bytes)
+    } else {
+        glibc_allocation_bytes(bytes)
+    }
+}
+
+/// glibc malloc: a chunk of the request plus an 8-byte header, 16-byte aligned, on the heap; from the 128 KiB mmap threshold (compared with that chunk size), whole 4 KiB pages with a header. A larger dynamic threshold only moves allocations to the cheaper heap branch.
+const fn glibc_allocation_bytes(bytes: usize) -> usize {
+    if bytes + 32 < 128 << 10 {
+        bytes + 32
+    } else {
+        bytes.next_multiple_of(4096) + 4096
+    }
+}
+
+/// macOS (checked against `malloc_size`): size classes at most a quarter above the request up to 15 KiB, whole 16 KiB pages above. From 2 MiB, macOS can serve a request from a larger freed block it keeps cached, which this does not bound.
+const fn macos_allocation_bytes(bytes: usize) -> usize {
+    if bytes <= 15 << 10 {
+        bytes + bytes / 4 + 128
+    } else {
+        bytes.next_multiple_of(16 << 10)
+    }
+}
+
+/// A vector's buffer at its capacity ([`buffer_bytes`]).
+pub(crate) fn vec_bytes<T>(v: &Vec<T>) -> usize {
+    buffer_bytes(v.capacity() * std::mem::size_of::<T>())
+}
+
+/// An `Arc`'s two reference counts precede its value in the allocation.
+pub(crate) const ARC_HEADER: usize = 2 * std::mem::size_of::<usize>();
+
+/// What one chunk costs: its `Arc`, holding the vector, and the vector's buffer at `capacity` rows.
+fn chunk_bytes(capacity: usize) -> usize {
+    buffer_bytes(ARC_HEADER + std::mem::size_of::<Vec<CachedRow>>())
+        + buffer_bytes(capacity * std::mem::size_of::<CachedRow>())
+}
+
+/// The snapshot's own `Arc` allocation and its chunk list at `capacity` chunks.
+fn snapshot_overhead(capacity: usize) -> usize {
+    buffer_bytes(ARC_HEADER + std::mem::size_of::<SeriesSnapshot>())
+        + buffer_bytes(capacity * std::mem::size_of::<Chunk>())
+}
+
+/// A full read decoded straight into chunks. Rows must arrive (tag, step)-ordered, as ClickHouse returns them, each (tag, step) once; a row out of that order fails the read ([`Self::push`]). Each tag's rows fill chunks of [`COMPACT_ROWS`] rows, which become chunks without a copy; a tag's last, partly filled chunk is copied once to its length. So a read holds no more than its rows plus one filling chunk (at most [`COMPACT_ROWS`] rows, 1 MiB; briefly twice that while a last chunk is copied to its length) at a time, and each tag is allocated once. A batched read (`ChClient::fetch_full_many`) decodes into one per run, so it holds one filling chunk per run until it finishes.
+#[derive(Default)]
+pub(crate) struct FullRead {
+    chunks: Vec<Chunk>,
+    tag: Option<Arc<str>>,
+    filling: Vec<CachedRow>,
+    /// The last row's step, which the next row of its tag must exceed.
+    last_step: i64,
+}
+
+impl FullRead {
+    /// Add the read's next row. One out of (tag, step) order is an error: the snapshot's searches and merges rely on that order.
+    pub(crate) fn push(&mut self, tag: &str, row: CachedRow) -> anyhow::Result<()> {
+        if self.tag.as_deref() != Some(tag) {
+            if let Some(held) = self.tag.as_deref().filter(|&held| held >= tag) {
+                anyhow::bail!("full read out of (tag, step) order: tag {tag:?} after {held:?}");
+            }
+            self.seal();
+            self.tag = Some(Arc::from(tag));
+        } else if row.step <= self.last_step {
+            anyhow::bail!(
+                "full read out of (tag, step) order: step {} after {} in tag {tag:?}",
+                row.step,
+                self.last_step
+            );
+        } else if self.filling.len() == COMPACT_ROWS {
+            self.seal();
+        }
+        self.last_step = row.step;
+        self.filling.push(row);
+        Ok(())
+    }
+
+    fn seal(&mut self) {
+        if self.filling.is_empty() {
+            return;
+        }
+        self.chunks.push(Chunk {
+            tag: self.tag.clone().expect("rows have a tag"),
+            rows: Arc::new(exact_vec(std::mem::take(&mut self.filling))),
+        });
+    }
+
+    fn finish(mut self) -> Vec<Chunk> {
+        self.seal();
+        self.chunks
+    }
+}
+
+/// Fixtures arrive as flat rows.
+#[cfg(test)]
+impl From<Vec<VersionedRawPoint>> for FullRead {
+    fn from(rows: Vec<VersionedRawPoint>) -> Self {
+        let mut read = Self::default();
+        for row in &rows {
+            read.push(&row.tag, CachedRow::of(row))
+                .expect("fixture rows are (tag, step)-ordered");
+        }
+        read
+    }
+}
+
+/// One tag's rows, in step order across its chunks.
+pub(crate) struct TagRows<'a> {
+    chunks: &'a [Chunk],
+}
+
+impl<'a> TagRows<'a> {
+    pub(crate) fn tag(&self) -> &'a str {
+        &self.chunks[0].tag
+    }
+
+    /// The tag's rows, chunk by chunk.
+    pub(crate) fn chunks(&self) -> impl Iterator<Item = &'a [CachedRow]> + 'a {
+        self.chunks.iter().map(|chunk| chunk.rows.as_slice())
+    }
+
+    /// The (chunk, row) of the first row whose step is not `below`, (chunks, 0) past the last: a binary search over the chunks' last steps, then within the chunk.
+    fn seek(&self, below: impl Fn(i64) -> bool) -> (usize, usize) {
+        let c = self
+            .chunks
+            .partition_point(|chunk| below(chunk.rows[chunk.rows.len() - 1].step));
+        let r = self
+            .chunks
+            .get(c)
+            .map_or(0, |chunk| chunk.rows.partition_point(|row| below(row.step)));
+        (c, r)
+    }
+
+    /// The tag's rows with a step in `lo..=hi`, chunk by chunk ([`Self::seek`] for each bound).
+    pub(crate) fn between(&self, lo: i64, hi: i64) -> impl Iterator<Item = &'a [CachedRow]> + 'a {
+        let chunks = self.chunks;
+        let start = self.seek(|step| step < lo);
+        let end = self.seek(|step| step <= hi).max(start);
+        chunks[start.0..chunks.len().min(end.0 + 1)]
+            .iter()
+            .zip(start.0..)
+            .map(move |(chunk, c)| {
+                let from = if c == start.0 { start.1 } else { 0 };
+                let to = if c == end.0 { end.1 } else { chunk.rows.len() };
+                &chunk.rows[from..to]
+            })
+    }
+
+    /// How many of the tag's rows have a step in `lo..=hi` ([`Self::between`]).
+    pub(crate) fn rows_between(&self, lo: i64, hi: i64) -> usize {
+        self.between(lo, hi).map(<[CachedRow]>::len).sum()
+    }
+
+    /// The tag's high-water step: rows are step-sorted and chunks are never empty.
+    fn last_step(&self) -> i64 {
+        let rows = &self.chunks[self.chunks.len() - 1].rows;
+        rows[rows.len() - 1].step
+    }
+
+    fn find(&self, step: i64) -> Option<&'a CachedRow> {
+        let (c, r) = self.seek(|held| held < step);
+        let row = self.chunks.get(c)?.rows.get(r)?;
+        (row.step == step).then_some(row)
+    }
 }
 
 /// Immutable rows and their append lineage travel together through retained and pass-through refreshes.
@@ -56,19 +252,14 @@ fn row_content(row: &VersionedRawPoint) -> u64 {
 /// Filtering at a previously authenticated maximum therefore recovers exactly that held snapshot.
 #[derive(Debug)]
 pub struct SeriesSnapshot {
-    rows: Vec<VersionedRawPoint>,
+    /// (tag, step) order: tags ascend, a tag's chunks are adjacent and share one tag allocation, and steps ascend across them. Never reallocated once built: [`Self::bytes`] charges its capacity.
+    chunks: Vec<Chunk>,
+    /// What the snapshot holds, each allocation once: see [`Self::bytes`].
+    bytes: usize,
     lineage: u64,
     maximum: Option<i64>,
     origin: LineageOrigin,
     content: u64,
-}
-
-impl std::ops::Deref for SeriesSnapshot {
-    type Target = [VersionedRawPoint];
-
-    fn deref(&self) -> &Self::Target {
-        &self.rows
-    }
 }
 
 impl SeriesSnapshot {
@@ -78,51 +269,74 @@ impl SeriesSnapshot {
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
+    fn assemble(
+        chunks: Vec<Chunk>,
+        lineage: u64,
+        maximum: Option<i64>,
+        origin: LineageOrigin,
+        content: u64,
+    ) -> Self {
+        let chunks = exact_vec(chunks);
+        let mut bytes = snapshot_overhead(chunks.capacity());
+        for tag in chunks.chunk_by(|a, b| Arc::ptr_eq(&a.tag, &b.tag)) {
+            bytes += buffer_bytes(ARC_HEADER + tag[0].tag.len());
+            bytes += tag
+                .iter()
+                .map(|chunk| chunk_bytes(chunk.rows.capacity()))
+                .sum::<usize>();
+        }
+        Self {
+            chunks,
+            bytes,
+            lineage,
+            maximum,
+            origin,
+            content,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn full(rows: Vec<VersionedRawPoint>) -> Self {
         Self::full_with_origin(rows, LineageOrigin::Miss)
     }
 
-    pub(crate) fn full_with_origin(rows: Vec<VersionedRawPoint>, origin: LineageOrigin) -> Self {
-        Self::reload(rows, origin, None)
+    pub(crate) fn full_with_origin(rows: impl Into<FullRead>, origin: LineageOrigin) -> Self {
+        Self::reload(rows.into(), origin, None)
     }
 
-    fn reload(
-        rows: Vec<VersionedRawPoint>,
-        origin: LineageOrigin,
-        evicted: Option<&EvictedLineage>,
-    ) -> Self {
+    /// Adopt a full read's chunks, hashing each row once.
+    fn reload(read: FullRead, origin: LineageOrigin, evicted: Option<&EvictedLineage>) -> Self {
+        let chunks = read.finish();
         let (mut maximum, mut content) = (None, 0u64);
         let (mut held_count, mut held_content) = (0, 0u64);
-        let (mut tag, mut seen_new, mut prefix) = (None, false, true);
-        for row in &rows {
-            let hash = row_content(row);
-            content = content.wrapping_add(hash);
-            maximum = Some(maximum.map_or(row.inserted_ms, |max: i64| max.max(row.inserted_ms)));
-            if let Some(old) = evicted {
-                if tag != Some(row.tag.as_str()) {
-                    tag = Some(row.tag.as_str());
-                    seen_new = false;
-                }
-                if old.maximum.is_some_and(|max| row.inserted_ms <= max) {
-                    held_count += 1;
-                    held_content = held_content.wrapping_add(hash);
-                    prefix &= !seen_new;
-                } else {
-                    seen_new = true;
+        let mut prefix = true;
+        for tag in chunks.chunk_by(|a, b| Arc::ptr_eq(&a.tag, &b.tag)) {
+            let mut seen_new = false;
+            for row in tag.iter().flat_map(|chunk| chunk.rows.iter()) {
+                let hash = row_content(&tag[0].tag, row);
+                content = content.wrapping_add(hash);
+                maximum = maximum.max(Some(row.inserted_ms));
+                if let Some(old) = evicted {
+                    if old.maximum.is_some_and(|max| row.inserted_ms <= max) {
+                        held_count += 1;
+                        held_content = held_content.wrapping_add(hash);
+                        prefix &= !seen_new;
+                    } else {
+                        seen_new = true;
+                    }
                 }
             }
         }
         // Full reads are (tag, step)-sorted. Count and sum prove the held set; the prefix check also rejects newly stamped lower-step backfills, preserving the cache merge's append contract.
         let restored =
             evicted.filter(|old| prefix && old.count == held_count && old.content == held_content);
-        Self {
-            rows,
-            lineage: restored.map_or_else(Self::next_lineage, |old| old.lineage),
+        Self::assemble(
+            chunks,
+            restored.map_or_else(Self::next_lineage, |old| old.lineage),
             maximum,
-            origin: restored.map_or(origin, |old| old.origin),
+            restored.map_or(origin, |old| old.origin),
             content,
-        }
+        )
     }
 
     pub(crate) fn lineage(&self) -> u64 {
@@ -135,46 +349,152 @@ impl SeriesSnapshot {
         self.origin
     }
 
-    fn merge(&self, increment: &[VersionedRawPoint]) -> Option<Self> {
-        let merged = merge_increment_tracked(self, increment)?;
-        let late = merged
-            .added_min
-            .is_some_and(|min| self.maximum.is_some_and(|max| min <= max));
-        Some(Self {
-            rows: merged.rows,
-            lineage: if late {
-                Self::next_lineage()
-            } else {
-                self.lineage
-            },
-            maximum: self.maximum.into_iter().chain(merged.added_max).max(),
-            origin: if late {
-                LineageOrigin::Late
-            } else {
-                self.origin
-            },
-            content: self.content.wrapping_add(merged.added_content),
+    /// The number of rows.
+    pub(crate) fn len(&self) -> usize {
+        self.chunks.iter().map(|chunk| chunk.rows.len()).sum()
+    }
+
+    /// Upper bound on the live allocations this snapshot holds: its own allocation and chunk list, each chunk, and each tag allocation once, at the allocator's rounding ([`buffer_bytes`]). It does not cover memory the allocator retains after a free, nor a read's transients. A chunk two snapshots share counts in each: the cache charges the one snapshot it retains per series, and chart admission the ones a request pins.
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Each tag's rows, tags ascending.
+    pub(crate) fn tags(&self) -> impl Iterator<Item = TagRows<'_>> {
+        // A tag's chunks share one tag allocation, as [`Self::assemble`] counts them.
+        self.chunks
+            .chunk_by(|a, b| Arc::ptr_eq(&a.tag, &b.tag))
+            .map(|chunks| TagRows { chunks })
+    }
+
+    fn tag(&self, tag: &str) -> Option<TagRows<'_>> {
+        let start = self.chunks.partition_point(|chunk| &*chunk.tag < tag);
+        let len = self.chunks[start..].partition_point(|chunk| &*chunk.tag == tag);
+        (len > 0).then(|| TagRows {
+            chunks: &self.chunks[start..start + len],
         })
+    }
+
+    /// Every row in (tag, step) order, as the flat form a read returns.
+    #[cfg(test)]
+    pub(crate) fn to_vec(&self) -> Vec<VersionedRawPoint> {
+        self.chunks
+            .iter()
+            .flat_map(|chunk| {
+                chunk.rows.iter().map(|row| VersionedRawPoint {
+                    tag: chunk.tag.to_string(),
+                    step: row.step,
+                    timestamp_ms: row.timestamp_ms,
+                    value: row.value,
+                    is_value: 1,
+                    inserted_ms: row.inserted_ms,
+                })
+            })
+            .collect()
+    }
+
+    /// This snapshot with `increment` merged in, or `None` when the increment rewrites history: a row whose (tag, step) the snapshot holds with a different value or timestamp (a resumed run re-logging), a new row at or below its tag's high-water step, or a deletion of a held row. Exact re-reads (the watermark overlap) are dropped. An increment that adds no row returns this same snapshot: same lineage, maximum and content.
+    fn merge(self: &Arc<Self>, increment: &[VersionedRawPoint]) -> Option<Arc<Self>> {
+        // The increment is read WITHOUT FINAL (see `fetch_increment`), so one (tag, step) can appear as several versions — unmerged duplicate inserts, or a re-log inside the watermark window. ORDER BY (tag, step) leaves versions adjacent but unordered; keep the one FINAL would have kept (max `inserted_ms` — the ReplacingMergeTree version column) before any rewrite comparison, so a superseded sibling never masquerades as a conflict. That order is also what lets each tag's additions extend its chunks: anything else, tombstones included, is refused, so the caller reads the series in full.
+        let mut versions: Vec<&VersionedRawPoint> = Vec::with_capacity(increment.len());
+        let mut maximum_version_conflicts = false;
+        for r in increment {
+            let key = (r.tag.as_str(), r.step);
+            match versions.last_mut() {
+                Some(last) if (last.tag.as_str(), last.step) == key => {
+                    if r.inserted_ms > last.inserted_ms {
+                        *last = r;
+                        maximum_version_conflicts = false;
+                    } else if r.inserted_ms == last.inserted_ms
+                        && (r.is_value != last.is_value
+                            || (r.is_value != 0
+                                && (r.value.to_bits() != last.value.to_bits()
+                                    || r.timestamp_ms != last.timestamp_ms)))
+                    {
+                        // ReplacingMergeTree cannot deterministically choose between disagreeing equal-version siblings from this non-FINAL result. Let an authoritative FINAL read settle the key instead of depending on physical row order.
+                        maximum_version_conflicts = true;
+                    }
+                }
+                Some(last) if (last.tag.as_str(), last.step) > key => return None,
+                _ => {
+                    if maximum_version_conflicts {
+                        return None;
+                    }
+                    versions.push(r);
+                }
+            }
+        }
+        if maximum_version_conflicts {
+            return None;
+        }
+
+        // A newer nonnumeric payload at an existing numeric key is a deletion from this series. Fall back to the authoritative FINAL read. Tombstones for keys the numeric cache never held are irrelevant but still advance the fetch watermark in apply_increment.
+        if versions.iter().any(|row| {
+            row.is_value == 0
+                && self
+                    .tag(&row.tag)
+                    .and_then(|held| held.find(row.step))
+                    .is_some_and(|held| row.inserted_ms >= held.inserted_ms)
+        }) {
+            return None;
+        }
+        versions.retain(|row| row.is_value != 0);
+
+        // Existing (tag, step) pairs near each tag's tail can re-appear via the overlap window; identical rows are dropped, differing ones are rewrites.
+        // An added row stamped at or below the held maximum is late, and starts a new lineage.
+        let (mut late, mut maximum, mut content) = (false, self.maximum, self.content);
+        let mut appended: Vec<(&str, &[&VersionedRawPoint])> = Vec::new();
+        for group in versions.chunk_by(|a, b| a.tag == b.tag) {
+            let tag = group[0].tag.as_str();
+            let held = self.tag(tag);
+            let high_water = held.as_ref().map(TagRows::last_step);
+            // The group ascends in step, so the rows past the tag's high-water step are its suffix.
+            let (reread, added) =
+                group.split_at(group.partition_point(|y| high_water.is_some_and(|m| y.step <= m)));
+            for y in reread {
+                // A genuinely new row must extend its tag past the cached high-water step; anything else must be an identical re-read of a held row, whose ORIGINAL insertion stamp is retained: the append-lineage proof depends on that stamp staying unchanged even when a re-log supplies a newer one.
+                let x = held.as_ref().and_then(|held| held.find(y.step))?;
+                if x.value.to_bits() != y.value.to_bits() || x.timestamp_ms != y.timestamp_ms {
+                    return None;
+                }
+            }
+            for y in added {
+                late |= self.maximum.is_some_and(|max| y.inserted_ms <= max);
+                maximum = maximum.max(Some(y.inserted_ms));
+                content = content.wrapping_add(row_content(tag, &CachedRow::of(y)));
+            }
+            if !added.is_empty() {
+                appended.push((tag, added));
+            }
+        }
+        if appended.is_empty() {
+            return Some(Arc::clone(self));
+        }
+        let (lineage, origin) = if late {
+            (Self::next_lineage(), LineageOrigin::Late)
+        } else {
+            (self.lineage, self.origin)
+        };
+        Some(Arc::new(Self::assemble(
+            append_chunks(&self.chunks, appended),
+            lineage,
+            maximum,
+            origin,
+            content,
+        )))
     }
 
     /// Fixture source snapshots pass through the same merge proof. Missing/replaced rows model an authoritative refetch.
     #[cfg(test)]
-    pub(crate) fn refreshed_fixture(&self, rows: &[VersionedRawPoint]) -> Self {
-        if let Some(merged) = self.merge(rows) {
-            if merged.len() == rows.len()
-                && merged.iter().zip(rows).all(|(a, b)| {
-                    a.tag == b.tag
-                        && a.step == b.step
-                        && a.timestamp_ms == b.timestamp_ms
-                        && a.value.to_bits() == b.value.to_bits()
-                        && a.is_value == b.is_value
-                        && a.inserted_ms == b.inserted_ms
-                })
-            {
-                return merged;
-            }
-        }
-        Self::full_with_origin(rows.to_vec(), LineageOrigin::Rewrite)
+    pub(crate) fn refreshed_fixture(self: &Arc<Self>, rows: &[VersionedRawPoint]) -> Arc<Self> {
+        self.merge(rows)
+            .filter(|merged| tests::same_rows(&merged.to_vec(), rows))
+            .unwrap_or_else(|| {
+                Arc::new(Self::full_with_origin(
+                    rows.to_vec(),
+                    LineageOrigin::Rewrite,
+                ))
+            })
     }
 }
 
@@ -200,7 +520,7 @@ impl SeriesKey {
     }
 }
 
-/// Bounded, process-local history of LRU victims; neither rows nor tags are retained, and a restart discards it.
+/// Bounded, process-local history of LRU victims and of series too large to retain; neither rows nor tags are retained, and a restart discards it.
 const EVICTED_LINEAGE_LIMIT: usize = 4096;
 
 struct EvictedLineage {
@@ -210,6 +530,20 @@ struct EvictedLineage {
     content: u64,
     count: usize,
     evicted: Instant,
+}
+
+impl EvictedLineage {
+    /// The record an LRU victim, or a series too large to retain, leaves.
+    fn of(rows: &SeriesSnapshot) -> Self {
+        Self {
+            lineage: rows.lineage,
+            maximum: rows.maximum,
+            origin: rows.origin,
+            content: rows.content,
+            count: rows.len(),
+            evicted: Instant::now(),
+        }
+    }
 }
 
 /// Re-read this much of the watermark's past on each incremental fetch.
@@ -306,9 +640,66 @@ fn default_budget_bytes() -> usize {
         .expect("invalid kymo series-cache environment")
 }
 
-fn entry_bytes(rows: &[VersionedRawPoint]) -> usize {
-    std::mem::size_of::<SeriesSnapshot>()
-        + rows.len() * (std::mem::size_of::<VersionedRawPoint>() + 16)
+/// What a full read of `rows` rows of one tag will cost once cached (about 32 bytes per row; [`FullRead`]'s layout), for estimates made before its rows exist; the rows in hand are charged [`SeriesSnapshot::bytes`].
+pub(crate) fn snapshot_bytes(rows: usize) -> usize {
+    let (full, rest) = (rows / COMPACT_ROWS, rows % COMPACT_ROWS);
+    let chunks = full + usize::from(rest > 0);
+    let tag = if chunks == 0 {
+        0
+    } else {
+        buffer_bytes(ARC_HEADER)
+    };
+    let partial = if rest == 0 { 0 } else { chunk_bytes(rest) };
+    snapshot_overhead(chunks) + tag + full * chunk_bytes(COMPACT_ROWS) + partial
+}
+
+/// What the cache charges an entry: its snapshot and its key's strings. Its map slot is charged with the whole table ([`table_bytes`]).
+fn entry_bytes(key: &SeriesKey, rows: &SeriesSnapshot) -> usize {
+    rows.bytes()
+        + [&key.project_id, &key.run_id, &key.metric_name]
+            .into_iter()
+            .map(|text| buffer_bytes(text.capacity()))
+            .sum::<usize>()
+}
+
+/// What a hash table holds at `capacity` with `slot`-byte entries, occupied or not: hashbrown's one allocation of a slot and a control byte per bucket, plus a group of trailing control bytes. Buckets are a power of two, at least 4, at most 7/8 usable; removals never return them and can lower `capacity()` while they stay, so a table is charged at the largest capacity it has reported since it last shrank, and shrunk once a quarter full of it ([`shrink_table`]).
+pub(crate) fn hash_table_bytes(capacity: usize, slot: usize) -> usize {
+    if capacity == 0 {
+        return 0;
+    }
+    let buckets = (capacity * 8).div_ceil(7).next_power_of_two().max(4);
+    buffer_bytes(buckets * (slot + 1) + 16)
+}
+
+/// What the cache's map holds at `capacity` ([`hash_table_bytes`]).
+fn table_bytes(capacity: usize) -> usize {
+    hash_table_bytes(capacity, std::mem::size_of::<(SeriesKey, Entry)>())
+}
+
+/// Raise `capacity`, the high-water capacity `map` is charged at ([`hash_table_bytes`]), to what it reports, and shrink a table a quarter full of it.
+pub(crate) fn shrink_table<K: Eq + Hash, V>(map: &mut HashMap<K, V>, capacity: &mut usize) {
+    *capacity = (*capacity).max(map.capacity());
+    if map.len() * 4 <= *capacity {
+        map.shrink_to_fit();
+        *capacity = map.capacity();
+    }
+}
+
+/// What the cache charges an entry of these rows under `key` as its only entry: the entry, and the smallest table.
+#[cfg(test)]
+pub(crate) fn entry_charge(key: &SeriesKey, rows: Vec<VersionedRawPoint>) -> usize {
+    entry_bytes(key, &SeriesSnapshot::full(rows)) + table_bytes(1)
+}
+
+/// What the cache knows about a series' size (chart admission, docs/chart-request-latency.md stage 2).
+pub(crate) enum CachedSize {
+    /// A retained entry, fresh or stale: its snapshot, for the caller to price outside the cache's lock ([`SeriesCache::sizes`]).
+    Cached(Arc<SeriesSnapshot>),
+    /// A recovery record (an LRU victim's, or a series' too large to retain): its row count when it left.
+    Evicted {
+        rows: usize,
+    },
+    Unknown,
 }
 
 pub struct Entry {
@@ -316,8 +707,6 @@ pub struct Entry {
     pub max_inserted_ms: i64,
     /// When the fetch that produced these rows STARTED — the bump-gate stamp (a note after this instant means the rows may predate a write) and the start of the [`FRESH_WINDOW`]. Start, not completion, so query duration can't fake safety.
     started: Instant,
-    /// Identity of this store, unique per insert_full. An incremental fetch is computed against ONE base's watermark; if a concurrent full fetch replaces the entry before the increment applies, merging into the replacement can leave rows missing BELOW the merged watermark — a hole no later incremental re-reads. apply_increment refuses a stale generation and the caller full-rebuilds.
-    gen: u64,
     last_access: Instant,
     bytes: usize,
 }
@@ -326,12 +715,29 @@ pub struct Entry {
 struct Inner {
     map: HashMap<SeriesKey, Entry>,
     evicted: HashMap<SeriesKey, EvictedLineage>,
+    /// Every entry's [`entry_bytes`], and [`table_bytes`] of `table_capacity`.
     total_bytes: usize,
+    /// The largest capacity `map` has reported since it last shrank ([`hash_table_bytes`]).
+    table_capacity: usize,
     /// run_id → the run's latest note ([`SeriesCache::note_bumps`]). Notes must outlive any fetch that started before them (see [`BUMP_RETENTION`]); pruned every [`PRUNE_INTERVAL`], the map self-bounds at "runs written in the last hour".
     bumps: HashMap<String, Instant>,
     last_prune: Option<Instant>,
-    /// Source of [`Entry::gen`] values.
-    next_gen: u64,
+}
+
+impl Inner {
+    /// Leave the recovery record of `rows`, the snapshot last handed out for `key` and no longer retained (an LRU victim, or a series larger than the whole budget): a matching full read restores its lineage, and stage 2 prices the series by its row count ([`SeriesCache::sizes`]). The oldest records past [`EVICTED_LINEAGE_LIMIT`] are dropped.
+    fn record_evicted(&mut self, key: SeriesKey, rows: &SeriesSnapshot) {
+        self.evicted.insert(key, EvictedLineage::of(rows));
+        if self.evicted.len() > EVICTED_LINEAGE_LIMIT {
+            let oldest = self
+                .evicted
+                .iter()
+                .min_by_key(|(_, record)| record.evicted)
+                .map(|(key, _)| key.clone())
+                .unwrap();
+            self.evicted.remove(&oldest);
+        }
+    }
 }
 
 pub struct SeriesCache {
@@ -400,8 +806,7 @@ impl SeriesRefreshLocks {
         F: FnOnce(Lookup) -> Fut,
         Fut: std::future::Future<Output = RefreshOutcome> + Send + 'static,
     {
-        if let Lookup::Fresh(rows) = cache.lookup_untracked(key) {
-            SeriesCache::record_lookup_result("fresh");
+        if let Some(rows) = cache.lookup_fresh(key) {
             return Ok(rows);
         }
         let lease = self.lease_for(key);
@@ -609,10 +1014,11 @@ pub(crate) struct ElectedMiss {
 pub enum Lookup {
     /// Entry is fresh enough to serve as-is.
     Fresh(Arc<SeriesSnapshot>),
-    /// Entry exists; fetch rows with `inserted_at > watermark - overlap`
-    /// and call [`SeriesCache::apply_increment`] with this `gen` — it names
-    /// the base the watermark came from (see [`Entry::gen`]).
-    Stale { watermark_ms: i64, gen: u64 },
+    /// Entry exists; fetch rows with `inserted_at > watermark - overlap` and call [`SeriesCache::apply_increment`] with `base`, the snapshot the watermark came from.
+    Stale {
+        watermark_ms: i64,
+        base: Arc<SeriesSnapshot>,
+    },
     /// No entry; fetch everything and call [`SeriesCache::insert_full_with_origin`].
     Miss,
 }
@@ -669,10 +1075,37 @@ impl SeriesCache {
                 } else {
                     Lookup::Stale {
                         watermark_ms: e.max_inserted_ms,
-                        gen: e.gen,
+                        base: e.rows.clone(),
                     }
                 }
             }
+        }
+    }
+
+    /// Each key's size as the cache records it, without touching recency: a retained snapshot's `Arc` is cloned under the cache's lock, which the caller prices after it is released (pricing a request's tag groups can take milliseconds).
+    pub(crate) fn sizes(&self, keys: &[SeriesKey]) -> Vec<CachedSize> {
+        let inner = self.inner.lock().unwrap();
+        keys.iter()
+            .map(|key| match inner.map.get(key) {
+                Some(entry) => CachedSize::Cached(entry.rows.clone()),
+                None => inner
+                    .evicted
+                    .get(key)
+                    .map_or(CachedSize::Unknown, |record| CachedSize::Evicted {
+                        rows: record.count,
+                    }),
+            })
+            .collect()
+    }
+
+    /// A fresh retained entry, pinned and counted as a fresh lookup. Anything else is left to [`SeriesRefreshLocks::get_or_refresh`], which records its own disposition.
+    pub(crate) fn lookup_fresh(&self, key: &SeriesKey) -> Option<Arc<SeriesSnapshot>> {
+        match self.lookup_untracked(key) {
+            Lookup::Fresh(rows) => {
+                Self::record_lookup_result("fresh");
+                Some(rows)
+            }
+            _ => None,
         }
     }
 
@@ -714,14 +1147,18 @@ impl SeriesCache {
     pub(crate) fn insert_full_with_origin(
         &self,
         key: SeriesKey,
-        rows: Vec<VersionedRawPoint>,
+        rows: impl Into<FullRead>,
         fetch_started: Instant,
         origin: LineageOrigin,
     ) -> Arc<SeriesSnapshot> {
-        let bytes = entry_bytes(&rows);
         // Consume before hashing outside the mutex: exactly one full fetch can own this lineage while no cache entry holds it. Never restore a claimed record, even if the fetched contents do not match.
         let evicted = self.inner.lock().unwrap().evicted.remove(&key);
-        let rows = Arc::new(SeriesSnapshot::reload(rows, origin, evicted.as_ref()));
+        let rows = Arc::new(SeriesSnapshot::reload(
+            rows.into(),
+            origin,
+            evicted.as_ref(),
+        ));
+        let bytes = entry_bytes(&key, &rows);
         let max_inserted_ms = rows.maximum.unwrap_or(0).min(watermark_cap(fetch_started));
         let mut inner = self.inner.lock().unwrap();
         // A concurrent fetch may have published and evicted a different lineage while this one was hashing. That record must not survive this replacement.
@@ -730,22 +1167,20 @@ impl SeriesCache {
         if let Some(old) = inner.map.remove(&key) {
             inner.total_bytes -= old.bytes;
         }
-        // An entry larger than the whole budget is never retained — eviction can't save a sole entry, so once stored it would sit over budget for as long as it's read. Serving it pass-through makes the budget a hard bound on retained memory, at ablated-mode read cost for just this series.
-        if bytes > self.budget_bytes {
+        // An entry larger than the whole budget (with the smallest table) is never retained — eviction can't save a sole entry, so once stored it would sit over budget for as long as it's read. Serving it pass-through makes the budget a hard bound on retained memory, at ablated-mode read cost for just this series. It leaves a recovery record as an LRU victim does, so its size is known.
+        if bytes + table_bytes(1) > self.budget_bytes {
             metrics::counter!("mkdb2_series_cache_oversized_total").increment(1);
+            inner.record_evicted(key, &rows);
             Self::settle(&mut inner, self.budget_bytes);
             return rows;
         }
         inner.total_bytes += bytes;
-        let gen = inner.next_gen;
-        inner.next_gen += 1;
         inner.map.insert(
             key,
             Entry {
                 rows: rows.clone(),
                 max_inserted_ms,
                 started: fetch_started,
-                gen,
                 last_access: Instant::now(),
                 bytes,
             },
@@ -754,43 +1189,40 @@ impl SeriesCache {
         rows
     }
 
-    /// Fold an incremental fetch into the cached entry. `Ok(rows)` is the
-    /// merged series; `Err(())` means the increment rewrites history and
-    /// the caller must do a full fetch + [`Self::insert_full_with_origin`].
-    /// `fetch_started` is the fetch START, as in [`Self::insert_full_with_origin`]; it only ever advances `started` (a concurrent later-started query may have stamped first), which restarts the fresh window: the rows are verified current as of that fetch. `gen` is the [`Lookup::Stale`] generation the increment's watermark came from.
+    /// Fold an incremental fetch into the cached entry: `Ok` is the merged series, `Err` a refusal after which the caller reads in full ([`Self::insert_full_with_origin`]). `base` is the [`Lookup::Stale`] snapshot the increment's watermark came from; `fetch_started` is the fetch START, as in [`Self::insert_full_with_origin`], and only ever advances `started` (a concurrent later-started query may have stamped first), which restarts the fresh window: the rows are verified current as of that fetch.
+    ///
+    /// The merge refuses an increment that rewrites history ([`SeriesSnapshot::merge`]). It runs against `base` outside the cache's lock (its compaction can copy up to 2 MiB per tag the increment extends), and its result is installed only if the entry still holds `base`: an entry replaced (by a full read, which may be older than `base`, so the increment could leave a hole below the merged watermark that no later increment reads), evicted, purged or since refreshed by a direct caller ([`SeriesRefreshLocks`] serializes a series' refreshes) refuses.
     pub fn apply_increment(
         &self,
         key: &SeriesKey,
         increment: Vec<VersionedRawPoint>,
         fetch_started: Instant,
-        gen: u64,
+        base: &Arc<SeriesSnapshot>,
     ) -> Result<Arc<SeriesSnapshot>, ()> {
-        let mut inner = self.inner.lock().unwrap();
-        let Some(e) = inner.map.get_mut(key) else {
-            // Evicted between lookup and apply — treat as rewrite so the
-            // caller re-inserts from a full fetch.
-            return Err(());
-        };
-        if e.gen != gen {
-            // The base was replaced while the increment was in flight (concurrent full fetch): the watermark this increment was computed against no longer describes the entry, and merging could bury a hole below the merged watermark where no later incremental looks. Same remedy as eviction: full rebuild.
-            return Err(());
+        let holds_base = |e: &&mut Entry| Arc::ptr_eq(&e.rows, base);
+        {
+            let mut inner = self.inner.lock().unwrap();
+            let e = inner.map.get_mut(key).filter(holds_base).ok_or(())?;
+            if increment.is_empty() {
+                e.started = e.started.max(fetch_started);
+                return Ok(e.rows.clone());
+            }
         }
-        if increment.is_empty() {
-            e.started = e.started.max(fetch_started);
-            return Ok(e.rows.clone());
-        }
-        let Some(merged) = e.rows.merge(&increment) else {
+        let Some(merged) = base.merge(&increment) else {
             metrics::counter!("mkdb2_series_cache_rewrites_total").increment(1);
             return Err(());
         };
-        let new_bytes = entry_bytes(&merged);
-        // The merge grew the entry past the whole budget: hand out the merged rows but stop retaining the entry (see the full-store path) — the next poll misses, full-fetches, and stays pass-through while the series is this large.
-        if new_bytes > self.budget_bytes {
+        let mut inner = self.inner.lock().unwrap();
+        let e = inner.map.get_mut(key).filter(holds_base).ok_or(())?;
+        let new_bytes = entry_bytes(key, &merged);
+        // The merge grew the entry past the whole budget: hand out the merged rows but stop retaining the entry (see the full-store path), leaving the merged rows' recovery record — the next poll misses, full-fetches, and stays pass-through while the series is this large.
+        if new_bytes + table_bytes(1) > self.budget_bytes {
             metrics::counter!("mkdb2_series_cache_oversized_total").increment(1);
             let e = inner.map.remove(key).unwrap();
             inner.total_bytes -= e.bytes;
+            inner.record_evicted(key.clone(), &merged);
             Self::settle(&mut inner, self.budget_bytes);
-            return Ok(Arc::new(merged));
+            return Ok(merged);
         }
         // Capped like the full-store watermark; never regresses below the old mark (it
         // was capped the same way when set).
@@ -801,18 +1233,28 @@ impl SeriesCache {
             .unwrap_or(e.max_inserted_ms)
             .min(watermark_cap(fetch_started))
             .max(e.max_inserted_ms);
-        inner.total_bytes = inner.total_bytes + new_bytes - inner.map[key].bytes;
-        let e = inner.map.get_mut(key).unwrap();
-        e.rows = Arc::new(merged);
+        let old_bytes = e.bytes;
+        e.rows = merged;
         e.max_inserted_ms = new_wm;
         e.bytes = new_bytes;
         e.started = e.started.max(fetch_started);
         let rows = e.rows.clone();
+        inner.total_bytes = inner.total_bytes + new_bytes - old_bytes;
         Self::settle(&mut inner, self.budget_bytes);
         Ok(rows)
     }
 
-    /// Remove every cached metric for the exact `(project_id, run_id)` identities. The full identity matches the cache/storage key and keeps this eviction defensively project-scoped, even though admission now permanently reserves each run ID to one project.
+    /// Evict one entry as the LRU would, leaving its recovery record.
+    #[cfg(test)]
+    pub(crate) fn evict_for_test(&self, key: &SeriesKey) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(e) = inner.map.remove(key) {
+            inner.total_bytes -= e.bytes;
+            inner.record_evicted(key.clone(), &e.rows);
+        }
+    }
+
+    /// Remove every cached metric for the exact `(project_id, run_id)` identities. The full identity matches the cache/storage key and keeps this eviction defensively project-scoped, even though admission reserves each run ID to one project for good.
     ///
     /// Bump notes follow a separate safety lifetime: they must outlive any fetch that started before the insert they note (see [`BUMP_RETENTION`]). They hold no series rows and age out on their existing retention schedule.
     pub fn purge_runs<'a>(&self, runs: impl IntoIterator<Item = (&'a str, &'a str)>) -> usize {
@@ -837,9 +1279,15 @@ impl SeriesCache {
         removed
     }
 
-    /// Drop least-recently-accessed entries until under budget, then publish the size gauges. Call before returning from any mutation. Every retained entry is individually within budget (oversized ones are rejected at both insert sites), so the loop reaches the budget before it could empty the map.
+    /// Drop least-recently-accessed entries until under budget, then publish the size gauges. Call before returning from any mutation. Before each eviction the map's table is charged at `table_capacity`, shrunk once a quarter full of it, so an emptied cache neither holds nor charges its buckets and every retained entry, individually within budget beside the smallest table (oversized ones are rejected at both insert sites), outlasts the loop if it is alone.
     fn settle(inner: &mut Inner, budget: usize) {
-        while inner.total_bytes > budget {
+        loop {
+            let charged = table_bytes(inner.table_capacity);
+            shrink_table(&mut inner.map, &mut inner.table_capacity);
+            inner.total_bytes = inner.total_bytes - charged + table_bytes(inner.table_capacity);
+            if inner.total_bytes <= budget {
+                break;
+            }
             let oldest = inner
                 .map
                 .iter()
@@ -848,26 +1296,7 @@ impl SeriesCache {
             let Some(k) = oldest else { break };
             if let Some(e) = inner.map.remove(&k) {
                 inner.total_bytes -= e.bytes;
-                inner.evicted.insert(
-                    k,
-                    EvictedLineage {
-                        lineage: e.rows.lineage,
-                        maximum: e.rows.maximum,
-                        origin: e.rows.origin,
-                        content: e.rows.content,
-                        count: e.rows.len(),
-                        evicted: Instant::now(),
-                    },
-                );
-                if inner.evicted.len() > EVICTED_LINEAGE_LIMIT {
-                    let oldest = inner
-                        .evicted
-                        .iter()
-                        .min_by_key(|(_, record)| record.evicted)
-                        .map(|(key, _)| key.clone())
-                        .unwrap();
-                    inner.evicted.remove(&oldest);
-                }
+                inner.record_evicted(k, &e.rows);
                 metrics::counter!("mkdb2_series_cache_evictions_total").increment(1);
             }
         }
@@ -876,156 +1305,58 @@ impl SeriesCache {
     }
 }
 
-/// Merge incremental rows into a cached (tag, step)-sorted list. Returns
-/// None when the increment rewrites history — a row whose (tag, step)
-/// already exists with different content (a resumed run re-logging), or
-/// lands before that tag's high-water step. Exact duplicates (same step,
-/// same bits — the watermark-overlap re-read) are dropped.
+/// [`SeriesSnapshot::merge`] of flat rows, as fixtures hold them.
 #[cfg(test)]
 pub fn merge_increment(
     cached: &[VersionedRawPoint],
     increment: &[VersionedRawPoint],
 ) -> Option<Vec<VersionedRawPoint>> {
-    merge_increment_tracked(cached, increment).map(|merged| merged.rows)
+    Arc::new(SeriesSnapshot::full(cached.to_vec()))
+        .merge(increment)
+        .map(|merged| merged.to_vec())
 }
 
-struct MergedRows {
-    rows: Vec<VersionedRawPoint>,
-    added_min: Option<i64>,
-    added_max: Option<i64>,
-    added_content: u64,
-}
-
-fn merge_increment_tracked(
-    cached: &[VersionedRawPoint],
-    increment: &[VersionedRawPoint],
-) -> Option<MergedRows> {
-    // The increment is read WITHOUT FINAL (see `fetch_increment`), so one
-    // (tag, step) can appear as several versions — unmerged duplicate
-    // inserts, or a re-log inside the watermark window. ORDER BY (tag,
-    // step) leaves versions adjacent but unordered; keep the one FINAL
-    // would have kept (max `inserted_ms` — the ReplacingMergeTree version
-    // column) before any rewrite comparison, so a superseded sibling never
-    // masquerades as a conflict.
-    let mut versions: Vec<&VersionedRawPoint> = Vec::with_capacity(increment.len());
-    let mut maximum_version_conflicts = false;
-    for r in increment {
-        match versions.last_mut() {
-            Some(last) if last.tag == r.tag && last.step == r.step => {
-                if r.inserted_ms > last.inserted_ms {
-                    *last = r;
-                    maximum_version_conflicts = false;
-                } else if r.inserted_ms == last.inserted_ms
-                    && (r.is_value != last.is_value
-                        || (r.is_value != 0
-                            && (r.value.to_bits() != last.value.to_bits()
-                                || r.timestamp_ms != last.timestamp_ms)))
-                {
-                    // ReplacingMergeTree cannot deterministically choose between disagreeing equal-version siblings from this non-FINAL result. Let an authoritative FINAL read settle the key instead of depending on physical row order.
-                    maximum_version_conflicts = true;
-                }
-            }
-            _ => {
-                if maximum_version_conflicts {
-                    return None;
-                }
-                versions.push(r);
-                maximum_version_conflicts = false;
-            }
+/// The held chunks, shared, with each tag's additions (tags ascending) in a new chunk after the tag's last one; the additions absorb the tag's trailing chunks as [`COMPACT_ROWS`] describes, so each absorbed row is copied once, into a chunk allocated at its length.
+fn append_chunks(held: &[Chunk], appended: Vec<(&str, &[&VersionedRawPoint])>) -> Vec<Chunk> {
+    let mut chunks = Vec::with_capacity(held.len() + appended.len());
+    let mut rest = held;
+    for (tag, added) in appended {
+        // The held chunks through the tag's own, which share one tag allocation.
+        let through = rest.partition_point(|chunk| &*chunk.tag <= tag);
+        chunks.extend_from_slice(&rest[..through]);
+        rest = &rest[through..];
+        let tag = match chunks.last() {
+            Some(chunk) if &*chunk.tag == tag => chunk.tag.clone(),
+            _ => Arc::from(tag),
+        };
+        let mut start = chunks.len();
+        let mut merged = added.len();
+        while start > 0
+            && Arc::ptr_eq(&chunks[start - 1].tag, &tag)
+            && chunks[start - 1].rows.len() < COMPACT_ROWS
+            && chunks[start - 1].rows.len() <= merged * 2
+        {
+            start -= 1;
+            merged += chunks[start].rows.len();
         }
-    }
-    if maximum_version_conflicts {
-        return None;
-    }
-
-    // A newer nonnumeric payload at an existing numeric key is a deletion from this series. Fall back to the authoritative FINAL read. Tombstones for keys the numeric cache never held are irrelevant but still advance the fetch watermark in apply_increment.
-    let mut tombstone_rewrite = false;
-    versions.retain(|row| {
-        if row.is_value != 0 {
-            return true;
+        let mut rows = Vec::with_capacity(merged);
+        for chunk in chunks.drain(start..) {
+            rows.extend_from_slice(&chunk.rows);
         }
-        tombstone_rewrite |= cached
-            .binary_search_by(|cached| {
-                (cached.tag.as_str(), cached.step).cmp(&(row.tag.as_str(), row.step))
-            })
-            .is_ok_and(|index| row.inserted_ms >= cached[index].inserted_ms);
-        false
-    });
-    if tombstone_rewrite {
-        return None;
+        rows.extend(added.iter().map(|row| CachedRow::of(row)));
+        chunks.push(Chunk {
+            tag,
+            rows: Arc::new(rows),
+        });
     }
-    let inc = versions;
-
-    // Per-tag high-water steps of the cached rows (one pass — sorted by tag).
-    let mut tag_max: HashMap<&str, i64> = HashMap::new();
-    for r in cached {
-        tag_max.insert(r.tag.as_str(), r.step); // sorted: last write wins
-    }
-    // Existing (tag, step) pairs near each tag's tail can re-appear via the
-    // overlap window; identical rows are dropped, differing ones are rewrites.
-    let mut out = Vec::with_capacity(cached.len() + inc.len());
-    let (mut added_min, mut added_max) = (None, None);
-    let mut added_content = 0u64;
-    let mut note_added = |row: &VersionedRawPoint| {
-        let stamp = row.inserted_ms;
-        added_min = Some(added_min.map_or(stamp, |old: i64| old.min(stamp)));
-        added_max = Some(added_max.map_or(stamp, |old: i64| old.max(stamp)));
-        added_content = added_content.wrapping_add(row_content(row));
-    };
-    let (mut a, mut b) = (cached.iter().peekable(), inc.iter().peekable());
-    loop {
-        match (a.peek(), b.peek()) {
-            (Some(x), Some(y)) => {
-                let kx = (x.tag.as_str(), x.step);
-                let ky = (y.tag.as_str(), y.step);
-                if kx < ky {
-                    out.push((*x).clone());
-                    a.next();
-                } else if kx > ky {
-                    // A genuinely new row must extend its tag past the
-                    // cached high-water step; anything else is a rewrite.
-                    if tag_max.get(ky.0).is_some_and(|&m| ky.1 <= m) {
-                        return None;
-                    }
-                    note_added(y);
-                    out.push((**y).clone());
-                    b.next();
-                } else {
-                    // Same (tag, step): retain the cached row and its ORIGINAL insertion stamp on an identical-content overlap. The append-lineage proof depends on that stamp staying unchanged even when a re-log supplies a newer one.
-                    if x.value.to_bits() != y.value.to_bits() || x.timestamp_ms != y.timestamp_ms {
-                        return None;
-                    }
-                    out.push((*x).clone());
-                    a.next();
-                    b.next();
-                }
-            }
-            (Some(x), None) => {
-                out.push((*x).clone());
-                a.next();
-            }
-            (None, Some(y)) => {
-                if tag_max.get(y.tag.as_str()).is_some_and(|&m| y.step <= m) {
-                    return None;
-                }
-                note_added(y);
-                out.push((**y).clone());
-                b.next();
-            }
-            (None, None) => break,
-        }
-    }
-    Some(MergedRows {
-        rows: out,
-        added_min,
-        added_max,
-        added_content,
-    })
+    chunks.extend_from_slice(rest);
+    chunks
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wait_until;
 
     fn row(tag: &str, step: i64, value: f32, ins: i64) -> VersionedRawPoint {
         VersionedRawPoint {
@@ -1049,9 +1380,23 @@ mod tests {
         }
     }
 
-    /// Current generation of the cached entry (what Lookup::Stale would hand a caller).
-    fn gen_of(cache: &SeriesCache, k: &SeriesKey) -> u64 {
-        cache.inner.lock().unwrap().map[k].gen
+    /// What the cache charges a snapshot of these rows.
+    fn charged(rows: Vec<VersionedRawPoint>) -> usize {
+        entry_charge(&SeriesKey::new("p", "r", "m"), rows)
+    }
+
+    /// `rows` rows of one untagged series at distinct steps, as a full read returns them: for sizes and filler.
+    fn filler(rows: usize) -> Vec<VersionedRawPoint> {
+        (0..rows as i64).map(|step| row("", step, 0.0, 0)).collect()
+    }
+
+    fn point_content(row: &VersionedRawPoint) -> u64 {
+        row_content(&row.tag, &CachedRow::of(row))
+    }
+
+    /// The cached entry's snapshot (what Lookup::Stale would hand a caller).
+    fn base_of(cache: &SeriesCache, k: &SeriesKey) -> Arc<SeriesSnapshot> {
+        cache.inner.lock().unwrap().map[k].rows.clone()
     }
 
     #[test]
@@ -1062,24 +1407,23 @@ mod tests {
         let first = cache.insert_full(key.clone(), vec![row("", 0, 1.0, now)], Instant::now());
         assert_eq!(first.maximum(), Some(now));
         assert!(cache.inner.lock().unwrap().map[&key].max_inserted_ms < now);
-        let generation = gen_of(&cache, &key);
         let overlap = cache
             .apply_increment(
                 &key,
                 vec![row("", 0, 1.0, now + 1)],
                 Instant::now(),
-                generation,
+                &base_of(&cache, &key),
             )
             .unwrap();
         assert_eq!(overlap.lineage(), first.lineage());
-        assert_eq!(overlap[0].inserted_ms, now);
+        assert_eq!(overlap.to_vec()[0].inserted_ms, now);
         assert_eq!(overlap.maximum(), Some(now));
         let appended = cache
             .apply_increment(
                 &key,
                 vec![row("", 1, 2.0, now + 2)],
                 Instant::now(),
-                generation,
+                &base_of(&cache, &key),
             )
             .unwrap();
         assert_eq!(appended.lineage(), first.lineage());
@@ -1089,7 +1433,7 @@ mod tests {
                 &key,
                 vec![row("", 2, 3.0, now + 2)],
                 Instant::now(),
-                generation,
+                &base_of(&cache, &key),
             )
             .unwrap();
         assert_ne!(equal_stamp.lineage(), appended.lineage());
@@ -1099,20 +1443,15 @@ mod tests {
                 &key,
                 vec![row("tag", 0, 4.0, now - 1)],
                 Instant::now(),
-                generation,
+                &base_of(&cache, &key),
             )
             .unwrap();
         assert_ne!(older_new_tag.lineage(), equal_stamp.lineage());
         assert_eq!(older_new_tag.maximum(), Some(now + 2));
         assert_eq!(first.origin(), LineageOrigin::Miss);
+        // The cached sum includes additions exactly once and retains overlap stamps.
         for snapshot in [&first, &overlap, &appended, &equal_stamp, &older_new_tag] {
-            assert_eq!(
-                snapshot.content,
-                snapshot
-                    .iter()
-                    .fold(0u64, |sum, row| sum.wrapping_add(row_content(row))),
-                "the cached sum includes additions exactly once and retains overlap stamps"
-            );
+            assert_layout(snapshot);
         }
         assert_eq!(first.len(), 1, "published snapshots remain immutable");
     }
@@ -1127,7 +1466,7 @@ mod tests {
                 &key,
                 vec![tombstone("", 5, 500)],
                 Instant::now(),
-                gen_of(&cache, &key),
+                &base_of(&cache, &key),
             )
             .unwrap();
         assert_eq!(next.lineage(), first.lineage());
@@ -1138,10 +1477,10 @@ mod tests {
     #[test]
     fn replacement_purge_and_unrecorded_reloads_start_new_lineages() {
         let source = vec![row("", 0, 1.0, 100)];
-        let cache = SeriesCache::with_budget(entry_bytes(&source));
+        let cache = SeriesCache::with_budget(charged(source.clone()));
         let key = SeriesKey::new("p", "r", "m");
         let first = cache.insert_full(key.clone(), source.clone(), Instant::now());
-        let stale_generation = gen_of(&cache, &key);
+        let stale_base = base_of(&cache, &key);
         let replacement = cache.insert_full(key.clone(), source.clone(), Instant::now());
         assert_ne!(first.lineage(), replacement.lineage());
         assert!(cache
@@ -1149,24 +1488,9 @@ mod tests {
                 &key,
                 vec![row("", 1, 2.0, 200)],
                 Instant::now(),
-                stale_generation
+                &stale_base
             )
             .is_err());
-        let oversized = cache
-            .apply_increment(
-                &key,
-                vec![row("", 1, 2.0, 200)],
-                Instant::now(),
-                gen_of(&cache, &key),
-            )
-            .unwrap();
-        assert_eq!(oversized.lineage(), replacement.lineage());
-        assert!(matches!(cache.lookup(&key), Lookup::Miss));
-        assert!(!cache.inner.lock().unwrap().evicted.contains_key(&key));
-        let reloaded = cache.insert_full(key.clone(), oversized.to_vec(), Instant::now());
-        assert_ne!(reloaded.lineage(), oversized.lineage());
-        assert!(matches!(cache.lookup(&key), Lookup::Miss));
-        assert!(!cache.inner.lock().unwrap().evicted.contains_key(&key));
         let another_cache = SeriesCache::new();
         let other = another_cache.insert_full(key.clone(), source.clone(), Instant::now());
         assert_ne!(other.lineage(), first.lineage());
@@ -1179,19 +1503,17 @@ mod tests {
         );
     }
 
+    /// Room for exactly one `evict` pressure entry of `row_count` rows, whose key is the longest the eviction tests use.
     fn eviction_cache(row_count: usize) -> SeriesCache {
-        SeriesCache::with_budget(entry_bytes(&vec![row("", 0, 0.0, 0); row_count]))
+        SeriesCache::with_budget(entry_charge(
+            &SeriesKey::new("p", "eviction-pressure", "m"),
+            filler(row_count),
+        ))
     }
 
     fn evict(cache: &SeriesCache, key: &SeriesKey, row_count: usize) {
         let other = SeriesKey::new("p", "eviction-pressure", "m");
-        cache.insert_full(
-            other,
-            (0..row_count)
-                .map(|step| row("", step as i64, 0.0, 1))
-                .collect(),
-            Instant::now(),
-        );
+        cache.insert_full(other, filler(row_count), Instant::now());
         assert!(matches!(cache.lookup(key), Lookup::Miss));
         assert!(cache.inner.lock().unwrap().evicted.contains_key(key));
     }
@@ -1272,20 +1594,47 @@ mod tests {
         assert_eq!(populated.maximum(), Some(-5));
     }
 
+    /// A series too large to retain is served without being stored (eviction cannot help a sole entry, so the budget stays a hard bound on retained memory) and leaves the recovery record of the rows it handed out, from a full read or an increment, as an LRU victim does: stage 2 prices it by its row count, and a matching full read keeps its lineage.
     #[test]
-    fn oversized_reload_consumes_recovery_without_recording_its_returned_snapshot() {
+    fn oversized_results_leave_recovery_records() {
         let cache = eviction_cache(1);
+        let retained_bytes = || cache.inner.lock().unwrap().total_bytes;
+        let recorded = |key: &SeriesKey| match cache.sizes(std::slice::from_ref(key))[..] {
+            [CachedSize::Evicted { rows }] => Some(rows),
+            _ => None,
+        };
+        // A full read past the budget after an LRU eviction restores the victim's lineage and leaves its own record.
         let key = SeriesKey::new("p", "r", "m");
         let first = cache.insert_full(key.clone(), vec![row("", 0, 1.0, 100)], Instant::now());
         evict(&cache, &key, 1);
+        let before = retained_bytes();
         let full = vec![row("", 0, 1.0, 100), row("", 1, 2.0, 200)];
         let oversized = cache.insert_full(key.clone(), full.clone(), Instant::now());
-        assert_eq!(oversized.lineage(), first.lineage());
+        assert_eq!((oversized.len(), oversized.lineage()), (2, first.lineage()));
         assert!(matches!(cache.lookup(&key), Lookup::Miss));
-        assert!(!cache.inner.lock().unwrap().evicted.contains_key(&key));
+        assert_eq!(retained_bytes(), before, "nothing retained");
+        assert_eq!(recorded(&key), Some(2));
         let repeated = cache.insert_full(key.clone(), full, Instant::now());
-        assert_ne!(repeated.lineage(), oversized.lineage());
-        assert!(!cache.inner.lock().unwrap().evicted.contains_key(&key));
+        assert_eq!(repeated.lineage(), oversized.lineage());
+        assert_eq!(recorded(&key), Some(2));
+        // An increment growing a retained entry past the budget hands out the merged rows and leaves their record.
+        let other = SeriesKey::new("p", "other", "m");
+        let retained = cache.insert_full(other.clone(), vec![row("", 0, 1.0, 100)], Instant::now());
+        assert_eq!(recorded(&other), None);
+        let merged = cache
+            .apply_increment(
+                &other,
+                vec![row("", 1, 2.0, 200)],
+                Instant::now(),
+                &base_of(&cache, &other),
+            )
+            .unwrap();
+        assert_eq!((merged.len(), merged.lineage()), (2, retained.lineage()));
+        assert!(matches!(cache.lookup(&other), Lookup::Miss));
+        assert_eq!(retained_bytes(), 0, "the entry is dropped");
+        assert_eq!(recorded(&other), Some(2));
+        let reloaded = cache.insert_full(other.clone(), merged.to_vec(), Instant::now());
+        assert_eq!(reloaded.lineage(), merged.lineage());
     }
 
     #[test]
@@ -1361,18 +1710,18 @@ mod tests {
         let mut refused = 0;
         let mut late = 0;
         for seed in 1..=8u64 {
-            let cache = eviction_cache(128);
+            // Room for a multi-chunk series of three tags (each tag's appends are compacted chunks).
+            let cache = eviction_cache(256);
             let key = SeriesKey::new("p", "r", "m");
             let mut current =
                 cache.insert_full(key.clone(), vec![row("", 2, 1.0, 100)], Instant::now());
             let mut history = vec![current.clone()];
-            let mut random = seed;
+            let mut rng = crate::Rng(seed);
             for tick in 1..=120 {
-                random ^= random << 13;
-                random ^= random >> 7;
-                random ^= random << 17;
+                let random = rng.next();
                 let tag = ["", "a", "b"][(random as usize >> 8) % 3];
                 let step = current
+                    .to_vec()
                     .iter()
                     .filter(|row| row.tag == tag)
                     .map(|row| row.step)
@@ -1388,16 +1737,17 @@ mod tests {
                         reloaded.push(row(tag, step, tick as f32, stamp));
                         reloaded.sort_by(|a, b| (&a.tag, a.step).cmp(&(&b.tag, b.step)));
                     }
-                    evict(&cache, &key, 128);
+                    evict(&cache, &key, 256);
                     current = cache.insert_full(key.clone(), reloaded, Instant::now());
                     restored += usize::from(current.lineage() == old_lineage);
                 } else {
                     let mut changed = row(tag, step, tick as f32, stamp);
-                    if !current.is_empty() {
+                    if current.len() > 0 {
                         match random % 9 {
                             3 => changed.inserted_ms = current.maximum().unwrap(),
                             4 | 5 | 7 => {
-                                changed = current[(random as usize >> 16) % current.len()].clone();
+                                changed = current.to_vec()[(random as usize >> 16) % current.len()]
+                                    .clone();
                                 changed.inserted_ms = stamp;
                                 if random % 9 == 5 {
                                     changed.value += 1.0;
@@ -1413,7 +1763,7 @@ mod tests {
                         &key,
                         vec![changed.clone()],
                         Instant::now(),
-                        gen_of(&cache, &key),
+                        &base_of(&cache, &key),
                     ) {
                         Ok(rows) => rows,
                         Err(()) => {
@@ -1443,7 +1793,8 @@ mod tests {
                     comparisons += 1;
                     let mut recovered = Vec::new();
                     let (mut last_tag, mut seen_new) = (None, false);
-                    for row in current.iter() {
+                    let rows = current.to_vec();
+                    for row in &rows {
                         if last_tag != Some(row.tag.as_str()) {
                             last_tag = Some(row.tag.as_str());
                             seen_new = false;
@@ -1456,33 +1807,15 @@ mod tests {
                                 !seen_new,
                                 "seed {seed}, tick {tick}: new step precedes held row"
                             );
-                            recovered.push(row);
+                            recovered.push(row.clone());
                         } else {
                             seen_new = true;
                         }
                     }
-                    assert_eq!(recovered.len(), held.len(), "seed {seed}, tick {tick}");
-                    for (actual, expected) in recovered.into_iter().zip(held.iter()) {
-                        assert_eq!(
-                            (
-                                &actual.tag,
-                                actual.step,
-                                actual.timestamp_ms,
-                                actual.value.to_bits(),
-                                actual.is_value,
-                                actual.inserted_ms
-                            ),
-                            (
-                                &expected.tag,
-                                expected.step,
-                                expected.timestamp_ms,
-                                expected.value.to_bits(),
-                                expected.is_value,
-                                expected.inserted_ms
-                            ),
-                            "seed {seed}, tick {tick}"
-                        );
-                    }
+                    assert!(
+                        same_rows(&recovered, &held.to_vec()),
+                        "seed {seed}, tick {tick}"
+                    );
                 }
                 history.push(current.clone());
             }
@@ -1629,7 +1962,12 @@ mod tests {
         let wm = cache.inner.lock().unwrap().map[&k].max_inserted_ms;
         assert_eq!(wm, 100);
         cache
-            .apply_increment(&k, vec![row("", 2, 2.0, now)], started, gen_of(&cache, &k))
+            .apply_increment(
+                &k,
+                vec![row("", 2, 2.0, now)],
+                started,
+                &base_of(&cache, &k),
+            )
             .unwrap();
         let wm = cache.inner.lock().unwrap().map[&k].max_inserted_ms;
         assert!(wm.abs_diff(expected) < 1_000, "{wm} vs {expected}");
@@ -1637,7 +1975,8 @@ mod tests {
 
     #[test]
     fn bump_gate_forces_stale_inside_the_fresh_window() {
-        let cache = SeriesCache::with_budget(entry_bytes(&vec![row("", 0, 0.0, 0); 8]));
+        // Room for both one-row entries.
+        let cache = SeriesCache::with_budget(charged(filler(64)));
         let k = SeriesKey::new("p", "r", "m");
         cache.insert_full(k.clone(), vec![row("", 1, 1.0, 100)], Instant::now());
         assert!(matches!(cache.lookup(&k), Lookup::Fresh(_)));
@@ -1652,41 +1991,40 @@ mod tests {
         // The refetch the bump triggers re-stamps past the note; the rest of
         // its burst dedups as Fresh again.
         cache
-            .apply_increment(&k, vec![], Instant::now(), gen_of(&cache, &k))
+            .apply_increment(&k, vec![], Instant::now(), &base_of(&cache, &k))
             .expect("empty increment ok");
         assert!(matches!(cache.lookup(&k), Lookup::Fresh(_)));
     }
 
     #[test]
     fn increment_against_a_replaced_base_forces_full_rebuild() {
-        let cache = SeriesCache::with_budget(entry_bytes(&vec![row("", 0, 0.0, 0); 8]));
+        let cache = SeriesCache::with_budget(charged(filler(8)));
         let k = SeriesKey::new("p", "r", "m");
         cache.insert_full(k.clone(), vec![row("", 1, 1.0, 100)], Instant::now());
-        let stale_gen = gen_of(&cache, &k);
-        // A concurrent full fetch replaces the entry while the increment
-        // (computed against stale_gen's watermark) is still in flight...
+        let stale_base = base_of(&cache, &k);
+        // A concurrent full fetch replaces the entry while the increment (computed against stale_base's watermark) is still in flight...
         cache.insert_full(k.clone(), vec![row("", 1, 1.0, 100)], Instant::now());
         // ...so applying it must refuse: merging into the replacement could
         // bury a hole below the merged watermark that no incremental
         // re-reads.
         assert!(cache
-            .apply_increment(&k, vec![row("", 2, 2.0, 300)], Instant::now(), stale_gen)
+            .apply_increment(&k, vec![row("", 2, 2.0, 300)], Instant::now(), &stale_base)
             .is_err());
-        // With the CURRENT generation the same increment applies fine.
+        // Against the CURRENT snapshot the same increment applies fine.
         let rows = cache
             .apply_increment(
                 &k,
                 vec![row("", 2, 2.0, 300)],
                 Instant::now(),
-                gen_of(&cache, &k),
+                &base_of(&cache, &k),
             )
-            .expect("current gen applies");
+            .expect("the current snapshot applies");
         assert_eq!(rows.len(), 2);
     }
 
     #[test]
     fn bump_notes_survive_pruning_while_a_fetch_is_in_flight() {
-        let cache = SeriesCache::with_budget(entry_bytes(&vec![row("", 0, 0.0, 0); 8]));
+        let cache = SeriesCache::with_budget(charged(filler(8)));
         let k = SeriesKey::new("p", "r", "m");
         // A bump noted seconds ago while a slow
         // fetch is still in flight. Backdate it directly; note_bumps always
@@ -1720,7 +2058,7 @@ mod tests {
 
     #[test]
     fn fresh_window_counts_from_fetch_start() {
-        let cache = SeriesCache::with_budget(entry_bytes(&vec![row("", 0, 0.0, 0); 8]));
+        let cache = SeriesCache::with_budget(charged(filler(8)));
         // A fetch that started a whole window ago is stale on arrival, however recently it stored.
         if let Some(started) = Instant::now().checked_sub(FRESH_WINDOW + Duration::from_secs(1)) {
             let k = SeriesKey::new("p", "r", "m");
@@ -1731,7 +2069,7 @@ mod tests {
 
     #[test]
     fn cache_insert_lookup_increment_evict() {
-        let cache = SeriesCache::with_budget(entry_bytes(&vec![row("", 0, 0.0, 0); 3]) * 2);
+        let cache = SeriesCache::with_budget(charged(filler(3)) * 2);
         let k1 = SeriesKey::new("p", "r1", "m");
         let k2 = SeriesKey::new("p", "r2", "m");
 
@@ -1742,7 +2080,7 @@ mod tests {
 
         // Empty increment refreshes the clock and keeps rows
         let rows = cache
-            .apply_increment(&k1, vec![], Instant::now(), gen_of(&cache, &k1))
+            .apply_increment(&k1, vec![], Instant::now(), &base_of(&cache, &k1))
             .expect("empty increment ok");
         assert_eq!(rows.len(), 1);
 
@@ -1752,7 +2090,7 @@ mod tests {
                 &k1,
                 vec![row("", 2, 2.0, 250)],
                 Instant::now(),
-                gen_of(&cache, &k1),
+                &base_of(&cache, &k1),
             )
             .expect("append ok");
         assert_eq!(rows.len(), 2);
@@ -1762,41 +2100,112 @@ mod tests {
         }
 
         // Second entry blows the (tiny) budget: LRU evicts k1
-        cache.insert_full(k2.clone(), vec![row("", 1, 1.0, 100); 3], Instant::now());
+        cache.insert_full(k2.clone(), filler(3), Instant::now());
         let inner = cache.inner.lock().unwrap();
         assert!(inner.total_bytes <= cache.budget_bytes || inner.map.len() == 1);
     }
 
+    /// The map's bucket array is charged at its capacity, which removals never shrink by themselves: a filled-then-purged cache shrinks its table and charges nothing, and a full one charges every bucket it holds.
     #[test]
-    fn oversized_entries_are_never_retained() {
-        // Budget fits exactly two rows. Eviction can't touch a sole entry, so a series over the whole budget must be served without being stored — the budget is a hard bound on retained memory.
-        let cache = SeriesCache::with_budget(entry_bytes(&vec![row("", 0, 0.0, 0); 2]));
-        let k = SeriesKey::new("p", "r", "m");
-
-        // Full insert over budget: rows come back, nothing is retained.
-        let rows = cache.insert_full(k.clone(), vec![row("", 1, 1.0, 100); 3], Instant::now());
-        assert_eq!(rows.len(), 3);
-        assert!(matches!(cache.lookup(&k), Lookup::Miss));
-        assert_eq!(cache.inner.lock().unwrap().total_bytes, 0);
-
-        // An increment that grows a retained entry past the budget serves the merged rows but drops the entry.
-        cache.insert_full(
-            k.clone(),
-            vec![row("", 1, 1.0, 100), row("", 2, 2.0, 200)],
-            Instant::now(),
-        );
-        assert!(matches!(cache.lookup(&k), Lookup::Fresh(_)));
-        let rows = cache
-            .apply_increment(
-                &k,
-                vec![row("", 3, 3.0, 300)],
+    fn the_map_table_is_charged_at_capacity_and_given_back_when_emptied() {
+        let cache = SeriesCache::with_budget(usize::MAX);
+        let runs: Vec<String> = (0..100_000).map(|i| format!("run-{i}")).collect();
+        for run in &runs {
+            cache.insert_full(
+                SeriesKey::new("p", run.as_str(), "m"),
+                Vec::new(),
                 Instant::now(),
-                gen_of(&cache, &k),
-            )
-            .expect("append ok");
-        assert_eq!(rows.len(), 3);
-        assert!(matches!(cache.lookup(&k), Lookup::Miss));
-        assert_eq!(cache.inner.lock().unwrap().total_bytes, 0);
+            );
+        }
+        {
+            let inner = cache.inner.lock().unwrap();
+            let entries: usize = inner.map.values().map(|entry| entry.bytes).sum();
+            assert!(inner.map.capacity() >= 100_000);
+            let table = table_bytes(inner.table_capacity);
+            assert_eq!(table, table_bytes(inner.map.capacity()));
+            assert!(table >= inner.map.capacity() * std::mem::size_of::<(SeriesKey, Entry)>());
+            assert_eq!(inner.total_bytes, entries + table);
+        }
+        assert_eq!(
+            cache.purge_runs(runs.iter().map(|run| ("p", run.as_str()))),
+            100_000
+        );
+        let inner = cache.inner.lock().unwrap();
+        assert_eq!(inner.map.capacity(), 0, "an emptied table is given back");
+        assert_eq!(inner.total_bytes, 0);
+    }
+
+    /// A tag's rows in a step range, counted by binary searches over its chunks, are the rows a scan finds.
+    #[test]
+    fn rows_between_counts_across_chunks() {
+        let rows: Vec<VersionedRawPoint> = (0..2 * COMPACT_ROWS as i64 + 1_000)
+            .map(|step| row("t", 2 * step, 1.0, 1))
+            .collect();
+        let snapshot = SeriesSnapshot::full(rows.clone());
+        let tag = snapshot.tags().next().unwrap();
+        assert!(tag.chunks().count() >= 3);
+        let last = 2 * (rows.len() as i64 - 1);
+        for (lo, hi) in [
+            (i64::MIN, i64::MAX),
+            (-5, -1),
+            (0, 0),
+            (1, 1),
+            (65_535, 65_537),
+            (100, 140_000),
+            (last, last + 10),
+            (last + 1, i64::MAX),
+            (10, 5),
+        ] {
+            let scanned = rows.iter().filter(|r| (lo..=hi).contains(&r.step)).count();
+            assert_eq!(tag.rows_between(lo, hi), scanned, "{lo}..={hi}");
+        }
+    }
+
+    /// Removals that leave tombstones lower the map's `capacity()` while its buckets stay: the table is charged at the largest capacity since it last shrank, and that capacity decides the quarter-full shrink.
+    #[test]
+    fn the_map_table_is_charged_at_its_buckets_after_removals() {
+        for (fill, remove) in [(1_792usize, 1_000usize), (1_792, 1_500), (14_336, 12_000)] {
+            let cache = SeriesCache::with_budget(usize::MAX);
+            let runs: Vec<String> = (0..fill).map(|i| format!("run-{i}")).collect();
+            for run in &runs {
+                cache.insert_full(
+                    SeriesKey::new("p", run.as_str(), "m"),
+                    Vec::new(),
+                    Instant::now(),
+                );
+            }
+            let full = cache.inner.lock().unwrap().map.capacity();
+            cache.purge_runs(runs[..remove].iter().map(|run| ("p", run.as_str())));
+            let inner = cache.inner.lock().unwrap();
+            let left = fill - remove;
+            if left * 4 <= full {
+                assert!(
+                    inner.map.capacity() < full,
+                    "fill {fill} remove {remove}: a quarter-full table shrinks"
+                );
+                assert_eq!(inner.table_capacity, inner.map.capacity());
+            } else {
+                assert_eq!(
+                    inner.table_capacity, full,
+                    "fill {fill} remove {remove}: the buckets stay charged"
+                );
+            }
+        }
+    }
+
+    /// An entry that fits beside the smallest table is retained, however large a table the cache's earlier entries grew: eviction charges the table as it shrinks.
+    #[test]
+    fn a_grown_table_never_evicts_an_entry_that_fits() {
+        let key = SeriesKey::new("p", "r", "m");
+        let rows: Vec<_> = (0..200_000).map(|step| row("", step, 1.0, 1)).collect();
+        let cache = SeriesCache::with_budget(entry_charge(&key, rows.clone()));
+        for i in 0..3_000 {
+            let empty = SeriesKey::new("p", format!("run-{i}"), "m");
+            cache.insert_full(empty, Vec::new(), Instant::now());
+        }
+        cache.insert_full(key.clone(), rows, Instant::now());
+        assert!(matches!(cache.lookup(&key), Lookup::Fresh(_)));
+        assert_eq!(cache.inner.lock().unwrap().map.len(), 1);
     }
 
     #[test]
@@ -1828,6 +2237,7 @@ mod tests {
         assert_eq!(
             inner.total_bytes,
             inner.map.values().map(|entry| entry.bytes).sum::<usize>()
+                + table_bytes(inner.table_capacity)
         );
         assert!(inner.bumps.contains_key("same-run"));
     }
@@ -1848,20 +2258,9 @@ mod tests {
                         .try_read_owned()
                         .unwrap(),
                 ),
+                _charge: Box::new(()),
             })
         }
-    }
-
-    /// Poll `ready` between yields, bounded so a pinned regression fails the
-    /// test instead of hanging it.
-    async fn wait_until(mut ready: impl FnMut() -> bool) {
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !ready() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("condition not reached within 1s");
     }
 
     fn plain_cache() -> Arc<SeriesCache> {
@@ -2240,7 +2639,7 @@ mod tests {
                     no_detach,
                     move |lookup| async move {
                         follower_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        let Lookup::Stale { gen, .. } = lookup else {
+                        let Lookup::Stale { base, .. } = lookup else {
                             panic!("the leader's pre-bump snapshot must remain stale");
                         };
                         Ok::<_, RefreshError>(
@@ -2249,7 +2648,7 @@ mod tests {
                                     &follower_refresh_key,
                                     Vec::new(),
                                     Instant::now(),
-                                    gen,
+                                    &base,
                                 )
                                 .unwrap(),
                         )
@@ -2476,7 +2875,7 @@ mod tests {
             })
         };
         let first = attach(keys[0].clone()).await.unwrap().unwrap();
-        assert_eq!(first[0].value, 0.0);
+        assert_eq!(first.to_vec()[0].value, 0.0);
         wait_until(|| reads.load(std::sync::atomic::Ordering::SeqCst) == 1).await;
         // The finished task released nothing: the read still runs.
         assert_eq!(sem.available_permits(), 0);
@@ -2487,7 +2886,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .expect("the waiter shares the batch's result");
-        assert_eq!(rows[0].value, 1.0);
+        assert_eq!(rows.to_vec()[0].value, 1.0);
         wait_until(|| sem.available_permits() == 2).await;
         assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(locks.registry_len(), 0);
@@ -2534,7 +2933,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .expect("the re-poll shares the batch's result");
-        assert_eq!(rows[0].value, 1.0);
+        assert_eq!(rows.to_vec()[0].value, 1.0);
     }
 
     #[tokio::test]
@@ -2566,5 +2965,1132 @@ mod tests {
             .unwrap();
         // The batch started before the bump, so its result must not satisfy a later consult.
         assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// The differential oracle: the merge and restore rules over one (tag, step)-sorted vector per snapshot, stated over maps rather than chunks. It hashes rows as the cache does, so the two contents agree, and draws lineage identifiers from its own counter; the differential test pairs them.
+    mod flat {
+        use super::super::{EvictedLineage, LineageOrigin};
+        use super::point_content;
+        use crate::clickhouse::VersionedRawPoint;
+        use std::collections::{BTreeMap, HashMap};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        fn next_lineage() -> u64 {
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        }
+
+        fn content<'a>(rows: impl Iterator<Item = &'a VersionedRawPoint>) -> u64 {
+            rows.map(point_content).fold(0, u64::wrapping_add)
+        }
+
+        pub(super) struct FlatSnapshot {
+            pub(super) rows: Vec<VersionedRawPoint>,
+            pub(super) lineage: u64,
+            pub(super) maximum: Option<i64>,
+            pub(super) origin: LineageOrigin,
+            pub(super) content: u64,
+        }
+
+        impl FlatSnapshot {
+            /// What `SeriesCache::settle` records for an LRU victim.
+            pub(super) fn evicted(&self) -> EvictedLineage {
+                EvictedLineage {
+                    lineage: self.lineage,
+                    maximum: self.maximum,
+                    origin: self.origin,
+                    content: self.content,
+                    count: self.rows.len(),
+                    evicted: std::time::Instant::now(),
+                }
+            }
+
+            /// A full read. It restores `evicted`'s lineage when the rows that record held (stamped at or below its maximum) lead each tag and match its count and content.
+            pub(super) fn reload(
+                rows: Vec<VersionedRawPoint>,
+                origin: LineageOrigin,
+                evicted: Option<&EvictedLineage>,
+            ) -> Self {
+                let restored = evicted.filter(|old| {
+                    let held = |row: &&VersionedRawPoint| {
+                        old.maximum.is_some_and(|max| row.inserted_ms <= max)
+                    };
+                    rows.chunk_by(|a, b| a.tag == b.tag)
+                        .all(|tag| tag.iter().skip_while(held).all(|row| !held(&row)))
+                        && rows.iter().filter(held).count() == old.count
+                        && content(rows.iter().filter(held)) == old.content
+                });
+                Self {
+                    lineage: restored.map_or_else(next_lineage, |old| old.lineage),
+                    maximum: rows.iter().map(|row| row.inserted_ms).max(),
+                    origin: restored.map_or(origin, |old| old.origin),
+                    content: content(rows.iter()),
+                    rows,
+                }
+            }
+
+            /// The increment merged in, or `None` (read in full) for disagreeing versions at a key's newest stamp, a deletion stamped at or after its held row, a held row re-logged with another value or timestamp, or a new row at or below its tag's highest held step.
+            pub(super) fn merge(&self, increment: &[VersionedRawPoint]) -> Option<Self> {
+                // Each key's newest version, and whether a version at that stamp disagrees with it.
+                let mut newest: BTreeMap<(&str, i64), (&VersionedRawPoint, bool)> = BTreeMap::new();
+                for row in increment {
+                    let (kept, ambiguous) = newest
+                        .entry((row.tag.as_str(), row.step))
+                        .or_insert((row, false));
+                    if row.inserted_ms > kept.inserted_ms {
+                        (*kept, *ambiguous) = (row, false);
+                    } else if row.inserted_ms == kept.inserted_ms
+                        && (row.is_value != kept.is_value
+                            || (row.is_value != 0
+                                && (row.value.to_bits(), row.timestamp_ms)
+                                    != (kept.value.to_bits(), kept.timestamp_ms)))
+                    {
+                        *ambiguous = true;
+                    }
+                }
+                let held: HashMap<(&str, i64), &VersionedRawPoint> = self
+                    .rows
+                    .iter()
+                    .map(|row| ((row.tag.as_str(), row.step), row))
+                    .collect();
+                // Rows are step-sorted within a tag, so its last row is its highest step.
+                let high: HashMap<&str, i64> = self
+                    .rows
+                    .iter()
+                    .map(|row| (row.tag.as_str(), row.step))
+                    .collect();
+                let mut added = Vec::new();
+                for ((tag, step), (row, ambiguous)) in newest {
+                    let refused = match held.get(&(tag, step)) {
+                        _ if ambiguous => true,
+                        Some(held) if row.is_value == 0 => row.inserted_ms >= held.inserted_ms,
+                        Some(held) => {
+                            (row.value.to_bits(), row.timestamp_ms)
+                                != (held.value.to_bits(), held.timestamp_ms)
+                        }
+                        None if row.is_value == 0 => false,
+                        None => {
+                            added.push(row.clone());
+                            high.get(tag).is_some_and(|&max| step <= max)
+                        }
+                    };
+                    if refused {
+                        return None;
+                    }
+                }
+                let late = added
+                    .iter()
+                    .any(|row| self.maximum.is_some_and(|max| row.inserted_ms <= max));
+                let mut rows = self.rows.clone();
+                rows.extend(added.iter().cloned());
+                rows.sort_by(|a, b| (&a.tag, a.step).cmp(&(&b.tag, b.step)));
+                Some(Self {
+                    rows,
+                    lineage: if late { next_lineage() } else { self.lineage },
+                    maximum: self
+                        .maximum
+                        .max(added.iter().map(|row| row.inserted_ms).max()),
+                    origin: if late {
+                        LineageOrigin::Late
+                    } else {
+                        self.origin
+                    },
+                    content: self.content.wrapping_add(content(added.iter())),
+                })
+            }
+        }
+    }
+
+    pub(super) fn same_rows(a: &[VersionedRawPoint], b: &[VersionedRawPoint]) -> bool {
+        a.len() == b.len()
+            && a.iter().zip(b).all(|(a, b)| {
+                (
+                    a.tag.as_str(),
+                    a.step,
+                    a.timestamp_ms,
+                    a.value.to_bits(),
+                    a.is_value,
+                    a.inserted_ms,
+                ) == (
+                    b.tag.as_str(),
+                    b.step,
+                    b.timestamp_ms,
+                    b.value.to_bits(),
+                    b.is_value,
+                    b.inserted_ms,
+                )
+            })
+    }
+
+    /// The layout's invariants: tags ascend, a tag's chunks are adjacent, non-empty, share one tag allocation and ascend in step; within a tag every chunk below COMPACT_ROWS holds more than twice its successor, which bounds the count; `bytes` counts each allocation once; `content` sums the rows' hashes.
+    fn assert_layout(snapshot: &SeriesSnapshot) {
+        assert_chunk_layout(snapshot);
+        for tag in snapshot.tags() {
+            for rows in tag.chunks() {
+                assert!(rows.windows(2).all(|pair| pair[0].step < pair[1].step));
+            }
+        }
+        let content = snapshot
+            .chunks
+            .iter()
+            .flat_map(|chunk| chunk.rows.iter().map(|row| row_content(&chunk.tag, row)))
+            .fold(0u64, u64::wrapping_add);
+        assert_eq!(snapshot.content, content);
+    }
+
+    /// [`assert_layout`] at chunk granularity: steps are checked across chunk boundaries only.
+    fn assert_chunk_layout(snapshot: &SeriesSnapshot) {
+        let mut previous_tag: Option<&str> = None;
+        for tag in snapshot.tags() {
+            assert!(previous_tag.is_none_or(|previous| previous < tag.tag()));
+            previous_tag = Some(tag.tag());
+            assert!(tag.chunks.iter().all(|chunk| {
+                Arc::ptr_eq(&chunk.tag, &tag.chunks[0].tag) && !chunk.rows.is_empty()
+            }));
+            for pair in tag.chunks.windows(2) {
+                assert!(pair[0].rows[pair[0].rows.len() - 1].step < pair[1].rows[0].step);
+                assert!(
+                    pair[0].rows.len() >= COMPACT_ROWS
+                        || pair[0].rows.len() > 2 * pair[1].rows.len(),
+                    "uncompacted chunks: {} then {}",
+                    pair[0].rows.len(),
+                    pair[1].rows.len()
+                );
+            }
+            let rows: usize = tag.chunks.iter().map(|chunk| chunk.rows.len()).sum();
+            assert!(
+                tag.chunks.len() <= rows / COMPACT_ROWS + 15,
+                "{} chunks for {rows} rows",
+                tag.chunks.len()
+            );
+        }
+        let mut tags = HashSet::new();
+        let mut bytes = snapshot_overhead(snapshot.chunks.capacity());
+        for chunk in &snapshot.chunks {
+            if tags.insert(Arc::as_ptr(&chunk.tag) as *const u8) {
+                bytes += buffer_bytes(ARC_HEADER + chunk.tag.len());
+            }
+            bytes += chunk_bytes(chunk.rows.capacity());
+        }
+        assert_eq!(snapshot.bytes(), bytes);
+    }
+
+    /// Rows of `next` in chunks `previous` does not hold: what a refresh copied or added.
+    fn unshared_rows(previous: &SeriesSnapshot, next: &SeriesSnapshot) -> usize {
+        next.chunks
+            .iter()
+            .filter(|chunk| {
+                !previous
+                    .chunks
+                    .iter()
+                    .any(|held| Arc::ptr_eq(&held.rows, &chunk.rows))
+            })
+            .map(|chunk| chunk.rows.len())
+            .sum()
+    }
+
+    #[derive(Default, Debug)]
+    struct Coverage {
+        appends: usize,
+        unchanged: usize,
+        late: usize,
+        refused: usize,
+        restored: usize,
+        reloads: usize,
+        big_chunks: usize,
+        tags_extended: usize,
+    }
+
+    /// Random refreshes applied to the flat oracle and to the chunked cache: the same rows, merge outcomes, maxima, origins and restore decisions, and lineages that pair one to one, at every step. `tags` is the tag pool, `appended` the most tags an increment extends, and `rows` the most rows it adds to one tag.
+    fn differential(
+        seed: u64,
+        ticks: i64,
+        tags: &[&str],
+        appended: u64,
+        rows: u64,
+        coverage: &mut Coverage,
+    ) {
+        use flat::FlatSnapshot;
+        use std::collections::BTreeMap;
+        let mut rng = crate::Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        // The source table as a FINAL read sees it: (tag, step) → its newest version.
+        let mut table: BTreeMap<(String, i64), VersionedRawPoint> = BTreeMap::new();
+        let mut stamp = 1_000i64;
+        let point = |tag: &str, step: i64, value: f32, stamp: i64| VersionedRawPoint {
+            tag: tag.to_string(),
+            step,
+            timestamp_ms: step * 10 + 7,
+            value,
+            is_value: 1,
+            inserted_ms: stamp,
+        };
+        for tag in &tags[..1 + (seed as usize % 3).min(tags.len() - 1)] {
+            for step in 0..rng.below(rows * 4) as i64 {
+                table.insert(
+                    (tag.to_string(), step * 2),
+                    point(tag, step * 2, step as f32, stamp),
+                );
+                stamp += 1;
+            }
+        }
+        let full = |table: &BTreeMap<(String, i64), VersionedRawPoint>| -> Vec<VersionedRawPoint> {
+            table
+                .values()
+                .filter(|row| row.is_value != 0)
+                .cloned()
+                .collect()
+        };
+        // A random numeric row the source holds, in O(log rows).
+        let pick = |table: &BTreeMap<(String, i64), VersionedRawPoint>, random: u64| {
+            let tag = tags[(random % tags.len() as u64) as usize].to_string();
+            let mut range = table.range((tag.clone(), i64::MIN)..=(tag.clone(), i64::MAX));
+            let (first, last) = (
+                range.next()?.0 .1,
+                range.next_back().map_or(i64::MIN, |row| row.0 .1),
+            );
+            let step = first + ((random >> 20) % (last.max(first) - first + 1) as u64) as i64;
+            table
+                .range((tag.clone(), step)..=(tag, i64::MAX))
+                .map(|(_, row)| row)
+                .find(|row| row.is_value != 0)
+                .cloned()
+        };
+        let mut old = FlatSnapshot::reload(full(&table), LineageOrigin::Miss, None);
+        let mut new = Arc::new(SeriesSnapshot::reload(
+            full(&table).into(),
+            LineageOrigin::Miss,
+            None,
+        ));
+        // Lineage identifiers pair one to one.
+        let mut pairs: HashMap<u64, u64> = HashMap::new();
+        let mut reverse: HashMap<u64, u64> = HashMap::new();
+        let mut check = |old: &FlatSnapshot, new: &SeriesSnapshot, context: &str| {
+            assert!(
+                new.len() == old.rows.len()
+                    && new
+                        .chunks
+                        .iter()
+                        .flat_map(|chunk| chunk.rows.iter().map(move |row| (&chunk.tag, row)))
+                        .zip(&old.rows)
+                        .all(|((tag, row), flat)| {
+                            **tag == *flat.tag
+                                && (row.step, row.timestamp_ms, row.value.to_bits())
+                                    == (flat.step, flat.timestamp_ms, flat.value.to_bits())
+                                && (1, row.inserted_ms) == (flat.is_value, flat.inserted_ms)
+                        }),
+                "{context}: rows"
+            );
+            assert_eq!(
+                *pairs.entry(old.lineage).or_insert(new.lineage),
+                new.lineage,
+                "{context}: lineage"
+            );
+            assert_eq!(
+                *reverse.entry(new.lineage).or_insert(old.lineage),
+                old.lineage,
+                "{context}: lineage"
+            );
+            assert_eq!(old.maximum, new.maximum(), "{context}: maximum");
+            assert_eq!(old.origin, new.origin(), "{context}: origin");
+            assert_eq!(old.content, new.content, "{context}: content");
+            // The row comparison covers step order.
+            assert_chunk_layout(new);
+        };
+        check(&old, &new, &format!("seed {seed} load"));
+        for tick in 0..ticks {
+            let context = format!("seed {seed} tick {tick}");
+            let choice = rng.below(100);
+            if choice >= 88 {
+                // LRU eviction, possibly a change in the source, then a full reload against each side's record.
+                let (old_record, new_record) = (old.evicted(), EvictedLineage::of(&new));
+                match rng.below(4) {
+                    0 => {
+                        let tag = rng.pick(tags);
+                        let step = table
+                            .range((tag.to_string(), i64::MIN)..=(tag.to_string(), i64::MAX))
+                            .next_back()
+                            .map_or(0, |(key, _)| key.1)
+                            + 1;
+                        stamp += 1;
+                        table.insert((tag.to_string(), step), point(tag, step, 0.5, stamp));
+                    }
+                    1 => {
+                        if let Some(row) = pick(&table, rng.next()) {
+                            stamp += 1;
+                            let held = table.get_mut(&(row.tag.clone(), row.step)).unwrap();
+                            held.value += 1.0;
+                            held.inserted_ms = stamp;
+                        }
+                    }
+                    _ => {}
+                }
+                let rows = full(&table);
+                old = FlatSnapshot::reload(rows.clone(), LineageOrigin::Miss, Some(&old_record));
+                new = Arc::new(SeriesSnapshot::reload(
+                    rows.into(),
+                    LineageOrigin::Miss,
+                    Some(&new_record),
+                ));
+                coverage.restored += usize::from(new.lineage() == new_record.lineage);
+                coverage.reloads += 1;
+                check(&old, &new, &format!("{context}: reload"));
+                continue;
+            }
+            let maximum = old.maximum.unwrap_or(stamp);
+            let mut increment: Vec<VersionedRawPoint> = Vec::new();
+            // New rows past each chosen tag's high-water step, some tags new, stamped above the maximum or, for late rows, at or below it.
+            let is_late = choice < 10;
+            for _ in 0..1 + rng.below(appended) {
+                let tag = rng.pick(tags);
+                let high = table
+                    .range((tag.to_string(), i64::MIN)..=(tag.to_string(), i64::MAX))
+                    .next_back()
+                    .map_or(-3, |(key, _)| key.1);
+                let mut step = high;
+                for _ in 0..1 + rng.below(rows) {
+                    step += 1 + rng.below(3) as i64;
+                    stamp += 1;
+                    let at = if is_late {
+                        maximum - rng.below(3) as i64
+                    } else {
+                        stamp.max(maximum + 1)
+                    };
+                    let value = if rng.below(17) == 0 {
+                        f32::NAN
+                    } else {
+                        rng.below(1000) as f32 / 8.0
+                    };
+                    increment.push(point(tag, step, value, at));
+                    if rng.below(29) == 0 {
+                        // An older sibling version of the same key: deduplicated away.
+                        let mut sibling = point(tag, step, -1.0, at - 1);
+                        sibling.is_value = rng.below(2) as u8;
+                        increment.push(sibling);
+                    }
+                }
+            }
+            // The overlap re-read: held rows come back identical, some re-stamped.
+            for _ in 0..rng.below(6) {
+                if let Some(mut row) = pick(&table, rng.next()) {
+                    if rng.below(3) == 0 {
+                        stamp += 1;
+                        row.inserted_ms = stamp;
+                    }
+                    increment.push(row);
+                }
+            }
+            // Tombstones the cache never held, or older than the held row: irrelevant.
+            if rng.below(4) == 0 {
+                let tag = rng.pick(tags);
+                let step = -100 - rng.below(50) as i64;
+                let mut tombstone = point(tag, step, 0.0, stamp);
+                tombstone.is_value = 0;
+                increment.push(tombstone);
+            }
+            if rng.below(5) == 0 {
+                if let Some(mut tombstone) = pick(&table, rng.next()) {
+                    tombstone.is_value = 0;
+                    tombstone.value = 0.0;
+                    tombstone.inserted_ms -= 1;
+                    increment.push(tombstone);
+                }
+            }
+            // History changes the merge must refuse.
+            match choice {
+                10..=14 => {
+                    // A held key re-logged with a different value or timestamp.
+                    if let Some(mut row) = pick(&table, rng.next()) {
+                        stamp += 1;
+                        row.inserted_ms = stamp;
+                        if rng.below(2) == 0 {
+                            row.value += 0.25;
+                        } else {
+                            row.timestamp_ms += 1;
+                        }
+                        increment.push(row);
+                    }
+                }
+                15..=17 => {
+                    // A new step below a tag's high-water step.
+                    if let Some(row) = pick(&table, rng.next()) {
+                        let step = row.step - 1;
+                        if !table.contains_key(&(row.tag.clone(), step)) {
+                            stamp += 1;
+                            increment.push(point(&row.tag, step, 3.0, stamp));
+                        }
+                    }
+                }
+                18..=20 => {
+                    // A deletion of a held key, newer than the held row or stamped exactly as it is.
+                    if let Some(mut tombstone) = pick(&table, rng.next()) {
+                        if rng.below(2) == 0 {
+                            stamp += 1;
+                            tombstone.inserted_ms = stamp;
+                        }
+                        tombstone.is_value = 0;
+                        tombstone.value = 0.0;
+                        increment.push(tombstone);
+                    }
+                }
+                21..=22 => {
+                    // Disagreeing versions at one stamp, of a held key or a new one.
+                    stamp += 1;
+                    let (tag, step) = match pick(&table, rng.next()) {
+                        Some(row) if rng.below(2) == 0 => (row.tag, row.step),
+                        _ => ("zz".to_string(), 1_000_000 + tick),
+                    };
+                    increment.push(point(&tag, step, 1.0, stamp));
+                    increment.push(point(&tag, step, 2.0, stamp));
+                }
+                23..=24 => {
+                    // A value and a nonnumeric payload at one stamp, of a held key or a new one.
+                    stamp += 1;
+                    let (tag, step) = match pick(&table, rng.next()) {
+                        Some(row) if rng.below(2) == 0 => (row.tag, row.step),
+                        _ => ("zz".to_string(), 1_000_000 + tick),
+                    };
+                    increment.push(point(&tag, step, 1.0, stamp));
+                    let mut tombstone = point(&tag, step, 0.0, stamp);
+                    tombstone.is_value = 0;
+                    increment.push(tombstone);
+                }
+                25..=26 => increment.clear(),
+                _ => {}
+            }
+            // ClickHouse's ORDER BY tag, step: versions of a key adjacent, in arbitrary order.
+            let mut keyed: Vec<_> = increment.into_iter().map(|row| (rng.next(), row)).collect();
+            keyed.sort_by(|(a, x), (b, y)| {
+                (x.tag.as_str(), x.step, a).cmp(&(y.tag.as_str(), y.step, b))
+            });
+            let increment: Vec<VersionedRawPoint> = keyed.into_iter().map(|(_, row)| row).collect();
+            let merged = (old.merge(&increment), new.merge(&increment));
+            // The source applies the increment: each key keeps its newest version.
+            for row in &increment {
+                let key = (row.tag.clone(), row.step);
+                if table
+                    .get(&key)
+                    .is_none_or(|held| row.inserted_ms >= held.inserted_ms)
+                {
+                    table.insert(key, row.clone());
+                }
+            }
+            match merged {
+                (Some(old_merged), Some(new_merged)) => {
+                    let added = new_merged.len() - new.len();
+                    let rows_of = |snapshot: &SeriesSnapshot| -> HashMap<String, usize> {
+                        snapshot
+                            .tags()
+                            .map(|tag| (tag.tag().to_string(), tag.chunks().map(<[_]>::len).sum()))
+                            .collect()
+                    };
+                    let before = rows_of(&new);
+                    let extended = rows_of(&new_merged)
+                        .into_iter()
+                        .filter(|(tag, rows)| before.get(tag).is_none_or(|held| rows > held))
+                        .count();
+                    assert!(
+                        unshared_rows(&new, &new_merged) <= added + extended * 2 * COMPACT_ROWS,
+                        "{context}: copy bound"
+                    );
+                    coverage.late += usize::from(
+                        new_merged.origin() == LineageOrigin::Late
+                            && new_merged.lineage() != new.lineage(),
+                    );
+                    if added == 0 {
+                        assert!(
+                            Arc::ptr_eq(&new, &new_merged),
+                            "{context}: an empty append shares"
+                        );
+                        coverage.unchanged += 1;
+                    } else {
+                        coverage.appends += 1;
+                        coverage.tags_extended = coverage.tags_extended.max(extended);
+                    }
+                    coverage.big_chunks += new_merged
+                        .chunks
+                        .iter()
+                        .filter(|chunk| {
+                            chunk.rows.len() >= COMPACT_ROWS
+                                && !new
+                                    .chunks
+                                    .iter()
+                                    .any(|held| Arc::ptr_eq(&held.rows, &chunk.rows))
+                        })
+                        .count();
+                    old = old_merged;
+                    new = new_merged;
+                    check(&old, &new, &format!("{context}: merge"));
+                }
+                (None, None) => {
+                    coverage.refused += 1;
+                    let rows = full(&table);
+                    old = FlatSnapshot::reload(rows.clone(), LineageOrigin::Rewrite, None);
+                    new = Arc::new(SeriesSnapshot::reload(
+                        rows.into(),
+                        LineageOrigin::Rewrite,
+                        None,
+                    ));
+                    check(&old, &new, &format!("{context}: refused"));
+                }
+                (old_merged, new_merged) => panic!(
+                    "{context}: flat merged={}, chunked merged={}",
+                    old_merged.is_some(),
+                    new_merged.is_some()
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn chunked_snapshots_match_the_flat_representation_across_random_refreshes() {
+        let mut coverage = Coverage::default();
+        // Many small refreshes over eight tags, up to five extended at once.
+        let tags = ["", "a", "b", "c", "loss/x", "m", "q", "zz"];
+        for seed in 1..=32u64 {
+            differential(seed, 150, &tags, 5, 12, &mut coverage);
+        }
+        assert!(
+            coverage.appends > 2_500
+                && coverage.unchanged > 40
+                && coverage.late > 200
+                && coverage.refused > 500
+                && coverage.restored > 100
+                && coverage.reloads > 300
+                && coverage.tags_extended == 5,
+            "{coverage:?}"
+        );
+        // Bulk refreshes over two tags, so tags pass COMPACT_ROWS: full-read chunks, compacted chunks past it, and lookups across big and small chunks.
+        let mut bulk = Coverage::default();
+        differential(101, 60, &["", "a"], 1, 8_000, &mut bulk);
+        assert!(
+            bulk.appends > 30 && bulk.refused > 5 && bulk.reloads > 3 && bulk.big_chunks > 0,
+            "{bulk:?}"
+        );
+    }
+
+    #[test]
+    fn append_only_refreshes_share_held_chunks_and_charge_them_once() {
+        let cache = SeriesCache::with_budget(usize::MAX);
+        let key = SeriesKey::new("p", "r", "m");
+        let mut rows: Vec<_> = (0..1_000)
+            .map(|step| row("", step, 1.0, 100 + step))
+            .collect();
+        rows.extend((0..500).map(|step| row("x", step, 2.0, 100 + step)));
+        let first = cache.insert_full(key.clone(), rows, Instant::now());
+        assert_eq!(first.chunks.len(), 2);
+        assert_eq!(
+            cache.inner.lock().unwrap().total_bytes,
+            entry_bytes(&key, &first) + table_bytes(1)
+        );
+        // The overlap re-read plus ten new scalar rows.
+        let increment: Vec<_> = (990..1_010)
+            .map(|step| row("", step, 1.0, 100 + step))
+            .collect();
+        let second = cache
+            .apply_increment(&key, increment, Instant::now(), &base_of(&cache, &key))
+            .unwrap();
+        assert_eq!(second.len(), 1_510);
+        assert_eq!(second.lineage(), first.lineage());
+        // Every held chunk is shared; only the ten rows are new, in a chunk allocated at their number.
+        assert!(Arc::ptr_eq(&first.chunks[0].rows, &second.chunks[0].rows));
+        assert!(Arc::ptr_eq(&first.chunks[1].rows, &second.chunks[2].rows));
+        assert!(Arc::ptr_eq(&first.chunks[0].tag, &second.chunks[1].tag));
+        assert_eq!(unshared_rows(&first, &second), 10);
+        assert_eq!(second.chunks[1].rows.capacity(), 10);
+        assert_eq!(
+            second.bytes() + snapshot_overhead(first.chunks.capacity()),
+            first.bytes() + chunk_bytes(10) + snapshot_overhead(second.chunks.capacity())
+        );
+        // The cache charges the snapshot it retains, the shared chunks once; the replaced snapshot is charged by whoever still pins it.
+        assert_eq!(
+            cache.inner.lock().unwrap().total_bytes,
+            entry_bytes(&key, &second) + table_bytes(1)
+        );
+        // Chart admission reads the same record.
+        assert!(matches!(
+            &cache.sizes(std::slice::from_ref(&key))[..],
+            [CachedSize::Cached(rows)] if Arc::ptr_eq(rows, &second)
+        ));
+        for rows in [1, 1_000, COMPACT_ROWS, COMPACT_ROWS + 1, 100_000] {
+            assert_eq!(
+                snapshot_bytes(rows),
+                SeriesSnapshot::full((0..rows as i64).map(|step| row("", step, 1.0, 1)).collect())
+                    .bytes(),
+                "the estimate of a read of {rows} rows is what one tag of it costs"
+            );
+        }
+        // A refresh that adds nothing keeps the held snapshot.
+        let third = cache
+            .apply_increment(
+                &key,
+                vec![row("x", 499, 2.0, 599)],
+                Instant::now(),
+                &base_of(&cache, &key),
+            )
+            .unwrap();
+        assert!(Arc::ptr_eq(&second, &third));
+        assert!(Arc::ptr_eq(
+            &cache.inner.lock().unwrap().map[&key].rows,
+            &second
+        ));
+    }
+
+    #[test]
+    fn a_full_read_fills_chunks_at_their_length() {
+        let mut read = FullRead::default();
+        for step in 0..(2 * COMPACT_ROWS + 5) as i64 {
+            read.push("", CachedRow::of(&row("", step, 0.0, step)))
+                .unwrap();
+        }
+        for step in 0..3 {
+            read.push("t", CachedRow::of(&row("t", step, 0.0, step)))
+                .unwrap();
+        }
+        let snapshot = SeriesSnapshot::reload(read, LineageOrigin::Miss, None);
+        let shape: Vec<_> = snapshot
+            .chunks
+            .iter()
+            .map(|chunk| (&*chunk.tag, chunk.rows.len(), chunk.rows.capacity()))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("", COMPACT_ROWS, COMPACT_ROWS),
+                ("", COMPACT_ROWS, COMPACT_ROWS),
+                ("", 5, 5),
+                ("t", 3, 3)
+            ]
+        );
+        assert!(Arc::ptr_eq(
+            &snapshot.chunks[0].tag,
+            &snapshot.chunks[2].tag
+        ));
+        assert_layout(&snapshot);
+    }
+
+    /// A full read whose rows leave (tag, step) order, or repeat a (tag, step), fails, in a release build too; a chunk boundary or a new tag's first step changes nothing.
+    #[test]
+    fn a_full_read_out_of_order_fails() {
+        let read = |rows: &[(&str, i64)]| {
+            let mut read = FullRead::default();
+            rows.iter()
+                .try_for_each(|&(tag, step)| read.push(tag, CachedRow::of(&row(tag, step, 0.0, 1))))
+        };
+        assert!(read(&[("a", 5), ("a", 7), ("b", -3), ("c", -1_000)]).is_ok());
+        let across: Vec<_> = (0..=COMPACT_ROWS as i64).map(|step| ("a", step)).collect();
+        assert!(read(&across).is_ok());
+        for rows in [
+            &[("a", 1), ("a", 0)][..],
+            &[("a", 1), ("a", 1)],
+            &[("b", 0), ("a", 1)],
+            &[("a", 0), ("b", 0), ("a", 1)],
+        ] {
+            assert!(read(rows).is_err(), "{rows:?}");
+        }
+        let mut late = across;
+        late.push(("a", 3));
+        assert!(read(&late).is_err(), "after a sealed chunk");
+    }
+
+    #[test]
+    fn compaction_bounds_chunks_and_the_rows_a_refresh_copies() {
+        let mut rng = crate::Rng(0x2545_F491_4F6C_DD1D);
+        // Tiny appends (the common poll), then large ones (a backlog), on a series loaded with full chunks.
+        let mut snapshot = Arc::new(SeriesSnapshot::full(
+            (0..50_000).map(|step| row("", step, 0.0, step)).collect(),
+        ));
+        let mut expected = snapshot.to_vec();
+        let mut next = 50_000i64;
+        for round in 0..1_600 {
+            let count = if round < 1_500 {
+                1 + rng.below(40)
+            } else {
+                1 + rng.below(9_000)
+            } as i64;
+            let increment: Vec<_> = (next..next + count)
+                .map(|step| row("", step, 1.0, step))
+                .collect();
+            next += count;
+            expected.extend(increment.iter().cloned());
+            let merged = snapshot.merge(&increment).unwrap();
+            assert!(unshared_rows(&snapshot, &merged) <= count as usize + 2 * COMPACT_ROWS);
+            assert!(merged
+                .chunks
+                .iter()
+                .all(|chunk| chunk.rows.capacity() == chunk.rows.len()));
+            assert_chunk_layout(&merged);
+            snapshot = merged;
+        }
+        assert_layout(&snapshot);
+        assert!(same_rows(&snapshot.to_vec(), &expected));
+        assert!(snapshot.chunks.len() > 2);
+    }
+
+    #[test]
+    fn increments_out_of_tag_step_order_are_refused() {
+        let held = Arc::new(SeriesSnapshot::full(vec![
+            row("", 1, 1.0, 100),
+            row("b", 1, 1.0, 100),
+        ]));
+        // ClickHouse orders increments by (tag, step); an unordered one is read again in full.
+        assert!(held
+            .merge(&[row("", 3, 1.0, 200), row("", 2, 1.0, 200)])
+            .is_none());
+        assert!(held
+            .merge(&[row("b", 2, 1.0, 200), row("a", 1, 1.0, 200)])
+            .is_none());
+        // A tombstone out of order is refused too, though deduplication drops it before any value row is placed.
+        assert!(held
+            .merge(&[
+                row("", 2, 1.0, 200),
+                tombstone("c", 5, 200),
+                row("a", 1, 1.0, 200)
+            ])
+            .is_none());
+        let merged = held
+            .merge(&[
+                row("", 2, 1.0, 200),
+                row("a", 1, 1.0, 200),
+                row("b", 2, 1.0, 200),
+            ])
+            .unwrap();
+        assert!(same_rows(
+            &merged.to_vec(),
+            &[
+                row("", 1, 1.0, 100),
+                row("", 2, 1.0, 200),
+                row("a", 1, 1.0, 200),
+                row("b", 1, 1.0, 100),
+                row("b", 2, 1.0, 200),
+            ]
+        ));
+        assert_layout(&merged);
+    }
+
+    /// glibc's chunk for a request: the request and an 8-byte header, 16-byte aligned, at least 32 bytes; mmapped as whole pages with the header once that chunk reaches the 128 KiB threshold (the lowest it can be).
+    fn glibc_chunk(bytes: usize) -> usize {
+        let chunk = ((bytes + 8 + 15) & !15).max(32);
+        if chunk >= 128 << 10 {
+            (chunk + 8).next_multiple_of(4096)
+        } else {
+            chunk
+        }
+    }
+
+    #[test]
+    fn the_allocation_models_bound_their_allocators() {
+        for bytes in (1..=300_000).chain((1..4_000).map(|n| n * 25_013)) {
+            assert!(
+                glibc_allocation_bytes(bytes) >= glibc_chunk(bytes),
+                "glibc: {bytes} bytes"
+            );
+        }
+        // At the mmap threshold, compared with the chunk: 4,094 and 4,095 rows of 32 bytes.
+        assert!(glibc_allocation_bytes(131_008) >= 131_024);
+        assert!(glibc_allocation_bytes(131_040) >= 135_168);
+        // Below 2 MiB: from there macOS can serve a request from a larger freed block it keeps cached.
+        #[cfg(target_os = "macos")]
+        for bytes in (1..=70_000).chain((70..2_097).map(|n| n * 1_000 + 7)) {
+            // SAFETY: a fresh allocation, measured and freed at once.
+            let held = unsafe {
+                let pointer = libc::malloc(bytes);
+                let held = libc::malloc_size(pointer);
+                libc::free(pointer);
+                held
+            };
+            assert!(
+                macos_allocation_bytes(bytes) >= held,
+                "macOS: {bytes} bytes"
+            );
+        }
+    }
+
+    /// Bytes the process allocator reports in use (allocation sizes as rounded by the allocator).
+    fn allocator_bytes_in_use() -> Option<usize> {
+        #[cfg(target_os = "macos")]
+        {
+            let mut stats = libc::malloc_statistics_t {
+                blocks_in_use: 0,
+                size_in_use: 0,
+                max_size_in_use: 0,
+                size_allocated: 0,
+            };
+            // SAFETY: a null zone asks for every zone's totals; `stats` is a valid out-pointer.
+            unsafe { libc::malloc_zone_statistics(std::ptr::null_mut(), &mut stats) };
+            Some(stats.size_in_use)
+        }
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        {
+            // SAFETY: mallinfo2 only reads the allocator's counters.
+            let info = unsafe { libc::mallinfo2() };
+            Some(info.uordblks + info.hblkhd)
+        }
+        #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
+        {
+            None
+        }
+    }
+
+    /// Refresh cost per append, at the doc's sizes. Run alone:
+    /// `cargo test --release -p kymo-server --lib series_cache_append_benchmark -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore = "local release benchmark; no CI timing job"]
+    fn series_cache_append_benchmark() {
+        const APPENDS: usize = 4096;
+        const NEW: i64 = 16;
+        // A refresh re-reads the visibility margin: rows the cache already holds come back with the new ones.
+        const OVERLAP: i64 = 16;
+        for size in [100_000i64, 1_000_000] {
+            let cache = SeriesCache::with_budget(usize::MAX);
+            let key = SeriesKey::new("p", "r", "m");
+            let point = |step: i64| row("", step, step as f32 * 0.5, 1_000 + step);
+            cache.insert_full(key.clone(), (0..size).map(point).collect(), Instant::now());
+            let mut times = Vec::with_capacity(APPENDS);
+            let mut next = size;
+            for _ in 0..APPENDS {
+                let increment: Vec<_> = (next - OVERLAP..next + NEW).map(point).collect();
+                let base = base_of(&cache, &key);
+                let start = Instant::now();
+                let rows = cache
+                    .apply_increment(&key, increment, Instant::now(), &base)
+                    .unwrap();
+                times.push(start.elapsed().as_secs_f64() * 1e3);
+                assert_eq!(rows.len() as i64, next + NEW);
+                drop(std::hint::black_box(rows));
+                next += NEW;
+            }
+            let mean = times.iter().sum::<f64>() / times.len() as f64;
+            times.sort_by(f64::total_cmp);
+            println!(
+                "BENCH append rows={size} appends={APPENDS} new={NEW} overlap={OVERLAP} median_ms={:.4} mean_ms={:.4} p99_ms={:.4} max_ms={:.4}",
+                times[times.len() / 2],
+                mean,
+                times[times.len() * 99 / 100],
+                times[times.len() - 1]
+            );
+        }
+    }
+
+    /// Memory of a cache full of typical series: rows retained, the cache's accounted bytes, and the allocator's bytes in use. Run alone (the allocator counters are process-wide):
+    /// `cargo test --release -p kymo-server --lib series_cache_memory_benchmark -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore = "local release benchmark; no CI timing job"]
+    fn series_cache_memory_benchmark() {
+        const BUDGET: usize = 256 << 20;
+        // The prod-average series (26k rows): a full load of 20k rows, then 300 refreshes of 20 new rows, each re-reading 10.
+        const LOADED: i64 = 20_000;
+        const REFRESHES: i64 = 300;
+        const NEW: i64 = 20;
+        const OVERLAP: i64 = 10;
+        for tags in [
+            &[""][..],
+            &[
+                "layer.00.grad_norm",
+                "layer.01.grad_norm",
+                "layer.02.grad_norm",
+                "layer.03.grad_norm",
+            ][..],
+        ] {
+            let before = allocator_bytes_in_use();
+            let cache = SeriesCache::with_budget(BUDGET);
+            let t = tags.len() as i64;
+            // (tag, step)-ordered, as ClickHouse returns them; the tag names are sorted.
+            let rows_in = |from: i64, to: i64| -> Vec<VersionedRawPoint> {
+                tags.iter()
+                    .flat_map(|tag| {
+                        (from..to).map(move |step| row(tag, step, step as f32, 1_000 + step))
+                    })
+                    .collect()
+            };
+            let mut series = 0usize;
+            let mut stored_after_first_eviction = None;
+            loop {
+                let key = SeriesKey::new("p", format!("run-{series}"), "loss");
+                cache.insert_full(key.clone(), rows_in(0, LOADED / t), Instant::now());
+                for refresh in 0..REFRESHES {
+                    let end = LOADED / t + (refresh + 1) * (NEW / t);
+                    let base = base_of(&cache, &key);
+                    cache
+                        .apply_increment(
+                            &key,
+                            rows_in(end - NEW / t - OVERLAP / t, end),
+                            Instant::now(),
+                            &base,
+                        )
+                        .unwrap();
+                }
+                series += 1;
+                let evicted = !cache.inner.lock().unwrap().evicted.is_empty();
+                if evicted && stored_after_first_eviction.is_none() {
+                    stored_after_first_eviction = Some(series);
+                }
+                if stored_after_first_eviction.is_some_and(|first| series >= first + first / 10) {
+                    break;
+                }
+            }
+            let after = allocator_bytes_in_use();
+            let inner = cache.inner.lock().unwrap();
+            let rows: usize = inner.map.values().map(|entry| entry.rows.len()).sum();
+            let real = before
+                .zip(after)
+                .map(|(before, after)| after.saturating_sub(before));
+            println!(
+                "BENCH memory tags={} budget_bytes={BUDGET} entries={} rows={rows} accounted_bytes={} allocator_bytes={} allocator_per_row={:.1} accounted_per_row={:.1}",
+                tags.len(),
+                inner.map.len(),
+                inner.total_bytes,
+                real.map_or("n/a".into(), |real| real.to_string()),
+                real.map_or(f64::NAN, |real| real as f64 / rows as f64),
+                inner.total_bytes as f64 / rows as f64,
+            );
+        }
+    }
+
+    /// A cold full read end to end through the client (decode, chunking, hashing, storing) from a local mock of ClickHouse that serves the rows already encoded: the median time, and the allocator's peak above its level before the read (sampled every 50 µs), per row. Run alone:
+    /// `cargo test --release -p kymo-server --lib series_cache_cold_read_benchmark -- --ignored --nocapture --test-threads=1`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "local release benchmark; no CI timing job"]
+    async fn series_cache_cold_read_benchmark() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        #[derive(serde::Serialize, ::clickhouse::Row)]
+        struct Encoded {
+            run_id: String,
+            tag: String,
+            step: i64,
+            timestamp_ms: i64,
+            value: f32,
+            inserted_ms: i64,
+        }
+        for (rows, tags) in [
+            (100_000i64, 1i64),
+            (100_000, 4),
+            (1_000_000, 1),
+            (1_000_000, 4),
+        ] {
+            let names: Vec<String> = (0..tags)
+                .map(|i| {
+                    if tags == 1 {
+                        String::new()
+                    } else {
+                        format!("layer.{i:02}.grad_norm")
+                    }
+                })
+                .collect();
+            let mock = ::clickhouse::test::Mock::new();
+            let client = crate::clickhouse::ChClient::new(mock.url()).unwrap();
+            let (mut times, mut peaks) = (Vec::new(), Vec::new());
+            for _ in 0..7 {
+                client.purge_run_caches(&[("p", "r")]);
+                mock.add(::clickhouse::test::handlers::provide(
+                    names.iter().flat_map(|tag| {
+                        (0..rows / tags).map(move |step| Encoded {
+                            run_id: "r".into(),
+                            tag: tag.clone(),
+                            step,
+                            timestamp_ms: 1_000 + step * 10,
+                            value: step as f32 * 0.5,
+                            inserted_ms: 1_000 + step,
+                        })
+                    }),
+                ));
+                let before = allocator_bytes_in_use().unwrap_or(0);
+                let stop = Arc::new(AtomicBool::new(false));
+                let sampler = {
+                    let stop = stop.clone();
+                    std::thread::spawn(move || {
+                        let mut peak = 0;
+                        while !stop.load(Ordering::Relaxed) {
+                            peak = peak.max(allocator_bytes_in_use().unwrap_or(0));
+                            std::thread::sleep(Duration::from_micros(50));
+                        }
+                        peak.max(allocator_bytes_in_use().unwrap_or(0))
+                    })
+                };
+                let start = Instant::now();
+                let snapshot = client
+                    .query_raw_any_cached("p", "r", "m", || None)
+                    .await
+                    .unwrap();
+                times.push(start.elapsed().as_secs_f64() * 1e3);
+                stop.store(true, Ordering::Relaxed);
+                peaks.push(sampler.join().unwrap().saturating_sub(before) as f64 / rows as f64);
+                assert_eq!(snapshot.len() as i64, rows);
+            }
+            times.sort_by(f64::total_cmp);
+            peaks.sort_by(f64::total_cmp);
+            println!(
+                "BENCH cold_read rows={rows} tags={tags} median_ms={:.2} min_ms={:.2} peak_bytes_per_row={:.1}",
+                times[times.len() / 2],
+                times[0],
+                peaks[peaks.len() / 2]
+            );
+        }
+    }
+
+    /// The cache's lock under refreshes that extend many tags at once: 64 tags of 20k rows, 1,024 refreshes of 16 new rows per tag, while another thread times lookups of an unrelated entry, each of which waits for the lock. Run alone:
+    /// `cargo test --release -p kymo-server --lib series_cache_lockstep_tags_benchmark -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore = "local release benchmark; no CI timing job"]
+    fn series_cache_lockstep_tags_benchmark() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const TAGS: usize = 64;
+        const LOADED: i64 = 20_000;
+        const REFRESHES: i64 = 1_024;
+        const NEW: i64 = 16;
+        let cache = Arc::new(SeriesCache::with_budget(usize::MAX));
+        let key = SeriesKey::new("p", "r", "m");
+        let probe = SeriesKey::new("p", "probe", "m");
+        cache.insert_full(probe.clone(), vec![row("", 0, 0.0, 1)], Instant::now());
+        let tags: Vec<String> = (0..TAGS).map(|i| format!("t{i:02}")).collect();
+        let point = |tag: &str, step: i64| row(tag, step, step as f32, 1_000 + step);
+        cache.insert_full(
+            key.clone(),
+            tags.iter()
+                .flat_map(|tag| (0..LOADED).map(move |step| point(tag, step)))
+                .collect(),
+            Instant::now(),
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let prober = {
+            let (cache, stop, probe) = (cache.clone(), stop.clone(), probe.clone());
+            std::thread::spawn(move || {
+                let mut waits = Vec::new();
+                while !stop.load(Ordering::Relaxed) {
+                    let start = Instant::now();
+                    drop(std::hint::black_box(cache.lookup(&probe)));
+                    waits.push(start.elapsed().as_secs_f64() * 1e3);
+                }
+                waits
+            })
+        };
+        let mut times = Vec::new();
+        for refresh in 0..REFRESHES {
+            let from = LOADED + refresh * NEW;
+            let increment: Vec<_> = tags
+                .iter()
+                .flat_map(|tag| (from..from + NEW).map(move |step| point(tag, step)))
+                .collect();
+            let base = base_of(&cache, &key);
+            let start = Instant::now();
+            let rows = cache
+                .apply_increment(&key, increment, Instant::now(), &base)
+                .unwrap();
+            times.push(start.elapsed().as_secs_f64() * 1e3);
+            drop(std::hint::black_box(rows));
+        }
+        stop.store(true, Ordering::Relaxed);
+        let mut waits = prober.join().unwrap();
+        let mean = times.iter().sum::<f64>() / times.len() as f64;
+        times.sort_by(f64::total_cmp);
+        waits.sort_by(f64::total_cmp);
+        println!(
+            "BENCH lockstep tags={TAGS} refreshes={REFRESHES} refresh_median_ms={:.4} refresh_mean_ms={:.4} refresh_max_ms={:.3} lookups={} lookup_p999_ms={:.4} lookup_max_ms={:.3}",
+            times[times.len() / 2],
+            mean,
+            times[times.len() - 1],
+            waits.len(),
+            waits[waits.len() * 999 / 1000],
+            waits[waits.len() - 1]
+        );
     }
 }

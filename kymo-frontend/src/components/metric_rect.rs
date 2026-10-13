@@ -13,10 +13,13 @@ use crate::state::app_state::set_chart_facts;
 use crate::state::chart_sync::ChartCacheEntry;
 use crate::state::layout_config::{CdnDisplayMode, MetricBinding, RectOptions, RunRef};
 use crate::state::panel_cache::{panel_key, Store};
+use crate::state::run_metrics::{self, RunMetrics, Stamp};
 use crate::state::visibility::{self, Zone};
 use crate::state::zones::ZoneRegistry;
 use crate::state::{resolve_capped_bindings, DashboardState, DisplayType, PanelTarget, RectConfig};
-use crate::util::{confirm, editor_trigger_id, focus_on_mount, is_app_escape, primary};
+use crate::util::{
+    confirm, editor_trigger_id, focus_on_mount, is_app_escape, primary, set_if_changed,
+};
 
 /// A chart's title: its label, else its metrics' names without their section prefix.
 pub(crate) fn rect_title(config: &RectConfig) -> String {
@@ -54,11 +57,11 @@ mod numeric_content;
 mod resize_js;
 use numeric_content::NumericContent;
 
-/// The old count-only assumption was 256 entries at a few hundred KiB each.
-/// Make that intended ~128 MiB ceiling explicit; a single larger response is
-/// rendered but not retained after its panel unmounts.
+/// Room for the chart cache's 256 entries at a few hundred KiB each; a single larger response is rendered but not retained after its panel unmounts.
 const CHART_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
 const CDN_KEYS_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
+/// A type cache entry weighs about 200 bytes per source: room for thousands of panels of a dozen runs, and for a few that bind every run of a large project.
+const TYPE_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 thread_local! {
     /// Per-panel chart cache (chart_sync::ChartCacheEntry), surviving body unmounts (see MetricRect). Validity = ChartCacheEntry::fresh_for (the reply's version echo and send-time snapshots vs current values), never which version bump triggered a resource run. Entries always hold a FULL response (deltas splice before storing): they answer run-subset requests locally, splice the next delta, and re-render instantly on remount. Rc: hits are refcount bumps, not multi-MB copies. Both entry count and estimated retained heap bytes are hard-bounded.
@@ -68,10 +71,10 @@ thread_local! {
     #[allow(clippy::type_complexity)]
     static CDN_KEYS_CACHE: RefCell<Store<(Vec<SeriesRef>, HashMap<String, u64>, Vec<CdnSeries>)>> =
         RefCell::new(Store::with_weight_limit(256, CDN_KEYS_CACHE_MAX_BYTES));
-    /// Per-panel (metrics-gen key, bound metric names) -> detected (numeric, cdn, text). Tiny entries, generous cap.
+    /// Per-panel (metrics-gen key, resolved sources) -> detected types, serving while both are unchanged: run A's `m` beside run B's `n` can detect differently from A's `n` beside B's `m`, which binds the same runs and names. The sources are the panel's own refs, shared while it is mounted.
     #[allow(clippy::type_complexity)]
-    static TYPE_CACHE: RefCell<Store<(u64, Vec<String>, (bool, bool, bool))>> =
-        RefCell::new(Store::new(2048));
+    static TYPE_CACHE: RefCell<Store<(u64, Rc<Vec<SeriesRef>>, Detection)>> =
+        RefCell::new(Store::with_weight_limit(2048, TYPE_CACHE_MAX_BYTES));
 }
 
 /// The gallery cache hit rule (CDN_KEYS_CACHE): an entry serves a request whose refs match while every requested run's stamp covers what the client knows ([`crate::state::stamp_covers`]).
@@ -90,33 +93,33 @@ fn cdn_cache_hit(
         })
 }
 
+/// Whether two lists of refs name the same metrics, whatever runs they bind. A chart or gallery answer for other metrics (a retargeted source) is no answer for the panel's refs, which show "Loading..." until theirs lands; one for other runs of the same metrics (a run toggle, the max_runs slide) keeps showing meanwhile. A source with no metric chosen names nothing.
+fn same_metric_names(answered: &[SeriesRef], current: &[SeriesRef]) -> bool {
+    fn names(refs: &[SeriesRef]) -> std::collections::HashSet<&str> {
+        refs.iter()
+            .map(|r| r.metric_name.as_str())
+            .filter(|name| !name.is_empty())
+            .collect()
+    }
+    names(answered) == names(current)
+}
+
 fn cdn_cache_heap_bytes(
     refs: &Vec<SeriesRef>,
     stamps: &HashMap<String, u64>,
     series: &Vec<CdnSeries>,
 ) -> usize {
+    use crate::state::chart_sync::{string_map_heap_bytes, vec_heap_bytes};
     let mut bytes = std::mem::size_of::<(Vec<SeriesRef>, HashMap<String, u64>, Vec<CdnSeries>)>()
-        .saturating_add(
-            refs.capacity()
-                .saturating_mul(std::mem::size_of::<SeriesRef>()),
-        )
-        .saturating_add(crate::state::chart_sync::string_map_heap_bytes(stamps))
-        .saturating_add(
-            series
-                .capacity()
-                .saturating_mul(std::mem::size_of::<CdnSeries>()),
-        );
+        .saturating_add(vec_heap_bytes(refs))
+        .saturating_add(string_map_heap_bytes(stamps))
+        .saturating_add(vec_heap_bytes(series));
     for reference in refs {
         bytes = bytes
             .saturating_add(reference.project_id.capacity())
             .saturating_add(reference.run_id.capacity())
             .saturating_add(reference.metric_name.capacity())
-            .saturating_add(
-                reference
-                    .tags
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<String>()),
-            )
+            .saturating_add(vec_heap_bytes(&reference.tags))
             .saturating_add(
                 reference
                     .tags
@@ -130,11 +133,7 @@ fn cdn_cache_heap_bytes(
             .saturating_add(item.project_id.capacity())
             .saturating_add(item.run_id.capacity())
             .saturating_add(item.metric_name.capacity())
-            .saturating_add(
-                item.entries
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<crate::grpc::proto::CdnEntry>()),
-            )
+            .saturating_add(vec_heap_bytes(&item.entries))
             .saturating_add(
                 item.entries
                     .iter()
@@ -176,15 +175,15 @@ fn decorate_cdn_series(
     series
         .into_iter()
         .map(|series| {
-            let run_name = crate::state::run_name_for(all_runs, &series.run_id);
-            let ordinal = crate::state::run_ordinal_for(all_runs, &series.run_id);
-            let ended =
-                crate::state::app_state::find_run(all_runs, &series.run_id).is_some_and(|run| {
-                    matches!(
-                        run.status(),
-                        RunStatus::Crashed | RunStatus::Finished | RunStatus::PresumedDead
-                    )
-                });
+            let run = crate::state::app_state::find_run(all_runs, &series.run_id);
+            let run_name = run.map_or_else(|| series.run_id.clone(), |run| run.run_name.clone());
+            let ordinal = run.map_or(0, |run| run.ordinal);
+            let ended = run.is_some_and(|run| {
+                matches!(
+                    run.status(),
+                    RunStatus::Crashed | RunStatus::Finished | RunStatus::PresumedDead
+                )
+            });
             let (label, color) = if all_same_metric {
                 (run_name, run_color(&series.run_id, ordinal))
             } else {
@@ -238,17 +237,12 @@ pub fn MetricRect(
     // The body's title rename: scrolling it out of the band mid-rename must not unmount the input. Fetches still freeze at Far — `allowed` gates on the zone, not on mount.
     let renaming = use_signal(|| false);
     let registry = use_context::<ZoneRegistry>();
-    use_hook({
-        let registry = registry.clone();
-        let id = config.id.clone();
-        move || {
-            if !is_maximized {
-                registry.register(id, zone);
-            }
+    use_hook(|| {
+        if !is_maximized {
+            registry.register(config.id.clone(), zone);
         }
     });
     use_drop({
-        let registry = registry.clone();
         let id = config.id.clone();
         move || {
             if !is_maximized {
@@ -285,7 +279,6 @@ fn MetricRectBody(
     zone: Signal<Zone>,
     mut renaming: Signal<bool>,
 ) -> Element {
-    let initial_label = config.label.clone();
     let trigger_id = editor_trigger_id(
         if is_maximized {
             "rect-max"
@@ -306,15 +299,11 @@ fn MetricRectBody(
     // facts so the chart panel shows only modes that apply (e.g. hides Image
     // Gallery mode for metadata trees).
     let cdn_class = use_signal(|| Option::<String>::None);
-    // AutoContent may need a registry probe when a saved Specific rect has
-    // outlived its discovery metric. Keep that observed type ephemeral: the
-    // editor needs the right controls, but the synthetic fallback must never
-    // become a persisted user override.
     let resolved_display_type = use_signal(|| Option::<DisplayType>::None);
 
     let display_title = rect_title(&config);
 
-    let mut rename_value = use_signal(move || initial_label.clone());
+    let mut rename_value = use_signal(|| config.label.clone());
 
     let state = use_context::<DashboardState>();
     // The options panel edits the maximized chart from outside this body, so the maximized copy reports what it learns about its content; what the grid copy handed over (Configure, below) fills in what it hasn't learned yet.
@@ -354,7 +343,6 @@ fn MetricRectBody(
                 .read()
                 .as_ref()
                 .is_some_and(|p| p.target == PanelTarget::Chart));
-    let options = config.options.clone();
     // Key into the module-level caches. The overlay copy gets its own entries — its width (and so its chart request) differs from the grid rect's, and the two must not evict each other per open/close.
     let cache_key = use_hook(|| {
         let base = panel_key(&state.project_id.peek(), &config.id);
@@ -364,20 +352,6 @@ fn MetricRectBody(
             base
         }
     });
-    let content = rsx! {
-        AutoContent {
-            rect_id: config.id.clone(),
-            bindings: config.bindings.clone(),
-            display_type_hint: config.display_type,
-            options: options,
-            loading: loading,
-            cdn_class: cdn_class,
-            zone: zone,
-            cache_key: cache_key.clone(),
-            resolved_display_type: resolved_display_type,
-        }
-    };
-
     rsx! {
         Fragment {
             div { class: "rect-header",
@@ -496,54 +470,59 @@ fn MetricRectBody(
                 }
             }
 
-            {content}
+            AutoContent {
+                rect_id: config.id.clone(),
+                bindings: config.bindings.clone(),
+                display_type_hint: config.display_type,
+                options: config.options.clone(),
+                loading: loading,
+                cdn_class: cdn_class,
+                zone: zone,
+                cache_key: cache_key.clone(),
+                resolved_display_type: resolved_display_type,
+            }
 
             if *loading.read() {
                 span { class: "rect-loading-indicator", SpinnerIcon {} }
             }
 
             if !is_maximized {
-                {
-                let rect_id_for_resize = config.id.clone();
-                rsx! {
-                    div {
-                        class: "rect-resize-handle",
-                        "data-rect-id": "{rect_id_for_resize}",
-                        title: "Drag to resize",
-                        onmousedown: primary({
-                            let rect_id = config.id.clone();
-                            move |e: Event<MouseData>| {
-                                // The default mousedown action anchors a text selection that the drag then extends; the resize JS attaches too late (async eval) to stop it, so kill it here, as width_drag.js does for the width handles.
-                                e.prevent_default();
-                                let start_y = e.page_coordinates().y;
-                                let rid = rect_id.clone();
-                                spawn(async move {
-                                    let js = resize_js::build(start_y, &rid);
-                                    let mut eval = document::eval(&js);
-                                    match eval.recv::<serde_json::Value>().await {
-                                        Ok(val) => {
-                                            let dy = val["dy"].as_f64().unwrap_or(0.0) as i32;
-                                            // One gesture, two edits: the height belongs to the section, the span to the rect.
-                                            if dy != 0 {
-                                                let section = state.layout_config.peek().as_ref().and_then(|l| l.section_of_rect(&rid).map(|s| (s.name.clone(), s.chart_height)));
-                                                if let Some((section, height)) = section {
-                                                    let height = (height as i32 + dy).clamp(100, 800) as u32;
-                                                    state.edit_section_settings(&section, |s| s.chart_height = height);
-                                                } else {
-                                                    crate::util::warn(&format!("[resize] {rid} is no longer in the layout; its height drag was dropped"));
-                                                }
-                                            }
-                                            if let Some(span) = val["span"].as_u64().map(|v| v as u32) {
-                                                state.edit_rect(&rid, |diff, base| diff.edit_rect(base, &rid, |r| r.options.column_span = span));
+                div {
+                    class: "rect-resize-handle",
+                    "data-rect-id": "{config.id}",
+                    title: "Drag to resize",
+                    onmousedown: primary({
+                        let rect_id = config.id.clone();
+                        move |e: Event<MouseData>| {
+                            // The default mousedown action anchors a text selection that the drag then extends; the resize JS attaches too late (async eval) to stop it, so kill it here, as width_drag.js does for the width handles.
+                            e.prevent_default();
+                            let start_y = e.page_coordinates().y;
+                            let rid = rect_id.clone();
+                            spawn(async move {
+                                let js = resize_js::build(start_y, &rid);
+                                let mut eval = document::eval(&js);
+                                match eval.recv::<serde_json::Value>().await {
+                                    Ok(val) => {
+                                        let dy = val["dy"].as_f64().unwrap_or(0.0) as i32;
+                                        // One gesture, two edits: the height belongs to the section, the span to the rect.
+                                        if dy != 0 {
+                                            let section = state.layout_config.peek().as_ref().and_then(|l| l.section_of_rect(&rid).map(|s| (s.name.clone(), s.chart_height)));
+                                            if let Some((section, height)) = section {
+                                                let height = (height as i32 + dy).clamp(100, 800) as u32;
+                                                state.edit_section_settings(&section, |s| s.chart_height = height);
+                                            } else {
+                                                crate::util::warn(&format!("[resize] {rid} is no longer in the layout; its height drag was dropped"));
                                             }
                                         }
-                                        Err(e) => crate::util::warn(&format!("[resize] bridge channel lost: {e:?}")),
+                                        if let Some(span) = val["span"].as_u64().map(|v| v as u32) {
+                                            state.edit_rect(&rid, |diff, base| diff.edit_rect(base, &rid, |r| r.options.column_span = span));
+                                        }
                                     }
-                                });
-                            }
-                        }),
-                    }
-                }
+                                    Err(e) => crate::util::warn(&format!("[resize] bridge channel lost: {e:?}")),
+                                }
+                            });
+                        }
+                    }),
                 }
             }
 
@@ -551,57 +530,72 @@ fn MetricRectBody(
     }
 }
 
+/// Whether a panel detects its type instead of taking the discovery hint: a metric other than the one it is named for (`rect_id`), which several names always include, or specific runs, so a legacy saved override can be reconstructed after its discovery metric vanishes without guessing its type. A source with no metric chosen (the editor's "— Select metric —") names nothing, so it is skipped: adding one keeps the panel on its renderer.
 fn needs_metric_type_check(rect_id: &str, bindings: &[MetricBinding]) -> bool {
-    let distinct_metrics: std::collections::HashSet<&str> = bindings
+    bindings
         .iter()
-        .map(|binding| binding.metric_name.as_str())
-        .collect();
-    distinct_metrics.len() > 1
-        || bindings
-            .iter()
-            .any(|binding| !binding.metric_name.is_empty() && binding.metric_name != rect_id)
-        || bindings.iter().any(
-            |binding| matches!(&binding.runs, RunRef::Specific(run_ids) if !run_ids.is_empty()),
-        )
+        .filter(|binding| !binding.metric_name.is_empty())
+        .any(|binding| {
+            binding.metric_name != rect_id
+                || matches!(&binding.runs, RunRef::Specific(run_ids) if !run_ids.is_empty())
+        })
 }
 
-fn every_source_terminal(source_count: usize, terminal_count: usize) -> bool {
-    source_count > 0 && terminal_count == source_count
+/// What a panel's sources detect from their runs' registries.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Detection {
+    /// No readable source's run lists its metric: the panel shows the numeric chart.
+    Nothing,
+    One(DisplayType),
+    /// Different names of different types, which a chart cannot mix.
+    Mixed,
 }
 
-fn sole_detected_display_type(types: (bool, bool, bool)) -> Option<DisplayType> {
-    match types {
-        (true, false, false) => Some(DisplayType::Numeric),
-        (false, true, false) => Some(DisplayType::Cdn),
-        (false, false, true) => Some(DisplayType::TextStream),
-        _ => None,
+impl Detection {
+    /// The editor's type, only when unambiguous.
+    fn sole(self) -> Option<DisplayType> {
+        match self {
+            Self::One(kind) => Some(kind),
+            _ => None,
+        }
     }
 }
 
-fn note_resolved_display_type(
-    mut resolved: Signal<Option<DisplayType>>,
-    next: Option<DisplayType>,
-) {
-    if *resolved.peek() != next {
-        resolved.set(next);
+/// What a panel's sources detect, from each source run's registry (None: the run is terminal); None when every source is terminal. A name listed as different types by different runs takes the highest [`DisplayType`], as discovery over a run set lists it: run A's CDN `m` beside run B's numeric `m` is a numeric chart with B's data, whichever run comes first.
+fn merged_types(
+    refs: &[SeriesRef],
+    lists: &HashMap<(&str, &str), Option<RunMetrics>>,
+) -> Option<Detection> {
+    let mut kinds: HashMap<&str, DisplayType> = HashMap::new();
+    let mut terminal = 0;
+    for r in refs {
+        let Some(Some(list)) = lists.get(&(r.project_id.as_str(), r.run_id.as_str())) else {
+            terminal += 1;
+            continue;
+        };
+        if let Some(&kind) = list.get(&r.metric_name) {
+            let merged = kinds.entry(&r.metric_name).or_insert(kind);
+            *merged = kind.max(*merged);
+        }
     }
+    if terminal > 0 && terminal == refs.len() {
+        return None;
+    }
+    let mut kinds = kinds.into_values();
+    Some(match kinds.next() {
+        None => Detection::Nothing,
+        Some(first) if kinds.all(|kind| kind == first) => Detection::One(first),
+        Some(_) => Detection::Mixed,
+    })
 }
 
-/// Detects whether bindings resolve to numeric, CDN, or mixed metrics,
-/// and renders the appropriate content (or an error for mixed).
-/// Multiple or retargeted metric names need type detection. Specific bindings
-/// also detect even with one unchanged metric so a legacy saved override can
-/// be reconstructed after its discovery metric vanishes without guessing its
-/// numeric/CDN/text type.
+/// Detects whether bindings resolve to numeric, CDN, or mixed metrics when [`needs_metric_type_check`] asks, and renders the appropriate content (or an error for mixed).
 #[component]
 fn AutoContent(
     rect_id: String,
     bindings: ReadSignal<Vec<MetricBinding>>,
-    display_type_hint: DisplayType,
+    display_type_hint: ReadSignal<DisplayType>,
     options: ReadSignal<RectOptions>,
-    /// Flipped true while a leaf content's data query is in flight, so the
-    /// parent MetricRect can show a spinner and the leaves can gate their
-    /// own version-driven refetches against being cancelled mid-flight.
     loading: Signal<bool>,
     /// CDN sub-type bubbled up from the manifest renderer. Numeric and text
     /// paths leave it None.
@@ -609,7 +603,6 @@ fn AutoContent(
     /// Viewport zone from the slot (see MetricRect) — the leaves gate
     /// fetching (and, for charts, rendering) on it.
     zone: Signal<Zone>,
-    /// Key into the module-level caches (see the thread_locals up top).
     cache_key: String,
     /// The type actually observed for this binding set, used only to choose
     /// the editor's controls. It never mutates or persists the RectConfig.
@@ -617,22 +610,17 @@ fn AutoContent(
 ) -> Element {
     let state = use_context::<DashboardState>();
 
-    let needs_type_check = needs_metric_type_check(&rect_id, &bindings.read());
+    // A memo, not a value captured from the render: an edit restarts the detection resource below through `refs` before this body renders again, and that restart must see the new bindings' answer.
+    let needs_type_check = use_memo(move || needs_metric_type_check(&rect_id, &bindings.read()));
     let max_runs = use_memo(move || options.read().max_runs);
 
     // ONE resolution pass per panel — AutoContent is the parent of every content viewer. The leaves query these refs, so a run list or names landing restarts nothing whose refs are unchanged.
     let refs = use_memo(move || {
-        Rc::new(
-            resolve_capped_bindings(&bindings.read(), &state.view_context(), *max_runs.read())
-                .into_iter()
-                .map(|r| SeriesRef {
-                    project_id: r.project_id,
-                    run_id: r.run_id,
-                    metric_name: r.metric_name,
-                    tags: vec![],
-                })
-                .collect::<Vec<_>>(),
-        )
+        Rc::new(resolve_capped_bindings(
+            &bindings.read(),
+            &state.view_context(),
+            *max_runs.read(),
+        ))
     });
     // The one readiness rule: hold the panel until its runs and their names are known.
     let ready = use_memo(move || {
@@ -660,120 +648,119 @@ fn AutoContent(
         )
     });
 
-    // Zone gate + cache, like the data fetches: an out-of-band rect (mounted only mid-rename) must not turn a registry event into list_metrics traffic, and a Near/Visible re-detection defers to visible fetches. The cache keys on (metrics-gen hash, bound metric NAMES) — a binding edit that keeps the same runs but swaps metrics must not serve the old types. All-terminal passes never enter it. It lives in TYPE_CACHE so a body remounting after a scroll-away skips re-detection.
+    // Zone gate + cache, like the data fetches: an out-of-band rect (mounted only mid-rename) must not turn a registry event into list_metrics traffic, and a Near/Visible re-detection defers to visible fetches. TYPE_CACHE lets a body remounting after a scroll-away skip re-detection; all-terminal passes never enter it.
     let type_allowed = use_memo(move || *zone.read() != Zone::Far);
 
     enum TypeFetch {
-        UseHint,
-        Detected((bool, bool, bool)),
-        RunUnavailable,
+        /// With the refs it answers for, as bindings that need no detection; None for the out-of-band fallback, which never detected and answers for none.
+        UseHint(Option<Rc<Vec<SeriesRef>>>),
+        /// With the refs it was detected for and the bindings they resolved from: `use_resource` keeps it while it re-detects for new refs, and it is no answer for them.
+        Detected(Detection, Rc<Vec<SeriesRef>>, Vec<MetricBinding>),
+        RunUnavailable(Rc<Vec<SeriesRef>>),
         /// The panel was not ready, so nothing probed. A distinct value because `use_resource` keeps it through the restart that readiness triggers: on that frame it must keep showing "Loading...", not mount the hint's leaf.
         Unready,
     }
 
-    // Only do the expensive type detection when the hint is insufficient.
     let detected_types = use_resource({
         let cache_key = cache_key.clone();
         move || {
             let grpc = state.grpc.read().clone();
             let mg = *my_metrics_gen.read();
             let refs = refs.read().clone();
+            // Read, not peeked: a binding edit that leaves the refs alone reruns this (answered from TYPE_CACHE while its entry lasts), so the held detection names the current bindings when the runs later move.
+            let bound = bindings.read().clone();
             let ready = *ready.read();
             let allowed = *type_allowed.read();
+            // Only a panel that doesn't detect answers with the hint, so only it subscribes: discovery's hint follows the shown runs but lands after the refs it answers for, so a hint change reruns this itself (at once, with no request) for the editor's type to follow.
+            let hint = (!*needs_type_check.read()).then(|| *display_type_hint.read());
             let cache_key = cache_key.clone();
-            let resolved_display_type = resolved_display_type;
             async move {
-                if !needs_type_check {
-                    note_resolved_display_type(resolved_display_type, Some(display_type_hint));
-                    return TypeFetch::UseHint;
+                if let Some(hint) = hint {
+                    set_if_changed(resolved_display_type, Some(hint));
+                    return TypeFetch::UseHint(Some(refs));
                 }
                 // A new binding set must not expose controls from the stale
                 // type while its probe is in flight.
-                note_resolved_display_type(resolved_display_type, None);
+                set_if_changed(resolved_display_type, None);
                 // Not ready: the readiness flip restarts this resource.
                 if !ready {
                     return TypeFetch::Unready;
                 }
-                let mut metric_names: Vec<String> =
-                    refs.iter().map(|r| r.metric_name.clone()).collect();
-                metric_names.sort_unstable();
-                metric_names.dedup();
                 let cached = TYPE_CACHE.with(|c| c.borrow_mut().get(&cache_key));
                 let first_paint = cached.is_none();
-                if let Some((cached_mg, cached_names, types)) = cached {
-                    if (cached_mg == mg && cached_names == metric_names) || !allowed {
-                        note_resolved_display_type(
-                            resolved_display_type,
-                            sole_detected_display_type(types),
-                        );
-                        return TypeFetch::Detected(types);
+                if let Some((cached_mg, cached_refs, detected)) = cached {
+                    if (cached_mg == mg && cached_refs == refs) || !allowed {
+                        set_if_changed(resolved_display_type, detected.sole());
+                        return TypeFetch::Detected(detected, cached_refs, bound);
                     }
                 }
                 if !allowed {
-                    // Never detected and out of band: fall back to the hint; the allowed flip on re-entry restarts this and detects for real.
-                    return TypeFetch::UseHint;
+                    // Never detected and out of band: fall back to the hint, an answer for no refs; the allowed flip on re-entry restarts this and detects for real, showing "Loading..." meanwhile.
+                    return TypeFetch::UseHint(None);
                 }
-                // One readable run per distinct metric name suffices. Probe
-                // candidates in binding order: transient failures retry, but
-                // a terminal run is skipped so a healthy sibling (notably a
-                // text stream) can still determine the panel type and mount.
-                let mut detected_names = std::collections::HashSet::new();
-                let mut terminal_sources = 0usize;
-                let mut has_numeric = false;
-                let mut has_cdn = false;
-                let mut has_text = false;
-                for r in refs.iter() {
-                    if detected_names.contains(&r.metric_name) {
-                        continue;
-                    }
-                    let metrics = visibility::retry_visible_run("type detection", async || {
-                        let _hi = visibility::admit_fetch(|| *zone.peek(), first_paint).await;
-                        grpc.list_metrics(&r.project_id, &r.run_id).await
-                    })
-                    .await;
-                    let Ok(metrics) = metrics else {
-                        terminal_sources += 1;
-                        continue;
-                    };
-                    let Some(metric) = metrics
-                        .iter()
-                        .find(|metric| metric.metric_name == r.metric_name)
-                    else {
-                        continue;
-                    };
-                    detected_names.insert(r.metric_name.clone());
-                    match DisplayType::for_metric(metric) {
-                        DisplayType::Cdn => has_cdn = true,
-                        DisplayType::TextStream => has_text = true,
-                        DisplayType::Numeric => has_numeric = true,
-                    }
-                }
-                if every_source_terminal(refs.len(), terminal_sources) {
+                // Every bound run's registry, each listed once and shared with other panels (state/run_metrics.rs), merged per metric name by the server's precedence ([`merged_types`]). Transient failures retry, but a terminal run is skipped so a healthy sibling (notably a text stream) can still determine the panel type and mount.
+                let stamped: HashMap<(&str, &str), Stamp> = {
+                    let epoch = *state.resync_gen.peek();
+                    let metrics_gen = state.metrics_gen.peek();
+                    refs.iter()
+                        .map(|r| {
+                            let metrics_gen = metrics_gen.get(&r.run_id).copied();
+                            let run = (r.project_id.as_str(), r.run_id.as_str());
+                            (run, Stamp { epoch, metrics_gen })
+                        })
+                        .collect()
+                };
+                let admit = async || visibility::admit_fetch(|| *zone.peek(), first_paint).await;
+                use futures::StreamExt as _;
+                let lists: HashMap<(&str, &str), Option<RunMetrics>> =
+                    futures::stream::iter(stamped)
+                        .map(|((project_id, run_id), stamp)| {
+                            let (grpc, admit) = (&grpc, &admit);
+                            async move {
+                                let listed =
+                                    run_metrics::list(grpc, project_id, run_id, stamp, admit).await;
+                                ((project_id, run_id), listed)
+                            }
+                        })
+                        .buffer_unordered(8)
+                        .collect()
+                        .await;
+                let Some(detected) = merged_types(&refs, &lists) else {
                     evict_panel_caches(&cache_key);
-                    return TypeFetch::RunUnavailable;
-                }
-                let types = (has_numeric, has_cdn, has_text);
-                note_resolved_display_type(
-                    resolved_display_type,
-                    sole_detected_display_type(types),
-                );
-                TYPE_CACHE.with(|c| c.borrow_mut().put(cache_key, (mg, metric_names, types)));
-                TypeFetch::Detected(types)
+                    return TypeFetch::RunUnavailable(refs);
+                };
+                set_if_changed(resolved_display_type, detected.sole());
+                let weight = refs.len() * std::mem::size_of::<SeriesRef>()
+                    + refs.iter().map(prost::Message::encoded_len).sum::<usize>();
+                TYPE_CACHE.with(|c| {
+                    c.borrow_mut()
+                        .put_weighted(cache_key, (mg, refs.clone(), detected), weight)
+                });
+                TypeFetch::Detected(detected, refs, bound)
             }
         }
     });
 
-    // Helper to render the right content for a display type
+    // The refs the leaf shows: while only the runs moved under unchanged bindings (a run arrived, the selection or Max runs changed) and the metric names are the same, those the held detection answered for, so the chart or gallery stays mounted and refetches once the detection for the new refs lands. After a binding edit, or for other metric names, the current refs, so the held detection shows "Loading..." below.
+    let shown_refs = use_memo(move || match &*detected_types.read() {
+        Some(TypeFetch::Detected(_, detected_for, bound))
+            if *bound == *bindings.read() && same_metric_names(detected_for, &refs.read()) =>
+        {
+            detected_for.clone()
+        }
+        _ => refs.read().clone(),
+    });
+
     let render_for_type = |dt: &DisplayType| -> Element {
         match dt {
             DisplayType::Cdn => rsx! {
-                CdnContent { refs: refs, cdn_display_mode: options.read().cdn_display_mode, loading: loading, cdn_class: cdn_class, metadata_diff_only: options.read().metadata_diff_only, zone: zone, cache_key: cache_key.clone() }
+                CdnContent { refs: shown_refs, cdn_display_mode: options.read().cdn_display_mode, loading: loading, cdn_class: cdn_class, metadata_diff_only: options.read().metadata_diff_only, zone: zone, cache_key: cache_key.clone() }
             },
             DisplayType::TextStream => rsx! {
-                TextStreamViewer { stream_refs: refs.read().to_vec(), zone: zone, persist_key: cache_key.clone() }
+                TextStreamViewer { stream_refs: shown_refs.read().to_vec(), zone: zone, persist_key: cache_key.clone() }
             },
             DisplayType::Numeric => rsx! {
-                NumericContent { refs: refs, options: options, loading: loading, zone: zone, cache_key: cache_key.clone() }
+                NumericContent { refs: shown_refs, options: options, loading: loading, zone: zone, cache_key: cache_key.clone() }
             },
         }
     };
@@ -791,31 +778,36 @@ fn AutoContent(
 
     let read = detected_types.read();
     match &*read {
-        // Type check completed
-        Some(TypeFetch::Detected((has_numeric, has_cdn, has_text))) => {
-            let type_count = [*has_numeric, *has_cdn, *has_text]
-                .iter()
-                .filter(|&&x| x)
-                .count();
-            if type_count > 1 {
-                crate::state::heal_loading(loading);
-                rsx! { div { class: "rect-error", "Cannot mix different metric types" } }
-            } else if *has_text {
-                render_for_type(&DisplayType::TextStream)
-            } else if *has_cdn {
-                render_for_type(&DisplayType::Cdn)
-            } else {
-                render_for_type(&DisplayType::Numeric)
-            }
+        // A detection for other refs, held while these re-detect, unless only their runs moved (`shown_refs`): its type may not be theirs, so no leaf mounts over them until theirs lands.
+        Some(TypeFetch::Detected(_, detected_for, _) | TypeFetch::RunUnavailable(detected_for))
+            if *detected_for != *shown_refs.read() =>
+        {
+            crate::state::heal_loading(loading);
+            rsx! { div { class: "rect-loading", "Loading..." } }
         }
-        // No type check needed — use hint
-        Some(TypeFetch::UseHint) => render_for_type(&display_type_hint),
-        Some(TypeFetch::RunUnavailable) => {
+        // The hint while these bindings detect, in band, unless it answered for these very refs: an edit that leaves them unchanged (a source switched to specific runs, which start as the shown ones) keeps its renderer while the detection runs.
+        Some(TypeFetch::UseHint(hinted_for))
+            if *needs_type_check.read()
+                && *type_allowed.read()
+                && hinted_for.as_ref() != Some(&*refs.read()) =>
+        {
+            crate::state::heal_loading(loading);
+            rsx! { div { class: "rect-loading", "Loading..." } }
+        }
+        Some(TypeFetch::Detected(Detection::One(kind), ..)) => render_for_type(kind),
+        Some(TypeFetch::Detected(Detection::Nothing, ..)) => render_for_type(&DisplayType::Numeric),
+        Some(TypeFetch::Detected(Detection::Mixed, ..)) => {
+            crate::state::heal_loading(loading);
+            rsx! { div { class: "rect-error", "Cannot mix different metric types" } }
+        }
+        // No type check needed, the hint held for these refs while they detect, or the Far fallback out of band: use the hint.
+        Some(TypeFetch::UseHint(_)) => render_for_type(&display_type_hint()),
+        Some(TypeFetch::RunUnavailable(_)) => {
             crate::state::heal_loading(loading);
             rsx! { div { class: "rect-empty", "Run no longer available" } }
         }
         // Still loading, and no type check is needed: use the hint.
-        None if !needs_type_check => render_for_type(&display_type_hint),
+        None if !*needs_type_check.read() => render_for_type(&display_type_hint()),
         // Still loading, or the not-ready value held through the readiness restart.
         None | Some(TypeFetch::Unready) => {
             rsx! { div { class: "rect-loading", "Loading..." } }
@@ -826,8 +818,8 @@ fn AutoContent(
 #[derive(PartialEq)]
 enum CdnFetch {
     Pending,
-    /// RAW key series: decoration happens at render, so the fetch and its cache hold no presentation state.
-    Answer(Vec<CdnSeries>),
+    /// RAW key series, with the refs they answer for (the signal keeps them while new refs fetch): decoration happens at render, so the fetch and its cache hold no presentation state.
+    Answer(Vec<CdnSeries>, Rc<Vec<SeriesRef>>),
     Unavailable,
 }
 
@@ -835,7 +827,7 @@ enum CdnFetch {
 fn CdnContent(
     refs: Memo<Rc<Vec<SeriesRef>>>,
     cdn_display_mode: CdnDisplayMode,
-    loading: Signal<bool>,
+    mut loading: Signal<bool>,
     cdn_class: Signal<Option<String>>,
     metadata_diff_only: bool,
     zone: Signal<Zone>,
@@ -853,13 +845,12 @@ fn CdnContent(
     });
     let allowed = use_memo(move || *zone.read() != Zone::Far);
     // One in-flight signal for spinner + bridge, exactly as in NumericContent.
-    let data_seq = crate::state::use_version_bridge(my_version, loading, allowed);
-    let mut loading = loading;
+    let refresh = crate::state::use_version_bridge(my_version, loading, allowed);
 
     // The (refs, stamps) -> key-series memoization lives in CDN_KEYS_CACHE (module-level, survives this body unmounting at Far), so re-entering the band with nothing changed is network-free.
     // Written only by settled fetches, so deferred passes retain the last
     // series; transient failures retry and terminal failures settle once.
-    let mut fetch = use_signal(|| CdnFetch::Pending);
+    let fetch = use_signal(|| CdnFetch::Pending);
 
     let _fetch = use_resource({
         let cache_key = cache_key.clone();
@@ -867,10 +858,9 @@ fn CdnContent(
             let cache_key = cache_key.clone();
             let grpc = state.grpc.read().clone();
             // The refresh heartbeat: version-bump propagations (floored and gated in use_version_bridge) restart this resource through it. Only the subscription matters — entry validity is decided by cdn_cache_hit, not the key.
-            let _refresh = *data_seq.read();
+            let _refresh = *refresh.read();
             let refs = refs.read().clone();
             let allowed = *allowed.read();
-            let mut cdn_class = cdn_class;
             async move {
                 crate::state::heal_loading(loading);
                 if !allowed {
@@ -905,12 +895,8 @@ fn CdnContent(
                             Ok(result) => result,
                             Err(_) => {
                                 evict_panel_caches(&cache_key);
-                                if cdn_class.peek().is_some() {
-                                    cdn_class.set(None);
-                                }
-                                if *fetch.peek() != CdnFetch::Unavailable {
-                                    fetch.set(CdnFetch::Unavailable);
-                                }
+                                set_if_changed(cdn_class, None);
+                                set_if_changed(fetch, CdnFetch::Unavailable);
                                 return;
                             }
                         };
@@ -932,16 +918,14 @@ fn CdnContent(
                     }
                 };
 
-                if !matches!(&*fetch.peek(), CdnFetch::Answer(current) if current == &series) {
-                    fetch.set(CdnFetch::Answer(series));
-                }
+                set_if_changed(fetch, CdnFetch::Answer(series, refs));
             }
         }
     });
 
     let shown = fetch.read();
     match &*shown {
-        CdnFetch::Answer(series) => {
+        CdnFetch::Answer(series, answered) if same_metric_names(answered, &refs.read()) => {
             // Decoration at render: names, ordinals and colors come from the live run list and the color overrides, so the resource above fetches and caches RAW key series only, and a metadata change re-decorates without restarting or cancelling the key query.
             // Run colors live in localStorage, outside Dioxus. The sidebar bumps this signal after an override changes; tracking it here rebuilds presentation without querying the key series again.
             let _color_version = *state.color_version.read();
@@ -957,7 +941,7 @@ fn CdnContent(
         CdnFetch::Unavailable => rsx! {
             div { class: "rect-empty", "Run no longer available" }
         },
-        CdnFetch::Pending => rsx! {
+        CdnFetch::Answer(..) | CdnFetch::Pending => rsx! {
             div { class: "rect-loading", "Loading..." }
         },
     }
@@ -966,25 +950,174 @@ fn CdnContent(
 #[cfg(test)]
 mod tests {
     use super::{
-        cdn_cache_heap_bytes, cdn_cache_hit, decorate_cdn_series, normalize_rect_label, refs_known,
+        cdn_cache_heap_bytes, cdn_cache_hit, decorate_cdn_series, merged_types,
+        needs_metric_type_check, normalize_rect_label, refs_known, Detection, RunMetrics,
     };
     use crate::grpc::proto::{CdnEntry, CdnSeries, RunInfo, RunStatus, SeriesRef};
-    use crate::state::layout_config::{MetricBinding, ProjectRef, RunRef};
+    use crate::state::layout_config::binding_resolution_tests::binding;
+    use crate::state::layout_config::RunRef;
+    use crate::state::DisplayType;
     use std::collections::HashMap;
+    use std::rc::Rc;
 
-    fn binding(runs: RunRef) -> MetricBinding {
-        MetricBinding {
-            project: ProjectRef::Current,
-            runs,
-            metric_name: "loss".to_string(),
+    fn source(run_id: &str, metric_name: &str) -> SeriesRef {
+        SeriesRef {
+            project_id: "p".to_string(),
+            run_id: run_id.to_string(),
+            metric_name: metric_name.to_string(),
+            tags: vec![],
         }
+    }
+
+    /// A run's registry (state/run_metrics.rs).
+    fn registry(metrics: &[(&str, DisplayType)]) -> Option<RunMetrics> {
+        Some(Rc::new(
+            metrics
+                .iter()
+                .map(|(name, kind)| (name.to_string(), *kind))
+                .collect(),
+        ))
+    }
+
+    /// Each run's registry, None for a terminal run.
+    fn lists(runs: Vec<(&str, Option<RunMetrics>)>) -> HashMap<(&str, &str), Option<RunMetrics>> {
+        runs.into_iter()
+            .map(|(run, list)| (("p", run), list))
+            .collect()
+    }
+
+    #[test]
+    fn same_named_sources_of_different_types_merge_by_the_registry_precedence() {
+        let mixed = lists(vec![
+            ("a", registry(&[("m", DisplayType::Cdn)])),
+            (
+                "b",
+                registry(&[("m", DisplayType::Numeric), ("n", DisplayType::Numeric)]),
+            ),
+        ]);
+        // Run A's CDN `m` beside run B's numeric `m` is a numeric chart, whichever run comes first, as discovery lists it.
+        for refs in [
+            [source("a", "m"), source("b", "m")],
+            [source("b", "m"), source("a", "m")],
+        ] {
+            assert_eq!(
+                merged_types(&refs, &mixed),
+                Some(Detection::One(DisplayType::Numeric))
+            );
+        }
+        // Different names of different types still refuse to mix.
+        assert_eq!(
+            merged_types(&[source("a", "m"), source("b", "n")], &mixed),
+            Some(Detection::Mixed)
+        );
+        // A text stream outranks both.
+        let text = lists(vec![
+            ("a", registry(&[("m", DisplayType::TextStream)])),
+            ("b", registry(&[("m", DisplayType::Numeric)])),
+        ]);
+        assert_eq!(
+            merged_types(&[source("b", "m"), source("a", "m")], &text),
+            Some(Detection::One(DisplayType::TextStream))
+        );
+        // A terminal run is skipped, and a run that lacks the metric adds nothing; only every source terminal leaves nothing to show.
+        let partial = lists(vec![
+            ("a", None),
+            ("b", registry(&[("n", DisplayType::Cdn)])),
+        ]);
+        assert_eq!(
+            merged_types(
+                &[source("a", "m"), source("b", "m"), source("b", "n")],
+                &partial
+            ),
+            Some(Detection::One(DisplayType::Cdn))
+        );
+        assert_eq!(
+            merged_types(&[source("b", "m")], &partial),
+            Some(Detection::Nothing)
+        );
+        assert_eq!(merged_types(&[source("a", "m")], &partial), None);
+        assert_eq!(merged_types(&[], &partial), Some(Detection::Nothing));
+    }
+
+    #[test]
+    fn the_same_runs_and_names_can_detect_differently() {
+        // Run A lists `m` as numeric and `n` as CDN, run B the other way round: the same runs and names detect differently, so the type cache keys on the resolved sources.
+        let crossed = lists(vec![
+            (
+                "a",
+                registry(&[("m", DisplayType::Numeric), ("n", DisplayType::Cdn)]),
+            ),
+            (
+                "b",
+                registry(&[("m", DisplayType::Cdn), ("n", DisplayType::Numeric)]),
+            ),
+        ]);
+        assert_eq!(
+            merged_types(&[source("a", "m"), source("b", "n")], &crossed),
+            Some(Detection::One(DisplayType::Numeric))
+        );
+        assert_eq!(
+            merged_types(&[source("a", "n"), source("b", "m")], &crossed),
+            Some(Detection::One(DisplayType::Cdn))
+        );
+    }
+
+    #[test]
+    fn retargeted_and_specific_bindings_detect_type() {
+        assert!(!needs_metric_type_check(
+            "loss",
+            &[binding(RunRef::Selected, "loss")]
+        ));
+        assert!(!needs_metric_type_check(
+            "loss",
+            &[binding(RunRef::Specific(vec![]), "loss")]
+        ));
+        assert!(!needs_metric_type_check(
+            "new-panel-id",
+            &[binding(RunRef::Selected, "")]
+        ));
+        assert!(needs_metric_type_check(
+            "loss",
+            &[binding(RunRef::Selected, "logs/std_out")]
+        ));
+        assert!(needs_metric_type_check(
+            "new-panel-id",
+            &[binding(RunRef::All, "images/sample")]
+        ));
+        assert!(needs_metric_type_check(
+            "loss",
+            &[binding(RunRef::Specific(vec!["run".to_string()]), "loss",)]
+        ));
+        assert!(needs_metric_type_check(
+            "loss",
+            &[
+                binding(RunRef::Selected, "loss"),
+                binding(RunRef::Selected, "accuracy"),
+            ]
+        ));
+        // A source with no metric chosen names nothing, whatever its runs.
+        assert!(!needs_metric_type_check(
+            "loss",
+            &[
+                binding(RunRef::Selected, "loss"),
+                binding(RunRef::Selected, ""),
+                binding(RunRef::Specific(vec!["run".to_string()]), ""),
+            ]
+        ));
+        assert!(needs_metric_type_check(
+            "loss",
+            &[
+                binding(RunRef::Selected, ""),
+                binding(RunRef::Selected, "accuracy"),
+            ]
+        ));
     }
 
     #[test]
     fn refs_known_needs_the_list_only_for_selected_without_a_run_and_all() {
-        let specific = || binding(RunRef::Specific(vec!["r".into()]));
-        let selected = || binding(RunRef::Selected);
-        let all = || binding(RunRef::All);
+        let specific = || binding(RunRef::Specific(vec!["r".into()]), "loss");
+        let selected = || binding(RunRef::Selected, "loss");
+        let all = || binding(RunRef::All, "loss");
 
         // Before the list lands, only Specific (and Selected on a run page) is known.
         assert!(refs_known(&[specific()], None, false));
@@ -1085,18 +1218,9 @@ mod tests {
         assert!(two_keys >= one_key.saturating_add(256));
     }
 
-    fn cdn_ref(run: &str) -> SeriesRef {
-        SeriesRef {
-            project_id: "project".into(),
-            run_id: run.into(),
-            metric_name: "images".into(),
-            tags: vec![],
-        }
-    }
-
     #[test]
     fn cdn_cache_hit_needs_matching_refs_and_covering_stamps() {
-        let request = vec![cdn_ref("a"), cdn_ref("b")];
+        let request = vec![source("a", "m"), source("b", "m")];
         let stamped: HashMap<String, u64> = [("a".into(), 5), ("b".into(), 5)].into();
         let at = |a: u64, b: u64| HashMap::from([("a".to_string(), a), ("b".to_string(), b)]);
 
@@ -1107,20 +1231,39 @@ mod tests {
         assert!(!cdn_cache_hit(
             &request,
             &stamped,
-            &[cdn_ref("a")],
+            &[source("a", "m")],
             &at(5, 5)
         ));
         assert!(!cdn_cache_hit(
             &request,
             &stamped,
-            &[cdn_ref("b"), cdn_ref("a")],
+            &[source("b", "m"), source("a", "m")],
             &at(5, 5)
         ));
         assert!(!cdn_cache_hit(
-            &[cdn_ref("a")],
+            &[source("a", "m")],
             &[("a".into(), 5)].into(),
             &request,
             &at(5, 5)
+        ));
+    }
+
+    /// An answer serves the refs while it names the same metrics, whatever runs, order or repeats, or sources with no metric: a run toggle keeps it, a retarget doesn't.
+    #[test]
+    fn an_answer_serves_refs_naming_the_same_metrics() {
+        use super::same_metric_names;
+        let answered = [source("a", "m"), source("b", "m"), source("a", "n")];
+        assert!(same_metric_names(
+            &answered,
+            &[source("c", "n"), source("c", "m"), source("c", "")]
+        ));
+        assert!(!same_metric_names(
+            &answered,
+            &[source("a", "m"), source("b", "m")]
+        ));
+        assert!(!same_metric_names(
+            &answered,
+            &[source("a", "m"), source("a", "x")]
         ));
     }
 }

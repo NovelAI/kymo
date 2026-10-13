@@ -6,35 +6,24 @@ use crate::route::{ChartQuery, Route};
 use crate::state::app_state::request_refresh;
 use crate::state::trash::{clock_wait_ms, compact_duration, effective_lifecycle};
 use crate::state::{DashboardState, DirectRunLoad};
-use crate::util::primary;
+use crate::util::{primary, use_clock_tick};
 
 #[component]
 pub fn RunPage(project_id: String, run_id: String, chart: ChartQuery) -> Element {
     let state = use_context::<DashboardState>();
-    // `chart` is consumed by DashboardLayout's URL→overlay sync, not here;
+    // `chart` is consumed by ProjectDashboard's URL→overlay sync, not here;
     // it is a prop only because route fields are.
     let _ = chart;
 
     // Re-render at the authoritative expiry boundary (and once a minute for
     // the relative label). This is a display clock only: the server remains
     // the admission authority for Restore and data reads.
-    let mut clock_tick = use_signal(|| 0u64);
-    let _clock = use_resource(move || {
-        let tick = *clock_tick.read();
-        let direct_run = state.direct_run.read();
-        let wait_ms = match &*direct_run {
-            DirectRunLoad::Loaded(view) => {
-                clock_wait_ms(view.authoritative_now_ms(), view.record.purge_at_ms, true)
-            }
-            _ => clock_wait_ms(0, None, false),
-        };
-        drop(direct_run);
-        async move {
-            gloo_timers::future::sleep(std::time::Duration::from_millis(wait_ms)).await;
-            clock_tick.set(tick.wrapping_add(1));
+    let clock_tick = use_clock_tick(move || match &*state.direct_run.read() {
+        DirectRunLoad::Loaded(view) => {
+            clock_wait_ms(view.authoritative_now_ms(), view.record.purge_at_ms, true)
         }
+        _ => clock_wait_ms(0, None, false),
     });
-    let _ = *clock_tick.read();
 
     // A focused chart lives outside this page's subtree. Close that sibling
     // overlay when the read deadline arrives, otherwise it could outlive the

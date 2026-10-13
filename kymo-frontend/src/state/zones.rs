@@ -9,6 +9,7 @@ use dioxus::prelude::*;
 use gloo_timers::future::sleep;
 
 use crate::state::visibility::Zone;
+use crate::util::set_if_changed;
 
 /// The JS half. Element state lives on a Map keyed by element; slots carry their rect id in `data-slot-id`. Zone codes match the old per-rect protocol: 2 = Visible, 1 = Near, 0 = Far. `js_bridge` owns predecessor eviction and late-drop fencing; this body owns only observer cleanup and messages.
 const BOOTSTRAP_JS: &str = r#"(()=>{
@@ -60,14 +61,10 @@ impl ZoneRegistry {
     fn apply(&self, id: &str, zone: Zone) {
         // Copy the signal out before writing — the write queues renders that may re-enter the registry.
         let sig = self.0.borrow().get(id).copied();
-        if let Some(mut sig) = sig {
+        if let Some(sig) = sig {
             // This cross-scope use is sound by the registry discipline above (entries leave in use_drop before their signal drops, and single-threaded wasm can't interleave the pump with a teardown), but dioxus's hoisted-value lint can't see that and prints its full help page per zone write — acknowledge it at this one site so the lint stays live everywhere else.
             use dioxus::warnings::Warning as _;
-            dioxus::signals::warnings::copy_value_hoisted::allow(|| {
-                if *sig.peek() != zone {
-                    sig.set(zone);
-                }
-            });
+            dioxus::signals::warnings::copy_value_hoisted::allow(|| set_if_changed(sig, zone));
         }
     }
 }

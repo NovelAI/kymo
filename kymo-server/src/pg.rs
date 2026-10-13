@@ -427,6 +427,8 @@ pub struct BumpRunVersionsOutcome {
     /// versions also advance so ListRuns refreshes the server timing shown by
     /// the dashboard.
     pub projects: Vec<(String, u64)>,
+    /// Projects whose `project_activity.last_logged_at` this pass rolled forward, with the new value as ListProjects serves it.
+    pub project_last_logged_at_ms: HashMap<String, i64>,
 }
 
 /// What one InitRun call did to the version counters, so the caller can
@@ -532,6 +534,9 @@ async fn merge_rows(
 pub struct PgStore {
     pool: PgPool,
     registry: RegistryCache,
+    /// [`Self::test_store`]'s lifecycle classes, which [`Self::classify_runs`] answers from instead of Postgres: every other run is active, and every run at version 0.
+    #[cfg(test)]
+    test_lifecycle: Option<std::sync::Mutex<HashMap<RunKey, RunLifecycleClass>>>,
 }
 
 impl PgStore {
@@ -567,7 +572,15 @@ impl PgStore {
                 .connect_lazy("postgres://localhost/mkdb2_test")
                 .expect("valid test Postgres URL"),
             registry: RegistryCache::new(),
+            test_lifecycle: Some(std::sync::Mutex::default()),
         }
+    }
+
+    /// The lifecycle class [`Self::test_store`]'s lifecycle checks see for `key`.
+    #[cfg(test)]
+    pub(crate) fn set_test_lifecycle(&self, key: RunKey, class: RunLifecycleClass) {
+        let classes = self.test_lifecycle.as_ref().expect("a test store");
+        classes.lock().unwrap().insert(key, class);
     }
 
     pub async fn connect(url: &str) -> Result<Self> {
@@ -579,6 +592,8 @@ impl PgStore {
         let store = Self {
             pool,
             registry: RegistryCache::new(),
+            #[cfg(test)]
+            test_lifecycle: None,
         };
         store.ensure_schema().await?;
         Ok(store)
@@ -1494,8 +1509,8 @@ impl PgStore {
         let sys_ms: Vec<Option<i64>> = touched.iter().map(|t| t.max_system_metric_at_ms).collect();
         let ingested_ms: Vec<i64> = touched.iter().map(|t| t.last_ingested_at_ms).collect();
 
-        // The same statement rolls project_activity.last_logged_at forward (rule on ListProjectsResponse.last_logged_at_ms), at most once per clock minute per project, the display's grid. InitRun or the boot seed created each project's row before its runs could log.
-        let rows: Vec<(String, String, i64, bool)> = sqlx::query_as(
+        // The same statement rolls project_activity.last_logged_at forward (rule on ListProjectsResponse.last_logged_at_ms), at most once per clock minute per project, the display's grid, and returns each new value for the push. InitRun or the boot seed created each project's row before its runs could log.
+        let rows: Vec<(String, String, i64, bool, Option<i64>)> = sqlx::query_as(
             "WITH bumped AS (
              UPDATE runs SET
                 version = version + 1,
@@ -1531,8 +1546,12 @@ impl PgStore {
                   AND (project_activity.last_logged_at IS NULL
                        OR logged.at >= date_trunc('minute', project_activity.last_logged_at)
                                        + INTERVAL '1 minute')
+                RETURNING project_activity.project_id,
+                          (EXTRACT(EPOCH FROM project_activity.last_logged_at) * 1000)::BIGINT
+                              AS last_logged_at_ms
              )
-             SELECT project_id, run_id, version, needs_project_refresh FROM bumped",
+             SELECT project_id, run_id, version, needs_project_refresh, last_logged_at_ms
+             FROM bumped LEFT JOIN rolled_forward USING (project_id)",
         )
         .bind(&pids)
         .bind(&rids)
@@ -1544,11 +1563,16 @@ impl PgStore {
 
         let mut refresh_projects: Vec<String> = rows
             .iter()
-            .filter(|(_, _, _, needs_project_refresh)| *needs_project_refresh)
-            .map(|(project_id, _, _, _)| project_id.clone())
+            .filter(|(_, _, _, needs_project_refresh, _)| *needs_project_refresh)
+            .map(|(project_id, _, _, _, _)| project_id.clone())
             .collect();
         refresh_projects.sort_unstable();
         refresh_projects.dedup();
+        // Repeated on each of the project's bumped rows; the map keeps one.
+        let project_last_logged_at_ms = rows
+            .iter()
+            .filter_map(|(project_id, _, _, _, at)| at.map(|at| (project_id.clone(), at)))
+            .collect();
 
         // Deliberately a second autocommitted statement. TerminateRun locks
         // project -> run; retaining run locks while updating projects here
@@ -1558,9 +1582,13 @@ impl PgStore {
         let projects = self.bump_project_versions(&refresh_projects).await?;
         let runs = rows
             .into_iter()
-            .map(|(_, run_id, version, _)| (run_id, version as u64))
+            .map(|(_, run_id, version, _, _)| (run_id, version as u64))
             .collect();
-        Ok(BumpRunVersionsOutcome { runs, projects })
+        Ok(BumpRunVersionsOutcome {
+            runs,
+            projects,
+            project_last_logged_at_ms,
+        })
     }
 
     /// Upsert newly observed metrics into the registry. The type can only
@@ -1777,6 +1805,20 @@ impl PgStore {
         if keys.is_empty() {
             return Ok(HashMap::new());
         }
+        #[cfg(test)]
+        if let Some(classes) = &self.test_lifecycle {
+            let classes = classes.lock().unwrap();
+            let class = |key| {
+                classes
+                    .get(key)
+                    .copied()
+                    .unwrap_or(RunLifecycleClass::Active)
+            };
+            return Ok(keys
+                .iter()
+                .map(|key| (key.clone(), (class(key), 0)))
+                .collect());
+        }
         let project_ids: Vec<&str> = keys.iter().map(|key| key.project_id.as_str()).collect();
         let run_ids: Vec<&str> = keys.iter().map(|key| key.run_id.as_str()).collect();
         type ClassifiedRunRow = (
@@ -1895,7 +1937,7 @@ impl PgStore {
         })
     }
 
-    /// Trash one chunk in one transaction. The public RPC deliberately has no size limit; QueryService feeds this method chunks of 256 positions and continues after a failed chunk.
+    /// Trash one chunk in one transaction. The public RPC takes up to MAX_REQUEST_RUN_IDS (query.rs) positions; QueryService feeds this method chunks of 256 of them and continues after a failed chunk.
     ///
     /// A writer that locks several runs without lifecycle gates (the ingest coalescer's bump_run_versions, a registry insert through its foreign-key checks, the reaper's note_purge_attempts and finalize_purged_runs) can take this chunk's runs in another order. PostgreSQL then aborts one side; those retry on their next tick or pass, and a chunk that was the victim retries once.
     pub async fn trash_runs_chunk(
@@ -3357,6 +3399,7 @@ mod live_pg_tests {
         let fresh = |budget| PgStore {
             pool: store.pool.clone(),
             registry: RegistryCache::with_budget(budget),
+            test_lifecycle: None,
         };
 
         let subset = run_ids[..30].to_vec();
@@ -3723,18 +3766,33 @@ mod live_pg_tests {
             .await?;
         store.init_run(&silent, &silent_id, "silent", None).await?;
 
-        // The first heartbeat records; the rest of its clock minute writes nothing; the next clock minute rolls forward, even under 60 s later.
-        for (ingested_ms, expected_ms) in [
-            (LIVE_MS + 50_000, LIVE_MS + 50_000),
-            (LIVE_MS + 55_000, LIVE_MS + 50_000),
-            (LIVE_MS + 70_000, LIVE_MS + 70_000),
+        // The first heartbeat records; the rest of its clock minute writes nothing; the next clock minute rolls forward, even under 60 s later. Each roll-forward, and only it, returns the value ListProjects then serves, once for the project's two bumped rows.
+        let live_second = format!("live-second-{suffix}");
+        store
+            .init_run(&live, &live_second, "live second", None)
+            .await?;
+        for (ingested_ms, expected_ms, rolled) in [
+            (LIVE_MS + 50_000, LIVE_MS + 50_000, true),
+            (LIVE_MS + 55_000, LIVE_MS + 50_000, false),
+            (LIVE_MS + 70_000, LIVE_MS + 70_000, true),
         ] {
-            store
-                .bump_run_versions(&[beat(&live, &live_id, ingested_ms)])
+            let bumped = store
+                .bump_run_versions(&[
+                    beat(&live, &live_id, ingested_ms),
+                    beat(&live, &live_second, ingested_ms - 1_000),
+                ])
                 .await?;
+            anyhow::ensure!(bumped.runs.len() == 2);
+            let echoed = HashMap::from([(live.clone(), expected_ms)]);
+            anyhow::ensure!(
+                bumped.project_last_logged_at_ms == if rolled { echoed } else { HashMap::new() },
+                "{ingested_ms}: echoed {:?}",
+                bumped.project_last_logged_at_ms
+            );
             let listing = store.list_metric_projects().await?;
             anyhow::ensure!(listed(&listing, &live) == Some(Some(expected_ms)));
         }
+        anyhow::ensure!(purge(&store, &live, &live_second).await?.is_some());
         // Trash keeps the project listed with its value; purging its last run delists it with a global bump; a new run relists it.
         store
             .trash_runs_chunk(&live, std::slice::from_ref(&live_id), &HashMap::new())
@@ -3766,9 +3824,13 @@ mod live_pg_tests {
             .terminate_run(&imported, &imported_id, 0, None, Some(ARCHIVED_END_MS))
             .await?
             .context("finalize should find the imported run")?;
-        store
+        let bumped = store
             .bump_run_versions(&[beat(&imported, &imported_id, IMPORT_INGEST_MS)])
             .await?;
+        anyhow::ensure!(
+            bumped.project_last_logged_at_ms
+                == HashMap::from([(imported.clone(), ARCHIVED_END_MS)])
+        );
         let listing = store.list_metric_projects().await?;
         anyhow::ensure!(listing.server_now_ms > LIVE_MS);
         anyhow::ensure!(listed(&listing, &imported) == Some(Some(ARCHIVED_END_MS)));

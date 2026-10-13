@@ -367,7 +367,7 @@ message ListProjectsRequest {}
 message ListProjectsResponse {
   // Projects with at least one run, in Trash or not; a project leaves the list when its last run is purged.
   repeated string project_ids = 1;
-  // Newest logging activity recorded per project, keyed by project_id. A run's activity is its last_ingested_at_ms capped at its terminated_at_ms, or its terminated_at_ms when it has no ingest clock (runs predating it): data drained after the end was logged before it, and imported runs carry an import-time ingest clock but their archived end. The ingest heartbeat rolls it forward at most once per clock minute; trashing runs does not lower it, and runs imported after the server first seeded it are not reflected. Absent when nothing was recorded.
+  // Newest logging activity recorded per project, keyed by project_id. A run's activity is its last_ingested_at_ms capped at its terminated_at_ms, or its terminated_at_ms when it has no ingest clock (runs predating it): data drained after the end was logged before it, and imported runs carry an import-time ingest clock but their archived end. The ingest heartbeat rolls it forward at most once per clock minute and pushes each new value (RunVersionsEvent.project_last_logged_at_ms); trashing runs does not lower it, and runs imported after the server first seeded it are not reflected. Absent when nothing was recorded.
   map<string, int64> last_logged_at_ms = 2;
   // Database clock read in the same statement, for relative display; zero when no project is listed.
   int64 server_now_ms = 3;
@@ -418,8 +418,8 @@ message MetricInfo {
 
 // === Push events (WebSocket transport only) ===
 
-// Server-initiated frame on /grpc-ws (correlation id 0, code 0): every version counter that changed since the connection's previous event, coalesced to at most one frame per second.
-// The frontend also polls once per minute to catch lost events and clock-driven run expiry.
+// Server-initiated frame on /grpc-ws and /grpc-ws2 (correlation id 0, code 0, never compressed): every version counter that changed since the connection's previous event, and each Last-logged value rolled forward, coalesced to at most one frame per second.
+// The dashboard also polls the version counters once per minute to catch lost events and clock-driven run expiry.
 // Run values are effective versions: stored data versions while readable and one final generation when a run becomes terminal.
 // Old bundles drop id-0 frames by construction, making this an additive extension of the frozen framing.
 message RunVersionsEvent {
@@ -437,11 +437,13 @@ message RunVersionsEvent {
   // The server lost events for this connection (broadcast lag): cached
   // versions are stale — PollVersions once and refetch run/metric lists.
   bool resync = 5;
+  // ListProjectsResponse.last_logged_at_ms values the ingest heartbeat rolled forward, keyed by project_id; they only rise. The landing page patches its rows from them instead of refetching the list. Each is sent once and the page never polls: when a heartbeat tick fails or is cancelled after its statement commits, the page shows the older value until the project's next roll-forward or a refetch of the list.
+  map<string, int64> project_last_logged_at_ms = 6;
 }
 
 // === Push control (WebSocket transport only) ===
 
-// Sent by the dashboard on the /grpc-ws pseudo-path "/kymo.push/control"
+// Sent by the dashboard on the socket pseudo-path "/kymo.push/control"
 // (not a service method — quiet is per connection, handled in ws_proxy's
 // socket loop; no response is sent). quiet=true mirrors a hidden tab: the
 // server suspends id-0 frames and collapses all detail to one resync marker;

@@ -115,9 +115,10 @@ def run_fences(page: Page, origin: str) -> None:
     assert all(after_visit.get(k) == v for k, v in legacy.items()), (
         f"a read-only visit changed legacy state: {after_visit}"
     )
-    # The reconnect schedule (KEY in kymo-frontend/src/grpc/reconnect.rs) is transport state that every connect writes, with no legacy key to migrate.
+    # The reconnect schedule (KEY in kymo-frontend/src/grpc/reconnect.rs), which every connect writes, and the /grpc-ws2 refusal record (WS2_REFUSED_KEY in grpc/ws.rs), which a connect that settles on /grpc-ws writes, are transport state with no legacy key to migrate.
+    transport = ("kymo_ws_reconnect", "kymo_ws2_refused")
     written = sorted(
-        k for k in after_visit if k.startswith("kymo_") and k != "kymo_ws_reconnect"
+        k for k in after_visit if k.startswith("kymo_") and k not in transport
     )
     assert not written, f"a read-only visit wrote canonical keys: {written}"
 

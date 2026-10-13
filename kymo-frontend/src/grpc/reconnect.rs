@@ -20,7 +20,7 @@ const KEY: &str = "kymo_ws_reconnect";
 const FAST_MS: [f64; 5] = [1_000.0, 2_000.0, 4_000.0, 8_000.0, 16_000.0];
 /// Firefox's 60 s of memory after a failure plus its longest delay, and a margin.
 /// A claimed attempt holds other tabs back this long too, in case its tab dies before the outcome: longer than Firefox's longest delay plus its 20 s handshake timeout.
-const SLOW_MS: f64 = 125_000.0;
+pub(super) const SLOW_MS: f64 = 125_000.0;
 /// Spreads tabs that find the same attempt due; also the second to which a hidden tab's browser holds shorter timers, which the windows and plans below lean on.
 const JITTER_MS: f64 = 1_000.0;
 
@@ -77,7 +77,7 @@ impl Reconnect {
         Self::default()
     }
 
-    /// Wait until this tab may attempt, then claim the attempt.
+    /// Wait until this tab may attempt; the connect then claims it ([`Self::opening`]).
     pub(super) async fn turn(&mut self) {
         // Drawn once per turn and kept across wakes: another tab's write wakes every tab at once.
         let jitter = js_sys::Math::random() * JITTER_MS;
@@ -100,8 +100,12 @@ impl Reconnect {
                 _ = wakes.changed().fuse() => false,
             };
         }
-        // This claim answers the intent shown so far; intent shown while its attempt runs stays pending for the next one.
+        // This attempt answers the intent shown so far; intent shown while it runs stays pending for the next one.
         WAKE.send_replace(false);
+    }
+
+    /// A socket of this attempt is about to open: hold the other tabs back until the attempt's outcome. A connect is one attempt however many sockets it opens (grpc/ws.rs `connect`), and claims before each, so the claim covers each handshake's wait (up to 90 s) however many the attempt takes; a later claim finds the earlier one live, and keeps the count.
+    pub(super) fn opening(&mut self) {
         self.update(Self::claim);
     }
 
@@ -148,7 +152,7 @@ impl Reconnect {
         }
     }
 
-    /// A `due` more than `SLOW_MS + JITTER_MS` ahead or behind is stale: claims last `SLOW_MS`, attempts settle within 90 s, and the jitter tolerates another tab reading a slightly earlier clock (Firefox, by a millisecond). A cleared record is stale too, and attempts at once.
+    /// A `due` more than `SLOW_MS + JITTER_MS` ahead or behind is stale: claims last `SLOW_MS`, an attempt renews its claim for each socket and each settles within 90 s, and the jitter tolerates another tab reading a slightly earlier clock (Firefox, by a millisecond). A cleared record is stale too, and attempts at once.
     /// Behind, the record survived an earlier outage (every tab closed, or a failure landed after a success), so Firefox has forgotten it; ahead, the clock moved back. Either way it holds no tab, and the next claim starts the count over.
     fn stale(&self, now: f64) -> bool {
         (now - self.due).abs() > SLOW_MS + JITTER_MS
@@ -287,6 +291,22 @@ mod tests {
         // The outcome replaces the claim.
         shared.fail(T + 1_500.0);
         assert_eq!(attempt(&shared, T + 1_600.0), Some(T + 3_500.0));
+    }
+
+    #[test]
+    fn each_socket_of_a_connect_renews_its_claim_and_keeps_the_count() {
+        // /grpc-ws2's handshake took its full 90 s and failed, and the /grpc-ws socket after it claims again (grpc/ws.rs `connect`), so the other tabs wait for the connect's outcome past the first claim's expiry.
+        let mut shared = after_failures(&[T, T + 1_000.0, T + 3_000.0]);
+        shared.claim(T + 7_000.0);
+        shared.claim(T + 97_000.0);
+        let first_expiry = T + 7_000.0 + SLOW_MS;
+        assert_eq!(
+            attempt(&shared, first_expiry + 1.0),
+            Some(T + 97_000.0 + SLOW_MS)
+        );
+        // The connect's one outcome goes on from the count it found.
+        shared.fail(T + 100_000.0);
+        assert_eq!(shared.failures, 4);
     }
 
     #[test]

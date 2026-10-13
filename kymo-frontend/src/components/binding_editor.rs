@@ -31,17 +31,13 @@ fn x_metric_discovery_source(
     })
 }
 
+/// A run's numeric metrics, in ListMetrics order (one row per name: the registry's key).
 fn x_metric_names(metrics: Vec<MetricInfo>) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut names = Vec::new();
-    for metric in metrics {
-        if metric.metric_type == MetricType::Numeric as i32
-            && seen.insert(metric.metric_name.clone())
-        {
-            names.push(metric.metric_name);
-        }
-    }
-    names
+    metrics
+        .into_iter()
+        .filter(|metric| metric.metric_type == MetricType::Numeric as i32)
+        .map(|metric| metric.metric_name)
+        .collect()
 }
 
 fn matching_x_metric_names(
@@ -169,13 +165,8 @@ fn kind_label(kind: DisplayType) -> &'static str {
     }
 }
 
-/// Match the server's TEXT_STREAM > NUMERIC > CDN precedence for names found in several runs.
+/// Match the server's precedence for names found in several runs (the order of [`DisplayType`]).
 fn metric_catalog(metrics: Vec<MetricInfo>) -> MetricCatalog {
-    let precedence = |kind: DisplayType| match kind {
-        DisplayType::TextStream => 2,
-        DisplayType::Numeric => 1,
-        DisplayType::Cdn => 0,
-    };
     let mut catalog: MetricCatalog = metrics
         .into_iter()
         .map(|metric| {
@@ -183,10 +174,7 @@ fn metric_catalog(metrics: Vec<MetricInfo>) -> MetricCatalog {
             (metric.metric_name, kind)
         })
         .collect();
-    catalog.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then_with(|| precedence(b.1).cmp(&precedence(a.1)))
-    });
+    catalog.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
     catalog.dedup_by(|later, earlier| later.0 == earlier.0);
     catalog
 }
@@ -1048,7 +1036,7 @@ mod tests {
     }
 
     #[test]
-    fn x_metric_names_include_only_numeric_metrics_in_first_seen_order() {
+    fn x_metric_names_include_only_numeric_metrics_in_order() {
         assert_eq!(
             x_metric_names(vec![
                 metric("image", MetricType::Cdn),
@@ -1058,7 +1046,6 @@ mod tests {
                     metric_name: "future_type".into(),
                     metric_type: 999,
                 },
-                metric("epoch", MetricType::Numeric),
                 metric("learning_rate", MetricType::Numeric),
             ]),
             ["epoch", "learning_rate"]

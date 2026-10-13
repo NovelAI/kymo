@@ -20,13 +20,14 @@ use crate::route::Route;
 use crate::state::app_state::request_refresh;
 use crate::state::trash::lookup_trashed_runs;
 use crate::state::DashboardState;
-use crate::util::{is_app_escape, js_bridge::js_string, local_storage, primary};
+use crate::util::{is_app_escape, js_bridge::js_string, local_storage, primary, set_if_changed};
 
 /// A transport cut, not a product limit. Arbitrarily large selections are
 /// sent sequentially so one WebSocket frame and one response stay modest.
 const TRASH_RPC_CHUNK: usize = 256;
 const MAX_RUN_NAME_BYTES: usize = 2_048;
 
+#[derive(PartialEq)]
 struct SelectionPaint {
     value: bool,
     last_run_id: String,
@@ -332,7 +333,7 @@ fn apply_trash_results(
         if summary.failed.is_empty() {
             close_trash_picker(picker, ui.paint);
         } else {
-            end_paint_if_active(ui.paint);
+            set_if_changed(ui.paint, None);
             picker.set(Some(summary.failed.clone()));
         }
     }
@@ -477,14 +478,6 @@ window.addEventListener('blur',end);
 document.addEventListener('keydown',key);
 })()"#;
 
-/// Peek before writing: an unconditional `set` would dirty the signal and
-/// re-render the sidebar on every hover and every pointer release.
-fn end_paint_if_active(mut paint: Signal<Option<SelectionPaint>>) {
-    if paint.peek().is_some() {
-        paint.set(None);
-    }
-}
-
 /// Closing the picker parks focus on the Trash trigger when the picker would take it along: focus in the sidebar (a picker control, or a selection row, which WebKit leaves focused after it stops being focusable) or already on the page (a pending reply's disabled controls drop it there). Focus the user moved elsewhere stays: a maximized panel or the grid, where Escape also cancels the picker, or anything focused while a reply was pending. Read before the picker unmounts.
 fn close_trash_picker(
     mut picker: Signal<Option<HashSet<String>>>,
@@ -493,7 +486,7 @@ fn close_trash_picker(
     let park = web_sys::window()
         .and_then(|window| window.document()?.active_element())
         .is_none_or(|active| active.matches("body, .sidebar *").unwrap_or(true));
-    end_paint_if_active(paint);
+    set_if_changed(paint, None);
     picker.set(None);
     if park {
         focus_when_mounted("sidebar-trash-trigger", None, false);
