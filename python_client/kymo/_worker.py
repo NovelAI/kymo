@@ -634,12 +634,16 @@ def _upload_worker(
         failure: int = 0,
         terminal: bool = False,
     ) -> None:
-        """Release delivery accounting without hanging on a dead owner."""
+        """Release delivery accounting, waiting out a stalled owner until the spill end and bypassing a dead owner's lock."""
         nonlocal accounting_bypass_warned
         lock = queue_status.get_lock()
         acquired = lock.acquire(timeout=_STATUS_LOCK_TIMEOUT)
-        if not acquired and owner_alive():
-            raise RuntimeError("kymo upload accounting lock is unavailable")
+        # The owner, or a fork child of it, holds this lock only briefly (a charge or a status read) and never waits on us meanwhile. A longer hold is a stalled holder (stopped, swapping, in its own handler) or a child killed holding it; nothing tells them apart, and either fails the owner's charges too. Wait rather than die with the unacked buffer while spilling is allowed: always mid-run, and at shutdown until the spill end, since the deadline spill must release accounting too.
+        while not acquired and owner_alive():
+            remaining = spill_end() - time.monotonic()
+            if remaining <= 0.0:
+                raise RuntimeError("kymo upload accounting lock is unavailable")
+            acquired = lock.acquire(timeout=min(_STATUS_LOCK_TIMEOUT, remaining))
         if not acquired:
             # The creator is gone, so no producer can race this worker. A lock
             # it died while holding must not defeat orphan spill/exit bounds.

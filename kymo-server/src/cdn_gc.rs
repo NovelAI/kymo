@@ -258,7 +258,7 @@ impl Uploads {
     }
 }
 
-/// What a collector lists, reads and deletes. The filesystem store is walked directly: `object_store`'s local lister follows symlinks and fails a whole listing on one non-UTF-8 name. `read` and `delete` take keys the inventory listed (canonical for the files store); only `exists` takes any referenced key, so only it validates.
+/// What a collector lists, reads and deletes. The filesystem store is walked directly, for its files' ctimes (`object_store` reports mtimes). `read` and `delete` take keys the inventory listed (canonical for the filesystem store); only `exists` takes any referenced key, so only it validates.
 #[derive(Clone)]
 pub enum Media {
     Bucket(Arc<dyn ObjectStore>),
@@ -473,10 +473,6 @@ pub async fn start(
 struct Inventory {
     objects: u64,
     bytes: u64,
-    foreign_objects: u64,
-    foreign_bytes: u64,
-    /// Symlinks in the filesystem store, counted among the foreign objects.
-    symlinks: u64,
 }
 
 #[derive(Debug)]
@@ -506,8 +502,6 @@ enum Disarmed {
     /// The dedup log, whose start row also arms the filesystem store, doesn't span the grace yet.
     AckLog,
     Unparsed,
-    /// Symlinks in the filesystem store: what they lead to is outside the inventory.
-    Symlinks,
     /// A local user hasn't answered the question a pass over the ceiling asked.
     Asked,
     Ceiling(u64),
@@ -564,7 +558,6 @@ impl Collector {
                             mode = ?self.mode,
                             objects = inventory.objects,
                             bytes = inventory.bytes,
-                            foreign_objects = inventory.foreign_objects,
                             referenced_objects = report.referenced_objects,
                             candidate_objects = report.candidate_objects,
                             candidate_bytes = report.candidate_bytes,
@@ -636,17 +629,11 @@ impl Collector {
                 ),
             ));
         }
-        // Each of these pauses deletion on its own, so each shows whatever else pauses it, the ack log's warmup included.
+        // Unreadable manifests pause deletion by themselves, so this shows even when something else, such as the ack log's warmup, pauses it too.
         if self.mode == Mode::Delete && summary.unparsed > 0 {
             alerts.push(alert(
                 "MediaCleanupUnreadable",
                 format!("Garbage collection of media paused: {} galleries or file lists couldn't be read; the server log names them.", summary.unparsed),
-            ));
-        }
-        if self.mode == Mode::Delete && summary.inventory.symlinks > 0 {
-            alerts.push(alert(
-                "MediaCleanupSymlinks",
-                format!("Garbage collection of media paused: the media directory holds {} symlinks, which it can't account for; replace them with what they point to.", summary.inventory.symlinks),
             ));
         }
         // Only an operator sees this: a pass that can ask turns it into a question (`delete_if_safe`). The value to set stays ungrouped, so it pastes.
@@ -743,14 +730,7 @@ impl Collector {
             Some(deletes) => {
                 stage(
                     "delete",
-                    self.delete_if_safe(
-                        deletes,
-                        cutoff,
-                        unparsed,
-                        inventory.symlinks,
-                        &report,
-                        approved,
-                    ),
+                    self.delete_if_safe(deletes, cutoff, unparsed, &report, approved),
                 )
                 .await?
             }
@@ -838,34 +818,21 @@ impl Collector {
         Ok(missing)
     }
 
-    /// Lists the store into the scratch table; objects outside the key grammar are counted but never collected.
+    /// Lists the store's objects into the scratch table.
     async fn inventory(&self) -> Result<Inventory> {
         self.ch.cdn_gc_reset().await?;
         let mut inventory = Inventory::default();
         let mut batch = Vec::with_capacity(INSERT_ROWS);
         let mut listing = self.listing();
-        while let Some(listed) = listing.try_next().await? {
+        while let Some(Listed { key, size, created }) = listing.try_next().await? {
             inventory.objects += 1;
-            match listed {
-                Listed::Object { key, size, created } => {
-                    inventory.bytes += size;
-                    batch.push(CdnInventoryRow {
-                        kind: "inventory",
-                        key,
-                        size,
-                        created,
-                    });
-                }
-                Listed::Foreign { size } => {
-                    inventory.bytes += size;
-                    inventory.foreign_objects += 1;
-                    inventory.foreign_bytes += size;
-                }
-                Listed::Symlink => {
-                    inventory.foreign_objects += 1;
-                    inventory.symlinks += 1;
-                }
-            }
+            inventory.bytes += size;
+            batch.push(CdnInventoryRow {
+                kind: "inventory",
+                key,
+                size,
+                created,
+            });
             if batch.len() == INSERT_ROWS {
                 self.ch.cdn_gc_insert_inventory(&batch).await?;
                 batch.clear();
@@ -878,21 +845,19 @@ impl Collector {
     /// The store's objects, in no particular order.
     fn listing(&self) -> futures::stream::BoxStream<'static, Result<Listed>> {
         match &self.media {
+            // Only the server writes the bucket, so a listed name is the object's own: no "<key>/" alias, nothing object_store can't parse (docs/cdn-gcs-migration.md § Garbage collection).
             Media::Bucket(bucket) => bucket
                 .list(None)
-                .map(|meta| {
-                    let meta = meta.inspect_err(|_| count_gcs_error("read"))?;
+                .inspect_err(|_| count_gcs_error("read"))
+                .err_into()
+                .try_filter_map(|meta| {
                     let key = meta.location.to_string();
-                    Ok(if validate_hosted_key(&key) {
-                        Listed::Object {
-                            key,
-                            size: meta.size,
-                            // Last-modified (GCS `updated`): objects are never rewritten, and a later metadata change only delays collection.
-                            created: unix_seconds(meta.last_modified.into()),
-                        }
-                    } else {
-                        Listed::Foreign { size: meta.size }
-                    })
+                    std::future::ready(Ok(validate_hosted_key(&key).then(|| Listed {
+                        key,
+                        size: meta.size,
+                        // Last-modified (GCS `updated`): objects are never rewritten, and a later metadata change only delays collection.
+                        created: unix_seconds(meta.last_modified.into()),
+                    })))
                 })
                 .boxed(),
             Media::Files(files) => {
@@ -900,9 +865,9 @@ impl Collector {
                 let (sender, receiver) = tokio::sync::mpsc::channel(1024);
                 let files = files.clone();
                 let walked = tokio::task::spawn_blocking(move || {
-                    files.walk(&mut |entry| {
+                    files.walk(&mut |listed| {
                         sender
-                            .blocking_send(entry)
+                            .blocking_send(listed)
                             .map_err(|_| std::io::ErrorKind::BrokenPipe.into())
                     })
                 });
@@ -988,7 +953,6 @@ impl Collector {
         deletes: &Media,
         cutoff: u32,
         unparsed: u64,
-        symlinks: u64,
         report: &CdnGcReport,
         approved: Option<u64>,
     ) -> Result<Deleted> {
@@ -1006,7 +970,6 @@ impl Collector {
         let mut disarmed = disarmed(
             log_start.is_some_and(|start| start <= cutoff),
             unparsed,
-            symlinks,
             question,
             approved,
             report.candidate_objects,
@@ -1025,7 +988,6 @@ impl Collector {
                 reason = ?disarmed,
                 question = ?question,
                 unparsed_roots = unparsed,
-                symlinks,
                 ack_log_start = ?log_start,
                 candidates = report.candidate_objects,
                 ceiling,
@@ -1127,7 +1089,6 @@ impl Collector {
 fn disarmed(
     acks_cover_grace: bool,
     unparsed: u64,
-    symlinks: u64,
     question: Option<u64>,
     approved: Option<u64>,
     candidates: u64,
@@ -1138,9 +1099,6 @@ fn disarmed(
     }
     if unparsed > 0 {
         return Some(Disarmed::Unparsed);
-    }
-    if symlinks > 0 {
-        return Some(Disarmed::Symlinks);
     }
     if question.is_some() {
         return (question != approved).then_some(Disarmed::Asked);
@@ -1200,19 +1158,12 @@ fn size(bytes: u64) -> String {
     }
 }
 
-/// Classes partition the store: foreign (outside the key grammar, never collected), referenced, candidate, and grace (unreferenced but recently created or re-uploaded). `None` (a failed pass) blanks them rather than leaving a previous pass's split beside fresh size gauges.
+/// Classes partition the store's objects: referenced, candidate, and grace (unreferenced but recently created or re-uploaded). `None` (a failed pass) blanks them rather than leaving a previous pass's split beside fresh size gauges.
 fn publish_classes(pass: Option<(&Inventory, &CdnGcReport, u64, u64)>) {
     let value = |n: u64| pass.map_or(f64::NAN, |_| n as f64);
     let blank = (Inventory::default(), CdnGcReport::default());
     let (inventory, report, unparsed, missing) = pass.unwrap_or((&blank.0, &blank.1, 0, 0));
-    let valid_objects = inventory.objects - inventory.foreign_objects;
-    let valid_bytes = inventory.bytes - inventory.foreign_bytes;
     for (class, objects, bytes) in [
-        (
-            "foreign",
-            inventory.foreign_objects,
-            inventory.foreign_bytes,
-        ),
         (
             "referenced",
             report.referenced_objects,
@@ -1225,8 +1176,12 @@ fn publish_classes(pass: Option<(&Inventory, &CdnGcReport, u64, u64)>) {
         ),
         (
             "grace",
-            valid_objects.saturating_sub(report.referenced_objects + report.candidate_objects),
-            valid_bytes.saturating_sub(report.referenced_bytes + report.candidate_bytes),
+            inventory
+                .objects
+                .saturating_sub(report.referenced_objects + report.candidate_objects),
+            inventory
+                .bytes
+                .saturating_sub(report.referenced_bytes + report.candidate_bytes),
         ),
     ] {
         metrics::gauge!("mkdb2_cdn_gc_objects", "class" => class).set(value(objects));
@@ -1799,20 +1754,18 @@ mod tests {
         drop(turn);
     }
 
-    /// A whole pass hands deletion the grace, the gates and the answer: a filesystem store's cutoff is 31 days back; a held "Delete them" pages its question's keys (scratch kind `approved`, which the failed page names); and a symlink or a root the parse can't read disarms the pass before any page, even an approved one.
+    /// A whole pass hands deletion the grace, the gates and the answer: a filesystem store's cutoff is 31 days back; a held "Delete them" pages its question's keys (scratch kind `approved`, which the failed page names); and a root the parse can't read disarms the pass before any page, even an approved one.
     #[tokio::test]
     async fn a_pass_judges_with_the_grace_the_gates_and_the_answer() {
         let now = 1_760_000_000;
         let cutoff: u32 = now - 31 * 24 * 3600;
         let root = key('c', "json");
-        for case in ["approved", "symlink", "unreadable"] {
+        for unreadable in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let files = FsStore::new(dir.path().to_owned());
-            match case {
-                "symlink" => std::os::unix::fs::symlink(dir.path(), dir.path().join("ee")).unwrap(),
-                // A directory where the root's file belongs: the walk calls it foreign, and reading it fails.
-                "unreadable" => std::fs::create_dir_all(files.path_for(&root)).unwrap(),
-                _ => {}
+            if unreadable {
+                // A directory where the root's file belongs: the walk skips it, and reading it fails.
+                std::fs::create_dir_all(files.path_for(&root)).unwrap();
             }
             let mock = Mock::new();
             let collector = Collector {
@@ -1822,12 +1775,12 @@ mod tests {
                 ..mock_collector(&mock)
             };
             *collector.status.turn.lock().await = Some(QUESTION.id);
-            serve_the_first_half(&mock, (case == "unreadable").then_some(root.as_str()));
+            serve_the_first_half(&mock, unreadable.then_some(root.as_str()));
             let candidates = mock.add(handlers::record_ddl());
             mock.add(handlers::provide(vec![CdnGcReport::default()]));
             mock.add(handlers::provide(vec![cutoff])); // the ack log covers the grace
             mock.add(handlers::provide(vec![QUESTION]));
-            let collected = (case == "approved").then(|| {
+            let collected = (!unreadable).then(|| {
                 let collected = mock.add(handlers::record_ddl());
                 mock.add(handlers::failure(status::INTERNAL_SERVER_ERROR)); // its first page
                 collected
@@ -1844,13 +1797,7 @@ mod tests {
                     let error = format!("{:#}", outcome.err().unwrap());
                     assert!(error.contains("approved keys"), "{error}");
                 }
-                None => assert_eq!(
-                    outcome.unwrap().deleted.disarmed,
-                    Some(match case {
-                        "symlink" => Disarmed::Symlinks,
-                        _ => Disarmed::Unparsed,
-                    })
-                ),
+                None => assert_eq!(outcome.unwrap().deleted.disarmed, Some(Disarmed::Unparsed)),
             }
         }
     }
@@ -2015,22 +1962,14 @@ mod tests {
                 .conditions(&Ok(summary(Some(disarmed), 0)), now)
                 .is_empty());
         }
-        // Unreadable manifests and symlinks each show whatever paused the pass first, the ack log's warmup included; report mode pauses nothing.
+        // Unreadable manifests show even when the ack log's warmup paused the pass first; report mode pauses nothing.
         let paused = Ok(PassSummary {
             unparsed: 4,
-            inventory: Inventory {
-                symlinks: 2,
-                ..Default::default()
-            },
             ..summary(Some(Disarmed::AckLog), 3)
         });
         assert_eq!(
             shown(collector.conditions(&paused, now)),
-            [
-                "MediaMissing:None",
-                "MediaCleanupUnreadable:None",
-                "MediaCleanupSymlinks:None"
-            ]
+            ["MediaMissing:None", "MediaCleanupUnreadable:None"]
         );
         let reporting = Collector {
             mode: Mode::Report,
@@ -2051,29 +1990,25 @@ mod tests {
     fn a_standing_question_pauses_until_answered() {
         let question = Some(7);
         assert_eq!(
-            disarmed(false, 1, 1, question, Some(7), 30, 10),
+            disarmed(false, 1, question, Some(7), 30, 10),
             Some(Disarmed::AckLog)
         );
         assert_eq!(
-            disarmed(true, 1, 1, question, Some(7), 30, 10),
+            disarmed(true, 1, question, Some(7), 30, 10),
             Some(Disarmed::Unparsed)
-        );
-        assert_eq!(
-            disarmed(true, 0, 2, question, Some(7), 30, 10),
-            Some(Disarmed::Symlinks)
         );
         // It pauses even a pass that fits the ceiling, until "Delete them" arms one for its files, over the ceiling too.
         for approved in [None, Some(8)] {
             assert_eq!(
-                disarmed(true, 0, 0, question, approved, 0, 10),
+                disarmed(true, 0, question, approved, 0, 10),
                 Some(Disarmed::Asked)
             );
         }
-        assert_eq!(disarmed(true, 0, 0, question, Some(7), 30, 10), None);
+        assert_eq!(disarmed(true, 0, question, Some(7), 30, 10), None);
         // Without one the ceiling decides, whatever was approved before.
-        assert_eq!(disarmed(true, 0, 0, None, None, 10, 10), None);
+        assert_eq!(disarmed(true, 0, None, None, 10, 10), None);
         assert_eq!(
-            disarmed(true, 0, 0, None, Some(7), 11, 10),
+            disarmed(true, 0, None, Some(7), 11, 10),
             Some(Disarmed::Ceiling(10))
         );
     }
@@ -2104,7 +2039,7 @@ mod tests {
                 mock.add(handlers::provide(Vec::<CdnGcKeySize>::new()));
             }
             let deleted = collector
-                .delete_if_safe(&collector.media, cutoff, 0, 0, &report(candidates), None)
+                .delete_if_safe(&collector.media, cutoff, 0, &report(candidates), None)
                 .await
                 .unwrap();
             assert_eq!(deleted.disarmed, expected, "{log_start:?}, {candidates}");
@@ -2114,23 +2049,15 @@ mod tests {
             asks: true,
             ..mock_collector(&mock)
         };
-        for (log_start, unparsed, symlinks, question, expected) in [
-            (cutoff + 1, 0, 0, None, Disarmed::AckLog),
-            (cutoff, 1, 0, None, Disarmed::Unparsed),
-            (cutoff, 0, 1, None, Disarmed::Symlinks),
-            (cutoff, 0, 0, Some(QUESTION), Disarmed::Asked),
+        for (log_start, unparsed, question, expected) in [
+            (cutoff + 1, 0, None, Disarmed::AckLog),
+            (cutoff, 1, None, Disarmed::Unparsed),
+            (cutoff, 0, Some(QUESTION), Disarmed::Asked),
         ] {
             mock.add(handlers::provide(vec![log_start]));
             mock.add(handlers::provide(Vec::from_iter(question)));
             let deleted = asking
-                .delete_if_safe(
-                    &asking.media,
-                    cutoff,
-                    unparsed,
-                    symlinks,
-                    &report(10_101),
-                    None,
-                )
+                .delete_if_safe(&asking.media, cutoff, unparsed, &report(10_101), None)
                 .await
                 .unwrap();
             assert_eq!(deleted.disarmed, Some(expected));
@@ -2156,7 +2083,7 @@ mod tests {
         mock.add(handlers::provide(Vec::<CdnGcKeySize>::new()));
         let withdrawn = mock.add(handlers::record_ddl());
         let deleted = collector
-            .delete_if_safe(&collector.media, cutoff, 0, 0, &over, Some(QUESTION.id))
+            .delete_if_safe(&collector.media, cutoff, 0, &over, Some(QUESTION.id))
             .await
             .unwrap();
         assert_eq!(deleted.disarmed, None);
@@ -2178,7 +2105,7 @@ mod tests {
         mock.add(handlers::provide(Vec::<CdnGcQuestion>::new()));
         let asked = mock.add(handlers::record_ddl());
         let deleted = collector
-            .delete_if_safe(&collector.media, cutoff, 0, 0, &over, Some(held))
+            .delete_if_safe(&collector.media, cutoff, 0, &over, Some(held))
             .await
             .unwrap();
         assert_eq!(deleted.disarmed, Some(Disarmed::Asked));
@@ -2255,12 +2182,9 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let listed: Vec<_> = collector.listing().try_collect().await.unwrap();
-        let foreign = listed
-            .iter()
-            .filter(|listed| matches!(listed, Listed::Foreign { .. }))
-            .count();
-        assert_eq!((listed.len(), foreign), (3, 1));
+        let listed: Vec<Listed> = collector.listing().try_collect().await.unwrap();
+        // The name outside the key grammar isn't listed.
+        assert_eq!(listed.len(), 2);
 
         let dir = tempfile::tempdir().unwrap();
         let store = CdnStore::Fs(FsStore::new(dir.path().to_owned()));
@@ -2343,7 +2267,6 @@ mod tests {
                 .await
                 .unwrap();
         }
-        std::fs::write(dir.path().join("stray"), "x").unwrap();
         // Dated by ctime, which a copy or restore keeping mtime (`rsync -a`, `cp -p`) can't set back: a file whose mtime says 60 days is still new.
         let old = SystemTime::now() - Duration::from_secs(60 * 24 * 3600);
         std::fs::File::options()
@@ -2357,19 +2280,16 @@ mod tests {
             )
             .unwrap();
         let now = unix_seconds(SystemTime::now());
-        let listed: Vec<_> = collector.listing().try_collect().await.unwrap();
+        let listed: Vec<Listed> = collector.listing().try_collect().await.unwrap();
         let mut objects: Vec<_> = listed
-            .iter()
-            .filter_map(|listed| match listed {
-                Listed::Object { key, created, .. } => {
-                    assert!(*created >= now - 10, "{key} dated by mtime");
-                    Some(key.clone())
-                }
-                _ => None,
+            .into_iter()
+            .map(|Listed { key, created, .. }| {
+                assert!(created >= now - 10, "{key} dated by mtime");
+                key
             })
             .collect();
         objects.sort();
-        assert_eq!((objects, listed.len()), (vec![a.clone(), b.clone()], 3));
+        assert_eq!(objects, [a.clone(), b.clone()]);
 
         // A cutoff past both files' ctime nominates them; one before it spares them, as a re-upload's mark would (`a` too, whatever its mtime says). A gone file is left to the delete, which counts it.
         let keys = [a.clone(), b.clone(), key('c', "png")];
@@ -2655,9 +2575,9 @@ mod tests {
         let orphan_body = format!("orphan {run}");
         let orphan = put(orphan_body.clone(), "png").await?;
         let acked = put(format!("acked {run}"), "png").await?;
-        let foreign = format!("probe-{run}.txt");
+        let stray = format!("probe-{run}.txt");
         bucket
-            .put(&ObjectPath::from(foreign.as_str()), "probe".into())
+            .put(&ObjectPath::from(stray.as_str()), "probe".into())
             .await?;
         let dangling = content_key(format!("never uploaded {run}").as_bytes(), "png");
 
@@ -2704,8 +2624,7 @@ mod tests {
 
         // Everything was just created: the grace keeps all of it.
         let summary = collector.pass(SystemTime::now()).await?;
-        assert_eq!(summary.inventory.objects, 8);
-        assert_eq!(summary.inventory.foreign_objects, 1);
+        assert_eq!(summary.inventory.objects, 7);
         assert_eq!(summary.unparsed, 0);
         assert_eq!(summary.report.referenced_objects, 5);
         assert_eq!(summary.report.candidate_objects, 0);
@@ -2727,7 +2646,7 @@ mod tests {
             Err(object_store::Error::NotFound { .. })
         ));
         for kept in [
-            &gallery, &resources, &child_a, &child_b, &child_c, &acked, &foreign,
+            &gallery, &resources, &child_a, &child_b, &child_c, &acked, &stray,
         ] {
             bucket.head(&ObjectPath::from(kept.as_str())).await?;
         }
@@ -2775,7 +2694,6 @@ mod tests {
                     &Media::Bucket(bucket.clone()),
                     cutoff,
                     unparsed,
-                    0,
                     report,
                     None,
                 )
@@ -2864,7 +2782,7 @@ mod tests {
         Ok(())
     }
 
-    /// A filesystem-store pass against a throwaway ClickHouse: past the grace only unreachable files go, a symlink pauses deletion, and a pass over the ceiling asks the local user and deletes nothing until the answer.
+    /// A filesystem-store pass against a throwaway ClickHouse: past the grace only unreachable files go, and a pass over the ceiling asks the local user and deletes nothing until the answer.
     #[tokio::test]
     #[ignore = "requires KYMO_LIVE_TEST_CLICKHOUSE_URL"]
     async fn live_filesystem_pass_deletes_past_the_grace_and_asks_over_the_ceiling() -> Result<()> {
@@ -2919,17 +2837,12 @@ mod tests {
             assert!(collector.media.exists(kept).await?, "{kept}");
         }
 
-        // Over the ceiling a pass asks, and until an answer nothing goes: not after symlinks clear, not under a ceiling that grew, not after a restart.
-        let link = dir.path().join("cdn").join("ee");
-        std::os::unix::fs::symlink(dir.path(), &link)?;
+        // Over the ceiling a pass asks, and until an answer nothing goes: not under a ceiling that grew, not after a restart.
         collector.max_candidates = Some(1);
         let orphans = [
             put(format!("orphan 1 {run}"), "png").await?,
             put(format!("orphan 2 {run}"), "png").await?,
         ];
-        let summary = collector.pass(later).await?;
-        assert_eq!(summary.deleted.disarmed, Some(Disarmed::Symlinks));
-        std::fs::remove_file(&link)?;
         let summary = collector.pass(later).await?;
         assert_eq!(summary.deleted.disarmed, Some(Disarmed::Asked));
         let question = ch.cdn_gc_question().await?.context("asked")?;

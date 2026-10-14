@@ -1033,7 +1033,7 @@ impl IngestService {
                 "rich mutation contains an unstorable identifier, resource id, or timestamp",
             ));
         }
-        let _work = self.bumps.activity.begin_work();
+        let work = self.bumps.activity.begin_work();
 
         let metadata_row = MetricRow {
             project_id: req.project_id.clone(),
@@ -1047,14 +1047,10 @@ impl IngestService {
             text_data: None,
         };
         let Some(mutation_version) = req.mutation_version else {
-            flush_rows_inner(
-                &self.ch,
-                &self.pg,
-                &self.gates,
-                &self.bumps,
-                vec![metadata_row],
-            )
-            .await?;
+            let charge = ByteCharge::new(self.byte_budget.clone());
+            self.spawn_owned_flush(vec![metadata_row], None, None, work, charge)
+                .await
+                .map_err(insert_task_failed)??;
             return Ok(Response::new(proto::PublishRichMutationResponse {
                 disposition: proto::RichMutationDisposition::RichMutationAccepted as i32,
                 stored_version: None,
@@ -1071,7 +1067,7 @@ impl IngestService {
         // Share the same global ClickHouse admission budget as streamed and
         // legacy unary inserts. The client keeps this ordered head until the
         // response, so waiting here adds backpressure without losing work.
-        let _flush_permit = if self.cap_unary_flushes {
+        let flush_permit = if self.cap_unary_flushes {
             Some(self.acquire_flush_slot().await?)
         } else {
             None
@@ -1080,25 +1076,12 @@ impl IngestService {
             return Err(Status::unavailable("server shutting down"));
         }
 
-        let key = RunKey::new(&req.project_id, &req.run_id);
         let admission_deadline = tokio::time::Instant::now() + PRE_CH_ADMISSION_TIMEOUT;
-        let _run_guards = wait_for_pre_ch_admission(
-            admission_deadline,
-            "rich_run_gate",
-            self.gates.read_many([key.clone()]),
-        )
-        .await?;
-        wait_for_pre_ch_admission(
-            admission_deadline,
-            "rich_lifecycle_check",
-            self.pg.ensure_runs_active(&[key]),
-        )
-        .await?
-        .map_err(run_access_status)?;
-        let _submission_guard = wait_for_pre_ch_admission(
-            admission_deadline,
-            "rich_submission_gate",
-            self.gates.read_submission(),
+        let (run_guards, submission_guard) = acquire_write_fences(
+            &self.pg,
+            &self.gates,
+            std::slice::from_ref(&metadata_row),
+            Some(admission_deadline),
         )
         .await?;
 
@@ -1150,24 +1133,20 @@ impl IngestService {
             cdn_key: req.cdn_key,
             mutation_version,
         };
-        self.ch
-            .insert_rich_mutation(&rich_row, CH_IO_TIMEOUT)
+        // The insert and its bump run in a task of their own, so a cancelled RPC can neither let Trash overtake a row still landing nor skip the bump; like other flushes, it keeps the guards until ClickHouse answers or CH_IO_TIMEOUT leaves the outcome unknown.
+        let ch = self.ch.clone();
+        let bumps = self.bumps.clone();
+        tokio::spawn(async move {
+            let _held = (work, flush_permit, run_guards, submission_guard);
+            insert_and_note(
+                ch.insert_rich_mutation(&rich_row, CH_IO_TIMEOUT),
+                &bumps,
+                std::slice::from_ref(&metadata_row),
+            )
             .await
-            .map_err(|error| match error {
-                clickhouse::error::Error::TimedOut => Status::unavailable(format!(
-                    "ClickHouse rich insert exceeded an I/O deadline of {}s; outcome unknown",
-                    CH_IO_TIMEOUT.as_secs()
-                )),
-                error => Status::internal(format!("ClickHouse rich insert failed: {error}")),
-            })?;
-        let rows = [metadata_row];
-        let metadata = batch_metadata(&rows);
-        self.bumps.mark_dirty(
-            metadata.heartbeats.into_iter(),
-            metadata.candidates,
-            chrono::Utc::now().timestamp_millis(),
-        );
-        metrics::counter!("mkdb2_ingest_points_total").increment(1);
+        })
+        .await
+        .map_err(insert_task_failed)??;
         Ok(Response::new(proto::PublishRichMutationResponse {
             disposition: disposition as i32,
             stored_version: Some(mutation_version),
@@ -1188,7 +1167,7 @@ impl IngestService {
         await_owned_flush(task, deadline, None).await
     }
 
-    /// Unbounded FIFO wait. Bidi callers keep disconnect cancellation armed around it, unary and rich-mutation waits die with their dropped RPC futures, and shutdown work is refused by flush_rows_inner's drain check.
+    /// Unbounded FIFO wait. Bidi callers keep disconnect cancellation armed around it, unary and rich-mutation waits die with their dropped RPC futures, and shutdown work is refused by the drain checks after it.
     async fn acquire_flush_slot(&self) -> Result<OwnedSemaphorePermit, Status> {
         let started = Instant::now();
         let acquired = self.flush_slots.clone().acquire_owned().await;
@@ -1359,11 +1338,15 @@ impl IngestService {
         tokio::spawn(async move {
             let _work = work;
             let mut guard = guard;
-            let result = flush_rows_inner(&ch, &pg, &gates, &bumps, rows).await;
+            let result = flush_rows_inner(&ch, &pg, &gates, &bumps, &rows).await;
             guard.finish(&result);
             result
         })
     }
+}
+
+fn insert_task_failed(error: tokio::task::JoinError) -> Status {
+    Status::internal(format!("ClickHouse insert task failed: {error}"))
 }
 
 async fn await_owned_flush(
@@ -1373,9 +1356,7 @@ async fn await_owned_flush(
 ) -> Result<(), Status> {
     match tokio::time::timeout_at(deadline, &mut task).await {
         Ok(Ok(result)) => result,
-        Ok(Err(error)) => Err(Status::internal(format!(
-            "ClickHouse flush task failed: {error}"
-        ))),
+        Ok(Err(error)) => Err(insert_task_failed(error)),
         Err(_) => {
             // Dropping the JoinHandle detaches rather than aborts. The task keeps
             // its permit/key ownership and native clickhouse-rs timers.
@@ -1853,7 +1834,7 @@ async fn flush_rows_inner(
     pg: &PgStore,
     gates: &LifecycleGates,
     bumps: &BumpCoalescer,
-    rows: Vec<MetricRow>,
+    rows: &[MetricRow],
 ) -> Result<(), Status> {
     debug_assert!(!rows.is_empty());
     // SIGTERM drain: refuse work; the client spools and re-sends after restart (as unary `flush`).
@@ -1866,36 +1847,36 @@ async fn flush_rows_inner(
     // completion before changing lifecycle state.
     let admission_deadline = tokio::time::Instant::now() + PRE_CH_ADMISSION_TIMEOUT;
     let (_run_guards, _submission_guard) =
-        acquire_write_fences(pg, gates, &rows, Some(admission_deadline)).await?;
+        acquire_write_fences(pg, gates, rows, Some(admission_deadline)).await?;
 
-    let n = rows.len() as u64;
-    let flush_start = Instant::now();
-    let result = ch.insert_batch(&rows, CH_IO_TIMEOUT, false).await;
-    let insert_duration = flush_start.elapsed().as_secs_f64();
-    metrics::histogram!("mkdb2_ch_insert_duration_seconds").record(insert_duration);
-    match result {
-        Ok(()) => {
-            metrics::counter!("mkdb2_ch_insert_attempts_total", "outcome" => "success")
-                .increment(1);
-        }
+    insert_and_note(ch.insert_batch(rows, CH_IO_TIMEOUT, false), bumps, rows).await
+}
+
+/// Run the ClickHouse insert of `rows`, timing and counting it by its outcome and mapping a failure to its status; then count the rows and mark them dirty. Registration candidates come only from rows whose insert succeeded, so the registry never lists a metric whose data write failed. The materialized-view outbox is already durable at this point; this marks the low-latency Postgres path dirty. Everything else (known-metric filter, Postgres writes, retry) lives in the coalescer, so the ack never waits on the metadata store (see BumpCoalescer).
+async fn insert_and_note(
+    insert: impl Future<Output = clickhouse::error::Result<()>>,
+    bumps: &BumpCoalescer,
+    rows: &[MetricRow],
+) -> Result<(), Status> {
+    let started = Instant::now();
+    let result = insert.await;
+    metrics::histogram!("mkdb2_ch_insert_duration_seconds").record(started.elapsed().as_secs_f64());
+    let (outcome, status) = match result {
+        Ok(()) => ("success", Ok(())),
         Err(error) => {
             let (outcome, status) = clickhouse_insert_error(error, CH_IO_TIMEOUT);
-            metrics::counter!("mkdb2_ch_insert_attempts_total", "outcome" => outcome).increment(1);
-            metrics::histogram!("mkdb2_flush_duration_seconds").record(insert_duration);
-            return Err(status);
+            (outcome, Err(status))
         }
-    }
-    metrics::counter!("mkdb2_ingest_points_total").increment(n);
-
-    // Registration candidates come only from a batch whose CH insert succeeded, so the registry never lists a metric whose data write failed. The materialized-view outbox is already durable at this point; this marks the low-latency Postgres path dirty. Everything else (known-metric filter, Postgres writes, retry) lives in the coalescer, so the ack never waits on the metadata store (see BumpCoalescer).
-    let metadata = batch_metadata(&rows);
+    };
+    metrics::counter!("mkdb2_ch_insert_attempts_total", "outcome" => outcome).increment(1);
+    status?;
+    metrics::counter!("mkdb2_ingest_points_total").increment(rows.len() as u64);
+    let metadata = batch_metadata(rows);
     bumps.mark_dirty(
         metadata.heartbeats.into_iter(),
         metadata.candidates,
         chrono::Utc::now().timestamp_millis(),
     );
-
-    metrics::histogram!("mkdb2_flush_duration_seconds").record(flush_start.elapsed().as_secs_f64());
     Ok(())
 }
 
@@ -1924,6 +1905,29 @@ pub(crate) fn clickhouse_insert_error(
                 "ClickHouse insert transport failed: {error}; outcome unknown"
             )),
         )
+    }
+}
+
+#[cfg(test)]
+impl IngestService {
+    /// A service over the given stores for tests: flush concurrency 1, with `free_slots` free global flush slots.
+    fn for_test(
+        ch: Arc<ChClient>,
+        pg: Arc<PgStore>,
+        gates: LifecycleGates,
+        bumps: Arc<BumpCoalescer>,
+        free_slots: usize,
+    ) -> Self {
+        Self {
+            ch,
+            pg,
+            gates,
+            bumps,
+            flush_concurrency: 1,
+            flush_slots: Arc::new(Semaphore::new(free_slots)),
+            byte_budget: ByteBudget::new(MEBIBYTE),
+            cap_unary_flushes: true,
+        }
     }
 }
 
@@ -2611,16 +2615,13 @@ mod registry_tests {
 
     #[tokio::test]
     async fn completed_ack_drains_while_waiting_for_global_permit() {
-        let service = IngestService {
-            ch: Arc::new(ChClient::new("http://unused").unwrap()),
-            pg: Arc::new(PgStore::test_store()),
-            gates: LifecycleGates::new(),
-            bumps: BumpCoalescer::empty_for_test(),
-            flush_concurrency: 1,
-            flush_slots: Arc::new(Semaphore::new(0)),
-            byte_budget: ByteBudget::new(MEBIBYTE),
-            cap_unary_flushes: true,
-        };
+        let service = IngestService::for_test(
+            Arc::new(ChClient::new("http://unused").unwrap()),
+            Arc::new(PgStore::test_store()),
+            LifecycleGates::new(),
+            BumpCoalescer::empty_for_test(),
+            0,
+        );
         let mut state = BidiState::new();
         state.cut.push(
             &service.byte_budget,

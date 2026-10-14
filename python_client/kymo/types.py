@@ -20,6 +20,9 @@ class Image:
         format: Image format for encoding (png, jpg, webp). For raw bytes,
                 the default png asks the client to detect the encoded format;
                 a non-default value is kept as an explicit extension override.
+                mpo (a multi-picture JPEG) is stored as jpeg, whether named
+                here or detected in raw bytes. An image in a format the CDN
+                does not serve is dropped with a warning.
     """
 
     def __init__(self, data: Any, caption: str = "", format: str = "png"):

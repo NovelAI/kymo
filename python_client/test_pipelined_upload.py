@@ -4305,6 +4305,40 @@ class AccountingTests(unittest.TestCase):
         self.assertEqual(texts, ["captured"])
 
     @unittest.skipUnless(hasattr(os, "fork"), "requires os.fork")
+    def test_a_raw_fork_child_frees_the_accounting_lock_another_thread_held(self):
+        script = """
+import multiprocessing, os, threading
+import kymo.client as client
+
+client._queue_status = multiprocessing.Value("q", 0)
+lock = client._queue_status.get_lock()
+held, forked = threading.Event(), threading.Event()
+
+
+def hold():
+    with lock:
+        held.set()
+        forked.wait()
+
+
+thread = threading.Thread(target=hold)
+thread.start()
+held.wait()
+pid = os.fork()
+if pid == 0:
+    client._charge_backlog(1, None)
+    os._exit(0)
+forked.set()
+thread.join()
+os.waitpid(pid, 0)
+client._charge_backlog(1, None)
+print(client._queue_status.get_obj().value, lock.acquire(timeout=1))
+"""
+        result = _run_script_file(script)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "2 True", result.stderr)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires os.fork")
     def test_a_fork_child_handles_shutdown_signals_at_once(self):
         # Forked from another thread while the main thread publishes: the child's main thread is the forking one, in no section.
         script = r"""
@@ -9673,6 +9707,51 @@ class PollerPublicationTests(unittest.TestCase):
         with self.assertRaises(OSError):
             poller._poll_once()
 
+    def test_polling_stops_once_the_worker_has_exited(self):
+        publish = mock.Mock(side_effect=client_module._WorkerExited("worker gone"))
+        poller = self._poller(publish)
+        with (
+            self.assertLogs("kymo", level="WARNING") as logs,
+            mock.patch.object(poller._stop, "wait", side_effect=[False]),
+        ):
+            poller._poll_loop()
+        self.assertEqual(publish.call_count, 1)
+        self.assertIn("upload worker has exited", "\n".join(logs.output))
+
+    def test_polling_survives_failed_publications(self):
+        # A failure after a success still waits out the minute.
+        busy = RuntimeError("accounting lock busy")
+        publish = mock.Mock(side_effect=[busy, None, busy, None])
+        poller = self._poller(publish)
+        with (
+            self.assertLogs("kymo", level="WARNING") as logs,
+            mock.patch.object(poller._stop, "wait", side_effect=[False] * 4 + [True]),
+        ):
+            poller._poll_loop()
+        self.assertEqual(publish.call_count, 4)
+        failures = [line for line in logs.output if "poll failed" in line]
+        self.assertEqual(len(failures), 1)
+
+    def test_polling_warns_again_once_the_minute_has_passed(self):
+        now = [0.0]
+
+        def publish(_groups):
+            # Failures 30 s apart: the first warns, the second is within its minute, the third is not.
+            now[0] += 30.0
+            raise RuntimeError("accounting lock busy")
+
+        poller = self._poller(publish)
+        with (
+            self.assertLogs("kymo", level="WARNING") as logs,
+            mock.patch.object(poller._stop, "wait", side_effect=[False] * 3 + [True]),
+            mock.patch.object(
+                system_metrics_module.time, "monotonic", side_effect=lambda: now[0]
+            ),
+        ):
+            poller._poll_loop()
+        failures = [line for line in logs.output if "poll failed" in line]
+        self.assertEqual(len(failures), 2)
+
     def test_nvml_discovery_failure_balances_successful_initialization(self):
         calls = []
 
@@ -10943,6 +11022,50 @@ class WorkerResponsivenessTests(unittest.TestCase):
             self.assertTrue(os.path.exists(spool_path))
             self.assertEqual(status.value, 0)
             self.assertEqual(spooled.value, 1)
+
+    def test_worker_waits_out_a_live_owner_stalled_on_the_accounting_lock(self):
+        class StalledLock:
+            """The accounting lock of a live owner that keeps it across several lock steps."""
+
+            def __init__(self, steps):
+                self.steps = steps
+                self.lock = threading.Lock()
+
+            def acquire(self, timeout=-1):
+                if self.steps:
+                    self.steps -= 1
+                    return False
+                return self.lock.acquire(timeout=timeout)
+
+            def release(self):
+                self.lock.release()
+
+        source = queue.Queue()
+        source.put([numeric(1)])
+        source.put([numeric(2)])
+        status = _QueueStatus(2)
+        status.lock = StalledLock(3)
+        with tempfile.TemporaryDirectory() as spool_dir:
+            spool_path = os.path.join(spool_dir, "stalled.mkspool")
+            with (
+                mock.patch.object(
+                    client_module,
+                    "_ConnectionAttempt",
+                    return_value=self._NeverConnects(),
+                ),
+                mock.patch.object(client_module, "_CONNECT_POLL_TIMEOUT", 0.001),
+                mock.patch.dict(os.environ, {"KYMO_MAX_BUFFER_POINTS": "1"}),
+            ):
+                # The RAM cap fails the lane over to disk, whose spill releases accounting before any deadline.
+                worker = _worker_thread(self, source, status, spool_path)
+                self.assertTrue(_wait_for(lambda: status.value == 0))
+                source.put(None)
+                worker.join(timeout=2)
+            records = list(read_spool(spool_path)[1])
+
+        self.assertEqual(worker.code, 0)
+        self.assertEqual(status.lock.steps, 0)
+        self.assertEqual([record[2] for record in records], [1, 2])
 
     def test_never_ready_connection_keeps_draining_until_ram_cap_failover(self):
         attempt_started = threading.Event()

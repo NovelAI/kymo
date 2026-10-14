@@ -73,7 +73,6 @@ pub fn clickhouse_config_xml(
   <tmp_path>{root}/tmp/</tmp_path>
   <user_files_path>{root}/user-files/</user_files_path>
   <format_schema_path>{root}/format-schemas/</format_schema_path>
-  <pid_file>{root}/clickhouse.pid</pid_file>
   <users_config>{users}</users_config>
   <listen_host>127.0.0.1</listen_host>
   <https_port>{port}</https_port>
@@ -133,7 +132,6 @@ mod tests {
         .unwrap();
         assert!(clickhouse.contains("<listen_host>127.0.0.1</listen_host>"));
         assert!(clickhouse.contains("<https_port>18123</https_port>"));
-        assert!(clickhouse.contains("<pid_file>/private/root&amp;data/clickhouse.pid</pid_file>"));
         assert!(clickhouse.contains("/private/root&amp;data"));
         assert!(!clickhouse.contains("<http_port>"));
         let users = clickhouse_users_xml("a&<password");

@@ -25,7 +25,6 @@ pub(crate) struct PreparedGeneration {
     pub(crate) lifecycle_bearer: String,
     pub(crate) clickhouse_certificate: PathBuf,
     pub(crate) clickhouse_password: String,
-    pub(crate) clickhouse_port: u16,
 }
 
 #[derive(Serialize)]
@@ -130,7 +129,6 @@ pub(crate) fn prepare(paths: &RuntimePaths, clickhouse_port: u16) -> Result<Prep
         lifecycle_bearer,
         clickhouse_certificate: certificate,
         clickhouse_password,
-        clickhouse_port,
     })
 }
 

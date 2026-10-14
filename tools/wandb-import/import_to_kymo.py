@@ -22,6 +22,7 @@ Mapping (wandb -> kymo):
     run  <id> "name"         -> run_id "wandb_<proj_slug>_<id>", run_name "name"
     history numeric cell     -> numeric_ts point (step=_step, ts=_timestamp)
     history string column    -> text_ts stream under the metric name
+    other history column     -> skipped (lists, maps, timestamps...; counted as unsupported_cells)
     images/separated, image-file -> CDN image_gallery manifest at the step
     table-/plotly-/html-file -> CDN gallery of file resources (download-only)
     histogram                -> skipped (counted; no kymo representation)
@@ -137,7 +138,7 @@ from kymo._wire import (
 )
 from kymo.client import (
     _MAX_RUN_NAME_BYTES,
-    _RESOURCE_EXTENSIONS,
+    _CDN_EXTENSIONS,
     _BidiStream,
     _strip_url_userinfo,
 )
@@ -721,7 +722,7 @@ class Sender:
 
 def media_ext(filename: str, fmt: str | None) -> str:
     ext = PurePosixPath(filename).suffix.lstrip(".").lower() or (fmt or "").lower()
-    return ext if ext in _RESOURCE_EXTENSIONS else "bin"
+    return ext if ext in _CDN_EXTENSIONS else "bin"
 
 
 def coerce_caption(v) -> str:
@@ -923,46 +924,54 @@ def leaf_owners(schema_arrow):
     return owners
 
 
-def footer_nonnull_by_field(pf):
-    """Exact per-top-level-field non-null cell counts from footer statistics.
-    Returns None if leaf alignment can't be established (caller falls back)."""
+def footer_numeric_counts(pf, kinds):
+    """Exact non-null cell counts of the numeric top-level fields from footer statistics.
+    Returns None if leaf alignment can't be established or a numeric leaf has no
+    statistics (caller falls back to reading)."""
     md = pf.metadata
-    schema = pf.schema_arrow
-    owners = leaf_owners(schema)
+    owners = leaf_owners(pf.schema_arrow)
     if md.num_row_groups and md.row_group(0).num_columns != len(owners):
         return None
     counts = collections.Counter()
-    struct_names = {
-        n
-        for i, n in enumerate(schema.names)
-        if str(schema.field(i).type).startswith("struct")
-    }
-    any_stats = False
     for rg in range(md.num_row_groups):
         rgm = md.row_group(rg)
-        for ci in range(rgm.num_columns):
-            top = owners[ci]
-            if top in struct_names:
-                continue  # media cells are counted by reading their columns
+        for ci, top in enumerate(owners):
+            if kinds.get(top) != "n":
+                continue
             st = rgm.column(ci).statistics
-            if st is not None and st.has_null_count:
-                any_stats = True
-                counts[top] += rgm.num_rows - st.null_count
-            else:
-                counts[top] += rgm.num_rows
-    if not any_stats and md.num_rows:
-        return None  # stats-less file (e.g. events): rows*cols would overcount
+            if st is None or not st.has_null_count:
+                return None
+            counts[top] += rgm.num_rows - st.null_count
     return counts
 
 
 def column_kind(field):
-    """How a history column imports: "_" (axes and wandb internals, skipped), "m" (struct cells: media, stats, type unions), "s" (text), or "n" (numeric)."""
-    t = str(field.type)
+    """How a history column imports: "_" (axes and wandb internals, skipped), "m" (struct cells: media, stats, type unions), "s" (text), "n" (numbers and booleans), or "x" (any other type: skipped, counted)."""
     if field.name.startswith("_"):
         return "_"
-    if t.startswith("struct"):
+    t = field.type
+    if pa.types.is_dictionary(t):
+        t = t.value_type
+    if pa.types.is_struct(t):
         return "m"
-    return "s" if t in ("string", "large_string", "binary") else "n"
+    # By name: older pyarrow lacks pa.types.is_string_view and is_binary_view.
+    if str(t) in (
+        "string",
+        "large_string",
+        "string_view",
+        "binary",
+        "large_binary",
+        "binary_view",
+    ):
+        return "s"
+    if (
+        pa.types.is_integer(t)
+        or pa.types.is_floating(t)
+        or pa.types.is_boolean(t)
+        or pa.types.is_decimal(t)
+    ):
+        return "n"
+    return "x"
 
 
 def iter_parquet_rows_meta(files):
@@ -1022,7 +1031,7 @@ def import_history(sender, ctx, run_dir, created_ms, deep):
                         )
             elif kind == "s":
                 for row, v in enumerate(col.to_pylist()):
-                    if v is None or v == "":
+                    if not v:
                         continue
                     text = v.decode("utf-8", "replace") if isinstance(v, bytes) else v
                     step = ctx.text_step(name, tss[row])
@@ -1033,45 +1042,43 @@ def import_history(sender, ctx, run_dir, created_ms, deep):
                     )
                     c["string_cells"] += 1
             elif kind == "n":
-                pts = []
-                for row, v in enumerate(col.to_pylist()):
-                    if v is None:
-                        continue
-                    try:
-                        pts.append(
-                            ("numeric_ts", name, steps[row], clamp_f32(v, c), tss[row])
-                        )
-                    except (TypeError, ValueError):
-                        c["unconvertible_values"] += 1
+                pts = [
+                    ("numeric_ts", name, steps[row], clamp_f32(v, c), tss[row])
+                    for row, v in enumerate(col.to_pylist())
+                    if v is not None
+                ]
                 sender.queue(ctx.project_id, ctx.run_id, pts)
+            elif kind == "x":
+                c["unsupported_cells"] += len(col) - col.null_count
 
 
 def count_history_dry(sender, ctx, files, created_ms):
-    """Dry-run: numeric/string counts from footers, media columns read fully."""
+    """Dry-run: numeric counts from footers; text, media and unsupported columns read."""
     c = sender.c
     for path in files:
         pf = pq.ParquetFile(path)
         kinds = {f.name: column_kind(f) for f in pf.schema_arrow}
-        nonnull = footer_nonnull_by_field(pf)
-        if nonnull is None:  # exotic schema; count by reading (slow, rare)
-            t = pf.read()
+        nonnull = footer_numeric_counts(pf, kinds)
+        if nonnull is None:  # exotic schema, missing stats; read (slow, rare)
+            t = pf.read(columns=[n for n, k in kinds.items() if k == "n"])
             nonnull = collections.Counter(
                 {
                     n: t.num_rows - t.column(i).null_count
                     for i, n in enumerate(t.column_names)
                 }
             )
-        c["numeric_ts"] += sum(
-            nn for top, nn in nonnull.items() if kinds.get(top) == "n"
-        )
+        c["numeric_ts"] += sum(nonnull.values())
         string_cols = [n for n, k in kinds.items() if k == "s"]
         media_cols = [n for n, k in kinds.items() if k == "m"]
-        if not string_cols and not media_cols:
+        # Read, not footer-counted: a list's footer statistics count its items, not its cells.
+        unsupported_cols = [n for n, k in kinds.items() if k == "x"]
+        if not string_cols and not media_cols and not unsupported_cols:
             ctx.history_rows += pf.metadata.num_rows  # keep ordinals = execute's
             continue
         take = (
             media_cols
             + string_cols
+            + unsupported_cols
             + [x for x in ("_step", "_timestamp") if x in kinds]
         )
         for batch in pf.iter_batches(batch_size=2048, columns=take):
@@ -1085,9 +1092,12 @@ def count_history_dry(sender, ctx, files, created_ms):
                         )
             for name in string_cols:
                 vals = batch.column(idx[name]).to_pylist()
-                got = sum(1 for v in vals if v not in (None, ""))
+                got = sum(1 for v in vals if v)
                 c["string_cells"] += got
                 c["text_ts"] += got
+            for name in unsupported_cols:
+                col = batch.column(idx[name])
+                c["unsupported_cells"] += len(col) - col.null_count
 
 
 def import_scan_history(sender, ctx, scan_path, created_ms):
@@ -1117,6 +1127,8 @@ def import_scan_history(sender, ctx, scan_path, created_ms):
                         c["string_cells"] += 1
                 elif isinstance(v, (int, float)):
                     pts.append(("numeric_ts", name, step, clamp_f32(v, c), ts))
+                else:
+                    c["unsupported_cells"] += 1
             sender.queue(ctx.project_id, ctx.run_id, pts)
 
 
@@ -1639,7 +1651,7 @@ def main():
     ap.add_argument(
         "--deep",
         action="store_true",
-        help="dry-run reads full data instead of parquet footers",
+        help="dry-run also reads numeric history instead of using parquet footer counts",
     )
     cfg = ap.parse_args()
 

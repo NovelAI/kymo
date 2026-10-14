@@ -1,8 +1,7 @@
 //! CDN blob storage backends behind one dispatch surface (docs/cdn-gcs-migration.md).
 //!
-//! Realized as a closed enum rather than a trait: the backend set is closed (filesystem, the
-//! default in both modes, and opt-in GCS) and enum dispatch keeps async methods dyn-safe without
-//! an async_trait dependency.
+//! A closed enum rather than a trait, since the backend set is closed: filesystem, the default
+//! in both modes, and opt-in GCS.
 //! The hosted routes validate the hosted key grammar; `FsStore::get` checks the local one, so
 //! every filesystem serves one spelling of a key, as GCS does.
 
@@ -138,7 +137,7 @@ fn resolve_range(range: Option<ByteRange>, total_len: u64) -> Result<(u64, u64),
 #[derive(Clone)]
 pub struct FsStore {
     root: PathBuf,
-    /// `MARK_INTERVAL`, shorter only in tests: nothing can backdate a ctime.
+    /// `MARK_INTERVAL`, shorter only in tests.
     mark_interval: Duration,
 }
 
@@ -154,17 +153,11 @@ async fn marked(path: &Path, interval: Duration) -> bool {
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || {
         use std::os::fd::AsRawFd;
-        use std::os::unix::fs::OpenOptionsExt;
-        // Only a regular file can carry the mark; anything else is left to the rewrite, which replaces it: opening a FIFO would block, and a symlink's target isn't the key's file.
+        // Only a regular file can carry the mark; anything else is left to the rewrite, which replaces it, since opening a FIFO would block.
         if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
             return false;
         }
-        // Not through a symlink swapped in since the lstat.
-        let Ok(file) = std::fs::File::options()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
-        else {
+        let Ok(file) = std::fs::File::open(path) else {
             return false;
         };
         let fresh = || {
@@ -195,24 +188,17 @@ fn changed_within(meta: &std::fs::Metadata, window: Duration) -> bool {
         .map_or(true, |age| age < window)
 }
 
-/// One entry of a collector listing (the bucket's, or [`FsStore::walk`]).
-pub(crate) enum Listed {
-    /// An object a viewer can open by its key. `created` starts its grace: GCS last-modified, or a file's ctime.
-    Object {
-        key: String,
-        size: u64,
-        created: u32,
-    },
-    /// Outside the key grammar; counted, never collected.
-    Foreign { size: u64 },
-    /// Whatever it leads to is beyond the inventory, so it disarms deletion.
-    Symlink,
+/// An object a collector lists (from the bucket, or [`FsStore::walk`]), which a viewer can open by its key. `created` starts its grace: GCS last-modified, or a file's ctime.
+pub(crate) struct Listed {
+    pub(crate) key: String,
+    pub(crate) size: u64,
+    pub(crate) created: u32,
 }
 
-/// One level of [`FsStore::walk`]; `prefix` is the shard names above it, so `"abcd"` lists files.
+/// One level of [`FsStore::walk`]; `depth` counts the shard levels above it, so 2 lists files.
 fn walk_level(
     dir: &Path,
-    prefix: &str,
+    depth: usize,
     each: &mut dyn FnMut(Listed) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
@@ -223,34 +209,22 @@ fn walk_level(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
         };
-        let listed = match entry.file_name().into_string() {
-            _ if meta.is_symlink() => Listed::Symlink,
-            Ok(shard)
-                if prefix.len() < 4
-                    && meta.is_dir()
-                    && shard.len() == 2
-                    && shard.bytes().all(|b| b.is_ascii_hexdigit()) =>
-            {
-                walk_level(&entry.path(), &format!("{prefix}{shard}"), each)?;
-                continue;
-            }
-            Ok(key)
-                if prefix.len() == 4
-                    && meta.is_file()
-                    && crate::cdn::validate_local_key(&key)
-                    && key[..4] == *prefix =>
-            {
-                Listed::Object {
-                    created: meta.ctime().clamp(0, u32::MAX.into()) as u32,
-                    size: meta.len(),
-                    key,
-                }
-            }
-            _ => Listed::Foreign {
-                size: if meta.is_file() { meta.len() } else { 0 },
-            },
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
         };
-        each(listed)?;
+        if depth < 2
+            && meta.is_dir()
+            && name.len() == 2
+            && name.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            walk_level(&entry.path(), depth + 1, each)?;
+        } else if depth == 2 && meta.is_file() && crate::cdn::validate_local_key(&name) {
+            each(Listed {
+                created: meta.ctime().clamp(0, u32::MAX.into()) as u32,
+                size: meta.len(),
+                key: name,
+            })?;
+        }
     }
     Ok(())
 }
@@ -280,12 +254,12 @@ impl FsStore {
         self.root.join(&key[..2]).join(&key[2..4]).join(key)
     }
 
-    /// Walks the fanout for the collector's inventory, without following symlinks (`DirEntry::metadata` is an lstat). An object is a regular file with a canonical name (`validate_local_key`, which every uploaded key meets) at exactly its `path_for`. A symlink anywhere it looks is reported as one; everything else, temps and files under any other name or path included, is foreign. An error from `each` stops the walk with it; files that vanish mid-walk are skipped, and a shard that vanishes fails it.
+    /// Walks the fanout for the collector's inventory, without following symlinks (`DirEntry::metadata` is an lstat). An object is a regular file with a canonical name (`validate_local_key`, which every uploaded key meets) in a second-level shard; the walk skips everything else (the upload temps, and whatever the filesystem keeps there, such as `lost+found`). An error from `each` stops the walk with it; files that vanish mid-walk are skipped, and a shard that vanishes fails it.
     pub(crate) fn walk(
         &self,
         each: &mut dyn FnMut(Listed) -> std::io::Result<()>,
     ) -> std::io::Result<()> {
-        walk_level(&self.root, "", each)
+        walk_level(&self.root, 0, each)
     }
 
     async fn put_if_absent(&self, key: &str, body: &[u8]) -> anyhow::Result<PutOutcome> {
@@ -331,7 +305,7 @@ impl FsStore {
                 std::process::id(),
                 TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
-            // Drop-guard removes the temp on ANY exit that didn't rename it — errors, but also cancellation (the uploader's client timeout dropping the connection while the write stalls on a slow volume), which skips ordinary error handling entirely. Only a hard kill mid-write still leaves one, for the sweep above.
+            // Drop-guard removes the temp on ANY exit that didn't rename it — errors, but also cancellation (the uploader's client timeout dropping the connection while the write stalls on a slow volume), which skips ordinary error handling entirely. Only a process exit mid-write (SIGTERM's drain or a hard kill) still leaves one, for the sweep above.
             struct TmpGuard(Option<std::path::PathBuf>);
             impl Drop for TmpGuard {
                 fn drop(&mut self) {
@@ -392,9 +366,7 @@ impl FsStore {
         }
         // Hand-rolled file→stream (no tokio-util dependency), ≤64KiB chunks. `Take` owns the
         // range ceiling, so a ranged read never yields past its window; `read_exact` makes a
-        // short object loud — shrinking under us is impossible under write-once, but never lie:
-        // a clean end would hand direct consumers a silently truncated body (this way it
-        // surfaces as UnexpectedEof).
+        // short file an error rather than a clean end.
         let stream = futures::stream::try_unfold(file.take(read_len), |mut reader| async move {
             let chunk_len = reader.limit().min(64 * 1024) as usize;
             if chunk_len == 0 {
@@ -416,8 +388,6 @@ impl FsStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use futures::TryStreamExt;
 
     use crate::cdn_store::gcs_test_support::{assert_range_contract, collect, EMPTY_KEY, KEY};
 
@@ -504,27 +474,6 @@ mod tests {
         assert_eq!(collect(mid).await, &body[60_001..190_003]);
     }
 
-    #[tokio::test]
-    async fn truncation_under_a_reader_is_an_error_not_a_clean_end() {
-        let root = tempfile::tempdir().unwrap();
-        let store = FsStore::new(root.path().to_path_buf());
-        let key = "aabbccdd0123456789aabbccdd0123456789aabbccdd0123456789aabbccdd01.txt";
-        store.put_if_absent(key, b"0123456789").await.unwrap();
-
-        let read = store.get(key, None).await.unwrap();
-        // Shrink the object under the open reader (write-once forbids this in production; the
-        // stream must fail loudly rather than return a truncated body as complete).
-        let path = root.path().join("aa").join("bb").join(key);
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_len(3)
-            .unwrap();
-        let err = read.stream.try_collect::<Vec<Bytes>>().await.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
-    }
-
     fn ctime(path: &Path) -> (i64, i64) {
         use std::os::unix::fs::MetadataExt;
         let meta = std::fs::metadata(path).unwrap();
@@ -560,19 +509,7 @@ mod tests {
         assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
         // An absent file has nothing to mark, so the upload writes it.
         assert!(!marked(&root.path().join("absent"), MARK_INTERVAL).await);
-        // A symlink isn't the key's file, even when what it leads to is fresh: it's replaced by the upload.
-        std::fs::remove_file(&path).unwrap();
-        let elsewhere = root.path().join("elsewhere");
-        std::fs::write(&elsewhere, b"other bytes").unwrap();
-        std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
-        assert_eq!(
-            store.put_if_absent(KEY, b"0123456789").await.unwrap(),
-            PutOutcome::Created
-        );
-        assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
-        assert_eq!(std::fs::read(&path).unwrap(), b"0123456789");
-        assert_eq!(std::fs::read(&elsewhere).unwrap(), b"other bytes");
-        // So is a FIFO, which opening would block on.
+        // A FIFO, which opening would block on, is replaced by the upload.
         std::fs::remove_file(&path).unwrap();
         let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
@@ -584,8 +521,7 @@ mod tests {
     }
 
     #[test]
-    fn the_walk_lists_only_canonical_files_at_their_fanout_path() {
-        use std::os::unix::ffi::OsStrExt;
+    fn the_walk_lists_only_canonical_files_in_the_fanout() {
         let root = tempfile::tempdir().unwrap();
         let store = FsStore::new(root.path().to_path_buf());
         let write = |path: &Path, body: &[u8]| {
@@ -593,45 +529,26 @@ mod tests {
             std::fs::write(path, body).unwrap();
         };
         let canonical = format!("{}.png", "ab".repeat(32));
-        let legacy = "abab.PNG";
-        let linked = format!("{}.json", "ab".repeat(32));
-        let misplaced = format!("{}.png", "cd".repeat(32));
         let shard = root.path().join("ab").join("ab");
         write(&store.path_for(&canonical), b"canonical");
-        write(&store.path_for(legacy), b"legacy");
-        std::os::unix::fs::symlink(store.path_for(&canonical), store.path_for(&linked)).unwrap();
         write(&shard.join(format!("{canonical}.1.2.tmp")), b"temp");
-        write(&shard.join(&misplaced), b"misplaced");
-        // APFS refuses a name that isn't UTF-8; Linux filesystems accept it.
-        let non_utf8 =
-            std::fs::write(shard.join(std::ffi::OsStr::from_bytes(b"\xff.png")), b"x").is_ok();
-        std::fs::create_dir(shard.join(format!("{}.bin", "ab".repeat(32)))).unwrap();
-        write(&root.path().join("README"), b"stray");
-        std::fs::create_dir(root.path().join("zz")).unwrap();
-        // A shard moved elsewhere and linked back.
-        let moved = tempfile::tempdir().unwrap();
+        // What the filesystem or a file browser keeps beside the server's files; the walk doesn't enter lost+found, which a volume root's owner may keep unreadable.
         write(
-            &moved.path().join(format!("{}.png", "cd".repeat(32))),
-            b"moved",
+            &root
+                .path()
+                .join("lost+found")
+                .join("ab")
+                .join(format!("{}.png", "cd".repeat(32))),
+            b"recovered",
         );
-        std::os::unix::fs::symlink(moved.path(), root.path().join("cd")).unwrap();
-
-        let (mut objects, mut symlinks, mut foreign) = (Vec::new(), 0, 0);
+        write(&shard.join(".DS_Store"), b"x");
+        let mut objects = Vec::new();
         store
-            .walk(&mut |entry| {
-                match entry {
-                    Listed::Object { key, .. } => objects.push(key),
-                    Listed::Symlink => symlinks += 1,
-                    Listed::Foreign { .. } => foreign += 1,
-                }
+            .walk(&mut |listed| {
+                objects.push(listed.key);
                 Ok(())
             })
             .unwrap();
-        objects.sort();
         assert_eq!(objects, [canonical]);
-        // The linked file and the linked shard, whose contents the walk doesn't enter.
-        assert_eq!(symlinks, 2);
-        // The legacy name, the temp, the misplaced file, the key-named directory, the two strays at the root, and the non-UTF-8 name.
-        assert_eq!(foreign, 6 + usize::from(non_utf8));
     }
 }

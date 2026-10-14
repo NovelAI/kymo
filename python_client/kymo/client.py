@@ -17,6 +17,7 @@ import io
 import json
 import math
 import multiprocessing
+import multiprocessing.synchronize
 import multiprocessing.util
 import ntpath
 import operator
@@ -95,8 +96,8 @@ from kymo.types import Image, Metadata, Resource
 from kymo._worker import _worker_process
 
 _MAX_RUN_NAME_BYTES = 2048
-# Client-side mirror of ALLOWED_EXTENSIONS in kymo-server/src/cdn.rs (keep in sync): the server 400s any other extension and the item would be dropped as a permanent upload error, so unsupported extensions are coerced to "bin" (stored/served as octet-stream; the manifest keeps the real filename).
-_RESOURCE_EXTENSIONS = frozenset(
+# Client-side mirror of ALLOWED_EXTENSIONS in kymo-server/src/cdn.rs (keep in sync): the server 400s any other extension, which would drop the item as a permanent upload error.
+_CDN_EXTENSIONS = frozenset(
     {
         "png",
         "jpg",
@@ -452,6 +453,11 @@ def _forget_pending_in_child() -> None:
     _forget_pending()
     _pending_lock = threading.RLock()
     _gallery_lock = threading.RLock()
+    # multiprocessing resets a SemLock's owner count only in its own children; after a raw fork while another thread held one, the child's release would leave the shared semaphore taken for good. Where the forking thread held it, the child's release then fails instead of freeing the semaphore under the parent. A test's stand-in status has a threading lock, hence the isinstance check.
+    for shared in (_queue_status, _rich_mutation_seq):
+        lock = None if shared is None else shared.get_lock()
+        if isinstance(lock, multiprocessing.synchronize.SemLock):
+            lock._semlock._after_fork()
     _deferred_signals.clear()
     _uncharged.clear()
     _held_back.clear()
@@ -3767,15 +3773,20 @@ def _encode_image(img: "Image") -> tuple[bytes, str]:
     fmt = img.format.lower()
     from PIL import Image as PILImage
 
-    # Raw bytes stay byte-identical. The default format is only a fallback for
-    # array/PIL encoding, so detect the actual container when bytes use it;
-    # preserve non-default overrides for formats Pillow cannot identify.
+    # The default format is only a fallback for array/PIL encoding, so detect the actual container when raw bytes use it; a non-default format is kept as an override, checked against the CDN's list below.
+    if isinstance(data, bytes) and fmt == "png":
+        with PILImage.open(io.BytesIO(data)) as encoded:
+            if encoded.format is None:
+                raise ValueError("encoded image format could not be detected")
+            fmt = encoded.format.lower()
+    # A camera's multi-picture JPEG is a JPEG stream; browsers show its first picture.
+    if fmt == "mpo":
+        fmt = "jpeg"
+    # The CDN refuses any other extension; one that is not even a token (empty, spaced) would also fail replay's pre-scan of a spooled segment and quarantine the segment whole.
+    if fmt not in _CDN_EXTENSIONS:
+        raise ValueError(f"unsupported image format {fmt!r}")
     if isinstance(data, bytes):
-        if fmt == "png":
-            with PILImage.open(io.BytesIO(data)) as encoded:
-                if encoded.format is None:
-                    raise ValueError("encoded image format could not be detected")
-                fmt = encoded.format.lower()
+        # Raw bytes stay byte-identical.
         return data, fmt
 
     if isinstance(data, PILImage.Image):
@@ -3834,7 +3845,8 @@ def _encode_image(img: "Image") -> tuple[bytes, str]:
 def _encode_resource(res: "Resource") -> tuple[bytes, str]:
     """Encode a Resource to bytes. Returns (data, extension)."""
     ext = ntpath.splitext(ntpath.basename(res.filename))[1].removeprefix(".").lower()
-    if ext not in _RESOURCE_EXTENSIONS:
+    # Stored and served as octet-stream; the manifest keeps the real filename.
+    if ext not in _CDN_EXTENSIONS:
         ext = "bin"
     return res.data, ext
 

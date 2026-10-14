@@ -16,6 +16,8 @@ import types
 import unittest
 from unittest import mock
 
+import numpy as np
+
 from kymo import _wire as wire_module
 from kymo import _worker as worker_module
 from kymo import client as client_module
@@ -297,6 +299,36 @@ class FrameValidationTests(unittest.TestCase):
             ),
             "cdn_batch_encoded_mutation_reserved",
         )
+
+    def test_an_image_format_the_cdn_refuses_is_dropped_before_the_spool(self):
+        png = io.BytesIO()
+        PILImage.new("RGB", (2, 2)).save(png, format="PNG")
+        with self.assertLogs("kymo", level="WARNING") as logs:
+            encoded = client_module._encode_cdn_items(
+                "gallery",
+                4,
+                [Image(png.getvalue(), format=""), Image(png.getvalue())],
+            )
+        self.assertIn("unsupported image format ''", "\n".join(logs.output))
+        self.assertTrue(encoded.dropped)
+        self.assertEqual([entry["ext"] for entry in encoded.entries], ["png"])
+        record = ("cdn_batch_encoded", "gallery", 4, encoded.entries)
+        self.assertEqual(
+            sync_module._validate_spool_record(record, {"cdn_batch_encoded"}),
+            "cdn_batch_encoded",
+        )
+
+    def test_a_camera_multi_picture_jpeg_is_published_as_jpeg(self):
+        frames = [PILImage.new("RGB", (2, 2), color) for color in ("red", "blue")]
+        mpo = io.BytesIO()
+        frames[0].save(mpo, format="MPO", save_all=True, append_images=frames[1:])
+        array = np.zeros((2, 2, 3), dtype=np.uint8)
+        encoded = client_module._encode_cdn_items(
+            "gallery", 4, [Image(mpo.getvalue()), Image(array, format="mpo")]
+        )
+        self.assertFalse(encoded.dropped)
+        self.assertEqual([entry["ext"] for entry in encoded.entries], ["jpeg", "jpeg"])
+        self.assertEqual(encoded.entries[0]["data"], mpo.getvalue())
 
     def test_reduced_legacy_versioned_manifest_fails_safe_without_reservation(self):
         original_version = (3 << 32) | 7
@@ -2425,32 +2457,73 @@ class SpoolDurabilityTests(unittest.TestCase):
 
     def test_worker_accounting_lock_wait_is_bounded(self):
         source, status = _charged_queue([numeric(1.0)], None)
-        status.lock.acquire()
-        deadline = _QueueStatus(time.monotonic() - 1)
-        started = time.monotonic()
-        try:
-            with (
-                mock.patch.object(
-                    client_module,
-                    "SpoolWriter",
-                    return_value=_SpoolStandIn("memory.mkspool"),
-                ),
-                mock.patch.object(client_module, "_STATUS_LOCK_TIMEOUT", 0.01),
-                self.assertRaisesRegex(RuntimeError, "accounting lock"),
-            ):
-                worker_module._upload_worker(
-                    "unused",
-                    "project",
-                    "run",
-                    source,
-                    status,
-                    shutdown_deadline=deadline,
-                )
-        finally:
-            status.lock.release()
+        now, waits = [100.0], []
 
-        self.assertLess(time.monotonic() - started, 0.5)
+        def acquire(timeout=-1):
+            waits.append(timeout)
+            now[0] += timeout
+            return False
+
+        status.lock = mock.Mock(acquire=acquire)
+        # Past delivery, a live owner's lock is waited for until the spill end (the shutdown's later deadline): the first acquire takes its full timeout, the retry only what is left.
+        with (
+            mock.patch.object(
+                client_module,
+                "SpoolWriter",
+                return_value=_SpoolStandIn("memory.mkspool"),
+            ),
+            mock.patch.object(client_module, "_STATUS_LOCK_TIMEOUT", 0.5),
+            mock.patch.object(worker_module.time, "monotonic", lambda: now[0]),
+            self.assertRaisesRegex(RuntimeError, "accounting lock"),
+        ):
+            worker_module._upload_worker(
+                "unused",
+                "project",
+                "run",
+                source,
+                status,
+                shutdown_deadline=_QueueStatus(99.0),
+                spill_deadline=_QueueStatus(100.7),
+            )
+
+        self.assertEqual(waits[0], 0.5)
+        self.assertAlmostEqual(waits[1], 0.2)
+        self.assertEqual(len(waits), 2)
         self.assertEqual(status.value, 1)
+
+    def test_worker_spills_once_an_owner_stalled_past_delivery_resumes(self):
+        # Delivery is over, but the deadline spill still releases accounting once the owner resumes within the spill window.
+        source, status = _charged_queue([numeric(1.0)], None)
+        resume = time.monotonic() + 0.3
+        held = status.lock
+
+        class StalledLock:
+            def acquire(self, timeout=-1):
+                if time.monotonic() < resume:
+                    time.sleep(timeout)
+                    return False
+                return held.acquire(timeout=timeout)
+
+            def release(self):
+                held.release()
+
+        status.lock = StalledLock()
+        spool = _SpoolStandIn("memory.mkspool")
+        with (
+            mock.patch.object(client_module, "SpoolWriter", return_value=spool),
+            mock.patch.object(client_module, "_STATUS_LOCK_TIMEOUT", 0.01),
+        ):
+            worker_module._upload_worker(
+                "unused",
+                "project",
+                "run",
+                source,
+                status,
+                shutdown_deadline=_QueueStatus(time.monotonic() - 1),
+                spill_deadline=_QueueStatus(time.monotonic() + 5),
+            )
+
+        self.assertEqual(status.value, 0)
 
 
 class ReplayTests(unittest.TestCase):

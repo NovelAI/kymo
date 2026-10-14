@@ -753,9 +753,11 @@ mod tests {
                 owner_uid: 0,
                 executable: std::env::current_exe().unwrap(),
                 start_identity: String::new(),
+                stable_start_identity: None,
             },
             started_at_unix_ms: supervisor::unix_time_ms(),
             child_process_groups: Vec::new(),
+            child_start_identities: Default::default(),
         });
         assert_eq!(runtime_state(&paths, &manifest).0, StatusState::Degraded);
         let lock = std::fs::OpenOptions::new()

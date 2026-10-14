@@ -10,8 +10,10 @@ import threading
 import time
 
 from kymo._log import logger as log
+from kymo.client import _WorkerExited
 
 _STOP_BARRIER_TIMEOUT = 1.0
+_FAILURE_WARN_INTERVAL = 60.0
 
 # Optional imports — gracefully degrade if not available
 try:
@@ -148,8 +150,19 @@ class SystemMetricsPoller:
     # ------------------------------------------------------------------
 
     def _poll_loop(self):
+        """Poll until stopped. A failed poll or publication is retried, with a warning at most once a minute: without system/ metrics, a run that rarely calls log() (each call sends one) reads as unresponsive. Of failures, only the upload worker's exit ends it: nothing restarts the worker (only init() starts one), so no later point could be delivered."""
+        warned_at = float("-inf")
         while not self._stop.wait(self._interval):
-            self._poll_once()
+            try:
+                self._poll_once()
+            except _WorkerExited:
+                log.warning("system metrics stopped: the upload worker has exited")
+                return
+            except Exception as error:
+                now = time.monotonic()
+                if now - warned_at >= _FAILURE_WARN_INTERVAL:
+                    log.warning("system metrics poll failed; retrying: %s", error)
+                    warned_at = now
 
     def _poll_once(self):
         if self._stop.is_set():

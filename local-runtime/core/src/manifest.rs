@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Write};
 use std::net::SocketAddr;
@@ -36,6 +37,9 @@ pub struct ProcessIdentity {
     pub owner_uid: u32,
     pub executable: PathBuf,
     pub start_identity: String,
+    /// A start identity wall-clock steps cannot change; recovery compares it instead of `start_identity` (which on Linux moves with the clock) where it was recorded. Older launchers leave it out.
+    #[serde(default)]
+    pub stable_start_identity: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -70,6 +74,9 @@ pub struct LaunchIntent {
     pub started_at_unix_ms: u64,
     /// Each child's dedicated process group, published right after its spawn, so recovery can prove an interrupted launch quiescent.
     pub child_process_groups: Vec<u32>,
+    /// Each group leader's clock-stable start identity (as `ProcessIdentity::stable_start_identity`), which tells the child's own group from a reused number. Where missing (unreadable, or written by an older launcher), only an empty group proves the child gone.
+    #[serde(default)]
+    pub child_start_identities: BTreeMap<u32, String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -327,6 +334,24 @@ pub fn read_installation_uuid(path: &Path) -> Result<Uuid> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_launch_without_child_start_identities_reads_as_empty() {
+        let mut launching: LaunchIntent = serde_json::from_value(serde_json::json!({
+            "supervisor": {"pid": 1, "owner_uid": 0, "executable": "/kymo", "start_identity": "1"},
+            "started_at_unix_ms": 0,
+            "child_process_groups": [7],
+        }))
+        .unwrap();
+        assert!(launching.child_start_identities.is_empty());
+        // JSON object keys are strings: integer groups must still read back.
+        launching.child_start_identities.insert(7, "5".to_owned());
+        let value = serde_json::to_value(&launching).unwrap();
+        assert_eq!(
+            serde_json::from_value::<LaunchIntent>(value).unwrap(),
+            launching
+        );
+    }
 
     fn installed_manifest(paths: &RuntimePaths) -> RuntimeManifest {
         let installation_uuid = initialize_installation_uuid(paths).unwrap();

@@ -2,7 +2,7 @@
 //! disposable databases. Drive coalescer ticks explicitly; its spawned worker
 //! owns process shutdown and would also make the lifecycle ordering nondeterministic.
 //! Wire decoding, stream admission/ACK framing, and the periodic status watcher
-//! are outside this suite; it starts at the shared production flush body.
+//! are outside this suite; it calls the production flush, rich-mutation and query methods directly.
 
 use super::*;
 use anyhow::{ensure, Context, Result};
@@ -152,7 +152,7 @@ impl Fixture {
             .into_iter()
             .collect();
         let before = chrono::Utc::now().timestamp_millis();
-        flush_rows_inner(&self.ch, &self.pg, &self.gates, &self.bumps, rows.clone()).await?;
+        flush_rows_inner(&self.ch, &self.pg, &self.gates, &self.bumps, &rows).await?;
         let after = chrono::Utc::now().timestamp_millis();
         let accepted = self.bumps.pending_last_ingested_at_ms(&self.project, &runs);
         assert_eq!(
@@ -620,6 +620,72 @@ async fn trash_before_drain(fixture: &mut Fixture, run: &str) -> Result<()> {
     Ok(())
 }
 
+/// A rich mutation, versioned or legacy, whose RPC is cancelled once its ClickHouse insert has started keeps the run's gate until the insert ends, so Trash cannot commit under a row still landing, and queues its bump then.
+async fn cancelled_rich_insert(fixture: &mut Fixture, run: &str, versioned: bool) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    fixture.init(run).await?;
+    ensure!(!fixture.bumps.state.lock().unwrap().has_pending_work());
+    // A ClickHouse that answers the insert only when told to.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let service = IngestService::for_test(
+        Arc::new(ChClient::new(&format!(
+            "http://{}",
+            listener.local_addr()?
+        ))?),
+        fixture.pg.clone(),
+        fixture.gates.clone(),
+        fixture.bumps.clone(),
+        1,
+    );
+    let request = proto::PublishRichMutationRequest {
+        project_id: fixture.project.clone(),
+        run_id: run.into(),
+        metric_name: "samples".into(),
+        step: 1,
+        cdn_key: "abcd.json".into(),
+        timestamp_ms: 1,
+        mutation_version: versioned.then_some((1 << 32) | 1),
+        ..Default::default()
+    };
+    let rpc = tokio::spawn(async move {
+        service
+            .publish_rich_mutation(Request::new(request))
+            .await
+            .map(drop)
+    });
+    let (mut socket, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+        .await
+        .context("the insert never reached ClickHouse")??;
+    let mut received = Vec::new();
+    while !received.ends_with(b"0\r\n\r\n") {
+        let mut chunk = [0; 4096];
+        let read = socket.read(&mut chunk).await?;
+        ensure!(read > 0, "the insert's request ended early");
+        received.extend_from_slice(&chunk[..read]);
+    }
+    rpc.abort();
+    ensure!(rpc.await.unwrap_err().is_cancelled());
+
+    let key = RunKey::new(&fixture.project, run);
+    ensure!(
+        tokio::time::timeout(
+            Duration::from_millis(300),
+            fixture.gates.write_many([key.clone()])
+        )
+        .await
+        .is_err(),
+        "the run's gate was released while its insert was still in flight"
+    );
+    socket
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+        .await?;
+    let _gate = tokio::time::timeout(Duration::from_secs(10), fixture.gates.write_many([key]))
+        .await
+        .context("the run's gate was never released")?;
+    ensure!(fixture.bumps.state.lock().unwrap().has_pending_work());
+    Ok(())
+}
+
 async fn assert_trashed(fixture: &Fixture, run: &str, accepted: i64) -> Result<()> {
     let listed = fixture
         .query
@@ -688,6 +754,18 @@ async fn stale_system_with_fresh_main_does_not_refresh_project() -> Result<()> {
 #[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL and KYMO_LIVE_TEST_CLICKHOUSE_URL"]
 async fn trash_retains_pending_ingest_timing() -> Result<()> {
     with_fixture(async |fixture, run| trash_before_drain(fixture, run).await).await
+}
+
+#[tokio::test]
+#[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL and KYMO_LIVE_TEST_CLICKHOUSE_URL"]
+async fn cancelled_rich_insert_keeps_its_run_gate() -> Result<()> {
+    with_fixture(async |fixture, run| cancelled_rich_insert(fixture, run, true).await).await
+}
+
+#[tokio::test]
+#[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL and KYMO_LIVE_TEST_CLICKHOUSE_URL"]
+async fn cancelled_legacy_rich_insert_keeps_its_run_gate() -> Result<()> {
+    with_fixture(async |fixture, run| cancelled_rich_insert(fixture, run, false).await).await
 }
 
 /// Numeric reads return only numeric rows and the CDN lookup only media rows, for a metric name that logged all three payload types; a SELECT alias must not shadow the column a filter tests.

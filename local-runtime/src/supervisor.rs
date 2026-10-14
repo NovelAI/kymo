@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener};
@@ -178,8 +178,6 @@ struct Children {
     server: Child,
     server_group: u32,
     server_sockets: Vec<OwnedSocket>,
-    postgresql_socket_dir: PathBuf,
-    clickhouse_client: reqwest::Client,
     _dashboard_listener: TcpListener,
     _cdn_listener: TcpListener,
 }
@@ -418,12 +416,15 @@ impl LaunchRecord<'_> {
 
     fn record(&mut self, child: &Child, name: &str) -> Result<u32> {
         let group = child_group(child, name)?;
-        self.manifest
+        let launching = self
+            .manifest
             .launching
             .as_mut()
-            .context("launch intent is missing")?
-            .child_process_groups
-            .push(group);
+            .context("launch intent is missing")?;
+        launching.child_process_groups.push(group);
+        if let Some(start) = stable_start_identity(group) {
+            launching.child_start_identities.insert(group, start);
+        }
         self.manifest.write_atomic(&self.paths.manifest())?;
         Ok(group)
     }
@@ -502,6 +503,7 @@ async fn run_inner(ready: &StdUnixStream) -> Result<()> {
         supervisor: process_identity(std::process::id(), std::env::current_exe()?)?,
         started_at_unix_ms: unix_time_ms(),
         child_process_groups: Vec::new(),
+        child_start_identities: BTreeMap::new(),
     });
     manifest.write_atomic(&paths.manifest())?;
 
@@ -524,8 +526,7 @@ async fn run_inner(ready: &StdUnixStream) -> Result<()> {
                 launching
                     .child_process_groups
                     .iter()
-                    .copied()
-                    .all(process_group_gone)
+                    .all(|&group| launch_child_gone(launching, group))
             }) {
                 manifest.launching = None;
             }
@@ -1058,7 +1059,7 @@ pub(crate) async fn stop(paths: &RuntimePaths, hold: bool) -> Result<()> {
     Ok(())
 }
 
-/// The supervisor is gone (its lock is ours) but some components may outlive it. Ask each one whose recorded identity, including its start time, still matches to shut down; anything else is left for `clear_stopped_remnants` to refuse.
+/// The supervisor is gone (its lock is ours) but some components may outlive it. Ask each one whose PID and recorded start identity still match to shut down; anything else is left for `clear_stopped_remnants` to refuse.
 async fn terminate_orphaned_stack(running: &RunningStack) {
     // Supervised-stop signals first (PostgreSQL's SIGINT is its fast shutdown); SIGINT escalates for anything still alive, since kymo-server does not handle it.
     for (name, identity, signals) in [
@@ -1132,18 +1133,12 @@ async fn start_children(
     let server_listeners = (dashboard_listener.try_clone()?, cdn_listener.try_clone()?);
     let (mut postgresql, postgresql_group, database_url) =
         start_postgresql(launch, &endpoints.postgresql_socket_dir).await?;
-    let (mut clickhouse, clickhouse_group, clickhouse_client) =
+    let (mut clickhouse, clickhouse_group) =
         match start_clickhouse(launch, generation, endpoints.clickhouse_addr).await {
             Ok(started) => started,
             Err(error) => {
-                if let Err(cleanup) = stop_postgresql(
-                    paths,
-                    &pg_ctl,
-                    &mut postgresql,
-                    postgresql_group,
-                    &endpoints.postgresql_socket_dir,
-                )
-                .await
+                if let Err(cleanup) =
+                    stop_postgresql(paths, &pg_ctl, &mut postgresql, postgresql_group).await
                 {
                     retain_ambiguous_startup(format!(
                     "ClickHouse startup failed: {error:#}; PostgreSQL cleanup failed: {cleanup:#}"
@@ -1164,22 +1159,9 @@ async fn start_children(
     {
         Ok(server) => server,
         Err(error) => {
-            let clickhouse_cleanup = stop_clickhouse(
-                generation,
-                &clickhouse_client,
-                &mut clickhouse,
-                clickhouse_group,
-                paths,
-            )
-            .await;
-            let postgresql_cleanup = stop_postgresql(
-                paths,
-                &pg_ctl,
-                &mut postgresql,
-                postgresql_group,
-                &endpoints.postgresql_socket_dir,
-            )
-            .await;
+            let clickhouse_cleanup = stop_clickhouse(&mut clickhouse, clickhouse_group).await;
+            let postgresql_cleanup =
+                stop_postgresql(paths, &pg_ctl, &mut postgresql, postgresql_group).await;
             if clickhouse_cleanup.is_err() || postgresql_cleanup.is_err() {
                 retain_ambiguous_startup(format!(
                     "server startup failed: {error:#}; ClickHouse cleanup: {}; PostgreSQL cleanup: {}",
@@ -1200,8 +1182,6 @@ async fn start_children(
         server,
         server_group,
         server_sockets,
-        postgresql_socket_dir: endpoints.postgresql_socket_dir.clone(),
-        clickhouse_client,
         _dashboard_listener: dashboard_listener,
         _cdn_listener: cdn_listener,
     })
@@ -1325,7 +1305,7 @@ async fn start_clickhouse(
     launch: &mut LaunchRecord<'_>,
     generation: &PreparedGeneration,
     address: SocketAddr,
-) -> Result<(Child, u32, reqwest::Client)> {
+) -> Result<(Child, u32)> {
     let paths = launch.paths;
     let binary = paths.clickhouse_binary(&launch.manifest.clickhouse.version);
     validate_confined_regular_file(&paths.state, &binary)?;
@@ -1346,21 +1326,8 @@ async fn start_clickhouse(
             "ClickHouse",
         )
         .await?;
-    let setup = async {
-        let certificate =
-            reqwest::Certificate::from_pem(&std::fs::read(&generation.clickhouse_certificate)?)?;
-        let client = reqwest::Client::builder()
-            .https_only(true)
-            .connect_timeout(Duration::from_secs(2))
-            .timeout(Duration::from_secs(5))
-            .add_root_certificate(certificate)
-            .build()?;
-        wait_for_clickhouse(&mut child, &client, generation, address).await?;
-        Result::<reqwest::Client>::Ok(client)
-    }
-    .await;
-    match setup {
-        Ok(client) => Ok((child, group, client)),
+    match wait_for_clickhouse(&mut child, generation, address).await {
+        Ok(()) => Ok((child, group)),
         Err(error) => abort_startup_child(&mut child, "ClickHouse", error).await,
     }
 }
@@ -1444,8 +1411,8 @@ async fn abort_startup_child<T>(child: &mut Child, name: &str, error: anyhow::Er
     if child.try_wait()?.is_none() {
         // These are still direct, unreaped startup children. SIGTERM is the
         // native initial stop path for all three.
-        let result = unsafe { libc::kill(-(process_group as i32), libc::SIGTERM) };
-        ensure!(result == 0, "failed to terminate {name} after: {error:#}");
+        sigterm_group(process_group, name)
+            .with_context(|| format!("{name} startup failed: {error:#}"))?;
         match tokio::time::timeout(STOP_TIMEOUT, child.wait()).await {
             Ok(status) => {
                 let _ = status?;
@@ -1476,20 +1443,12 @@ async fn stop_children(
         &children.server_sockets,
     )
     .await;
-    let clickhouse = stop_clickhouse(
-        generation,
-        &children.clickhouse_client,
-        &mut children.clickhouse,
-        children.clickhouse_group,
-        paths,
-    )
-    .await;
+    let clickhouse = stop_clickhouse(&mut children.clickhouse, children.clickhouse_group).await;
     let postgresql = stop_postgresql(
         paths,
         &children.pg_ctl,
         &mut children.postgresql,
         children.postgresql_group,
-        &children.postgresql_socket_dir,
     )
     .await;
     let failures = [server, clickhouse, postgresql]
@@ -1529,11 +1488,7 @@ async fn stop_server(
         {
             // SIGTERM runs the same bounded drain as ShutdownLocal, for a server whose control socket is gone or stuck.
             eprintln!("kymo-server did not stop after its shutdown request; sending SIGTERM");
-            let result = unsafe { libc::kill(-(process_group as i32), libc::SIGTERM) };
-            ensure!(
-                result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH),
-                "failed to send SIGTERM to kymo-server"
-            );
+            sigterm_group(process_group, "kymo-server")?;
         }
         wait_for_child(child, process_group, "kymo-server").await?;
     }
@@ -1543,39 +1498,12 @@ async fn stop_server(
     Ok(())
 }
 
-async fn stop_clickhouse(
-    generation: &PreparedGeneration,
-    client: &reqwest::Client,
-    child: &mut Child,
-    process_group: u32,
-    paths: &RuntimePaths,
-) -> Result<()> {
+async fn stop_clickhouse(child: &mut Child, process_group: u32) -> Result<()> {
     if !child_has_exited(child, process_group, "ClickHouse")? {
-        let response = client
-            .post(format!("https://localhost:{}/", generation.clickhouse_port))
-            .header("X-ClickHouse-User", CLICKHOUSE_USER)
-            .header("X-ClickHouse-Key", &generation.clickhouse_password)
-            .body("SYSTEM SHUTDOWN")
-            .send()
-            .await;
-        // ClickHouse may close the HTTP connection while SYSTEM SHUTDOWN is being
-        // answered. The retained child handle, not an HTTP response, proves stop.
-        let _ = response;
+        // SIGTERM starts ClickHouse's graceful shutdown; SYSTEM SHUTDOWN only sends it this signal.
+        sigterm_group(process_group, "ClickHouse")?;
         wait_for_child(child, process_group, "ClickHouse").await?;
     }
-    ensure!(
-        !paths.clickhouse_data().join("clickhouse.pid").exists(),
-        "ClickHouse pidfile remains after shutdown"
-    );
-    let endpoint_closed = client
-        .get(format!("https://localhost:{}/", generation.clickhouse_port))
-        .send()
-        .await
-        .is_err();
-    ensure!(
-        endpoint_closed,
-        "ClickHouse endpoint remains after shutdown"
-    );
     Ok(())
 }
 
@@ -1584,7 +1512,6 @@ async fn stop_postgresql(
     pg_ctl: &Path,
     child: &mut Child,
     process_group: u32,
-    socket_dir: &Path,
 ) -> Result<()> {
     if !child_has_exited(child, process_group, "PostgreSQL")? {
         run_checked(
@@ -1600,16 +1527,6 @@ async fn stop_postgresql(
         .await?;
         wait_for_child(child, process_group, "PostgreSQL").await?;
     }
-    ensure!(
-        !paths.postgresql_data().join("postmaster.pid").exists(),
-        "PostgreSQL postmaster.pid remains after shutdown"
-    );
-    ensure!(
-        !socket_dir
-            .join(format!(".s.PGSQL.{POSTGRESQL_PORT}"))
-            .exists(),
-        "PostgreSQL socket remains after shutdown"
-    );
     Ok(())
 }
 
@@ -1652,10 +1569,17 @@ async fn native_channel(socket: &Path) -> Result<Channel> {
 
 async fn wait_for_clickhouse(
     child: &mut Child,
-    client: &reqwest::Client,
     generation: &PreparedGeneration,
     address: SocketAddr,
 ) -> Result<()> {
+    let certificate =
+        reqwest::Certificate::from_pem(&std::fs::read(&generation.clickhouse_certificate)?)?;
+    let client = reqwest::Client::builder()
+        .https_only(true)
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5))
+        .add_root_certificate(certificate)
+        .build()?;
     let deadline = tokio::time::Instant::now() + START_TIMEOUT;
     loop {
         if let Some(status) = child.try_wait()? {
@@ -1721,13 +1645,22 @@ async fn wait_for_postgresql(child: &mut Child, psql: &Path, socket_dir: &Path) 
     }
 }
 
+fn sigterm_group(process_group: u32, name: &str) -> Result<()> {
+    let result = unsafe { libc::kill(-(process_group as i32), libc::SIGTERM) };
+    ensure!(
+        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH),
+        "failed to send SIGTERM to {name}"
+    );
+    Ok(())
+}
+
 async fn wait_for_child(child: &mut Child, process_group: u32, name: &str) -> Result<()> {
     let status = tokio::time::timeout(STOP_TIMEOUT, child.wait())
         .await
         .with_context(|| format!("{name} did not stop within {STOP_TIMEOUT:?}"))??;
     ensure_process_group_gone(process_group, name)?;
     if !status.success() {
-        eprintln!("{name} exited with {status} after its shutdown request");
+        eprintln!("{name} exited with {status} after its stop");
     }
     Ok(())
 }
@@ -2187,20 +2120,83 @@ fn process_identity(pid: u32, executable: PathBuf) -> Result<ProcessIdentity> {
         owner_uid: **owner_uid,
         executable,
         start_identity: process.start_time().to_string(),
+        stable_start_identity: stable_start_identity(pid),
     })
 }
 
-/// A recorded process is alive only if its PID still has its recorded start time. The executable path is not compared: a live process whose binary an upgrade replaced no longer resolves it.
+/// A recorded process is alive only if its PID still has its recorded start identity. The executable path is not compared: a live process whose binary an upgrade replaced no longer resolves it.
 pub(crate) fn recorded_process_alive(identity: &ProcessIdentity) -> bool {
-    process_start_identity(identity.pid).as_deref() == Some(identity.start_identity.as_str())
+    let (recorded, current) = recorded_and_current_start(identity);
+    current.as_deref() == Some(recorded)
 }
 
-/// A recorded group leader's PID now held by a process with a different start time proves reuse, and the kernel never reuses a number that still names a process group; otherwise the group itself must be empty.
 fn recorded_group_gone(identity: &ProcessIdentity) -> bool {
-    match process_start_identity(identity.pid) {
-        Some(start) => start != identity.start_identity,
-        None => process_group_gone(identity.pid),
+    let (recorded, current) = recorded_and_current_start(identity);
+    leader_group_gone(identity.pid, recorded, current)
+}
+
+/// A recorded identity's start, and the start its PID has now, read the same way: the clock-stable identity where one was recorded, else sysinfo's start time.
+fn recorded_and_current_start(identity: &ProcessIdentity) -> (&str, Option<String>) {
+    match &identity.stable_start_identity {
+        Some(stable) => (stable, stable_start_identity(identity.pid)),
+        None => (
+            &identity.start_identity,
+            process_start_identity(identity.pid),
+        ),
     }
+}
+
+/// A recorded group leader's PID now held by a process with a different start proves reuse, and the kernel never reuses a number that still names a process group; a start recorded under an earlier boot proves the group ended with it; otherwise the group itself must be empty.
+fn leader_group_gone(leader: u32, recorded: &str, current: Option<String>) -> bool {
+    match current {
+        Some(start) => start != recorded,
+        None => {
+            recorded_under_another_boot(recorded, boot_id().as_deref())
+                || process_group_gone(leader)
+        }
+    }
+}
+
+/// Whether a start identity names a boot other than `boot`, the current one; only a Linux clock-stable identity ([`stable_start_identity`]) names one.
+fn recorded_under_another_boot(recorded: &str, boot: Option<&str>) -> bool {
+    let Some((recorded_boot, _ticks)) = recorded.split_once(':') else {
+        return false;
+    };
+    boot.is_some_and(|boot| boot != recorded_boot)
+}
+
+/// Whether a launch child's group is gone: by its leader's recorded start identity, as [`leader_group_gone`] judges, where one was recorded; else only by the group being empty.
+fn launch_child_gone(launching: &LaunchIntent, group: u32) -> bool {
+    match launching.child_start_identities.get(&group) {
+        Some(recorded) => leader_group_gone(group, recorded, stable_start_identity(group)),
+        None => process_group_gone(group),
+    }
+}
+
+/// A process's start identity that wall-clock steps cannot change: on Linux the boot ID and start tick count (sysinfo's start time there adds the boot time as read now, which moves with the clock); elsewhere the start time the kernel stamped.
+#[cfg(target_os = "linux")]
+fn stable_start_identity(pid: u32) -> Option<String> {
+    let boot = boot_id()?;
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Field 22, the 20th after the command name, which may hold spaces and parentheses.
+    let ticks = stat.rsplit_once(')')?.1.split_whitespace().nth(19)?;
+    Some(format!("{boot}:{ticks}"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn stable_start_identity(pid: u32) -> Option<String> {
+    process_start_identity(pid)
+}
+
+#[cfg(target_os = "linux")]
+fn boot_id() -> Option<String> {
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    Some(boot.trim().to_owned())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn boot_id() -> Option<String> {
+    None
 }
 
 fn process_start_identity(pid: u32) -> Option<String> {
@@ -2223,7 +2219,7 @@ fn live_launch_groups(launching: &LaunchIntent) -> Vec<u32> {
         .child_process_groups
         .iter()
         .copied()
-        .filter(|&group| !process_group_gone(group))
+        .filter(|&group| !launch_child_gone(launching, group))
         .collect();
     if !recorded_group_gone(&launching.supervisor) {
         live.insert(0, launching.supervisor.pid);
@@ -2497,7 +2493,15 @@ mod tests {
             .expect("identify current test process");
         assert_eq!(identity.owner_uid, unsafe { libc::geteuid() });
         assert!(!identity.start_identity.is_empty());
+        assert!(identity.stable_start_identity.is_some());
         assert!(recorded_process_alive(&identity));
+        // An older launcher's record, without the stable identity, still matches by sysinfo's start time.
+        let older = ProcessIdentity {
+            stable_start_identity: None,
+            ..identity
+        };
+        assert!(recorded_process_alive(&older));
+        assert!(!recorded_group_gone(&older));
     }
 
     #[test]
@@ -2568,9 +2572,11 @@ mod tests {
                 owner_uid: unsafe { libc::geteuid() },
                 executable: std::env::current_exe().unwrap(),
                 start_identity: "exited".to_owned(),
+                stable_start_identity: None,
             },
             started_at_unix_ms: 0,
             child_process_groups,
+            child_start_identities: BTreeMap::new(),
         }
     }
 
@@ -2600,6 +2606,114 @@ mod tests {
         orphan.wait().unwrap();
         assert!(error.to_string().contains("live process"));
         assert!(manifest.launching.is_some());
+    }
+
+    #[test]
+    fn an_interrupted_launch_tells_a_reused_child_group_from_its_own() {
+        let _serial = crate::serialize_process_test();
+        let (_temporary, paths, mut manifest) = installed_paths();
+        let mut leader = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let group = leader.id();
+        let mut launching = interrupted_launch(vec![group]);
+        // The leader's own identity: the child's group, still live.
+        let start = stable_start_identity(group).unwrap();
+        launching.child_start_identities.insert(group, start);
+        manifest.launching = Some(launching.clone());
+        let own = clear_stopped_remnants(&paths, &mut manifest);
+        // A mismatched identity stands for the number now leading another process's group.
+        launching
+            .child_start_identities
+            .insert(group, "0".to_owned());
+        manifest.launching = Some(launching);
+        let reused = clear_stopped_remnants(&paths, &mut manifest);
+        leader.kill().unwrap();
+        leader.wait().unwrap();
+        assert!(own.unwrap_err().to_string().contains("live process"));
+        reused.unwrap();
+        assert!(manifest.launching.is_none());
+    }
+
+    #[test]
+    fn an_interrupted_launch_whose_child_left_its_group_alive_fails_closed() {
+        let _serial = crate::serialize_process_test();
+        let (_temporary, paths, mut manifest) = installed_paths();
+        // The leader exits; the sleep it started keeps its group alive.
+        let mut leader = std::process::Command::new("sh")
+            .args(["-c", "sleep 30 & sleep 0.3"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let group = leader.id();
+        let mut launching = interrupted_launch(vec![group]);
+        let start = stable_start_identity(group).unwrap();
+        launching.child_start_identities.insert(group, start);
+        leader.wait().unwrap();
+        manifest.launching = Some(launching);
+        let error = clear_stopped_remnants(&paths, &mut manifest);
+        // Recorded under an earlier boot, the same number now names someone else's group.
+        #[cfg(target_os = "linux")]
+        let earlier_boot_gone = {
+            let mut earlier = interrupted_launch(vec![group]);
+            earlier
+                .child_start_identities
+                .insert(group, "earlier-boot:1".to_owned());
+            launch_child_gone(&earlier, group)
+        };
+        unsafe { libc::kill(-(group as i32), libc::SIGKILL) };
+        assert!(error.unwrap_err().to_string().contains("live process"));
+        assert!(manifest.launching.is_some());
+        #[cfg(target_os = "linux")]
+        assert!(earlier_boot_gone);
+    }
+
+    #[test]
+    fn only_a_start_recorded_under_another_boot_names_one() {
+        assert!(recorded_under_another_boot("earlier:42", Some("current")));
+        assert!(!recorded_under_another_boot("current:42", Some("current")));
+        // sysinfo's start times name no boot, nor does a host without a boot ID.
+        assert!(!recorded_under_another_boot("1760000000", Some("current")));
+        assert!(!recorded_under_another_boot("earlier:42", None));
+    }
+
+    #[test]
+    fn clickhouse_is_stopped_with_sigterm() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let _serial = crate::serialize_process_test();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut child = Command::new("sleep")
+                .arg("600")
+                .process_group(0)
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let group = child.id().unwrap();
+            let started = std::time::Instant::now();
+            stop_clickhouse(&mut child, group).await.unwrap();
+            assert!(started.elapsed() < STOP_TIMEOUT / 2);
+            let status = child.wait().await.unwrap();
+            assert_eq!(status.signal(), Some(libc::SIGTERM));
+        });
+    }
+
+    #[test]
+    fn a_postgresql_that_crashed_stops_over_its_pid_file() {
+        let _serial = crate::serialize_process_test();
+        let (_temporary, paths, _manifest) = installed_paths();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            // A killed postmaster leaves postmaster.pid behind; its reaped child and empty group prove it stopped, and the next start runs over the file.
+            std::fs::create_dir_all(paths.postgresql_data()).unwrap();
+            std::fs::write(paths.postgresql_data().join("postmaster.pid"), "12345\n").unwrap();
+            let mut child = Command::new("true").process_group(0).spawn().unwrap();
+            let group = child.id().unwrap();
+            child.wait().await.unwrap();
+            stop_postgresql(&paths, Path::new("/nonexistent/pg_ctl"), &mut child, group)
+                .await
+                .unwrap();
+        });
     }
 
     #[test]
@@ -2644,11 +2758,20 @@ mod tests {
         let _serial = crate::serialize_process_test();
         let live = process_identity(std::process::id(), std::env::current_exe().unwrap()).unwrap();
         assert!(!recorded_group_gone(&live));
-        let reused = ProcessIdentity {
-            start_identity: "0".to_owned(),
-            ..live.clone()
-        };
-        assert!(recorded_group_gone(&reused));
+        // Another start, read the way it was recorded: the stable identity, or an older launcher's sysinfo start time.
+        for reused in [
+            ProcessIdentity {
+                stable_start_identity: Some("0".to_owned()),
+                ..live.clone()
+            },
+            ProcessIdentity {
+                start_identity: "0".to_owned(),
+                stable_start_identity: None,
+                ..live.clone()
+            },
+        ] {
+            assert!(recorded_group_gone(&reused));
+        }
         let exited = ProcessIdentity {
             pid: exited_process_group(),
             ..live
