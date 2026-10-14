@@ -44,12 +44,6 @@ fn metric_type_name(metric_type: u8) -> anyhow::Result<&'static str> {
     }
 }
 
-fn registrable(row: &clickhouse::RegistryRow) -> bool {
-    ingest::storable_ident(&row.project_id, ingest::MAX_ID_BYTES)
-        && ingest::storable_ident(&row.run_id, ingest::MAX_ID_BYTES)
-        && ingest::storable_ident(&row.metric_name, ingest::MAX_METRIC_NAME_BYTES)
-}
-
 pub(crate) async fn drain<F: std::future::Future<Output = anyhow::Result<()>>>(
     mut cursor: ::clickhouse::query::RowCursor<clickhouse::RegistryRow>,
     mut write_batch: impl FnMut(Vec<(String, String, String, String)>) -> F,
@@ -71,7 +65,7 @@ pub(crate) async fn drain<F: std::future::Future<Output = anyhow::Result<()>>>(
             // bad code must never disappear merely because another field is
             // also outside the historical Postgres boundary.
             let metric_type = metric_type_name(row.metric_type)?;
-            if !registrable(&row) {
+            if !ingest::storable_series(&row.project_id, &row.run_id, &row.metric_name) {
                 stats.skipped_rows += 1;
                 if stats.skipped_samples.len() < SKIPPED_SAMPLE_LIMIT {
                     stats

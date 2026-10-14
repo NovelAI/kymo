@@ -1,6 +1,9 @@
+use prost::Message;
+
 use super::proto::*;
 use super::routes;
 use super::ws::WsClient;
+use super::ws_rpc;
 
 /// The dashboard's RPC client. All unary calls ride the shared WebSocket
 /// transport (see ws.rs).
@@ -166,24 +169,13 @@ impl GrpcClient {
         self.ws.unary_route(routes::QUERY_CHART, request).await
     }
 
-    /// Batched CDN-key lookup. One round-trip covers any number of
-    /// (project_id, run_id, metric_name) tuples. The response carries one
-    /// CdnSeries per input ref, in the same order, with empty entries for
-    /// refs that have no CDN data, plus the data-version echo
-    /// (QueryCdnKeysResponse.run_versions).
+    /// Batched CDN-key lookup: one round trip for a gallery's (project_id, run_id, metric_name) tuples, as many as fit the request cap ([`cdn_keys_request_fits`]). The response carries one CdnSeries per input ref, in the same order, with empty entries for refs that have no CDN data, plus the data-version echo (QueryCdnKeysResponse.run_versions).
     pub async fn query_cdn_keys(
         &self,
         refs: Vec<SeriesRef>,
     ) -> Result<QueryCdnKeysResponse, tonic::Status> {
         self.ws
-            .unary_route(
-                routes::QUERY_CDN_KEYS,
-                QueryCdnKeysRequest {
-                    refs,
-                    step_min: None,
-                    step_max: None,
-                },
-            )
+            .unary_route(routes::QUERY_CDN_KEYS, cdn_keys_request(refs))
             .await
     }
 
@@ -225,5 +217,82 @@ impl GrpcClient {
                 },
             )
             .await
+    }
+}
+
+/// The request [`GrpcClient::query_cdn_keys`] sends, as [`cdn_keys_frame_len`] measures it.
+fn cdn_keys_request(refs: Vec<SeriesRef>) -> QueryCdnKeysRequest {
+    QueryCdnKeysRequest {
+        refs,
+        step_min: None,
+        step_max: None,
+    }
+}
+
+/// Whether a QueryCdnKeys naming `refs` is within the server's bounds: at most [`ws_rpc::MAX_REQUEST_RUN_IDS`] refs, in a frame of at most [`ws_rpc::MAX_REQUEST_BYTES`]. The frame is /grpc-ws's cap exactly, and at most 29 bytes stricter than the body caps of /grpc-ws2 and native gRPC.
+pub fn cdn_keys_request_fits(refs: &[SeriesRef]) -> bool {
+    refs.len() <= ws_rpc::MAX_REQUEST_RUN_IDS
+        && cdn_keys_frame_len(refs) <= ws_rpc::MAX_REQUEST_BYTES
+}
+
+/// The request frame of [`GrpcClient::query_cdn_keys`] for `refs`, without encoding them: each ref takes a one-byte key, its length and itself.
+fn cdn_keys_frame_len(refs: &[SeriesRef]) -> usize {
+    let refs_len: usize = refs
+        .iter()
+        .map(|series| {
+            let len = series.encoded_len();
+            1 + prost::length_delimiter_len(len) + len
+        })
+        .sum();
+    let body = cdn_keys_request(Vec::new()).encoded_len() + refs_len;
+    ws_rpc::request_frame_len(routes::QUERY_CDN_KEYS.path, body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gallery(runs: usize, metrics: usize, metric_bytes: usize) -> Vec<SeriesRef> {
+        (0..runs)
+            .flat_map(|run| {
+                (0..metrics).map(move |metric| SeriesRef {
+                    project_id: "p".repeat(20),
+                    run_id: format!("{run:032x}"),
+                    metric_name: format!("{metric:0metric_bytes$}"),
+                    tags: vec![],
+                })
+            })
+            .collect()
+    }
+
+    /// The check measures the frame the socket would send and counts the refs, holding back a gallery of every run of a large project, by bytes or by count, while letting one at the Max runs cap through.
+    #[test]
+    fn cdn_key_requests_past_the_cap_are_held_back() {
+        // 300-byte names take two-byte lengths.
+        for refs in [vec![], gallery(3, 2, 40), gallery(2, 2, 300)] {
+            let body = cdn_keys_request(refs.clone()).encode_to_vec();
+            let frame = ws_rpc::encode_request(0, routes::QUERY_CDN_KEYS.path, &body, false);
+            assert_eq!(cdn_keys_frame_len(&refs), frame.len());
+        }
+        assert!(cdn_keys_request_fits(&gallery(64, 4, 40)));
+        let every_run = gallery(11_000, 4, 40);
+        assert_eq!(cdn_keys_frame_len(&every_run), 4_400_029);
+        assert!(!cdn_keys_request_fits(&every_run));
+        // Short run ids: 100,004 refs in 1.5 MB.
+        let short_ids: Vec<_> = (0..25_001)
+            .flat_map(|run| {
+                (0..4).map(move |metric| SeriesRef {
+                    project_id: "p".into(),
+                    run_id: format!("{run:05}"),
+                    metric_name: metric.to_string(),
+                    tags: vec![],
+                })
+            })
+            .collect();
+        assert!(cdn_keys_frame_len(&short_ids) <= ws_rpc::MAX_REQUEST_BYTES);
+        assert!(!cdn_keys_request_fits(&short_ids));
+        assert!(cdn_keys_request_fits(
+            &short_ids[..ws_rpc::MAX_REQUEST_RUN_IDS]
+        ));
     }
 }

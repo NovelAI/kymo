@@ -36,12 +36,7 @@ enum ChartFetch {
 static NEXT_REPLY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 fn settled_failure(status: tonic::Status, refs: Rc<Vec<SeriesRef>>) -> ChartFetch {
-    let message = if visibility::is_terminal_run_status(&status) {
-        "Run no longer available".to_string()
-    } else {
-        format!("Chart unavailable: {}", status.message())
-    };
-    ChartFetch::Unavailable(message, refs)
+    ChartFetch::Unavailable(visibility::settled_message("Chart", &status), refs)
 }
 
 /// A full reply as its model. One that fails validation is an error no retry heals: the same request would loop, and an empty chart in its place would read as "No data", cached as fresh.

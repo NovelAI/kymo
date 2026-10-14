@@ -781,6 +781,116 @@ async fn mixed_payload_reads(fixture: &mut Fixture, run: &str) -> Result<()> {
     Ok(())
 }
 
+/// QueryCdnKeys for a gallery of `runs` runs by `metrics` metrics, through a client that sends `use_skip_indexes_if_final = 1` and `max_query_size = 65536` with every request, which the statement's own values must replace. Each ref gets its current keys once, in request order. The last ref repeats the first, and the second names a metric past the length ingest has taken since July, whose keys earlier ingest stored.
+async fn gallery_cdn_keys(
+    fixture: &mut Fixture,
+    run: &str,
+    runs: usize,
+    metrics: usize,
+) -> Result<()> {
+    let runs: Vec<String> = (0..runs).map(|index| format!("{run}-{index}")).collect();
+    for run in &runs {
+        fixture.init(run).await?;
+    }
+    let mut refs: Vec<proto::SeriesRef> = runs
+        .iter()
+        .flat_map(|run| {
+            (0..metrics).map(|index| proto::SeriesRef {
+                project_id: fixture.project.clone(),
+                run_id: run.clone(),
+                metric_name: format!("eval/gallery/prompt_{index:04}/samples"),
+                tags: vec![],
+            })
+        })
+        .collect();
+    let last = refs.len() - 1;
+    refs[last] = refs[0].clone();
+    refs[1].metric_name = "m".repeat(crate::ingest::MAX_METRIC_NAME_BYTES + 1);
+    // Keys for the first two refs, a middle one and the one before the repeat; tag b first, since the answer orders a step's keys by tag.
+    let middle = last / 2;
+    let seeded = [0, 1, middle, last - 1];
+    let key = |index: usize, step: i64, tag: &str| format!("{index}-{step}{tag}.png");
+    let rows = seeded
+        .iter()
+        .flat_map(|&index| {
+            let series = &refs[index];
+            [(2, ""), (4, "b"), (4, "a")].map(|(step, tag)| {
+                let key = key(index, step, tag);
+                fixture.media_row(&series.run_id, &series.metric_name, tag, step, &key)
+            })
+        })
+        .collect();
+    fixture.ingest_many(rows).await?;
+    // A number replaces the middle ref's step-2 key, in a part of its own whose granules hold no key: `idx_cdn_key` would prune them from the FINAL read and leave the replaced key current. Merges stay off until the answer, so the two rows stay apart.
+    let ch = fixture.ch.test_client();
+    ch.query("SYSTEM STOP MERGES mkdb2.metrics")
+        .execute()
+        .await?;
+    let replaced = &refs[middle];
+    fixture
+        .ingest(vec![fixture.row(
+            &replaced.run_id,
+            &replaced.metric_name,
+            2,
+            1,
+        )])
+        .await?;
+    let parts = ch
+        .query(
+            "SELECT uniqExact(_part) FROM mkdb2.metrics
+             WHERE project_id = ? AND run_id = ? AND metric_name = ? AND step = 2",
+        )
+        .bind(&replaced.project_id)
+        .bind(&replaced.run_id)
+        .bind(&replaced.metric_name)
+        .fetch_one::<u64>()
+        .await?;
+    assert_eq!(parts, 2, "the key and the number replacing it share a part");
+
+    let query = crate::query::QueryService::new(
+        Arc::new(
+            fixture
+                .ch
+                .with_session_setting("use_skip_indexes_if_final", "1")
+                .with_session_setting("max_query_size", "65536"),
+        ),
+        fixture.pg.clone(),
+        fixture.bumps.clone(),
+        fixture.gates.clone(),
+        None,
+        fixture.events.clone(),
+    );
+    let answer = query
+        .query_cdn_keys(Request::new(proto::QueryCdnKeysRequest {
+            refs: refs.clone(),
+            ..Default::default()
+        }))
+        .await;
+    ch.query("SYSTEM START MERGES mkdb2.metrics")
+        .execute()
+        .await?;
+    let answer = answer?.into_inner();
+    assert_eq!(answer.run_versions.len(), runs.len());
+    assert_eq!(answer.series.len(), refs.len());
+    for (index, (series, sent)) in answer.series.iter().zip(&refs).enumerate() {
+        assert_eq!(
+            (&series.project_id, &series.run_id, &series.metric_name),
+            (&sent.project_id, &sent.run_id, &sent.metric_name)
+        );
+        let source = if index == last { 0 } else { index };
+        let expected: Vec<_> = [(2, ""), (4, "a"), (4, "b")]
+            .into_iter()
+            .filter(|&(step, _)| seeded.contains(&source) && (source, step) != (middle, 2))
+            .map(|(step, tag)| proto::CdnEntry {
+                step,
+                cdn_key: key(source, step, tag),
+            })
+            .collect();
+        assert_eq!(series.entries, expected, "ref {index}");
+    }
+    Ok(())
+}
+
 /// A cold chart reads all of its runs' series in one ClickHouse statement, each run's rows reaching its own series.
 async fn cold_chart_batches_its_reads(fixture: &mut Fixture, run: &str) -> Result<()> {
     // A quote exercises the bound run-id array.
@@ -949,6 +1059,21 @@ async fn served_chart_replies_echo_their_polls_versions() -> Result<()> {
 #[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL and KYMO_LIVE_TEST_CLICKHOUSE_URL"]
 async fn mixed_payload_metric_reads() -> Result<()> {
     with_fixture(async |fixture, run| mixed_payload_reads(fixture, run).await).await
+}
+
+/// 64 refs: about 17 KB of SQL, which the crate sends as a POST with `readonly=1`.
+#[tokio::test]
+#[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL and KYMO_LIVE_TEST_CLICKHOUSE_URL"]
+async fn gallery_cdn_keys_past_eight_kib_of_sql() -> Result<()> {
+    with_fixture(async |fixture, run| gallery_cdn_keys(fixture, run, 8, 8).await).await
+}
+
+/// As many refs as a request may list: about 25 MB of SQL, split into about 100 statements.
+#[tokio::test]
+#[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL and KYMO_LIVE_TEST_CLICKHOUSE_URL"]
+async fn gallery_cdn_keys_at_the_request_bound() -> Result<()> {
+    let metrics = crate::ws_rpc::MAX_REQUEST_RUN_IDS / 100;
+    with_fixture(async |fixture, run| gallery_cdn_keys(fixture, run, 100, metrics).await).await
 }
 
 #[tokio::test]

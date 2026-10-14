@@ -26,7 +26,7 @@ use crate::pg::{
 };
 use crate::proto;
 use crate::proto::smoothing_config::Algorithm;
-use crate::series_cache::{SeriesKey, SeriesSnapshot};
+use crate::series_cache::{EvictedSize, SeriesKey, SeriesSnapshot};
 
 #[cfg(test)]
 mod alloc_probe;
@@ -45,7 +45,7 @@ const LIST_TRASH_MAX_FILTER_IDENTITIES: usize = 1_024;
 /// Most run ids (PollVersions, ListRunSetMetrics, TrashRuns), series refs (QueryCdnKeys) or metric names (QueryTextWindow) one request may list, checked before any other work on the list.
 /// Production's largest dashboard sends about 10k run ids per request, a tenth of this; a 4 MiB message holds about 110k 36-byte UUID run ids, so a dashboard of kymo-generated ids reaches the message cap first; the browser trashes 256 runs per request.
 /// Past it, 16 PollVersions of 2 million empty run ids in flight (4 KB each compressed) held about 85 MiB each through the query, and QueryCdnKeys of 2 million empty refs about 400 MiB each; at the bound, a PollVersions of short distinct ids holds about 6 MiB.
-const MAX_REQUEST_RUN_IDS: usize = 100_000;
+const MAX_REQUEST_RUN_IDS: usize = crate::ws_rpc::MAX_REQUEST_RUN_IDS;
 const MAX_RUN_NAME_BYTES: usize = 2_048;
 const MAX_TEXT_WINDOW_LINES: u32 = 2_000;
 const MAX_TEXT_WINDOW_METRICS: usize = 256;
@@ -114,7 +114,7 @@ fn custom_x_runs(request: &proto::ChartRequest) -> Option<(&proto::SeriesRef, Ve
 }
 
 /// Distinct series `keys` grouped by (project, metric), groups and members in first-appearance order.
-fn series_groups(keys: &[SeriesKey]) -> Vec<Vec<SeriesKey>> {
+fn series_groups<'a>(keys: impl IntoIterator<Item = &'a SeriesKey>) -> Vec<Vec<SeriesKey>> {
     let mut groups: Vec<Vec<SeriesKey>> = Vec::new();
     for key in keys {
         match groups.iter_mut().find(|group| {
@@ -326,9 +326,7 @@ struct ChartPlan {
     snapshots: Vec<u64>,
     /// What a build that may build in full attempts ([`held::build`]): [`held::Advance::Try`], or [`held::Advance::Skip`] once the poll started over ([`Self::restart`]) after its expected advance fell back (and counted why).
     attempt: held::Advance,
-    /// On the poll's first pass, whether corrections past its grant may be kept ahead of the waiters ([`budget::ChartCharge::overrun`]): where step 1 priced every series from the cache, a series' growth before its read is kept whenever it fits (within the budget, or alone in it); where it priced anything by estimate (a series the cache has never seen or evicted, a custom-X run), only if it fits with nobody waiting. `None` once the poll starts over, so it starts over at most once.
-    ahead: Option<bool>,
-    /// Once the poll starts over, the charge its first pass came to in full: step 1's floor ([`Self::estimate`]), so its next pass reserves the sizes it now knows.
+    /// Once the poll starts over, the charge its first pass came to in full: step 1's floor ([`Self::estimate`]), so its next pass reserves the sizes it now knows. Empty on the first pass, the only one that checks its overrun ([`budget::ChartCharge::overrun`]), so a poll starts over at most once.
     known: Vec<u64>,
 }
 
@@ -390,14 +388,15 @@ impl ChartPlan {
             beside,
             snapshots: Vec::new(),
             attempt: held::Advance::Try,
-            ahead: None,
             known: Vec::new(),
         }
     }
 
-    /// The poll starts over ([`budget::ChartCharge::try_recharge`] and [`budget::ChartCharge::overrun`] say when and why), building with `attempt` next, its first pass having come to `known`. Its plan keeps its audit draw; step 1 reserves its transients this time, at no less than `known`, and it expects no advance.
+    /// The poll starts over ([`budget::ChartCharge::overrun`] says when and why), building with `attempt` next, its first pass having come to `known`. Its plan keeps its audit draw; step 1 reserves its transients this time, at no less than `known`, and it expects no advance.
     fn restart(&mut self, attempt: held::Advance, known: Vec<u64>) {
         metrics::counter!("mkdb2_chart_budget_restarts_total").increment(1);
+        #[cfg(test)]
+        chart_admission_tests::RESTARTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.transients = true;
         self.held_hint = None;
         self.attempt = attempt;
@@ -480,14 +479,62 @@ impl ChartPlan {
             .fold(Kept::NONE, |kept, i| kept.join(groups[i].1))
     }
 
-    /// Step 1's charge, reserved before any lookup pins anything and priced outside the cache's lock from the snapshots `sizes` pinned (dropped before step 1 waits): a retained series at [`Self::pinned`]; an evicted one at the snapshot its recovery record's rows make (series only grow), its transients left to its read's correction, since how many rows a zoomed or filtered chart keeps is unknown until then; any other miss as the prod-average series, with transients over all its rows for every ref naming it (an upper bound on the rows a range keeps); custom-X runs at that series' points; the output at its bound over the priced series ([`Self::output_bound`]), or for a held hint at what the advance holds beside its working copies; once the poll started over, each item at no less than its first pass came to ([`Self::known`]). Records each series' snapshot bytes ([`Self::snapshots`]), and on a first pass whether its corrections may be kept ahead of the waiters ([`Self::ahead`]).
+    /// What `prepare` keeps of evicted series `index`, priced from its recovery `record` ([`EvictedSize`]): the share of its rows the fetch range spans at their mean density (all of them for an unzoomed chart), spread evenly over its groups. Each ref naming it keeps every group, or as many as the tags it lists, and nothing where that is more than [`MAX_TAG_GROUPS`], which `prepare` refuses, as [`Self::prepared_rows`] does; each group it keeps forms a series. A series that grew since, a range over denser steps than its average, a listed tag it never held, or groups larger than their mean, adds what its read corrects.
+    fn evicted_rows(&self, index: usize, record: EvictedSize) -> Kept {
+        let EvictedSize {
+            rows,
+            steps,
+            groups,
+            ..
+        } = record;
+        let (lo, hi) = (
+            self.params.fetch_min.max(steps.0),
+            self.params.fetch_max.min(steps.1),
+        );
+        // A record that held nothing in the range (an empty one's steps are an empty range) keeps no series: priced as any, it would add groups that take the chart's columns ([`Self::output_bound`]).
+        if lo > hi {
+            return Kept::NONE;
+        }
+        // u128: a span of every i64 step is 2^64 steps.
+        let span = u128::from(steps.1.abs_diff(steps.0)) + 1;
+        let share = u128::from(hi.abs_diff(lo)) + 1;
+        let kept = (rows as u128 * share).div_ceil(span);
+        // A record with rows in range has a group; an inconsistent one is priced wrong, not divided by zero in a poll.
+        let groups = groups.max(1);
+        self.refs[index]
+            .iter()
+            .map(|&r| {
+                let listed = self.params.filters.as_ref().map_or(0, |f| f[r].len());
+                let picked = if listed == 0 {
+                    groups
+                } else {
+                    listed.min(groups)
+                };
+                if picked > MAX_TAG_GROUPS {
+                    return Kept::NONE;
+                }
+                Kept {
+                    rows: (kept * picked as u128).div_ceil(groups as u128) as usize,
+                    largest: kept.div_ceil(groups as u128) as usize,
+                    series: picked,
+                    steps: (lo, hi),
+                }
+            })
+            .fold(Kept::NONE, Kept::join)
+    }
+
+    /// Step 1's charge, reserved before any lookup pins anything and priced outside the cache's lock from the snapshots `sizes` pinned (dropped before step 1 waits): a retained series at [`Self::pinned`]; an evicted one at the bytes its recovery record's snapshot charged and, with transients, at what its record says the request keeps of it ([`Self::evicted_rows`]); any other miss as the prod-average series, with transients over all its rows for every ref naming it (an upper bound on the rows a range keeps).
+    ///
+    /// Custom-X runs at that series' points; the output at its bound over the priced series ([`Self::output_bound`]), or for a held hint at what the advance holds beside its working copies.
+    ///
+    /// Once the poll started over, each item at no less than its first pass came to ([`Self::known`]). Records each series' snapshot bytes ([`Self::snapshots`]).
     fn estimate(&mut self, sizes: &[crate::series_cache::CachedSize]) -> Vec<u64> {
         use crate::series_cache::{snapshot_bytes, CachedSize};
         self.snapshots = sizes
             .iter()
             .map(|size| match size {
                 CachedSize::Cached(rows) => rows.bytes() as u64,
-                CachedSize::Evicted { rows } => snapshot_bytes(*rows) as u64,
+                CachedSize::Evicted(record) => record.bytes as u64,
                 CachedSize::Unknown => snapshot_bytes(budget::MISS_ESTIMATE_ROWS as usize) as u64,
             })
             .collect();
@@ -497,19 +544,23 @@ impl ChartPlan {
             .zip(&self.snapshots)
             .enumerate()
             .map(|(index, (size, &snapshot))| {
-                let series = match size {
-                    CachedSize::Cached(rows) if self.transients => self.prepared_rows(index, rows),
-                    CachedSize::Unknown if self.transients => {
-                        let rows = budget::MISS_ESTIMATE_ROWS as usize;
-                        let refs = self.refs[index].len();
-                        Kept {
-                            rows: rows * refs,
-                            largest: rows,
-                            series: refs,
-                            steps: (i64::MIN, i64::MAX),
+                let series = if self.transients {
+                    match size {
+                        CachedSize::Cached(rows) => self.prepared_rows(index, rows),
+                        CachedSize::Evicted(record) => self.evicted_rows(index, *record),
+                        CachedSize::Unknown => {
+                            let rows = budget::MISS_ESTIMATE_ROWS as usize;
+                            let refs = self.refs[index].len();
+                            Kept {
+                                rows: rows * refs,
+                                largest: rows,
+                                series: refs,
+                                steps: (i64::MIN, i64::MAX),
+                            }
                         }
                     }
-                    _ => Kept::NONE,
+                } else {
+                    Kept::NONE
                 };
                 kept = kept.join(series);
                 snapshot + Self::transient_bytes(series.rows)
@@ -519,18 +570,14 @@ impl ChartPlan {
             budget::MISS_ESTIMATE_ROWS * budget::X_BYTES_PER_ROW,
             self.x_runs,
         ));
-        items.push(match self.held_hint {
-            _ if self.transients => self.output_bound(kept),
-            Some(advance) => advance,
-            None => 0,
+        items.push(if self.transients {
+            self.output_bound(kept)
+        } else {
+            self.held_hint.unwrap_or(0)
         });
         for (item, &known) in items.iter_mut().zip(&self.known) {
             *item = (*item).max(known);
         }
-        let cached = sizes
-            .iter()
-            .all(|size| matches!(size, CachedSize::Cached(_)));
-        self.ahead = self.known.is_empty().then_some(self.x_runs == 0 && cached);
         items
     }
 }
@@ -587,13 +634,13 @@ fn columns_bound(spec: chart::GridSpec, kept: Kept) -> usize {
 
 /// The tag groups that become a ref's series, given the tags of the groups with rows in range, ascending: with any tagged group, the tagged ones (they win over stray scalar rows) the ref's filter `admits`; else the scalar group. Their positions, and whether they are tagged.
 pub(super) fn selected_groups<'a>(
-    tags: impl Iterator<Item = &'a str>,
+    tags: impl DoubleEndedIterator<Item = &'a str> + ExactSizeIterator + Clone,
     admits: impl Fn(&str) -> bool,
 ) -> (Vec<usize>, bool) {
-    let tags: Vec<&str> = tags.collect();
-    if tags.last().is_some_and(|tag| !tag.is_empty()) {
-        let picked = (0..tags.len())
-            .filter(|&i| !tags[i].is_empty() && admits(tags[i]))
+    if tags.clone().next_back().is_some_and(|tag| !tag.is_empty()) {
+        let picked = tags
+            .enumerate()
+            .filter_map(|(i, tag)| (!tag.is_empty() && admits(tag)).then_some(i))
             .collect();
         (picked, true)
     } else {
@@ -2281,7 +2328,7 @@ fn metric_info_from_row((metric_name, metric_type): (String, String)) -> proto::
 }
 
 fn assemble_cdn_series(
-    refs: Vec<proto::SeriesRef>,
+    refs: Vec<(String, String, String)>,
     rows: Vec<CdnKeyBatchRow>,
 ) -> Vec<proto::CdnSeries> {
     // Bucket interleaved rows by their (project, run, metric) key.
@@ -2297,18 +2344,14 @@ fn assemble_cdn_series(
             });
     }
     refs.into_iter()
-        .map(|r| {
-            let key = (
-                r.project_id.clone(),
-                r.run_id.clone(),
-                r.metric_name.clone(),
-            );
+        .map(|key| {
             // `get` + clone, not `remove`: duplicate refs must each receive the full entry list.
             let entries = by_key.get(&key).cloned().unwrap_or_default();
+            let (project_id, run_id, metric_name) = key;
             proto::CdnSeries {
-                project_id: r.project_id,
-                run_id: r.run_id,
-                metric_name: r.metric_name,
+                project_id,
+                run_id,
+                metric_name,
                 entries,
             }
         })
@@ -5140,12 +5183,6 @@ impl QueryService {
         }
         // Their units go back to the gate; each remaining read keeps one.
         permit.keep_for_reads(plan.series.len() - pinned.len() + plan.x_runs);
-        let read_keys: Vec<SeriesKey> = plan
-            .series
-            .iter()
-            .filter(|key| !pinned.contains_key(key))
-            .cloned()
-            .collect();
 
         let fetch_concurrency = self.chart_admission.fetch_concurrency();
         // Split lazily at election time: a unit leaves the request only when a detached refresh actually spawns, so protection lands on the series that scan. The refresh also holds its series' snapshot bytes, split off the request's charge, until it ends.
@@ -5163,7 +5200,7 @@ impl QueryService {
         // Distinct series grouped by (project, metric); a group's cache misses share one full read (clickhouse.rs fetch_full_many).
         // Election and unit splits run in this synchronous pass, before any per-series fetch below can split units or take slots; each batch is backed by one unit per series and spawns its detached tasks here.
         // A group of one distinct series keeps its own read (a larger group still elects a one-series batch when its other series are cached or busy), and batches take at most half of the request's `fetch_concurrency` reads, leaving the rest to the per-series stream below.
-        let mut groups = series_groups(&read_keys);
+        let mut groups = series_groups(plan.series.iter().filter(|key| !pinned.contains_key(*key)));
         let mut batches = Vec::new();
         for group in &mut groups {
             if batches.len() >= fetch_concurrency / 2 {
@@ -5197,10 +5234,10 @@ impl QueryService {
         let batched_rows = futures::future::try_join_all(batches);
 
         // Every other series: its own cached read (attached, incremental, or a full read of its own), concurrently, sharing the request's read bound with the batches.
-        let per_series_keys: Vec<_> = groups.iter().flatten().collect();
+        let per_series_keys = groups.iter().flatten();
         let fetches: Vec<_> = per_series_keys
-            .iter()
-            .map(|&key| {
+            .clone()
+            .map(|key| {
                 self.ch
                     .query_raw_any_cached(
                         &key.project_id,
@@ -5225,7 +5262,7 @@ impl QueryService {
             .iter()
             .flatten()
             .map(|(key, rows)| (key, rows))
-            .chain(per_series_keys.into_iter().zip(&per_series))
+            .chain(per_series_keys.zip(&per_series))
             .chain(pinned.iter().map(|(&key, rows)| (key, rows)))
             .collect();
         let all_rows: Arc<[Arc<SeriesSnapshot>]> = req
@@ -5337,6 +5374,7 @@ impl QueryService {
         };
         // An unaudited poll whose request has held state (`on`) tries the advance first, which step 1 reserved beside its working copies, charged once it has run; should it fall back, it builds in full in a slot taken again.
         let attempt = if plan.held_hint.is_some() {
+            charge.settle();
             match build(held::Advance::Only).await?? {
                 Some(response) => return Ok(ControlFlow::Break(response)),
                 None => held::Advance::Skip,
@@ -5344,13 +5382,10 @@ impl QueryService {
         } else {
             plan.attempt
         };
-        // A full build's charge before its slot wait: each series with its transients, and the output at its bound ([`ChartPlan::output_bound`]), reserved before it is allocated. If step 1 charged transients, the corrections counted it, and on a first pass ([`ChartPlan::ahead`]) what they came to past its grant must fit now ([`budget::ChartCharge::overrun`]); else (a memo or held state was stored) it is counted here and must fit now ([`budget::ChartCharge::try_recharge`]). Without room the poll starts over at the sizes it now knows: a storm of first reads, reads during a bulk write, a run's appends or a lineage rotation make many polls build at once, and keeping what each came to would pin them all past the budget while they wait for build slots.
+        // A full build's charge before its slot wait: each series with its transients, and the output at its bound ([`ChartPlan::output_bound`]), reserved before it is allocated. If step 1 charged transients, the corrections counted it; else (a memo or held state was stored) it is charged here ([`budget::ChartCharge::correct_all`]). Either way, on a first pass ([`ChartPlan::known`]) the poll keeps it within its grant, and past it only if it fits now, ahead of any waiter ([`budget::ChartCharge::overrun`]). Without room the poll starts over at the sizes it now knows: a storm of first reads, reads during a bulk write, a run's appends or a lineage rotation make many polls build at once, and keeping what each came to would pin them all past the budget while they wait for build slots.
         if plan.transients {
             let kept = kept_in_hand.into_inner().unwrap();
             charge.correct(output, plan.output_bound(kept));
-            if let Some(known) = plan.ahead.and_then(|ahead| charge.overrun(ahead)) {
-                return Ok(ControlFlow::Continue((attempt, known)));
-            }
         } else {
             // Every item of the charge: neither the memo nor held state serves custom x, so such a poll reads no x.
             let mut kept = Kept::NONE;
@@ -5365,9 +5400,14 @@ impl QueryService {
                 })
                 .collect();
             full.push(plan.output_bound(kept));
-            if !charge.try_recharge(&full) {
-                return Ok(ControlFlow::Continue((attempt, full)));
+            charge.correct_all(&full);
+        }
+        if plan.known.is_empty() {
+            if let Some(known) = charge.overrun() {
+                return Ok(ControlFlow::Continue((attempt, known)));
             }
+        } else {
+            charge.settle();
         }
         Ok(ControlFlow::Break(build(attempt).await??.expect(
             "only an Advance::Only call answers without building",
@@ -5383,6 +5423,19 @@ impl QueryService {
     ) -> Result<Response<proto::QueryCdnKeysResponse>, Status> {
         let req = request.into_inner();
         require_run_id_count("refs", req.refs.len())?;
+        for series in &req.refs {
+            let bytes = crate::clickhouse::cdn_key_cost(
+                &series.project_id,
+                &series.run_id,
+                &series.metric_name,
+            );
+            if bytes > crate::clickhouse::MAX_CDN_KEY_REF_BYTES {
+                return Err(Status::invalid_argument(format!(
+                    "refs: a ref's names take {bytes} bytes of SQL, past the {} one statement can give a ref",
+                    crate::clickhouse::MAX_CDN_KEY_REF_BYTES
+                )));
+            }
+        }
 
         let step_min = req.step_min.unwrap_or(i64::MIN);
         let step_max = req.step_max.unwrap_or(i64::MAX);
@@ -5400,14 +5453,8 @@ impl QueryService {
 
         let key_refs: Vec<(String, String, String)> = req
             .refs
-            .iter()
-            .map(|r| {
-                (
-                    r.project_id.clone(),
-                    r.run_id.clone(),
-                    r.metric_name.clone(),
-                )
-            })
+            .into_iter()
+            .map(|r| (r.project_id, r.run_id, r.metric_name))
             .collect();
 
         let rows = self
@@ -5416,10 +5463,8 @@ impl QueryService {
             .await
             .map_err(|e| Status::internal(format!("CDN query failed: {e}")))?;
 
-        // Emit one CdnSeries per requested ref, in request order. Refs with
-        // no rows still get an empty series so callers can rely on positional
-        // 1:1 correspondence with their request.
-        let series = assemble_cdn_series(req.refs, rows);
+        // One CdnSeries per requested ref, in request order, duplicates included; refs without rows get empty entries.
+        let series = assemble_cdn_series(key_refs, rows);
 
         Ok(Response::new(proto::QueryCdnKeysResponse {
             series,
@@ -5597,6 +5642,26 @@ mod request_list_bound_tests {
         );
     }
 
+    /// A ref no statement could hold even alone is refused before either database, naming the bound.
+    #[tokio::test]
+    async fn query_cdn_keys_refuses_a_ref_no_statement_holds() {
+        let mut refs = refs(2);
+        refs[1].metric_name = "'".repeat(70_000);
+        let request = proto::QueryCdnKeysRequest {
+            refs,
+            ..Default::default()
+        };
+        let status = service()
+            .query_cdn_keys(Request::new(request))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+        assert_eq!(
+            status.message(),
+            "refs: a ref's names take 280026 bytes of SQL, past the 258048 one statement can give a ref"
+        );
+    }
+
     #[tokio::test]
     async fn query_text_window_refuses_metric_names_past_the_bound_before_their_dedup() {
         let request = proto::QueryTextWindowRequest {
@@ -5638,13 +5703,8 @@ mod request_list_bound_tests {
 mod cdn_series_tests {
     use super::*;
 
-    fn reference(run_id: &str, tags: &[&str]) -> proto::SeriesRef {
-        proto::SeriesRef {
-            project_id: "project".to_string(),
-            run_id: run_id.to_string(),
-            metric_name: "gallery".to_string(),
-            tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
-        }
+    fn reference(run_id: &str) -> (String, String, String) {
+        ("project".into(), run_id.into(), "gallery".into())
     }
 
     fn row(run_id: &str, step: i64, cdn_key: &str) -> CdnKeyBatchRow {
@@ -5661,10 +5721,10 @@ mod cdn_series_tests {
     fn duplicate_cdn_refs_each_receive_their_positional_series() {
         let output = assemble_cdn_series(
             vec![
-                reference("a", &["ignored-a"]),
-                reference("missing", &[]),
-                reference("a", &["ignored-b"]),
-                reference("b", &[]),
+                reference("a"),
+                reference("missing"),
+                reference("a"),
+                reference("b"),
             ],
             vec![row("a", 1, "one.json"), row("b", 2, "two.json")],
         );
@@ -5687,9 +5747,23 @@ mod cdn_series_tests {
 mod chart_admission_tests {
     use super::frontier_delta_tests::{build_chart, continuation};
     use super::*;
+    use crate::series_cache::CachedSize;
+
+    /// Polls started over in this test binary ([`ChartPlan::restart`]), which the randomized admission test tallies.
+    pub(super) static RESTARTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     fn admission(limit: usize) -> ChartAdmission {
         ChartAdmission::new(limit, 1 << 30, DEFAULT_CHART_BUILD_SLOTS)
+    }
+
+    /// A recovery record of `rows` rows over `steps` in `groups` tag groups, its pin at a scalar snapshot's bytes ([`crate::series_cache::snapshot_bytes`]): what a tagged snapshot charged is more ([`an_evicted_tagged_series_pins_what_its_snapshot_charged`]).
+    fn evicted(rows: usize, steps: (i64, i64), groups: usize) -> CachedSize {
+        CachedSize::Evicted(EvictedSize {
+            rows,
+            bytes: crate::series_cache::snapshot_bytes(rows),
+            steps,
+            groups,
+        })
     }
 
     fn series(run_id: &str) -> proto::SeriesRef {
@@ -6445,7 +6519,7 @@ mod chart_admission_tests {
             let rows = wide(tags);
             let mut plan = plan_off(&request);
             let kept = plan.prepared_rows(0, &rows);
-            let estimate = plan.estimate(&[crate::series_cache::CachedSize::Cached(rows.clone())]);
+            let estimate = plan.estimate(&[CachedSize::Cached(rows.clone())]);
             let prepared = prepare(
                 &request,
                 &p,
@@ -6532,7 +6606,6 @@ mod chart_admission_tests {
 
     #[test]
     fn charges_are_estimated_from_the_cache_records_and_corrected_to_real_sizes() {
-        use crate::series_cache::CachedSize;
         let mut request = proto::ChartRequest {
             y_series: vec![series("a"), series("b"), series("a"), series("c")],
             x_series: Some(series("x")),
@@ -6553,7 +6626,7 @@ mod chart_admission_tests {
         ));
         let estimate = plan.estimate(&[
             CachedSize::Cached(cached.clone()),
-            CachedSize::Evicted { rows: 1_000 },
+            evicted(1_000, (0, 999), 1),
             CachedSize::Unknown,
         ]);
         let per_row = budget::BUILD_BYTES_PER_ROW;
@@ -6572,15 +6645,15 @@ mod chart_admission_tests {
             [
                 // Both refs of the cached series prepare its 100 rows.
                 cached.bytes() as u64 + 100 * 2 * per_row,
-                // An evicted series' transients wait for its read: how many of its rows a zoomed or filtered chart keeps is unknown until then.
-                crate::series_cache::snapshot_bytes(1_000) as u64,
+                // An evicted series as its record left it: all 1,000 rows on an unzoomed chart.
+                series_bytes(1_000),
                 series_bytes(budget::MISS_ESTIMATE_ROWS as usize),
                 budget::MISS_ESTIMATE_ROWS * budget::X_BYTES_PER_ROW,
                 budget::MISS_ESTIMATE_ROWS * budget::X_BYTES_PER_ROW,
                 budget::MISS_ESTIMATE_ROWS * budget::X_BYTES_PER_ROW,
-                // The largest series' working copies (the prod-average miss's), and a model of its three series with a column per row, its most without a resolution.
+                // The largest series' working copies (the prod-average miss's), and a model of its four series with a column per row, its most without a resolution.
                 budget::MISS_ESTIMATE_ROWS * per_row
-                    + 3 * (200 + budget::MISS_ESTIMATE_ROWS) * budget::DENSE_BYTES_PER_CELL,
+                    + 4 * (200 + 1_000 + budget::MISS_ESTIMATE_ROWS) * budget::DENSE_BYTES_PER_CELL,
             ]
         );
         // A long tag filter is looked up as a set: only the tags it names are prepared.
@@ -6609,6 +6682,174 @@ mod chart_admission_tests {
         assert_eq!((kept.rows, kept.largest, kept.series), (20, 10, 2));
         request.use_timestamp_axis = true;
         assert_eq!(plan_off(&request).x_runs, 0, "timestamp charts read no x");
+    }
+
+    /// An evicted series is priced from its recovery record as a retained one is from its snapshot: the whole snapshot, which its read pins, and transients and output over the rows the chart's step range keeps, at the record's mean density over the steps it held, in as many series as its tag groups.
+    #[test]
+    fn evicted_series_are_priced_by_the_share_of_their_records_the_range_keeps() {
+        let per_row = budget::BUILD_BYTES_PER_ROW;
+        let snapshot = crate::series_cache::snapshot_bytes(1_000) as u64;
+        let price = |step_min: Option<i64>, step_max: Option<i64>, groups: usize| {
+            let request = proto::ChartRequest {
+                y_series: vec![series("a")],
+                target_resolution: 300,
+                step_min,
+                step_max,
+                ..Default::default()
+            };
+            plan_off(&request).estimate(&[evicted(1_000, (1_000, 2_998), groups)])
+        };
+        // Unzoomed: every row, and the output's bound over them (a 300-column step chart: 602 columns).
+        assert_eq!(
+            price(None, None, 1),
+            [snapshot + 1_000 * per_row, output_bound(1, 1_000)]
+        );
+        // A tenth of the steps it held keeps a tenth of its rows, rounded up, and as many columns.
+        assert_eq!(
+            price(Some(1_000), Some(1_198), 1),
+            [
+                snapshot + 100 * per_row,
+                100 * per_row + 100 * budget::DENSE_BYTES_PER_CELL
+            ]
+        );
+        assert_eq!(price(Some(1_000), Some(1_000), 1)[0], snapshot + per_row);
+        // Past its steps, nothing but the pin.
+        assert_eq!(price(Some(3_000), None, 1), [snapshot, 0]);
+        // Four tag groups form four series of a quarter of its rows each.
+        assert_eq!(
+            price(None, None, 4),
+            [snapshot + 1_000 * per_row, output_bound(4, 250)]
+        );
+    }
+
+    /// A ref on an evicted tagged series keeps as many of its groups as the tags it lists, each at the record's mean group, and nothing where that is more than [`MAX_TAG_GROUPS`], as `prepare` refuses it: a retained series is priced the same way ([`ChartPlan::prepared_rows`]).
+    #[test]
+    fn a_ref_on_an_evicted_tagged_series_keeps_the_groups_its_tags_list() {
+        let per_row = budget::BUILD_BYTES_PER_ROW;
+        let snapshot = crate::series_cache::snapshot_bytes(1_600) as u64;
+        let price = |refs: Vec<proto::SeriesRef>, groups: usize| {
+            let request = proto::ChartRequest {
+                y_series: refs,
+                target_resolution: 300,
+                ..Default::default()
+            };
+            plan_off(&request).estimate(&[evicted(1_600, (0, 1_999), groups)])
+        };
+        let tagged = |tags: &[&str]| proto::SeriesRef {
+            tags: tags.iter().map(|tag| tag.to_string()).collect(),
+            ..series("a")
+        };
+        // Two of 16 groups: 200 rows in two series of 100, a column per row at most.
+        assert_eq!(
+            price(vec![tagged(&["t1", "t2"])], 16),
+            [
+                snapshot + 200 * per_row,
+                100 * per_row + 2 * 200 * budget::DENSE_BYTES_PER_CELL
+            ]
+        );
+        // Eight refs of one tag each: eight series of 100 rows.
+        let eight = (0..8).map(|i| tagged(&[&format!("t{i}")])).collect();
+        assert_eq!(
+            price(eight, 16),
+            [snapshot + 800 * per_row, output_bound(8, 100)]
+        );
+        let names: Vec<String> = (0..70).map(|i| format!("t{i}")).collect();
+        let listed: Vec<&str> = names.iter().map(String::as_str).collect();
+        // Every group, unfiltered or listing more tags than it held.
+        assert_eq!(
+            price(vec![tagged(&[])], 16),
+            price(vec![tagged(&listed[..20])], 16)
+        );
+        // More than 64 groups, unfiltered or listed: refused by `prepare`, so nothing but the pin.
+        assert_eq!(price(vec![tagged(&[])], 100), [snapshot, 0]);
+        assert_eq!(price(vec![tagged(&listed)], 100), [snapshot, 0]);
+        assert_eq!(
+            price(vec![tagged(&listed[..64])], 100)[0],
+            snapshot + 64 * 16 * per_row,
+            "64 of its 100 groups"
+        );
+    }
+
+    /// An evicted series' pin is priced at the bytes its snapshot charged when it left, which a tagged snapshot's row count alone under-prices (each tag's chunks and tag allocation): 64 tags of two rows.
+    #[tokio::test]
+    async fn an_evicted_tagged_series_pins_what_its_snapshot_charged() {
+        let service = chart_service("http://127.0.0.1:9", ChartAdmission::new(32, 1 << 30, 1));
+        let key = SeriesKey::new("project", "run-0", "loss");
+        let held = service.ch.series_cache().insert_full(
+            key.clone(),
+            (0..64)
+                .flat_map(|tag| (0..2).map(move |step| point(&format!("t{tag:02}"), step, 1.0, 1)))
+                .collect(),
+            std::time::Instant::now(),
+        );
+        service.ch.series_cache().evict_for_test(&key);
+        let request = proto::ChartRequest {
+            y_series: vec![series("run-0")],
+            target_resolution: 300,
+            ..Default::default()
+        };
+        let mut plan = plan_off(&request);
+        let estimate = plan.estimate(&service.ch.series_cache().sizes(&plan.series));
+        let pin = held.bytes() as u64;
+        assert!(pin > crate::series_cache::snapshot_bytes(128) as u64);
+        assert_eq!(plan.snapshots, [pin]);
+        assert_eq!(estimate[0], pin + 128 * budget::BUILD_BYTES_PER_ROW);
+    }
+
+    /// An evicted series of 64 tags and stray scalar rows is priced at its 64 tagged groups, as `prepare` builds it (it drops the scalar rows beside tagged ones, [`selected_groups`]), not refused as 65 groups past [`MAX_TAG_GROUPS`], which priced its pin alone.
+    #[tokio::test]
+    async fn an_evicted_series_with_stray_scalar_rows_is_priced_at_its_tagged_groups() {
+        let service = chart_service("http://127.0.0.1:9", ChartAdmission::new(32, 1 << 30, 1));
+        let key = SeriesKey::new("project", "run-0", "loss");
+        let held = service.ch.series_cache().insert_full(
+            key.clone(),
+            std::iter::once(point("", 0, 1.0, 1))
+                .chain((0..64).flat_map(|tag| {
+                    (0..1_000).map(move |step| point(&format!("t{tag:02}"), step, 1.0, 1))
+                }))
+                .collect(),
+            std::time::Instant::now(),
+        );
+        service.ch.series_cache().evict_for_test(&key);
+        let request = proto::ChartRequest {
+            y_series: vec![series("run-0")],
+            target_resolution: 300,
+            ..Default::default()
+        };
+        let mut plan = plan_off(&request);
+        let estimate = plan.estimate(&service.ch.series_cache().sizes(&plan.series));
+        assert_eq!(
+            estimate[0],
+            held.bytes() as u64 + 64_001 * budget::BUILD_BYTES_PER_ROW,
+            "every row, over 64 groups"
+        );
+        assert!(estimate[1] > 0, "and their output");
+    }
+
+    /// An evicted series that held nothing in a chart's range, or nothing at all, adds no series to the chart's output, which the series that do keep rows bound: the output item is the same as with that series absent.
+    #[test]
+    fn evicted_series_keeping_no_rows_add_no_output_series() {
+        let request = |runs: &[&str]| proto::ChartRequest {
+            y_series: runs.iter().map(|run| series(run)).collect(),
+            target_resolution: 300,
+            step_min: Some(0),
+            step_max: Some(1_999),
+            ..Default::default()
+        };
+        let kept = Arc::new(SeriesSnapshot::full(
+            (0..2_000).map(|step| point("", step, 1.0, 1)).collect(),
+        ));
+        let alone = plan_off(&request(&["a"])).estimate(&[CachedSize::Cached(kept.clone())]);
+        let disjoint = evicted(1_000, (5_000, 5_999), 64);
+        let empty = evicted(0, (i64::MAX, i64::MIN), 0);
+        for absent in [disjoint, empty] {
+            let both = plan_off(&request(&["a", "b"]))
+                .estimate(&[CachedSize::Cached(kept.clone()), absent]);
+            assert_eq!(
+                both[2], alone[1],
+                "the output of the one series that keeps rows"
+            );
+        }
     }
 
     /// What step 1 charges a series of `rows` rows that one ref prepares in full: its snapshot and its transients.
@@ -6682,6 +6923,13 @@ mod chart_admission_tests {
                 .collect(),
             std::time::Instant::now(),
         );
+    }
+
+    /// Yield 20 times: long enough for spawned polls to reach whatever they wait on next.
+    async fn yield_a_while() {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
     }
 
     /// Admit a request as `run_with_timeout` does, then answer it as `query_chart` does ([`QueryService::query_chart_admitted`], the test store answering the lifecycle checks); also the step-1 estimate and a handle on the request's charge (it keeps the charge's items readable after the request ends).
@@ -6765,9 +7013,7 @@ mod chart_admission_tests {
         let other = admission.bytes.reserve(vec![full]).await;
         let rebuilt = tokio::spawn(rebuilt);
         crate::wait_until(|| admission.bytes.in_use() == full).await;
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-        }
+        yield_a_while().await;
         assert_eq!(admission.bytes.in_use(), full, "waiting, not overdrawing");
         assert!(!rebuilt.is_finished());
         drop(other);
@@ -6799,12 +7045,14 @@ mod chart_admission_tests {
         assert_eq!(admission.bytes.in_use(), 0);
     }
 
-    /// Polls that skipped their transients (a memo was held for each) and build after all, with no room for them, start over ([`ChartPlan::restart`]): while they wait, none holds a snapshot, a byte, a scan unit or a run guard, and each checks its run's lifecycle again before it reads again.
+    /// Polls that skipped their transients (a memo was held for each) and build after all, with no room for them beside a request holding the rest of the budget, start over ([`ChartPlan::restart`]): while they wait, none holds a snapshot, a byte, a scan unit or a run guard, and each checks its run's lifecycle again before it reads again. Two polls: what one frees by starting over is no room for the other's transients.
     #[tokio::test]
     async fn polls_starting_over_wait_holding_no_snapshot() {
-        let limit = 1 << 30;
+        let pins = 2 * crate::series_cache::snapshot_bytes(1_001) as u64;
+        let (other, slack) = (1 << 30, 1_024);
+        let limit = pins + other + slack;
         let service = chart_service("http://127.0.0.1:9", ChartAdmission::new(32, limit, 1));
-        let runs: Vec<String> = (0..8).map(|i| format!("run-{i}")).collect();
+        let runs: Vec<String> = (0..2).map(|i| format!("run-{i}")).collect();
         let mut polls = Vec::new();
         for run in &runs {
             cache_rows(&service, run, 1_000);
@@ -6840,13 +7088,12 @@ mod chart_admission_tests {
             );
             admitted.push(poll);
         }
-        // A request ahead of their transients: first come, first served, so none fits now.
-        let mut ahead = Box::pin(admission.bytes.reserve(vec![limit]));
-        assert!(futures::FutureExt::now_or_never(&mut ahead).is_none());
+        // Another request holds all but `slack` of the rest: no room for any poll's transients.
+        let other = admission.bytes.reserve(vec![other]).await;
         let admitted: Vec<_> = admitted.into_iter().map(tokio::spawn).collect();
-        // Once every poll gave its pins' bytes back, the request ahead holds the whole budget and the polls wait behind it.
+        // Once every poll gave its pins' bytes back, only the other request holds bytes and the polls wait for room.
         crate::wait_until(|| {
-            admission.bytes.in_use() == limit && admission.bytes.waiters() == runs.len()
+            admission.bytes.in_use() == other.items()[0] && admission.bytes.waiters() == runs.len()
         })
         .await;
         // The series cache lets go of the snapshots the polls read.
@@ -6874,8 +7121,8 @@ mod chart_admission_tests {
             .pg
             .set_test_lifecycle(purging, RunLifecycleClass::Purging);
         drop(writers);
-        // The request ahead ends: each poll is admitted again with its transients, reads the cache's snapshots and answers in full, except the purging run's, which its lifecycle check refuses.
-        drop(ahead);
+        // The other request ends: each poll is admitted again with its transients, reads the cache's snapshots and answers in full, except the purging run's, which its lifecycle check refuses.
+        drop(other);
         for (index, poll) in admitted.into_iter().enumerate() {
             let answer = poll.await.unwrap();
             if index == 0 {
@@ -6889,7 +7136,7 @@ mod chart_admission_tests {
         assert_eq!(admission.bytes.waiters(), 0);
     }
 
-    /// A first read larger than step 1 priced it (a series the cache has never seen, priced as the prod average, or a cached one that grew before the poll read it) overdraws the budget only until the poll's reads are done. With no room for it then, the poll starts over, holding none of its bytes or pins while it waits for room at the size it read, then reserves that size (the series a fresh hit now) and builds within it. With room but an earlier request waiting, a cached series' growth is kept ahead of the waiter, since the budget's use stays within its limit, and the poll builds; a read past the prod-average estimate starts over behind the waiter.
+    /// A first read larger than step 1 priced it (a series the cache has never seen, priced as the prod average, or a cached one that grew before the poll read it) overdraws the budget only until the poll's reads are done. With no room for it then, the poll starts over, holding none of its bytes or pins while it waits for room at the size it read, then reserves that size (the series a fresh hit now) and builds within it. With room but an earlier request waiting, the read is kept ahead of the waiter, whether step 1 priced it from the cache or as the prod average, since the budget's use stays within its limit, and the poll builds.
     #[tokio::test]
     async fn a_first_read_past_its_price_starts_over_at_its_size_unless_it_may_keep_it() {
         for room in [false, true] {
@@ -6900,29 +7147,10 @@ mod chart_admission_tests {
     }
 
     async fn first_read_past_its_price(cached: bool, room: bool) {
-        #[derive(serde::Serialize, ::clickhouse::Row)]
-        struct Encoded {
-            run_id: String,
-            tag: String,
-            step: i64,
-            timestamp_ms: i64,
-            value: f32,
-            inserted_ms: i64,
-        }
         const ROWS: usize = 40_000;
         const LIMIT: u64 = 64 << 20;
-        let mut mock = ::clickhouse::test::Mock::new();
         // One full read: the poll that starts over finds the series cached.
-        mock.add(::clickhouse::test::handlers::provide((0..ROWS as i64).map(
-            |step| Encoded {
-                run_id: "run-0".into(),
-                tag: String::new(),
-                step,
-                timestamp_ms: step,
-                value: step as f32,
-                inserted_ms: 1,
-            },
-        )));
+        let mut mock = mock_full_reads(&[ROWS]);
         let service = chart_service(mock.url(), ChartAdmission::new(32, LIMIT, 1));
         let admission = &service.chart_admission;
         let priced = if cached {
@@ -6954,19 +7182,11 @@ mod chart_admission_tests {
             assert!(futures::FutureExt::now_or_never(earlier.as_mut()).is_none());
             let blocker = admission.builds.hold().await;
             let poll = tokio::spawn(poll);
-            let (items, waiters) = if cached {
-                (read.to_vec(), 1)
-            } else {
-                (vec![0, 0], 2)
-            };
-            crate::wait_until(|| charge.items() == items && admission.bytes.waiters() == waiters)
-                .await;
-            for _ in 0..20 {
-                tokio::task::yield_now().await;
-            }
+            crate::wait_until(|| charge.items() == read && admission.bytes.waiters() == 1).await;
+            yield_a_while().await;
             assert_eq!(
                 (charge.items(), admission.bytes.waiters()),
-                (items, waiters),
+                (read.to_vec(), 1),
                 "cached {cached}"
             );
             drop((blocker, other, charge));
@@ -6978,9 +7198,7 @@ mod chart_admission_tests {
         let other = admission.bytes.reserve(vec![LIMIT - reserved]).await;
         let poll = tokio::spawn(poll);
         crate::wait_until(|| admission.bytes.waiters() == 1).await;
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-        }
+        yield_a_while().await;
         assert_eq!(
             (admission.bytes.in_use(), charge.items()),
             (LIMIT - reserved, vec![0, 0]),
@@ -6998,9 +7216,7 @@ mod chart_admission_tests {
         let blocker = admission.builds.hold().await;
         drop(other);
         crate::wait_until(|| charge.items()[0] > 0).await;
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-        }
+        yield_a_while().await;
         assert_eq!(
             (charge.items(), admission.bytes.in_use()),
             (read.to_vec(), read.iter().sum())
@@ -7011,10 +7227,286 @@ mod chart_admission_tests {
         assert_eq!(admission.bytes.in_use(), 0);
     }
 
-    /// A first pass keeps a cached series' growth ahead of the waiters, an estimate's overrun only with nobody waiting; once the poll starts over, step 1 prices each item at no less than its first pass came to, and it starts over no more.
+    /// A ClickHouse that answers one full read of run-`i`'s `rows[i]` rows (run-0, run-1, ...), steps from 0, in the order a batch asks for them.
+    fn mock_full_reads(rows: &[usize]) -> ::clickhouse::test::Mock {
+        #[derive(serde::Serialize, ::clickhouse::Row)]
+        struct Encoded {
+            run_id: String,
+            tag: String,
+            step: i64,
+            timestamp_ms: i64,
+            value: f32,
+            inserted_ms: i64,
+        }
+        let mock = ::clickhouse::test::Mock::new();
+        mock.add(::clickhouse::test::handlers::provide(
+            rows.iter().enumerate().flat_map(|(run, &rows)| {
+                (0..rows as i64).map(move |step| Encoded {
+                    run_id: format!("run-{run}"),
+                    tag: String::new(),
+                    step,
+                    timestamp_ms: step,
+                    value: step as f32,
+                    inserted_ms: 1,
+                })
+            }),
+        ));
+        mock
+    }
+
+    /// A first pass holds back what its corrections take below their prices until it decides, so a waiter is not admitted on bytes its other corrections take back within its grant. Here a cold batch of an empty run and a 40,000-row one, both priced as the prod-average series: the empty run's read frees most of its price, the large run's growth and the output's bound take much of it back, and the poll keeps the rest within its grant. At its build boundary the budget is within its limit and the waiter still waits; before, it was admitted on the empty run's bytes and the budget sat past its limit while the poll waited for a build slot.
+    #[tokio::test]
+    async fn a_cold_batch_mixing_an_empty_and_a_large_run_keeps_the_budget_within_its_limit() {
+        const LIMIT: u64 = 64 << 20;
+        let mock = mock_full_reads(&[0, 40_000]);
+        let service = chart_service(mock.url(), ChartAdmission::new(32, LIMIT, 1));
+        let admission = &service.chart_admission;
+        let request = proto::ChartRequest {
+            y_series: vec![series("run-0"), series("run-1")],
+            target_resolution: 300,
+            ..Default::default()
+        };
+        let (poll, estimate, charge) = admitted_with_charge(&service, request).await;
+        let reserved: u64 = estimate.iter().sum();
+        let other = admission.bytes.reserve(vec![LIMIT - reserved]).await;
+        let mut waiter = Box::pin(admission.bytes.reserve(vec![estimate[0] / 2]));
+        assert!(futures::FutureExt::now_or_never(waiter.as_mut()).is_none());
+        let blocker = admission.builds.hold().await;
+        let poll = tokio::spawn(poll);
+        crate::wait_until(|| admission.slots.available_permits() == 32).await;
+        yield_a_while().await;
+        assert!(
+            charge.items().iter().sum::<u64>() <= reserved,
+            "it keeps its reads within its grant"
+        );
+        assert!(
+            admission.bytes.in_use() <= LIMIT,
+            "within the limit at the build boundary: {} past it",
+            admission.bytes.in_use().saturating_sub(LIMIT)
+        );
+        assert!(futures::FutureExt::now_or_never(waiter.as_mut()).is_none());
+        drop((blocker, other));
+        assert!(!poll.await.unwrap().unwrap().delta);
+        drop(charge);
+        drop(waiter.await);
+        assert_eq!(admission.bytes.in_use(), 0);
+    }
+
+    /// A ClickHouse that answers each full read (`run_id IN [...]`) with run-`i`'s `rows[i]` rows as they are when it asks, steps from 0, and anything else (an increment) with no rows: its URL, and its task.
+    fn fake_clickhouse(
+        rows: Arc<Vec<std::sync::atomic::AtomicUsize>>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback(move |uri: axum::http::Uri, body: String| {
+            let rows = rows.clone();
+            async move {
+                // Short reads carry their SQL in the URL, long ones in the body.
+                let sql = url::form_urlencoded::parse(uri.query().unwrap_or("").as_bytes())
+                    .find(|(name, _)| name == "query")
+                    .map_or(body, |(_, sql)| sql.into_owned());
+                let mut out = Vec::new();
+                let Some(list) = sql.split_once("run_id IN [").map(|(_, rest)| rest) else {
+                    return out;
+                };
+                for run in list[..list.find(']').unwrap()].split(',') {
+                    let run = run.trim().trim_matches('\'');
+                    let index: usize = run.strip_prefix("run-").unwrap().parse().unwrap();
+                    // RowBinary: run_id, tag (empty), step, timestamp_ms, value, inserted_ms.
+                    for step in 0..rows[index].load(std::sync::atomic::Ordering::Relaxed) as i64 {
+                        out.push(run.len() as u8);
+                        out.extend(run.as_bytes());
+                        out.push(0);
+                        out.extend(step.to_le_bytes());
+                        out.extend(step.to_le_bytes());
+                        out.extend((step as f32).to_le_bytes());
+                        out.extend(1i64.to_le_bytes());
+                    }
+                }
+                out
+            }
+        });
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, server)
+    }
+
+    /// A detached read's split goes back to its request when the read ends, not to the budget: the request holds the rows it read until its correction prices them, so a waiter must not be admitted on those bytes. Here the poll was priced from the cache, which evicted the series before its read, so its full read is detached and comes out at its price; a request waits for exactly the room its split would have freed.
+    #[tokio::test]
+    async fn a_waiter_is_not_admitted_on_the_bytes_a_detached_read_hands_its_request() {
+        const ROWS: usize = 40_000;
+        const LIMIT: u64 = 64 << 20;
+        let mock = mock_full_reads(&[ROWS]);
+        let service = chart_service(mock.url(), ChartAdmission::new(32, LIMIT, 1));
+        let admission = &service.chart_admission;
+        cache_rows(&service, "run-0", ROWS as i64);
+        let request = proto::ChartRequest {
+            y_series: vec![series("run-0")],
+            target_resolution: 300,
+            ..Default::default()
+        };
+        let (poll, estimate, charge) = admitted_with_charge(&service, request).await;
+        let reserved: u64 = estimate.iter().sum();
+        let key = SeriesKey::new("project", "run-0", "loss");
+        service.ch.series_cache().evict_for_test(&key);
+        let other = admission.bytes.reserve(vec![LIMIT - reserved]).await;
+        let split = crate::series_cache::snapshot_bytes(ROWS) as u64;
+        let mut waiter = Box::pin(admission.bytes.reserve(vec![split]));
+        assert!(futures::FutureExt::now_or_never(waiter.as_mut()).is_none());
+        // The poll reads, then waits for the build slot this test holds.
+        let blocker = admission.builds.hold().await;
+        let poll = tokio::spawn(poll);
+        // Its reads are done once its scan unit is back.
+        crate::wait_until(|| admission.slots.available_permits() == 32).await;
+        yield_a_while().await;
+        assert_eq!(charge.items(), estimate, "its read came out at its price");
+        assert_eq!(admission.bytes.in_use(), LIMIT, "nothing past the budget");
+        assert!(
+            futures::FutureExt::now_or_never(waiter.as_mut()).is_none(),
+            "the poll still holds its rows"
+        );
+        drop((blocker, other));
+        assert!(!poll.await.unwrap().unwrap().delta);
+        drop(charge);
+        drop(waiter.await);
+        assert_eq!(admission.bytes.in_use(), 0);
+    }
+
+    /// A cold batch that reads (one ClickHouse read of several runs, which their detached tasks share, each holding its series' split charge) returns every byte, scan unit and build slot to a budget a request waits on in full, whether its poll answers or is cancelled: before its reads, at any point around their end (where a split goes back to the request or, once it is gone, to the budget), waiting for a build slot, or building.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cold_batch_returns_every_byte_unit_and_slot_however_its_poll_ends() {
+        let request = proto::ChartRequest {
+            y_series: (0..4).map(|i| series(&format!("run-{i}"))).collect(),
+            target_resolution: 300,
+            ..Default::default()
+        };
+        let answered = cold_batch_poll(&request, None, false)
+            .await
+            .expect("not cancelled");
+        // Cancelled from at once to half again past the time an answer takes: where each lands varies with the host, and each returns everything wherever it lands.
+        for i in 0..=48u32 {
+            cold_batch_poll(&request, Some(answered * i / 32), false).await;
+        }
+        assert_eq!(
+            cold_batch_poll(&request, None, true).await,
+            None,
+            "cancelled waiting for a build slot, its reads done"
+        );
+    }
+
+    /// One poll of `request`'s cold series (20,000 rows each) against a fresh service, a request waiting for the whole budget behind it: cancelled after `cancel`, or with `blocked` once its reads are done, while the test holds the only build slot, else answered in full. Asserts that everything comes back, and returns how long the poll took if it answered.
+    async fn cold_batch_poll(
+        request: &proto::ChartRequest,
+        cancel: Option<Duration>,
+        blocked: bool,
+    ) -> Option<Duration> {
+        const LIMIT: u64 = 64 << 20;
+        let runs = request.y_series.len();
+        let mut mock = mock_full_reads(&vec![20_000; runs]);
+        // A poll cancelled before it reads never asks.
+        mock.non_exhaustive();
+        let service = chart_service(mock.url(), ChartAdmission::new(32, LIMIT, 1));
+        let admission = &service.chart_admission;
+        let (poll, _, charge) = admitted_with_charge(&service, request.clone()).await;
+        drop(charge);
+        let mut waiter = Box::pin(admission.bytes.reserve(vec![LIMIT]));
+        assert!(futures::FutureExt::now_or_never(waiter.as_mut()).is_none());
+        let blocker = if blocked {
+            Some(admission.builds.hold().await)
+        } else {
+            None
+        };
+        let started = std::time::Instant::now();
+        let poll = tokio::spawn(poll);
+        let keys: Vec<SeriesKey> = (0..runs)
+            .map(|i| SeriesKey::new("project", format!("run-{i}"), "loss"))
+            .collect();
+        let read = || {
+            keys.iter()
+                .all(|key| service.ch.series_cache().lookup_fresh(key).is_some())
+        };
+        if blocked {
+            crate::wait_until(|| admission.slots.available_permits() == 32 && read()).await;
+        } else if let Some(after) = cancel {
+            tokio::time::sleep(after).await;
+        }
+        if blocked || cancel.is_some() {
+            poll.abort();
+        }
+        // An abort lands at the poll's next await, or never if it already answered.
+        let end = match poll.await {
+            Ok(answer) => {
+                assert!(!answer.unwrap().delta);
+                Some(started.elapsed())
+            }
+            Err(error) => {
+                assert!(error.is_cancelled());
+                None
+            }
+        };
+        drop(blocker);
+        let waiting = tokio::time::timeout(Duration::from_secs(10), waiter)
+            .await
+            .expect("every byte comes back");
+        assert_eq!(admission.bytes.in_use(), LIMIT, "the waiter holds them all");
+        drop(waiting);
+        crate::wait_until(|| {
+            admission.slots.available_permits() == 32 && admission.builds.available() == 1
+        })
+        .await;
+        assert_eq!(
+            (admission.bytes.in_use(), admission.bytes.waiters()),
+            (0, 0)
+        );
+        end
+    }
+
+    /// A poll that started over checks no overrun again: its second pass keeps whatever its reads come to, even past a full budget, so it starts over at most once. Here its cached series grew past its price before each of its two reads.
+    #[tokio::test]
+    async fn a_poll_that_started_over_keeps_what_its_second_reads_come_to() {
+        const LIMIT: u64 = 64 << 20;
+        let service = chart_service("http://127.0.0.1:9", ChartAdmission::new(32, LIMIT, 1));
+        let admission = &service.chart_admission;
+        cache_rows(&service, "run-0", 1_000);
+        let request = proto::ChartRequest {
+            y_series: vec![series("run-0")],
+            target_resolution: 300,
+            ..Default::default()
+        };
+        let (poll, estimate, charge) = admitted_with_charge(&service, request).await;
+        let reserved: u64 = estimate.iter().sum();
+        // No room for its growth: it starts over, waiting for the size it read.
+        let other = admission.bytes.reserve(vec![LIMIT - reserved]).await;
+        cache_rows(&service, "run-0", 40_000);
+        let poll = tokio::spawn(poll);
+        crate::wait_until(|| admission.bytes.waiters() == 1).await;
+        let known = series_bytes(40_000) + output_bound(1, 40_000);
+        // A request after it takes all the room it leaves, and the series grows again before its second read.
+        let mut full = Box::pin(admission.bytes.reserve(vec![LIMIT - known]));
+        assert!(futures::FutureExt::now_or_never(full.as_mut()).is_none());
+        cache_rows(&service, "run-0", 80_000);
+        let blocker = admission.builds.hold().await;
+        drop(other);
+        let full = full.await;
+        let read = vec![series_bytes(80_000), output_bound(1, 80_000)];
+        crate::wait_until(|| charge.items() == read).await;
+        yield_a_while().await;
+        assert_eq!(
+            (charge.items(), admission.bytes.waiters()),
+            (read, 0),
+            "it keeps its overrun and waits for a build slot"
+        );
+        assert!(admission.bytes.in_use() > LIMIT, "an overdraft");
+        drop((blocker, full));
+        assert!(!poll.await.unwrap().unwrap().delta);
+        drop(charge);
+        assert_eq!(admission.bytes.in_use(), 0);
+    }
+
+    /// Once the poll starts over, step 1 prices each item at no less than its first pass came to ([`ChartPlan::known`]).
     #[test]
     fn a_poll_starting_over_reserves_at_least_what_its_first_pass_came_to() {
-        use crate::series_cache::CachedSize;
         let request = proto::ChartRequest {
             y_series: vec![series("a"), series("b")],
             target_resolution: 300,
@@ -7024,17 +7516,11 @@ mod chart_admission_tests {
         let cached = Arc::new(SeriesSnapshot::full(
             (0..1_000).map(|step| point("", step, 1.0, 1)).collect(),
         ));
-        plan.estimate(&[
-            CachedSize::Cached(cached.clone()),
-            CachedSize::Cached(cached.clone()),
-        ]);
-        assert_eq!(plan.ahead, Some(true), "priced from the cache");
         let sizes = [
             CachedSize::Cached(cached.clone()),
-            CachedSize::Evicted { rows: 40_000 },
+            evicted(40_000, (0, 39_999), 1),
         ];
         let first = plan.estimate(&sizes);
-        assert_eq!(plan.ahead, Some(false), "priced by estimate");
         let known = vec![first[0] - 1, first[1] + 5_000_000, first[2] + 7];
         plan.restart(held::Advance::Try, known.clone());
         assert_eq!(
@@ -7042,7 +7528,6 @@ mod chart_admission_tests {
             [first[0], known[1], known[2]],
             "each item at least what the first pass came to"
         );
-        assert_eq!(plan.ahead, None, "it starts over no more");
     }
 
     /// Append rows to a cached series as a poll's refresh does, keeping its lineage.
@@ -7162,7 +7647,7 @@ mod chart_admission_tests {
                 .sizes(&keys)
                 .iter()
                 .map(|size| match size {
-                    crate::series_cache::CachedSize::Cached(rows) => rows.bytes() as u64,
+                    CachedSize::Cached(rows) => rows.bytes() as u64,
                     _ => panic!("every series is cached"),
                 })
                 .sum()
@@ -7281,16 +7766,12 @@ mod chart_admission_tests {
             let (poll, estimate, charge) = admitted_with_charge(&service, next.clone()).await;
             let poll = tokio::spawn(poll);
             let reserved = estimate.iter().sum::<u64>();
-            for _ in 0..20 {
-                tokio::task::yield_now().await;
-            }
+            yield_a_while().await;
             assert_eq!(admission.bytes.in_use(), reserved);
             let other = admission.bytes.reserve(vec![LIMIT - reserved]).await;
             drop(blocker);
             crate::wait_until(|| admission.bytes.in_use() == LIMIT - reserved).await;
-            for _ in 0..20 {
-                tokio::task::yield_now().await;
-            }
+            yield_a_while().await;
             assert_eq!(
                 admission.bytes.in_use(),
                 LIMIT - reserved,
@@ -7481,7 +7962,7 @@ mod chart_admission_tests {
         .await;
     }
 
-    /// Randomized: tabs poll random charts (memo on or off, held state off, `shadow` or `on`, audits, cancellations, small budgets, few build slots and scan units) while a writer appends; every byte, scan unit and build slot comes back, nothing deadlocks and no audit fails. `KYMO_ADMISSION_FUZZ_CASES` lengthens it and `KYMO_ADMISSION_FUZZ_SEED` reseeds it.
+    /// Randomized: tabs poll random charts (memo on or off, held state off, `shadow` or `on`, audits, cancellations, small budgets, few build slots and scan units) while a writer appends; every byte, scan unit and build slot comes back, the budget never grants past its limit beside another charge (`count_grant`'s debug assertion, which a release run checks only built with `-C debug-assertions`), nothing deadlocks and no audit fails. In odd cases ClickHouse answers full reads ([`fake_clickhouse`]) of runs of 0 to 30,000 rows, cold at first, so prices miss both ways, the writer's rows land there, and tabs evict series between polls; in even ones it answers nothing and the series start cached. `KYMO_ADMISSION_FUZZ_CASES` lengthens it and `KYMO_ADMISSION_FUZZ_SEED` reseeds it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn randomized_polls_return_every_byte_unit_and_slot() {
         let env = |name: &str, default: u64| {
@@ -7495,6 +7976,8 @@ mod chart_admission_tests {
             env("KYMO_ADMISSION_FUZZ_SEED", 1),
         );
         let mut tally = std::collections::BTreeMap::<String, usize>::new();
+        // Run alone (filtered to this test), its tally counts only its own polls' restarts.
+        RESTARTS.store(0, std::sync::atomic::Ordering::Relaxed);
         for case in 0..cases {
             let mut rng = crate::Rng(
                 seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)
@@ -7511,8 +7994,20 @@ mod chart_admission_tests {
             let slots = rng.pick(&[1usize, 2, 4]);
             let units = rng.pick(&[1usize, 3, 32]);
             let held_budget = rng.pick(&[0usize, 50_000, usize::MAX]);
+            let answers = case % 2 == 1;
+            let read_rows: Arc<Vec<std::sync::atomic::AtomicUsize>> = Arc::new(
+                (0..5)
+                    .map(|_| match answers {
+                        true => rng.pick(&[0, 100, 1_000, 30_000]).into(),
+                        false => 0.into(),
+                    })
+                    .collect(),
+            );
+            let clickhouse = answers.then(|| fake_clickhouse(read_rows.clone()));
             let mut service = chart_service(
-                "http://127.0.0.1:9",
+                clickhouse
+                    .as_ref()
+                    .map_or("http://127.0.0.1:9", |(url, _)| url),
                 ChartAdmission::new(units, budget_bytes, slots),
             );
             let unshared = Arc::get_mut(&mut service).expect("not yet shared");
@@ -7522,20 +8017,31 @@ mod chart_admission_tests {
             let mut next = Vec::new();
             for run in &runs {
                 let rows = 50 + rng.below(400) as i64;
-                cache_rows(&service, run, rows);
+                if !answers {
+                    cache_rows(&service, run, rows);
+                }
                 next.push((rows, 2i64));
             }
-            // The writer: appends to random runs, one refresh at a time (the polls' own refreshes fail: no ClickHouse answers).
+            // The writer: appends to random runs, one refresh at a time (the polls' own refreshes fail: no ClickHouse answers), or in ClickHouse, where cached copies' refreshes find nothing new and reads after an eviction find them.
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let writer = {
                 let (service, runs, stop) = (service.clone(), runs.clone(), stop.clone());
-                let mut rng = crate::Rng(rng.next() | 1);
+                let (mut rng, read_rows) = (crate::Rng(rng.next() | 1), read_rows.clone());
                 tokio::spawn(async move {
                     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                         let r = rng.below(runs.len() as u64) as usize;
                         let (step, stamp) = &mut next[r];
                         let n = 1 + rng.below(20) as i64;
-                        append_rows(&service, &runs[r], *step..*step + n, *stamp);
+                        if answers {
+                            read_rows[r]
+                                .fetch_add(n as usize, std::sync::atomic::Ordering::Relaxed);
+                            service
+                                .ch
+                                .series_cache()
+                                .note_bumps(std::iter::once(runs[r].as_str()));
+                        } else {
+                            append_rows(&service, &runs[r], *step..*step + n, *stamp);
+                        }
                         (*step, *stamp) = (*step + n, *stamp + 1);
                         tokio::time::sleep(Duration::from_micros(200 + rng.below(2_000))).await;
                     }
@@ -7572,6 +8078,11 @@ mod chart_admission_tests {
                     };
                     let mut held: Option<proto::ChartResponse> = None;
                     for _ in 0..5 + rng.below(25) {
+                        if answers && rng.chance(15) {
+                            let run = &runs[rng.below(runs.len() as u64) as usize];
+                            let key = SeriesKey::new("project", run, "loss");
+                            service.ch.series_cache().evict_for_test(&key);
+                        }
                         let request = match &held {
                             Some(held) if !rng.chance(10) => continuation(&base, held),
                             _ => base.clone(),
@@ -7607,7 +8118,8 @@ mod chart_admission_tests {
                             }
                             Some(Err(status)) => format!("{:?}", status.code()),
                         };
-                        *outcomes.entry(label).or_default() += 1;
+                        let reads = if answers { "read " } else { "" };
+                        *outcomes.entry(format!("{reads}{label}")).or_default() += 1;
                     }
                     outcomes
                 }));
@@ -7644,8 +8156,14 @@ mod chart_admission_tests {
                 );
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
+            if let Some((_, server)) = clickhouse {
+                server.abort();
+            }
         }
-        eprintln!("ADMISSION FUZZ cases: {cases}, seed: {seed}, outcomes: {tally:?}");
+        eprintln!(
+            "ADMISSION FUZZ cases: {cases}, seed: {seed}, outcomes: {tally:?}, restarts: {}",
+            RESTARTS.load(std::sync::atomic::Ordering::Relaxed)
+        );
     }
 }
 

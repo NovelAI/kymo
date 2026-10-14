@@ -11,7 +11,7 @@ mod ws;
 #[allow(dead_code)]
 pub(crate) mod ws_rpc;
 
-pub use client::GrpcClient;
+pub use client::{cdn_keys_request_fits, GrpcClient};
 pub use gen::proto;
 pub use ws::{
     connection, connection_changed, is_stale, merge_versions, not_sent, raise, set_page_visibility,

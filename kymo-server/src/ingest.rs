@@ -23,10 +23,9 @@ use crate::pg::{
 use crate::proto;
 
 const BATCH_FLUSH_SIZE: usize = 10_000;
-/// Pin tonic's existing receive limit instead of relying on its default. The
-/// maximum ClickHouse payload below is derived from this bound and the fact
-/// that this service does not accept compressed gRPC requests.
-pub(crate) const MAX_GRPC_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+/// Pin tonic's existing receive limit instead of relying on its default. The maximum ClickHouse payload below is derived from this bound and the fact that this service does not accept compressed gRPC requests.
+/// The dashboard keeps a gallery's request under it (ws_rpc.rs).
+pub(crate) const MAX_GRPC_MESSAGE_BYTES: usize = crate::ws_rpc::MAX_REQUEST_BYTES;
 /// Retained heap memory per data cut. The row-count bound is enough for numeric
 /// metrics but not for large text/CDN payloads or tags. We charge collection
 /// backing storage and every retained string, then flush after the row that
@@ -351,6 +350,13 @@ pub(crate) fn storable_ident(s: &str, max_bytes: usize) -> bool {
     s.len() <= max_bytes && !s.contains('\0')
 }
 
+/// A (project, run, metric) key that run_metrics can store under the limits above.
+pub(crate) fn storable_series(project_id: &str, run_id: &str, metric_name: &str) -> bool {
+    storable_ident(project_id, MAX_ID_BYTES)
+        && storable_ident(run_id, MAX_ID_BYTES)
+        && storable_ident(metric_name, MAX_METRIC_NAME_BYTES)
+}
+
 pub(crate) fn is_reserved_project_id(project_id: &str) -> bool {
     project_id == RESERVED_PROJECT_ID
 }
@@ -374,9 +380,7 @@ pub(crate) fn validate_batch_ids(batch: &proto::MetricsBatch) -> Result<(), Stat
 }
 
 fn storable_rich_head_key(req: &proto::PublishRichMutationRequest) -> bool {
-    storable_ident(&req.project_id, MAX_ID_BYTES)
-        && storable_ident(&req.run_id, MAX_ID_BYTES)
-        && storable_ident(&req.metric_name, MAX_METRIC_NAME_BYTES)
+    storable_series(&req.project_id, &req.run_id, &req.metric_name)
         && storable_ident(&req.tag, MAX_RICH_HEAD_KEY_BYTES)
         && req.project_id.len() + req.run_id.len() + req.metric_name.len() + req.tag.len()
             <= MAX_RICH_HEAD_KEY_BYTES

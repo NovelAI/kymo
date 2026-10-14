@@ -804,7 +804,7 @@ fn AutoContent(
         Some(TypeFetch::UseHint(_)) => render_for_type(&display_type_hint()),
         Some(TypeFetch::RunUnavailable(_)) => {
             crate::state::heal_loading(loading);
-            rsx! { div { class: "rect-empty", "Run no longer available" } }
+            rsx! { div { class: "rect-empty", {visibility::RUN_GONE} } }
         }
         // Still loading, and no type check is needed: use the hint.
         None if !*needs_type_check.read() => render_for_type(&display_type_hint()),
@@ -820,7 +820,8 @@ enum CdnFetch {
     Pending,
     /// RAW key series, with the refs they answer for (the signal keeps them while new refs fetch): decoration happens at render, so the fetch and its cache hold no presentation state.
     Answer(Vec<CdnSeries>, Rc<Vec<SeriesRef>>),
-    Unavailable,
+    /// Settled with no answer, and why.
+    Unavailable(String),
 }
 
 #[component]
@@ -866,26 +867,31 @@ fn CdnContent(
                 if !allowed {
                     return;
                 }
-                let series_refs = refs.to_vec();
+                // Past the server's bounds a request is refused, and each retry would send it again, so it is never sent. No answer to these refs was ever cached, so the check comes before the cache lookup.
+                if !crate::grpc::cdn_keys_request_fits(&refs) {
+                    set_if_changed(cdn_class, None);
+                    set_if_changed(fetch, CdnFetch::Unavailable("This gallery names too many runs and metrics to load at once; narrow its runs or metrics".to_string()));
+                    return;
+                }
 
                 let cached = CDN_KEYS_CACHE.with(|c| c.borrow_mut().get(&cache_key));
                 // Any cached entry = the gallery already shows something: a
                 // refresh, not a first paint, for gate purposes.
                 let first_paint = cached.is_none();
                 let series = match cached.and_then(|(crefs, cstamps, cseries)| {
-                    cdn_cache_hit(&crefs, &cstamps, &series_refs, &state.run_versions.peek())
+                    cdn_cache_hit(&crefs, &cstamps, &refs, &state.run_versions.peek())
                         .then_some(cseries)
                 }) {
                     Some(series) => series,
                     None => {
                         loading.set(true);
-                        let response = visibility::retry_visible_run("cdn keys", async || {
+                        let response = visibility::retry_visible_chart("cdn keys", async || {
                             let _hi = visibility::admit_fetch(|| *zone.peek(), first_paint).await;
                             let sent = crate::state::versions_of(
                                 &state.run_versions.peek(),
-                                series_refs.iter().map(|s| s.run_id.as_str()),
+                                refs.iter().map(|s| s.run_id.as_str()),
                             );
-                            grpc.query_cdn_keys(series_refs.clone())
+                            grpc.query_cdn_keys(refs.to_vec())
                                 .await
                                 .map(|response| (sent, response))
                         })
@@ -893,10 +899,11 @@ fn CdnContent(
                         loading.set(false);
                         let (sent, response) = match response {
                             Ok(result) => result,
-                            Err(_) => {
+                            Err(status) => {
                                 evict_panel_caches(&cache_key);
                                 set_if_changed(cdn_class, None);
-                                set_if_changed(fetch, CdnFetch::Unavailable);
+                                let why = visibility::settled_message("Gallery", &status);
+                                set_if_changed(fetch, CdnFetch::Unavailable(why));
                                 return;
                             }
                         };
@@ -906,11 +913,11 @@ fn CdnContent(
                             sent,
                         );
                         let series = response.series;
-                        let weight = cdn_cache_heap_bytes(&series_refs, &stamps, &series);
+                        let weight = cdn_cache_heap_bytes(&refs, &stamps, &series);
                         CDN_KEYS_CACHE.with(|c| {
                             c.borrow_mut().put_weighted(
                                 cache_key,
-                                (series_refs, stamps, series.clone()),
+                                (refs.to_vec(), stamps, series.clone()),
                                 weight,
                             )
                         });
@@ -938,8 +945,8 @@ fn CdnContent(
                 CdnGallery { runs: run_data, display_mode: cdn_display_mode, cdn_class: cdn_class, metadata_diff_only: metadata_diff_only, persist_key: cache_key.clone() }
             }
         }
-        CdnFetch::Unavailable => rsx! {
-            div { class: "rect-empty", "Run no longer available" }
+        CdnFetch::Unavailable(why) => rsx! {
+            div { class: "rect-empty", "{why}" }
         },
         CdnFetch::Answer(..) | CdnFetch::Pending => rsx! {
             div { class: "rect-loading", "Loading..." }

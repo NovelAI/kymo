@@ -123,6 +123,18 @@ pub fn retry_cannot_heal(status: &tonic::Status) -> bool {
     is_terminal_run_status(status) || status.code() == tonic::Code::InvalidArgument
 }
 
+/// What a panel shows for a run whose reads have ended ([`is_terminal_run_status`]).
+pub const RUN_GONE: &str = "Run no longer available";
+
+/// What a panel shows once a status settles it ([`retry_cannot_heal`]): a run's end as such, anything else as `what` unavailable and the server's reason.
+pub fn settled_message(what: &str, status: &tonic::Status) -> String {
+    if is_terminal_run_status(status) {
+        RUN_GONE.to_string()
+    } else {
+        format!("{what} unavailable: {}", status.message())
+    }
+}
+
 /// [`retry_visible_run`] that also settles on InvalidArgument ([`retry_cannot_heal`]), so the panel renders the server's explanation.
 pub async fn retry_visible_chart<T>(
     what: &str,
@@ -151,7 +163,7 @@ async fn retry_visible_while<T, E: std::fmt::Display>(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_terminal_run_status, retry_cannot_heal};
+    use super::{is_terminal_run_status, retry_cannot_heal, settled_message};
 
     #[test]
     fn terminal_runs_and_unaskable_requests_settle_and_transient_failures_retry() {
@@ -167,5 +179,24 @@ mod tests {
             assert_eq!(is_terminal_run_status(&status), terminal, "{status}");
             assert_eq!(retry_cannot_heal(&status), settles, "{status}");
         }
+    }
+
+    /// A settled panel shows a run's end as such and anything else as the server's reason.
+    #[test]
+    fn a_settled_panel_says_why() {
+        use tonic::Status;
+        assert_eq!(
+            settled_message("Gallery", &Status::not_found("purged")),
+            "Run no longer available"
+        );
+        assert_eq!(
+            settled_message(
+                "Gallery",
+                &Status::invalid_argument(
+                    "refs lists 100004 entries; a request may list at most 100000"
+                )
+            ),
+            "Gallery unavailable: refs lists 100004 entries; a request may list at most 100000"
+        );
     }
 }

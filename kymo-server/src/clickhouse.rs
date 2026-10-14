@@ -514,6 +514,14 @@ impl ChClient {
         &self.client
     }
 
+    /// This client with `name = value` on every request, as a server profile would set it.
+    #[cfg(test)]
+    pub(crate) fn with_session_setting(&self, name: &str, value: &str) -> Self {
+        let mut ch = self.clone();
+        ch.client = ch.client.with_option(name, value);
+        ch
+    }
+
     /// Deletes a green live case's rows for its project from the metric tables and the registry outbox; each delete waits for its mutation.
     #[cfg(test)]
     pub(crate) async fn delete_live_project(&self, project_id: &str) -> Result<()> {
@@ -1415,7 +1423,7 @@ impl ChClient {
             step: i64,
             value: f32,
         }
-        // ClickHouse resolves a name to a same-named SELECT alias before the column, so a filter on a column its statement re-aliases must qualify it, or it tests the alias: `metrics.value` here and in `fetch_full_many`/`fetch_increment`, `metrics.cdn_key` in `query_cdn_keys_batch`.
+        // ClickHouse resolves a name to a same-named SELECT alias before the column, so a filter on a column its statement re-aliases must qualify it, or it tests the alias: `metrics.value` here and in `fetch_full_many`/`fetch_increment`, `metrics.cdn_key` in `cdn_keys_query`.
         let mut cursor = self
             .client
             .query(
@@ -1652,60 +1660,64 @@ impl ChClient {
 
     // --- CDN queries ---
 
-    /// Batched CDN-key lookup. One ClickHouse query (single FINAL scan)
-    /// covers every (project_id, run_id, metric_name) tuple in `refs`. Rows
-    /// come back interleaved; the caller partitions them back into per-ref
-    /// buckets.
-    /// `use_skip_indexes_if_final = 0` keeps `idx_cdn_key` out of the FINAL read, where pruning by it could hide the newer row that supersedes a media row.
-    /// That is 25.3's default, pinned so a profile or version change can't flip it.
+    /// Batched CDN-key lookup for every (project_id, run_id, metric_name) tuple in `refs`: one statement per chunk from [`cdn_key_chunks`]. The rows are interleaved, each ref's from one statement and in step order, for the caller to partition into per-ref buckets.
     pub async fn query_cdn_keys_batch(
         &self,
         refs: &[(String, String, String)],
         step_min: i64,
         step_max: i64,
     ) -> Result<Vec<CdnKeyBatchRow>> {
-        if refs.is_empty() {
-            return Ok(Vec::new());
+        let mut rows = Vec::new();
+        for chunk in cdn_key_chunks(refs) {
+            let mut cursor = self
+                .cdn_keys_query(&chunk, step_min, step_max)
+                .fetch::<CdnKeyBatchRow>()?;
+            while let Some(row) = cursor.next().await? {
+                rows.push(row);
+            }
         }
-        let placeholders = refs
-            .iter()
-            .map(|_| "(?, ?, ?)")
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "SELECT project_id, run_id, metric_name, step,
-                    argMax(cdn_key, tuple(is_versioned, mutation_version, inserted_at)) AS cdn_key
-             FROM (
-                 SELECT project_id, run_id, metric_name, tag, step,
-                        assumeNotNull(cdn_key) AS cdn_key,
-                        toUInt8(0) AS is_versioned,
-                        toUInt64(0) AS mutation_version,
-                        inserted_at
-                 FROM mkdb2.metrics FINAL
-                 WHERE (project_id, run_id, metric_name) IN ({placeholders})
-                   AND step >= ? AND step <= ? AND metrics.cdn_key IS NOT NULL
-                 UNION ALL
-                 SELECT project_id, run_id, metric_name, tag, step, cdn_key,
-                        toUInt8(1) AS is_versioned, mutation_version, inserted_at
-                 FROM mkdb2.rich_metrics FINAL
-                 WHERE (project_id, run_id, metric_name) IN ({placeholders})
-                   AND step >= ? AND step <= ?
-             )
-             GROUP BY project_id, run_id, metric_name, tag, step
-             ORDER BY project_id, run_id, metric_name, step, tag
-             SETTINGS use_skip_indexes_if_final = 0"
-        );
-        let mut q = self.client.query(&sql);
-        for (p, r, m) in refs {
-            q = q.bind(p).bind(r).bind(m);
-        }
-        q = q.bind(step_min).bind(step_max);
-        for (p, r, m) in refs {
-            q = q.bind(p).bind(r).bind(m);
-        }
-        q = q.bind(step_min).bind(step_max);
-        let rows = q.fetch_all::<CdnKeyBatchRow>().await?;
         Ok(rows)
+    }
+
+    /// One chunk's statement. Each `IN` list is one bound array: the crate binds a `?` by scanning its statement for the first unbound one, so binding each ref's values separately takes time quadratic in the refs.
+    /// `use_skip_indexes_if_final = 0` keeps `idx_cdn_key` out of the FINAL read, where pruning by it could hide the newer row that supersedes a media row, and `max_query_size` is the size [`cdn_key_chunks`] cuts for. Both ride the request's URL, like [`COMPLETE_READ_SETTINGS`], so no profile or version changes them. A `SETTINGS` clause would not do: the crate sends SQL over 8 KiB as a POST with `readonly=1`, under which ClickHouse refuses a clause that changes a setting.
+    fn cdn_keys_query(
+        &self,
+        refs: &[&(String, String, String)],
+        step_min: i64,
+        step_max: i64,
+    ) -> clickhouse::query::Query {
+        self.client
+            .query(
+                "SELECT project_id, run_id, metric_name, step,
+                        argMax(cdn_key, tuple(is_versioned, mutation_version, inserted_at)) AS cdn_key
+                 FROM (
+                     SELECT project_id, run_id, metric_name, tag, step,
+                            assumeNotNull(cdn_key) AS cdn_key,
+                            toUInt8(0) AS is_versioned,
+                            toUInt64(0) AS mutation_version,
+                            inserted_at
+                     FROM mkdb2.metrics FINAL
+                     WHERE (project_id, run_id, metric_name) IN ?
+                       AND step >= ? AND step <= ? AND metrics.cdn_key IS NOT NULL
+                     UNION ALL
+                     SELECT project_id, run_id, metric_name, tag, step, cdn_key,
+                            toUInt8(1) AS is_versioned, mutation_version, inserted_at
+                     FROM mkdb2.rich_metrics FINAL
+                     WHERE (project_id, run_id, metric_name) IN ?
+                       AND step >= ? AND step <= ?
+                 )
+                 GROUP BY project_id, run_id, metric_name, tag, step
+                 ORDER BY project_id, run_id, metric_name, step, tag",
+            )
+            .bind(refs)
+            .bind(step_min)
+            .bind(step_max)
+            .bind(refs)
+            .bind(step_min)
+            .bind(step_max)
+            .with_option("use_skip_indexes_if_final", "0")
+            .with_option("max_query_size", MAX_QUERY_BYTES.to_string())
     }
 
     // --- Text stream queries ---
@@ -2424,6 +2436,45 @@ const COMPLETE_READ_SETTINGS: [(&str, &str); 14] = [
     ("use_query_cache", "0"),
 ];
 
+/// ClickHouse's default `max_query_size`: it refuses longer SQL (Code 62). QueryCdnKeys pins it per query.
+const MAX_QUERY_BYTES: usize = 256 * 1024;
+
+/// The room a QueryCdnKeys statement leaves its refs ([`cdn_key_chunks`]): [`MAX_QUERY_BYTES`] less 4 KiB kept back for its own text, which takes about 1.3 KB. Names are read whatever their length, since ingest took any before July; a ref past this could not be read even alone, so QueryCdnKeys refuses it.
+pub(crate) const MAX_CDN_KEY_REF_BYTES: usize = MAX_QUERY_BYTES - 4096;
+
+/// What one ref adds to a QueryCdnKeys statement, which writes it into both of its `IN` lists as `('project','run','metric'),`: 11 bytes and its names as the crate escapes them ([`escaped_len`]).
+pub(crate) fn cdn_key_cost(project: &str, run: &str, metric: &str) -> usize {
+    2 * (11 + escaped_len(project) + escaped_len(run) + escaped_len(metric))
+}
+
+/// The refs a QueryCdnKeys reads, in chunks whose refs cost at most [`MAX_CDN_KEY_REF_BYTES`] together; a gallery of every run in a large project sends tens of thousands. Names of 92 bytes that need no escapes put 1,252 refs in a statement of 259 KB.
+/// They are sorted, so a chunk's refs share runs, and deduplicated here, so each ref's rows come from one statement: a ref in two chunks would get its rows twice.
+fn cdn_key_chunks(refs: &[(String, String, String)]) -> Vec<Vec<&(String, String, String)>> {
+    let mut refs: Vec<_> = refs.iter().collect();
+    refs.sort_unstable();
+    refs.dedup();
+    let mut chunks: Vec<Vec<_>> = Vec::new();
+    let mut bytes = 0;
+    for series @ (project, run, metric) in refs {
+        let cost = cdn_key_cost(project, run, metric);
+        match chunks.last_mut() {
+            Some(chunk) if bytes + cost <= MAX_CDN_KEY_REF_BYTES => chunk.push(series),
+            _ => {
+                chunks.push(vec![series]);
+                bytes = 0;
+            }
+        }
+        bytes += cost;
+    }
+    chunks
+}
+
+/// `text`'s length as the clickhouse crate writes it into SQL, a backslash before each of these bytes (its `sql/escape.rs`), without the quotes.
+fn escaped_len(text: &str) -> usize {
+    let escapes = text.bytes().filter(|byte| b"\\'`\t\n".contains(byte));
+    text.len() + escapes.count()
+}
+
 /// The GC's heavy statements, on top of [`COMPLETE_READ_SETTINGS`]: a memory cap fails the statement rather than the server (a ClickHouse OOM takes concurrent ingest with it), and two threads keep full scans off the dashboards' cores. The scratch table's sort key would make each `IN` set be built twice, once more for index analysis that prunes nothing here, which doubles set memory. Sync inserts: scratch batches are large, one part each.
 const CDN_GC_SETTINGS: [(&str, &str); 5] = [
     ("use_index_for_in_with_subqueries", "0"),
@@ -3050,6 +3101,66 @@ mod schema_tests {
                 "{pair} missing: {request_line}"
             );
         }
+    }
+
+    /// A name of `len` bytes that the crate escapes every byte of: `index` in base 5, one escaped byte per digit, padded with backslashes.
+    fn escaped_name(index: usize, len: usize) -> String {
+        let mut rest = index;
+        (0..len)
+            .map(|_| {
+                let byte = ['\\', '\'', '`', '\t', '\n'][rest % 5];
+                rest /= 5;
+                byte
+            })
+            .collect()
+    }
+
+    /// Each chunk's statement, as the crate renders it, fits ClickHouse's default `max_query_size`, and every chunk but the last fills it to within the 4 KiB left for the statement's own text: for typical names and for names the crate escapes every byte of. The largest refs QueryCdnKeys admits only have to fit, one to a statement.
+    #[test]
+    fn cdn_key_statements_fit_the_query_size() {
+        let client = ChClient::new("http://127.0.0.1:1").unwrap();
+        let typical: Vec<_> = (0..3_000)
+            .map(|i| ("p".repeat(20), format!("{i:032x}"), format!("m{i:039}")))
+            .collect();
+        let escaped_refs = |count, lens: [usize; 3]| -> Vec<_> {
+            (0..count)
+                .map(|i| {
+                    let [project, run, metric] = lens.map(|len| escaped_name(i, len));
+                    (project, run, metric)
+                })
+                .collect()
+        };
+        let escaped = escaped_refs(3_000, [20, 32, 40]);
+        let largest = escaped_refs(2, [1, 1, 64_504]);
+        assert!(largest
+            .iter()
+            .all(|(p, r, m)| cdn_key_cost(p, r, m) <= MAX_CDN_KEY_REF_BYTES));
+        for (refs, filled) in [(typical, true), (escaped, true), (largest, false)] {
+            let chunks = cdn_key_chunks(&refs);
+            assert!(chunks.len() > 1);
+            for (index, chunk) in chunks.iter().enumerate() {
+                let sql = client.cdn_keys_query(chunk, i64::MIN, i64::MIN);
+                let bytes = sql.sql_display().to_string().len() + " FORMAT RowBinary".len();
+                assert!(bytes <= MAX_QUERY_BYTES, "{bytes} bytes");
+                if filled && index + 1 < chunks.len() {
+                    assert!(bytes > MAX_QUERY_BYTES - 4096, "{bytes} bytes");
+                }
+            }
+        }
+    }
+
+    /// The chunks hold every ref exactly once, sorted, though a duplicate of the last ref of a full chunk would open the next one.
+    #[test]
+    fn cdn_key_chunks_hold_each_ref_once() {
+        let distinct: Vec<_> = (0..3_000)
+            .map(|i| ("p".repeat(20), format!("{i:032x}"), format!("m{i:039}")))
+            .collect();
+        let mut refs = distinct.clone();
+        refs.push(distinct[cdn_key_chunks(&distinct)[0].len() - 1].clone());
+        refs.reverse();
+        let chunks = cdn_key_chunks(&refs);
+        assert!(chunks.len() > 1);
+        assert_eq!(chunks.concat(), distinct.iter().collect::<Vec<_>>());
     }
 
     #[tokio::test]

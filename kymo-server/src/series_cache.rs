@@ -234,6 +234,11 @@ impl<'a> TagRows<'a> {
         self.between(lo, hi).map(<[CachedRow]>::len).sum()
     }
 
+    /// The tag's lowest step: rows are step-sorted and chunks are never empty.
+    fn first_step(&self) -> i64 {
+        self.chunks[0].rows[0].step
+    }
+
     /// The tag's high-water step: rows are step-sorted and chunks are never empty.
     fn last_step(&self) -> i64 {
         let rows = &self.chunks[self.chunks.len() - 1].rows;
@@ -328,8 +333,8 @@ impl SeriesSnapshot {
             }
         }
         // Full reads are (tag, step)-sorted. Count and sum prove the held set; the prefix check also rejects newly stamped lower-step backfills, preserving the cache merge's append contract.
-        let restored =
-            evicted.filter(|old| prefix && old.count == held_count && old.content == held_content);
+        let restored = evicted
+            .filter(|old| prefix && old.size.rows == held_count && old.content == held_content);
         Self::assemble(
             chunks,
             restored.map_or_else(Self::next_lineage, |old| old.lineage),
@@ -528,19 +533,39 @@ struct EvictedLineage {
     maximum: Option<i64>,
     origin: LineageOrigin,
     content: u64,
-    count: usize,
+    size: EvictedSize,
     evicted: Instant,
+}
+
+/// What a recovery record held when it left, for chart admission (docs/chart-request-latency.md stage 2): its rows, the bytes its snapshot charged ([`SeriesSnapshot::bytes`]), the lowest and highest of their steps (`rows` 0: an empty range) and the tag groups a chart builds of it: its tagged groups when it has any, as `prepare` drops stray scalar rows beside them (query.rs `selected_groups`), else its scalar group. Stage 2 prices its pin at those bytes, and from the rest the share of its rows a chart's step range keeps and the series its groups form.
+#[derive(Clone, Copy)]
+pub(crate) struct EvictedSize {
+    pub(crate) rows: usize,
+    pub(crate) bytes: usize,
+    pub(crate) steps: (i64, i64),
+    pub(crate) groups: usize,
 }
 
 impl EvictedLineage {
     /// The record an LRU victim, or a series too large to retain, leaves.
     fn of(rows: &SeriesSnapshot) -> Self {
+        let (mut steps, mut tagged) = ((i64::MAX, i64::MIN), 0);
+        for tag in rows.tags() {
+            steps = (steps.0.min(tag.first_step()), steps.1.max(tag.last_step()));
+            tagged += usize::from(!tag.tag().is_empty());
+        }
         Self {
             lineage: rows.lineage,
             maximum: rows.maximum,
             origin: rows.origin,
             content: rows.content,
-            count: rows.len(),
+            size: EvictedSize {
+                rows: rows.len(),
+                bytes: rows.bytes(),
+                steps,
+                // Its tagged groups, else its scalar one; an empty record's 1 is never read, its steps an empty range.
+                groups: tagged.max(1),
+            },
             evicted: Instant::now(),
         }
     }
@@ -695,10 +720,8 @@ pub(crate) fn entry_charge(key: &SeriesKey, rows: Vec<VersionedRawPoint>) -> usi
 pub(crate) enum CachedSize {
     /// A retained entry, fresh or stale: its snapshot, for the caller to price outside the cache's lock ([`SeriesCache::sizes`]).
     Cached(Arc<SeriesSnapshot>),
-    /// A recovery record (an LRU victim's, or a series' too large to retain): its row count when it left.
-    Evicted {
-        rows: usize,
-    },
+    /// A recovery record (an LRU victim's, or a series' too large to retain): what it held when it left.
+    Evicted(EvictedSize),
     Unknown,
 }
 
@@ -725,7 +748,7 @@ struct Inner {
 }
 
 impl Inner {
-    /// Leave the recovery record of `rows`, the snapshot last handed out for `key` and no longer retained (an LRU victim, or a series larger than the whole budget): a matching full read restores its lineage, and stage 2 prices the series by its row count ([`SeriesCache::sizes`]). The oldest records past [`EVICTED_LINEAGE_LIMIT`] are dropped.
+    /// Leave the recovery record of `rows`, the snapshot last handed out for `key` and no longer retained (an LRU victim, or a series larger than the whole budget): a matching full read restores its lineage, and stage 2 prices the series from it ([`SeriesCache::sizes`]). The oldest records past [`EVICTED_LINEAGE_LIMIT`] are dropped.
     fn record_evicted(&mut self, key: SeriesKey, rows: &SeriesSnapshot) {
         self.evicted.insert(key, EvictedLineage::of(rows));
         if self.evicted.len() > EVICTED_LINEAGE_LIMIT {
@@ -886,9 +909,10 @@ impl SeriesRefreshLocks {
     ) -> tokio::task::JoinHandle<RunningOutcome> {
         let task_lease = self.lease_for(key);
         tokio::spawn(async move {
-            // Declaration order is load-bearing: locals drop in reverse, so the lease (the slot's last owner) is declared AFTER the detach RAII and retires before the run guard is released — a writer taking the gate in between (finalize/purge evicting the run) must not find an attachable slot still holding a pre-eviction result.
+            // Locals drop in reverse: the lease, the slot's last owner, retires before `_detach` releases the run guard, so a writer taking the gate (finalize or purge evicting the run) never finds an attachable slot holding a pre-eviction result.
             let _detach = ctx;
             let _lease = task_lease;
+            // Both drop before the JoinHandle resolves, so a requester awaiting it finds `ctx`'s split back on its request (query/budget.rs `SplitCharge`) before it corrects the series, which would otherwise count those bytes twice.
             let outcome = tokio::time::timeout(DETACHED_REFRESH_TIMEOUT, refresh)
                 .await
                 .unwrap_or(Err(RefreshError::Timeout));
@@ -1091,8 +1115,8 @@ impl SeriesCache {
                 None => inner
                     .evicted
                     .get(key)
-                    .map_or(CachedSize::Unknown, |record| CachedSize::Evicted {
-                        rows: record.count,
+                    .map_or(CachedSize::Unknown, |record| {
+                        CachedSize::Evicted(record.size)
                     }),
             })
             .collect()
@@ -1594,13 +1618,56 @@ mod tests {
         assert_eq!(populated.maximum(), Some(-5));
     }
 
-    /// A series too large to retain is served without being stored (eviction cannot help a sole entry, so the budget stays a hard bound on retained memory) and leaves the recovery record of the rows it handed out, from a full read or an increment, as an LRU victim does: stage 2 prices it by its row count, and a matching full read keeps its lineage.
+    /// An LRU victim's record carries what stage 2 prices the series by until its read: its rows, the bytes its snapshot charged, the lowest and highest of their steps across its tags, and its tag groups.
+    #[test]
+    fn eviction_records_carry_the_rows_steps_and_tag_groups_they_held() {
+        let cache = SeriesCache::with_budget(1 << 20);
+        let key = SeriesKey::new("p", "r", "m");
+        let held = cache.insert_full(
+            key.clone(),
+            vec![
+                row("", 30, 1.0, 100),
+                row("a", 10, 1.0, 100),
+                row("a", 11, 1.0, 100),
+                row("b", 5, 1.0, 100),
+                row("b", 20, 1.0, 100),
+                row("b", 21, 1.0, 100),
+            ],
+            Instant::now(),
+        );
+        cache.evict_for_test(&key);
+        let bytes = held.bytes();
+        // The stray scalar row counts in rows and steps, not as a group: `prepare` drops it beside tagged ones.
+        assert!(matches!(
+            cache.sizes(std::slice::from_ref(&key))[..],
+            [CachedSize::Evicted(EvictedSize {
+                rows: 6,
+                bytes: b,
+                steps: (5, 30),
+                groups: 2
+            })] if b == bytes
+        ));
+        // One scalar and one tagged group: the tagged one.
+        let key = SeriesKey::new("p", "s", "m");
+        cache.insert_full(
+            key.clone(),
+            vec![row("", 1, 1.0, 100), row("a", 2, 1.0, 100)],
+            Instant::now(),
+        );
+        cache.evict_for_test(&key);
+        assert!(matches!(
+            cache.sizes(std::slice::from_ref(&key))[..],
+            [CachedSize::Evicted(EvictedSize { groups: 1, .. })]
+        ));
+    }
+
+    /// A series too large to retain is served without being stored (eviction cannot help a sole entry, so the budget stays a hard bound on retained memory) and leaves the recovery record of the rows it handed out, from a full read or an increment, as an LRU victim does: stage 2 prices it from that record, and a matching full read keeps its lineage.
     #[test]
     fn oversized_results_leave_recovery_records() {
         let cache = eviction_cache(1);
         let retained_bytes = || cache.inner.lock().unwrap().total_bytes;
         let recorded = |key: &SeriesKey| match cache.sizes(std::slice::from_ref(key))[..] {
-            [CachedSize::Evicted { rows }] => Some(rows),
+            [CachedSize::Evicted(record)] => Some(record.rows),
             _ => None,
         };
         // A full read past the budget after an LRU eviction restores the victim's lineage and leaves its own record.
@@ -2969,7 +3036,7 @@ mod tests {
 
     /// The differential oracle: the merge and restore rules over one (tag, step)-sorted vector per snapshot, stated over maps rather than chunks. It hashes rows as the cache does, so the two contents agree, and draws lineage identifiers from its own counter; the differential test pairs them.
     mod flat {
-        use super::super::{EvictedLineage, LineageOrigin};
+        use super::super::{EvictedLineage, EvictedSize, LineageOrigin};
         use super::point_content;
         use crate::clickhouse::VersionedRawPoint;
         use std::collections::{BTreeMap, HashMap};
@@ -3000,7 +3067,13 @@ mod tests {
                     maximum: self.maximum,
                     origin: self.origin,
                     content: self.content,
-                    count: self.rows.len(),
+                    size: EvictedSize {
+                        rows: self.rows.len(),
+                        // Pricing only: the oracle prices nothing.
+                        bytes: 0,
+                        steps: (i64::MAX, i64::MIN),
+                        groups: 0,
+                    },
                     evicted: std::time::Instant::now(),
                 }
             }
@@ -3017,7 +3090,7 @@ mod tests {
                     };
                     rows.chunk_by(|a, b| a.tag == b.tag)
                         .all(|tag| tag.iter().skip_while(held).all(|row| !held(&row)))
-                        && rows.iter().filter(held).count() == old.count
+                        && rows.iter().filter(held).count() == old.size.rows
                         && content(rows.iter().filter(held)) == old.content
                 });
                 Self {

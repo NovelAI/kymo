@@ -426,7 +426,7 @@ fn VirtualTextLog(
                 }
                 Err(status) if visibility::is_terminal_run_status(&status) => {
                     viewport.write().cleared();
-                    Some(Err("Run no longer available".to_string()))
+                    Some(Err(visibility::RUN_GONE.to_string()))
                 }
                 Err(status) if stream_failure_is_permanent(&status) => {
                     crate::util::warn(&format!(

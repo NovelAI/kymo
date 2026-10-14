@@ -40,6 +40,16 @@ pub const DEFLATE_MIN_BYTES: usize = 4096;
 /// /grpc-ws2: how the Internal error starts that a server answers to a compressed request body it cannot inflate (corrupt, truncated, or with bytes after the stream). The frontend counts it as a failure of the route, as it does a reply that fails to inflate.
 pub const REQUEST_INFLATE_FAILED: &str = "request body inflate failed";
 
+/// Most bytes one request may take: its frame on /grpc-ws and the local route, its inflated body on /grpc-ws2, a native gRPC message. The server refuses a larger one, closing a raw socket that carried it (ws_proxy.rs).
+pub const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+/// Most run ids, series refs or metric names one request may list; the server refuses more with InvalidArgument.
+pub const MAX_REQUEST_RUN_IDS: usize = 100_000;
+
+/// The length of a request frame on `path` with a body of `body_len` bytes.
+pub fn request_frame_len(path: &str, body_len: usize) -> usize {
+    6 + path.len() + body_len
+}
+
 /// `deflated` (/grpc-ws2 only) marks `body` as compressed.
 pub fn encode_request(id: u32, path: &str, body: &[u8], deflated: bool) -> Vec<u8> {
     debug_assert!(path.len() < usize::from(REQUEST_DEFLATED));
@@ -47,7 +57,7 @@ pub fn encode_request(id: u32, path: &str, body: &[u8], deflated: bool) -> Vec<u
     if deflated {
         path_len |= REQUEST_DEFLATED;
     }
-    let mut frame = Vec::with_capacity(6 + path.len() + body.len());
+    let mut frame = Vec::with_capacity(request_frame_len(path, body.len()));
     frame.extend_from_slice(&id.to_le_bytes());
     frame.extend_from_slice(&path_len.to_le_bytes());
     frame.extend_from_slice(path.as_bytes());
