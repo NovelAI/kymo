@@ -525,9 +525,18 @@ impl SeriesKey {
     }
 }
 
-/// Bounded, process-local history of LRU victims and of series too large to retain; neither rows nor tags are retained, and a restart discards it.
+/// Counts what the window refused and what growth evicted in this test binary, for the randomized admission test's tally.
+#[cfg(test)]
+pub(crate) static TEST_REFUSALS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+pub(crate) static TEST_GROWTH_EVICTIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Bounded, process-local history of LRU victims and of series not retained (too large, or refused for hot entries' room), at most this many; neither rows nor tags are retained, and a restart discards it.
 const EVICTED_LINEAGE_LIMIT: usize = 4096;
 
+#[derive(Clone)]
 struct EvictedLineage {
     lineage: u64,
     maximum: Option<i64>,
@@ -535,6 +544,8 @@ struct EvictedLineage {
     content: u64,
     size: EvictedSize,
     evicted: Instant,
+    /// A full read has claimed the lineage and is hashing its rows: no other read restores it, and stage 2 still prices the series from it ([`SeriesCache::insert_full_with_origin`]).
+    claimed: bool,
 }
 
 /// What a recovery record held when it left, for chart admission (docs/chart-request-latency.md stage 2): its rows, the bytes its snapshot charged ([`SeriesSnapshot::bytes`]), the lowest and highest of their steps (`rows` 0: an empty range) and the tag groups a chart builds of it: its tagged groups when it has any, as `prepare` drops stray scalar rows beside them (query.rs `selected_groups`), else its scalar group. Stage 2 prices its pin at those bytes, and from the rest the share of its rows a chart's step range keeps and the series its groups form.
@@ -547,7 +558,7 @@ pub(crate) struct EvictedSize {
 }
 
 impl EvictedLineage {
-    /// The record an LRU victim, or a series too large to retain, leaves.
+    /// The record an LRU victim, or a series not retained, leaves.
     fn of(rows: &SeriesSnapshot) -> Self {
         let (mut steps, mut tagged) = ((i64::MAX, i64::MIN), 0);
         for tag in rows.tags() {
@@ -567,6 +578,7 @@ impl EvictedLineage {
                 groups: tagged.max(1),
             },
             evicted: Instant::now(),
+            claimed: false,
         }
     }
 }
@@ -617,6 +629,10 @@ const _: () = assert!(FRESH_WINDOW.as_secs() < BUMP_RETENTION.as_secs());
 
 /// Pruning scans every note and every insert notes, so it runs at most this often; retention is only a lower bound.
 const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// An entry read within this window keeps its room: a series the cache does not hold, whose retention would evict one, is served without being retained ([`SeriesCache::insert_full_with_origin`]). LRU alone misses every lookup of a dashboard cycling through more series than fit; refusing the newcomers keeps a stable share. A panel's polls start at least 5 s apart (the frontend's refresh floor) and wait for the previous answer, so an open panel's series stay hot while its polls answer within about 40 s; series no poll reads (a panel scrolled away, a hidden or closed tab, a finished run) give up their room 40 s after their last read.
+/// Not 60 s, the period of the frontend's chart request deadline and version backstop, the local socket's keepalive timeout and [`PRUNE_INTERVAL`]: the window bounds an entry's age and has no phase, but a read cadence one of those clocks set would sit at its edge.
+const HOT_WINDOW: Duration = Duration::from_secs(40);
 
 /// Whole-task bound for a detached chart refresh (docs/admission-control.md Stage R). Detached tasks have no enclosing request deadline, so this is what frees a hung scan's admission unit and refresh slot; it sits inside [`FRESH_WINDOW`] so a finished scan's rows can still serve.
 const DETACHED_REFRESH_TIMEOUT: Duration = Duration::from_secs(300);
@@ -720,7 +736,7 @@ pub(crate) fn entry_charge(key: &SeriesKey, rows: Vec<VersionedRawPoint>) -> usi
 pub(crate) enum CachedSize {
     /// A retained entry, fresh or stale: its snapshot, for the caller to price outside the cache's lock ([`SeriesCache::sizes`]).
     Cached(Arc<SeriesSnapshot>),
-    /// A recovery record (an LRU victim's, or a series' too large to retain): what it held when it left.
+    /// A recovery record (an LRU victim's, or a series' not retained): what it held when it left.
     Evicted(EvictedSize),
     Unknown,
 }
@@ -748,18 +764,52 @@ struct Inner {
 }
 
 impl Inner {
-    /// Leave the recovery record of `rows`, the snapshot last handed out for `key` and no longer retained (an LRU victim, or a series larger than the whole budget): a matching full read restores its lineage, and stage 2 prices the series from it ([`SeriesCache::sizes`]). The oldest records past [`EVICTED_LINEAGE_LIMIT`] are dropped.
+    /// Record `rows`, the snapshot last handed out for `key` and no longer retained, for lineage recovery and stage 2's pricing ([`SeriesCache::sizes`]). Past [`EVICTED_LINEAGE_LIMIT`] records the oldest eighth (ties included) go at once, so the scan that finds them runs once per 512 records.
     fn record_evicted(&mut self, key: SeriesKey, rows: &SeriesSnapshot) {
         self.evicted.insert(key, EvictedLineage::of(rows));
         if self.evicted.len() > EVICTED_LINEAGE_LIMIT {
-            let oldest = self
-                .evicted
-                .iter()
-                .min_by_key(|(_, record)| record.evicted)
-                .map(|(key, _)| key.clone())
-                .unwrap();
-            self.evicted.remove(&oldest);
+            let mut ages: Vec<Instant> =
+                self.evicted.values().map(|record| record.evicted).collect();
+            let (_, &mut newest_dropped, _) = ages.select_nth_unstable(EVICTED_LINEAGE_LIMIT / 8);
+            self.evicted
+                .retain(|_, record| record.evicted > newest_dropped);
         }
+    }
+
+    /// Retain `rows` (`bytes`) under `key`, read from `started` on, which caps its watermark ([`watermark_cap`]).
+    fn install(
+        &mut self,
+        key: SeriesKey,
+        rows: &Arc<SeriesSnapshot>,
+        started: Instant,
+        bytes: usize,
+    ) {
+        let max_inserted_ms = rows.maximum.unwrap_or(0).min(watermark_cap(started));
+        self.total_bytes += bytes;
+        let entry = Entry {
+            rows: rows.clone(),
+            max_inserted_ms,
+            started,
+            last_access: Instant::now(),
+            bytes,
+        };
+        self.map.insert(key, entry);
+    }
+
+    /// Whether retaining a new entry of `bytes` must evict an entry read within [`HOT_WINDOW`]: the hot entries, the new one and the smallest table holding them exceed `budget`. Otherwise [`SeriesCache::settle`] evicts every older entry before a hot one, and compacts the table before it would. With nothing hot this is the oversized test: a cache with nothing hot evicts as the LRU does.
+    /// The pass over the entries runs only when the store needs room at all: every entry, the new one, and the table as charged or, if larger, the smallest holding one more (an insert can double it).
+    fn evicts_hot(&self, bytes: usize, budget: usize) -> bool {
+        let table = table_bytes(self.table_capacity);
+        if self.total_bytes - table + bytes + table.max(table_bytes(self.map.len() + 1)) <= budget {
+            return false;
+        }
+        let now = Instant::now();
+        let (count, hot) = self
+            .map
+            .values()
+            .filter(|entry| now.duration_since(entry.last_access) < HOT_WINDOW)
+            .fold((0, 0), |(count, hot), entry| (count + 1, hot + entry.bytes));
+        hot + bytes + table_bytes(count + 1) > budget
     }
 }
 
@@ -773,9 +823,8 @@ pub struct SeriesCache {
 /// the cache mutex across it would block every other series. A weak registry
 /// gives each key its own refresh slot without retaining request-derived keys
 /// after the last leader/waiter is gone. The slot briefly publishes a leader's
-/// successful Arc to the waiters that were already in flight. That sharing is
-/// independent of durable LRU admission, so a series larger than the cache
-/// budget is still fetched once per concurrent burst.
+/// successful Arc to the waiters that were already in flight, whether or not
+/// the cache retains it.
 #[derive(Clone, Default)]
 pub struct SeriesRefreshLocks {
     locks: crate::refresh_locks::RefreshLocks<SeriesKey, SlotState>,
@@ -820,7 +869,7 @@ impl SeriesRefreshLocks {
     /// waiter to retry.
     pub async fn get_or_refresh<F, Fut>(
         &self,
-        cache: &SeriesCache,
+        cache: &Arc<SeriesCache>,
         key: &SeriesKey,
         detach: impl FnOnce() -> Option<crate::clickhouse::RefreshDetach>,
         refresh: F,
@@ -859,8 +908,7 @@ impl SeriesRefreshLocks {
                 Ok(rows)
             }
             needs_refresh => {
-                // An oversized result is deliberately absent from the LRU.
-                // Existing waiters can nevertheless use the leader's Arc while it is fresh.
+                // A result the cache did not retain is absent from it; existing waiters can still use the leader's Arc while it is fresh.
                 if matches!(needs_refresh, Lookup::Miss) {
                     if let Some(rows) = state
                         .published
@@ -885,7 +933,8 @@ impl SeriesRefreshLocks {
                         started: refresh_started,
                     }),
                     Some(ctx) => {
-                        state.running = Some(self.spawn_detached(key, ctx, fut, refresh_started));
+                        state.running =
+                            Some(self.spawn_detached(cache, key, ctx, fut, refresh_started));
                         // The leader's consult predates its task's fetch
                         // start, so its delivery is never bump-gated.
                         Self::await_running(&mut state).await
@@ -899,19 +948,21 @@ impl SeriesRefreshLocks {
         }
     }
 
-    /// Stage R's detached refresh: the task owns `ctx` (the admission units and run guards backing its read) and its own lease, so the refresh slot, the attach point for re-polls, outlives every cancelled requester for the task's bounded lifetime.
+    /// Stage R's detached refresh: the task owns `ctx` (the admission units and run guards backing its read) and its own lease, so the refresh slot, the attach point for re-polls, outlives every cancelled requester for the task's bounded lifetime. A result nobody awaits when the read ends (its requesters were cancelled or timed out) is retained even where the window refused it ([`SeriesCache::retain_orphan`]): refused, it would live only in this slot, which retires with the task, and the re-poll would read the series again.
     fn spawn_detached<D: Send + 'static>(
         &self,
+        cache: &Arc<SeriesCache>,
         key: &SeriesKey,
         ctx: D,
         refresh: impl std::future::Future<Output = RefreshOutcome> + Send + 'static,
         started: Instant,
     ) -> tokio::task::JoinHandle<RunningOutcome> {
         let task_lease = self.lease_for(key);
+        let (cache, key) = (cache.clone(), key.clone());
         tokio::spawn(async move {
             // Locals drop in reverse: the lease, the slot's last owner, retires before `_detach` releases the run guard, so a writer taking the gate (finalize or purge evicting the run) never finds an attachable slot holding a pre-eviction result.
             let _detach = ctx;
-            let _lease = task_lease;
+            let lease = task_lease;
             // Both drop before the JoinHandle resolves, so a requester awaiting it finds `ctx`'s split back on its request (query/budget.rs `SplitCharge`) before it corrects the series, which would otherwise count those bytes twice.
             let outcome = tokio::time::timeout(DETACHED_REFRESH_TIMEOUT, refresh)
                 .await
@@ -925,6 +976,10 @@ impl SeriesRefreshLocks {
                 }
             )
             .increment(1);
+            // A requester or attached waiter awaits the result holding the slot's lock.
+            if let (Ok(rows), Some(_)) = (&outcome, lease.try_lock_owned()) {
+                cache.retain_orphan(&key, rows, started);
+            }
             outcome.map(|rows| PublishedRefresh { rows, started })
         })
     }
@@ -977,6 +1032,7 @@ impl SeriesRefreshLocks {
     /// The returned future awaits each task under its slot lock and publishes, as a leader does, up to the first failure; the tasks it leaves stay attachable, as a cancelled leader's do.
     pub(crate) fn spawn_batch<D, Fut>(
         &self,
+        cache: &Arc<SeriesCache>,
         elected: Vec<ElectedMiss>,
         ctx: D,
         mut refresh: impl FnMut(usize, &SeriesKey) -> Fut,
@@ -992,7 +1048,7 @@ impl SeriesRefreshLocks {
             .map(|(index, mut miss)| {
                 let fut = refresh(index, &miss.key);
                 miss.state.running =
-                    Some(self.spawn_detached(&miss.key, ctx.clone(), fut, started));
+                    Some(self.spawn_detached(cache, &miss.key, ctx.clone(), fut, started));
                 miss
             })
             .collect();
@@ -1167,7 +1223,7 @@ impl SeriesCache {
         self.insert_full_with_origin(key, rows, fetch_started, LineageOrigin::Miss)
     }
 
-    /// Store a full fetch. `fetch_started` anchors the watermark cap, feeds the bump gate and starts the fresh window. An LRU victim can recover its lineage only from a matching, single-use eviction record.
+    /// Store a full fetch. `fetch_started` anchors the watermark cap, feeds the bump gate and starts the fresh window. An LRU victim can recover its lineage only from a matching, single-use eviction record. A series the cache does not hold is retained only if that evicts no entry read within [`HOT_WINDOW`]; a cached one replaced by its full read is retained as a grown one is ([`Self::apply_increment`]), evicting the least recently read.
     pub(crate) fn insert_full_with_origin(
         &self,
         key: SeriesKey,
@@ -1175,45 +1231,60 @@ impl SeriesCache {
         fetch_started: Instant,
         origin: LineageOrigin,
     ) -> Arc<SeriesSnapshot> {
-        // Consume before hashing outside the mutex: exactly one full fetch can own this lineage while no cache entry holds it. Never restore a claimed record, even if the fetched contents do not match.
-        let evicted = self.inner.lock().unwrap().evicted.remove(&key);
+        // Claim before hashing outside the mutex: exactly one full fetch can own this lineage while no cache entry holds it. Never restore a claimed record, even if the fetched contents do not match. The claim leaves the record in place for stage 2's pricing (a refused series takes this path at every read).
+        let evicted = {
+            let mut inner = self.inner.lock().unwrap();
+            let record = inner.evicted.get_mut(&key).filter(|record| !record.claimed);
+            record.map(|record| {
+                record.claimed = true;
+                record.clone()
+            })
+        };
         let rows = Arc::new(SeriesSnapshot::reload(
             rows.into(),
             origin,
             evicted.as_ref(),
         ));
         let bytes = entry_bytes(&key, &rows);
-        let max_inserted_ms = rows.maximum.unwrap_or(0).min(watermark_cap(fetch_started));
         let mut inner = self.inner.lock().unwrap();
         // A concurrent fetch may have published and evicted a different lineage while this one was hashing. That record must not survive this replacement.
         inner.evicted.remove(&key);
         // Concurrent full fetches race their stores; last writer wins, even if its snapshot is older (local start order can't order ClickHouse snapshots anyway). Safe without an ordering guard: a noted insert is protected by the bump gate in lookup regardless of which racer won, and a regression past a write nothing notes heals on the first incremental after FRESH_WINDOW.
-        if let Some(old) = inner.map.remove(&key) {
-            inner.total_bytes -= old.bytes;
-        }
+        let cached = inner
+            .map
+            .remove(&key)
+            .inspect(|old| inner.total_bytes -= old.bytes)
+            .is_some();
         // An entry larger than the whole budget (with the smallest table) is never retained — eviction can't save a sole entry, so once stored it would sit over budget for as long as it's read. Serving it pass-through makes the budget a hard bound on retained memory, at ablated-mode read cost for just this series. It leaves a recovery record as an LRU victim does, so its size is known.
         if bytes + table_bytes(1) > self.budget_bytes {
-            metrics::counter!("mkdb2_series_cache_oversized_total").increment(1);
+            metrics::counter!("mkdb2_series_cache_oversized_total", "reason" => "budget")
+                .increment(1);
             inner.record_evicted(key, &rows);
             Self::settle(&mut inner, self.budget_bytes);
             return rows;
         }
-        inner.total_bytes += bytes;
-        inner.map.insert(
-            key,
-            Entry {
-                rows: rows.clone(),
-                max_inserted_ms,
-                started: fetch_started,
-                last_access: Instant::now(),
-                bytes,
-            },
-        );
+        // Nor a new entry retained only by evicting an entry read within HOT_WINDOW: served pass-through the same way, leaving the same record; the cache is unchanged.
+        if !cached && inner.evicts_hot(bytes, self.budget_bytes) {
+            metrics::counter!("mkdb2_series_cache_oversized_total", "reason" => "hot").increment(1);
+            #[cfg(test)]
+            TEST_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            inner.record_evicted(key, &rows);
+            return rows;
+        }
+        inner.install(key, &rows, fetch_started, bytes);
+        #[cfg(test)]
+        let held = inner.map.len();
         Self::settle(&mut inner, self.budget_bytes);
+        #[cfg(test)]
+        if cached {
+            Self::count_growth_evictions(held, &inner);
+        }
         rows
     }
 
     /// Fold an incremental fetch into the cached entry: `Ok` is the merged series, `Err` a refusal after which the caller reads in full ([`Self::insert_full_with_origin`]). `base` is the [`Lookup::Stale`] snapshot the increment's watermark came from; `fetch_started` is the fetch START, as in [`Self::insert_full_with_origin`], and only ever advances `started` (a concurrent later-started query may have stamped first), which restarts the fresh window: the rows are verified current as of that fetch.
+    ///
+    /// Growth evicts the least recently read entries, hot or not ([`HOT_WINDOW`] gates only new entries): a refresh adds a live run's few rows, so it rarely evicts, while dropping the growing entry instead would leave every live series uncached once the cache is full, and each poll of a live run waiting for a full read.
     ///
     /// The merge refuses an increment that rewrites history ([`SeriesSnapshot::merge`]). It runs against `base` outside the cache's lock (its compaction can copy up to 2 MiB per tag the increment extends), and its result is installed only if the entry still holds `base`: an entry replaced (by a full read, which may be older than `base`, so the increment could leave a hole below the merged watermark that no later increment reads), evicted, purged or since refreshed by a direct caller ([`SeriesRefreshLocks`] serializes a series' refreshes) refuses.
     pub fn apply_increment(
@@ -1241,7 +1312,8 @@ impl SeriesCache {
         let new_bytes = entry_bytes(key, &merged);
         // The merge grew the entry past the whole budget: hand out the merged rows but stop retaining the entry (see the full-store path), leaving the merged rows' recovery record — the next poll misses, full-fetches, and stays pass-through while the series is this large.
         if new_bytes + table_bytes(1) > self.budget_bytes {
-            metrics::counter!("mkdb2_series_cache_oversized_total").increment(1);
+            metrics::counter!("mkdb2_series_cache_oversized_total", "reason" => "budget")
+                .increment(1);
             let e = inner.map.remove(key).unwrap();
             inner.total_bytes -= e.bytes;
             inner.record_evicted(key.clone(), &merged);
@@ -1264,8 +1336,35 @@ impl SeriesCache {
         e.started = e.started.max(fetch_started);
         let rows = e.rows.clone();
         inner.total_bytes = inner.total_bytes + new_bytes - old_bytes;
+        #[cfg(test)]
+        let held = inner.map.len();
         Self::settle(&mut inner, self.budget_bytes);
+        #[cfg(test)]
+        Self::count_growth_evictions(held, &inner);
         Ok(rows)
+    }
+
+    #[cfg(test)]
+    fn count_growth_evictions(held: usize, inner: &Inner) {
+        let evicted = held - inner.map.len();
+        TEST_GROWTH_EVICTIONS.fetch_add(evicted as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Retain `rows`, a detached read's result that nobody awaited, which the window refused (the series' recovery record holds these rows), as the LRU would, evicting the least recently read: the re-poll after a cancelled or timed-out request then finds it (docs/admission-control.md Stage R). `started` predates the read, as its store's fetch start does, so the watermark and fresh window it stamps are no later than the store's. A series cached since (whose store removed its record), a record a later read replaced or a purge removed, and a series larger than the budget are left as they are.
+    fn retain_orphan(&self, key: &SeriesKey, rows: &Arc<SeriesSnapshot>, started: Instant) {
+        let mut inner = self.inner.lock().unwrap();
+        let refused = inner.evicted.get(key).is_some_and(|record| {
+            !record.claimed
+                && (record.lineage, record.maximum, record.content)
+                    == (rows.lineage, rows.maximum, rows.content)
+        });
+        let bytes = entry_bytes(key, rows);
+        if !refused || bytes + table_bytes(1) > self.budget_bytes {
+            return;
+        }
+        inner.evicted.remove(key);
+        inner.install(key.clone(), rows, started, bytes);
+        Self::settle(&mut inner, self.budget_bytes);
     }
 
     /// Evict one entry as the LRU would, leaving its recovery record.
@@ -1275,6 +1374,19 @@ impl SeriesCache {
         if let Some(e) = inner.map.remove(key) {
             inner.total_bytes -= e.bytes;
             inner.record_evicted(key.clone(), &e.rows);
+        }
+    }
+
+    /// Age every entry past [`HOT_WINDOW`], keeping the order and spacing of their reads: the most recently read one was read a window ago. Not cumulative, so it needs no `Instant` older than a window and the entries' spread; on a host up less than that it panics, which fails as loudly as its callers' assertions would.
+    #[cfg(test)]
+    pub(crate) fn cool_for_test(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(newest) = inner.map.values().map(|entry| entry.last_access).max() else {
+            return;
+        };
+        let cold = Instant::now() - HOT_WINDOW;
+        for entry in inner.map.values_mut() {
+            entry.last_access = cold - (newest - entry.last_access);
         }
     }
 
@@ -1303,8 +1415,9 @@ impl SeriesCache {
         removed
     }
 
-    /// Drop least-recently-accessed entries until under budget, then publish the size gauges. Call before returning from any mutation. Before each eviction the map's table is charged at `table_capacity`, shrunk once a quarter full of it, so an emptied cache neither holds nor charges its buckets and every retained entry, individually within budget beside the smallest table (oversized ones are rejected at both insert sites), outlasts the loop if it is alone.
+    /// Drop least-recently-accessed entries until under budget, then publish the size gauges. Call before returning from any mutation. Before each eviction the map's table is charged at `table_capacity`, shrunk once a quarter full of it, so an emptied cache neither holds nor charges its buckets and every retained entry, individually within budget beside the smallest table (no larger one is ever retained), outlasts the loop if it is alone. Before evicting an entry read within [`HOT_WINDOW`], it compacts a table larger than the smallest holding its entries (an insert can double a table that then shrinks only once a quarter full), once: the window's admission ([`Inner::evicts_hot`]) counts on that table.
     fn settle(inner: &mut Inner, budget: usize) {
+        let mut compacted = false;
         loop {
             let charged = table_bytes(inner.table_capacity);
             shrink_table(&mut inner.map, &mut inner.table_capacity);
@@ -1312,17 +1425,25 @@ impl SeriesCache {
             if inner.total_bytes <= budget {
                 break;
             }
-            let oldest = inner
-                .map
-                .iter()
-                .min_by_key(|(_, e)| e.last_access)
-                .map(|(k, _)| k.clone());
-            let Some(k) = oldest else { break };
-            if let Some(e) = inner.map.remove(&k) {
-                inner.total_bytes -= e.bytes;
-                inner.record_evicted(k, &e.rows);
-                metrics::counter!("mkdb2_series_cache_evictions_total").increment(1);
+            let Some((key, entry)) = inner.map.iter().min_by_key(|(_, e)| e.last_access) else {
+                break;
+            };
+            if !compacted
+                && entry.last_access.elapsed() < HOT_WINDOW
+                && table_bytes(inner.map.len()) < table_bytes(inner.table_capacity)
+            {
+                compacted = true;
+                let charged = table_bytes(inner.table_capacity);
+                inner.map.shrink_to_fit();
+                inner.table_capacity = inner.map.capacity();
+                inner.total_bytes = inner.total_bytes - charged + table_bytes(inner.table_capacity);
+                continue;
             }
+            let key = key.clone();
+            let e = inner.map.remove(&key).unwrap();
+            inner.total_bytes -= e.bytes;
+            inner.record_evicted(key, &e.rows);
+            metrics::counter!("mkdb2_series_cache_evictions_total").increment(1);
         }
         metrics::gauge!("mkdb2_series_cache_bytes").set(inner.total_bytes as f64);
         metrics::gauge!("mkdb2_series_cache_entries").set(inner.map.len() as f64);
@@ -1535,9 +1656,12 @@ mod tests {
         ))
     }
 
+    /// Evict `key` as the LRU does once it has gone unread for [`HOT_WINDOW`], leaving the pressure entry as cold for the next store.
     fn evict(cache: &SeriesCache, key: &SeriesKey, row_count: usize) {
         let other = SeriesKey::new("p", "eviction-pressure", "m");
+        cache.cool_for_test();
         cache.insert_full(other, filler(row_count), Instant::now());
+        cache.cool_for_test();
         assert!(matches!(cache.lookup(key), Lookup::Miss));
         assert!(cache.inner.lock().unwrap().evicted.contains_key(key));
     }
@@ -1739,6 +1863,31 @@ mod tests {
         assert_ne!(returned[0].lineage(), returned[1].lineage());
     }
 
+    /// A full read claims its series' record while it hashes its rows outside the cache's lock, and stage 2 still prices the series from it meanwhile: a refused series takes this path at every read.
+    #[test]
+    fn a_claimed_record_still_prices_its_series() {
+        let cache = SeriesCache::with_budget(usize::MAX);
+        let key = SeriesKey::new("p", "r", "m");
+        let rows = filler(500_000);
+        cache.insert_full(key.clone(), rows.clone(), Instant::now());
+        cache.evict_for_test(&key);
+        let unknown = std::thread::scope(|scope| {
+            let read = scope.spawn(|| cache.insert_full(key.clone(), rows, Instant::now()));
+            let mut unknown = 0;
+            while !read.is_finished() {
+                unknown += usize::from(matches!(
+                    cache.sizes(std::slice::from_ref(&key))[..],
+                    [CachedSize::Unknown]
+                ));
+            }
+            read.join().unwrap();
+            unknown
+        });
+        assert_eq!(unknown, 0);
+        assert!(matches!(cache.lookup(&key), Lookup::Fresh(_)));
+        assert!(!cache.inner.lock().unwrap().evicted.contains_key(&key));
+    }
+
     #[test]
     fn eviction_records_are_single_use_bounded_and_purged_by_exact_run() {
         let cache = eviction_cache(1);
@@ -1764,7 +1913,8 @@ mod tests {
             );
         }
         let evicted = &cache.inner.lock().unwrap().evicted;
-        assert_eq!(evicted.len(), EVICTED_LINEAGE_LIMIT);
+        // Past the cap the oldest eighth go at once.
+        assert!((EVICTED_LINEAGE_LIMIT * 7 / 8..=EVICTED_LINEAGE_LIMIT).contains(&evicted.len()));
         assert!(!evicted.contains_key(&SeriesKey::new("p", "bounded-0", "m")));
         let newest = SeriesKey::new("p", format!("bounded-{EVICTED_LINEAGE_LIMIT}"), "m");
         assert!(evicted.contains_key(&newest));
@@ -2136,9 +2286,9 @@ mod tests {
 
     #[test]
     fn cache_insert_lookup_increment_evict() {
-        let cache = SeriesCache::with_budget(charged(filler(3)) * 2);
         let k1 = SeriesKey::new("p", "r1", "m");
         let k2 = SeriesKey::new("p", "r2", "m");
+        let cache = SeriesCache::with_budget(entry_charge(&k2, filler(3)));
 
         assert!(matches!(cache.lookup(&k1), Lookup::Miss));
         cache.insert_full(k1.clone(), vec![row("", 1, 1.0, 100)], Instant::now());
@@ -2166,10 +2316,14 @@ mod tests {
             assert_eq!(inner.map[&k1].max_inserted_ms, 250);
         }
 
-        // Second entry blows the (tiny) budget: LRU evicts k1
+        // Room for one entry: once k1 has cooled, the LRU evicts it for k2, leaving its record.
+        cache.cool_for_test();
         cache.insert_full(k2.clone(), filler(3), Instant::now());
+        assert!(matches!(cache.lookup(&k1), Lookup::Miss));
+        assert!(matches!(cache.lookup(&k2), Lookup::Fresh(_)));
         let inner = cache.inner.lock().unwrap();
-        assert!(inner.total_bytes <= cache.budget_bytes || inner.map.len() == 1);
+        assert!(inner.evicted.contains_key(&k1));
+        assert!(inner.total_bytes <= cache.budget_bytes);
     }
 
     /// The map's bucket array is charged at its capacity, which removals never shrink by themselves: a filled-then-purged cache shrinks its table and charges nothing, and a full one charges every bucket it holds.
@@ -2270,9 +2424,208 @@ mod tests {
             let empty = SeriesKey::new("p", format!("run-{i}"), "m");
             cache.insert_full(empty, Vec::new(), Instant::now());
         }
+        cache.cool_for_test();
         cache.insert_full(key.clone(), rows, Instant::now());
         assert!(matches!(cache.lookup(&key), Lookup::Fresh(_)));
         assert_eq!(cache.inner.lock().unwrap().map.len(), 1);
+    }
+
+    /// An entry that fits beside the hot entries and the smallest table is retained, however large a table the cold entries grew: the LRU evicts them and shrinks it.
+    #[test]
+    fn a_grown_table_of_cold_entries_never_refuses_an_entry_that_fits_beside_the_hot_ones() {
+        let (hot, key) = (SeriesKey::new("p", "h", "m"), SeriesKey::new("p", "r", "m"));
+        let rows: Vec<_> = (0..200_000).map(|step| row("", step, 1.0, 1)).collect();
+        let cache = SeriesCache::with_budget(
+            entry_bytes(&hot, &SeriesSnapshot::full(filler(1)))
+                + entry_bytes(&key, &SeriesSnapshot::full(rows.clone()))
+                + table_bytes(2),
+        );
+        for i in 0..3_000 {
+            let empty = SeriesKey::new("p", format!("run-{i}"), "m");
+            cache.insert_full(empty, Vec::new(), Instant::now());
+        }
+        cache.cool_for_test();
+        cache.insert_full(hot.clone(), filler(1), Instant::now());
+        cache.insert_full(key.clone(), rows, Instant::now());
+        assert!(matches!(cache.lookup(&key), Lookup::Fresh(_)));
+        assert!(matches!(cache.lookup(&hot), Lookup::Fresh(_)));
+        assert_eq!(cache.inner.lock().unwrap().map.len(), 2);
+    }
+
+    /// Room for `n` entries of `rows` filler rows under the keys `r0`, `r1`, ... (`keys` of them), beside the table one more would grow.
+    fn guard_cache(n: usize, rows: usize, keys: usize) -> (SeriesCache, Vec<SeriesKey>) {
+        let keys: Vec<_> = (0..keys)
+            .map(|i| SeriesKey::new("p", format!("r{i}"), "m"))
+            .collect();
+        let entry = entry_bytes(&keys[0], &SeriesSnapshot::full(filler(rows)));
+        (
+            SeriesCache::with_budget(n * entry + table_bytes(n + 1)),
+            keys,
+        )
+    }
+
+    fn cached_keys(cache: &SeriesCache) -> Vec<String> {
+        let mut runs: Vec<_> = cache
+            .inner
+            .lock()
+            .unwrap()
+            .map
+            .keys()
+            .map(|key| key.run_id.clone())
+            .collect();
+        runs.sort();
+        runs
+    }
+
+    /// A new series the cache could retain only by evicting an entry read within HOT_WINDOW is served without being retained, and leaves the recovery record stage 2 prices it by and a matching full read restores its lineage from; cold entries make room as the LRU's victims.
+    #[test]
+    fn a_new_series_is_retained_only_in_the_room_of_cold_entries() {
+        let (cache, k) = guard_cache(3, 100, 6);
+        for key in &k[..3] {
+            cache.insert_full(key.clone(), filler(100), Instant::now());
+        }
+        cache.cool_for_test();
+        assert!(matches!(cache.lookup(&k[1]), Lookup::Fresh(_)));
+        // The cold r0 and r2 make room, least recently read first, though r1 is hot.
+        cache.insert_full(k[3].clone(), filler(100), Instant::now());
+        assert_eq!(cached_keys(&cache), ["r1", "r2", "r3"]);
+        cache.insert_full(k[4].clone(), filler(100), Instant::now());
+        assert_eq!(cached_keys(&cache), ["r1", "r3", "r4"]);
+        // Every entry is hot: r5 is served and not retained, and the cache is unchanged.
+        let total = cache.inner.lock().unwrap().total_bytes;
+        let refused = cache.insert_full(k[5].clone(), filler(100), Instant::now());
+        assert_eq!(refused.len(), 100);
+        assert!(matches!(cache.lookup(&k[5]), Lookup::Miss));
+        assert_eq!(cached_keys(&cache), ["r1", "r3", "r4"]);
+        assert_eq!(cache.inner.lock().unwrap().total_bytes, total);
+        assert!(matches!(
+            cache.sizes(std::slice::from_ref(&k[5]))[..],
+            [CachedSize::Evicted(EvictedSize { rows: 100, bytes, .. })] if bytes == refused.bytes()
+        ));
+        // Once they cool, its next read is retained and keeps the lineage it was served with.
+        cache.cool_for_test();
+        let retained = cache.insert_full(k[5].clone(), filler(100), Instant::now());
+        assert_eq!(retained.lineage(), refused.lineage());
+        assert_eq!(cached_keys(&cache), ["r3", "r4", "r5"]);
+    }
+
+    /// A cached series that grows, by an increment or by the full read that replaces it, evicts the least recently read entry even when it is hot: only new series wait for room.
+    #[test]
+    fn growth_evicts_the_least_recently_read_even_when_hot() {
+        for replace in [false, true] {
+            let (cache, k) = guard_cache(2, 100, 2);
+            for key in &k {
+                cache.insert_full(key.clone(), filler(100), Instant::now());
+            }
+            assert!(matches!(cache.lookup(&k[1]), Lookup::Fresh(_)));
+            let grown = if replace {
+                cache.insert_full(k[1].clone(), filler(101), Instant::now())
+            } else {
+                cache
+                    .apply_increment(
+                        &k[1],
+                        vec![row("", 100, 0.0, 1)],
+                        Instant::now(),
+                        &base_of(&cache, &k[1]),
+                    )
+                    .unwrap()
+            };
+            assert_eq!(grown.len(), 101);
+            assert_eq!(cached_keys(&cache), ["r1"], "replace {replace}");
+            assert!(matches!(cache.lookup(&k[1]), Lookup::Fresh(rows) if rows.len() == 101));
+            assert!(matches!(
+                cache.sizes(std::slice::from_ref(&k[0]))[..],
+                [CachedSize::Evicted(_)]
+            ));
+        }
+    }
+
+    /// A dashboard that reads more series than the cache holds, in the same order every poll: the LRU evicts each series just before its next read and never hits, while the window keeps the series it first retained.
+    #[test]
+    fn a_cyclic_dashboard_larger_than_the_cache_keeps_a_stable_share() {
+        for lru in [false, true] {
+            let (cache, k) = guard_cache(3, 100, 8);
+            let mut hits = Vec::new();
+            for _ in 0..6 {
+                let mut hit = Vec::new();
+                for key in &k {
+                    if let Lookup::Fresh(_) = cache.lookup(key) {
+                        hit.push(key.run_id.clone());
+                    } else {
+                        if lru {
+                            // Nothing hot: the cache evicts as the LRU alone.
+                            cache.cool_for_test();
+                        }
+                        cache.insert_full(key.clone(), filler(100), Instant::now());
+                    }
+                }
+                hits.push(hit);
+            }
+            let expected: Vec<Vec<String>> = if lru {
+                vec![vec![]; 6]
+            } else {
+                std::iter::once(vec![])
+                    .chain(std::iter::repeat_n(
+                        vec!["r0".into(), "r1".into(), "r2".into()],
+                        5,
+                    ))
+                    .collect()
+            };
+            assert_eq!(hits, expected, "lru {lru}");
+        }
+    }
+
+    /// The table a new series would grow counts against its room: with room for `n` entries in their table, but not in the doubled one another entry takes, a dashboard cycling past them keeps its `n` (a new series once fit by bytes alone, evicting a hot entry for the table, on every miss: none hit in 2,000 series of 100 rows through 9.24 MiB).
+    #[test]
+    fn a_new_series_that_would_grow_the_table_waits_for_cold_room() {
+        for (n, keys) in [(3, 8), (1_792, 2_000)] {
+            let keys: Vec<_> = (0..keys)
+                .map(|i| SeriesKey::new("p", format!("r{i:04}"), "m"))
+                .collect();
+            let entry = entry_bytes(&keys[0], &SeriesSnapshot::full(filler(100)));
+            assert!(table_bytes(n + 1) > table_bytes(n));
+            let cache = SeriesCache::with_budget((n + 1) * entry + table_bytes(n));
+            for wave in 0..4 {
+                let mut hits = 0;
+                for key in &keys {
+                    if let Lookup::Fresh(_) = cache.lookup(key) {
+                        hits += 1;
+                    } else {
+                        cache.insert_full(key.clone(), filler(100), Instant::now());
+                    }
+                }
+                assert_eq!(hits, if wave == 0 { 0 } else { n }, "n {n}, wave {wave}");
+            }
+            assert_eq!(cache.inner.lock().unwrap().map.len(), n);
+        }
+    }
+
+    /// A table larger than its entries need (grown by entries since replaced) is compacted before a hot entry is evicted, so the window's smallest-table admission holds: 4 empty entries grow it to 8 buckets, their replacements by 3 entries' worth fit in the 4-bucket table, and a cycle of 8 keeps those 3.
+    #[test]
+    fn a_grown_table_is_compacted_before_a_hot_entry_is_evicted() {
+        let (_, k) = guard_cache(0, 0, 8);
+        let entry = entry_bytes(&k[0], &SeriesSnapshot::full(filler(1_000)));
+        let cache = SeriesCache::with_budget(3 * entry + table_bytes(3));
+        for key in &k[..4] {
+            cache.insert_full(key.clone(), Vec::new(), Instant::now());
+        }
+        assert_eq!(cache.inner.lock().unwrap().table_capacity, 7);
+        for key in &k[..4] {
+            cache.insert_full(key.clone(), filler(1_000), Instant::now());
+        }
+        assert_eq!(cached_keys(&cache), ["r0", "r1", "r2"]);
+        assert_eq!(cache.inner.lock().unwrap().table_capacity, 3);
+        for wave in 0..4 {
+            let mut hits = 0;
+            for key in &k {
+                if let Lookup::Fresh(_) = cache.lookup(key) {
+                    hits += 1;
+                } else {
+                    cache.insert_full(key.clone(), filler(1_000), Instant::now());
+                }
+            }
+            assert_eq!(hits, 3, "wave {wave}");
+        }
     }
 
     #[test]
@@ -2394,6 +2747,63 @@ mod tests {
             cache.lookup_untracked(&key),
             Lookup::Fresh(_) | Lookup::Stale { .. }
         ));
+    }
+
+    /// Stage R under the window: a detached read whose requester was cancelled is retained though the window refused it, so the re-poll after its task has ended finds it instead of reading again; one its requester awaited stays refused, so detached reads keep the window.
+    #[tokio::test]
+    async fn an_orphaned_detached_read_the_window_refused_is_retained_for_its_re_poll() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        for cancelled in [true, false] {
+            let (cache, k) = guard_cache(1, 100, 2);
+            let (cache, locks) = (Arc::new(cache), Arc::new(SeriesRefreshLocks::default()));
+            cache.insert_full(k[0].clone(), filler(100), Instant::now());
+            let sem = Arc::new(tokio::sync::Semaphore::new(1));
+            let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+            let reads = Arc::new(AtomicUsize::new(0));
+            let leader = {
+                let (cache, locks, key, sem) =
+                    (cache.clone(), locks.clone(), k[1].clone(), sem.clone());
+                let (store, reads) = (cache.clone(), reads.clone());
+                tokio::spawn(async move {
+                    locks
+                        .get_or_refresh(
+                            &cache,
+                            &key.clone(),
+                            detach_ctx(&sem),
+                            move |_| async move {
+                                reads.fetch_add(1, SeqCst);
+                                let _ = gate_rx.await;
+                                Ok(store.insert_full(key, filler(100), Instant::now()))
+                            },
+                        )
+                        .await
+                })
+            };
+            wait_until(|| sem.available_permits() == 0).await;
+            if cancelled {
+                leader.abort();
+                assert!(leader.await.unwrap_err().is_cancelled());
+                gate_tx.send(()).unwrap();
+            } else {
+                gate_tx.send(()).unwrap();
+                assert_eq!(leader.await.unwrap().unwrap().len(), 100);
+            }
+            wait_until(|| sem.available_permits() == 1 && locks.registry_len() == 0).await;
+            let counted = reads.clone();
+            let repolled = locks
+                .get_or_refresh(&cache, &k[1], no_detach, |_| async move {
+                    counted.fetch_add(1, SeqCst);
+                    Ok(Arc::new(SeriesSnapshot::full(filler(100))))
+                })
+                .await
+                .unwrap();
+            assert_eq!(repolled.len(), 100);
+            assert_eq!(
+                reads.load(SeqCst),
+                if cancelled { 1 } else { 2 },
+                "cancelled {cancelled}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2840,7 +3250,7 @@ mod tests {
         drop(leader_lease);
         assert_eq!(locks.registry_len(), 0);
 
-        let cache = SeriesCache::with_budget(usize::MAX);
+        let cache = Arc::new(SeriesCache::with_budget(usize::MAX));
         let error = locks
             .get_or_refresh(&cache, &key, no_detach, |_| async {
                 Err::<Arc<SeriesSnapshot>, _>(anyhow::anyhow!("load failed").into())
@@ -2918,7 +3328,7 @@ mod tests {
         let units = Arc::new(sem.clone().try_acquire_many_owned(2).unwrap());
 
         let elected = locks.elect_misses(&cache, &keys, usize::MAX);
-        let batch = locks.spawn_batch(elected, units, |index, key| {
+        let batch = locks.spawn_batch(&cache, elected, units, |index, key| {
             let (read, cache, key) = (read.clone(), cache.clone(), key.clone());
             async move {
                 // The first task ends before the read completes, as one timing out would.
@@ -2972,7 +3382,7 @@ mod tests {
         .boxed()
         .shared();
         let elected = locks.elect_misses(&cache, std::slice::from_ref(&key), 1);
-        drop(locks.spawn_batch(elected, (), |_, key| {
+        drop(locks.spawn_batch(&cache, elected, (), |_, key| {
             let (read, cache, key) = (read.clone(), cache.clone(), key.clone());
             async move {
                 read.await;
@@ -3010,7 +3420,7 @@ mod tests {
         let key = series_key("a");
         let elected = locks.elect_misses(&cache, std::slice::from_ref(&key), 1);
         // A pass-through result, as under cache ablation, reaches others only through the slot, stamped by the task.
-        drop(locks.spawn_batch(elected, (), |_, _| async {
+        drop(locks.spawn_batch(&cache, elected, (), |_, _| async {
             Ok(Arc::new(SeriesSnapshot::full_with_origin(
                 vec![row("", 1, 1.0, 1)],
                 LineageOrigin::Miss,
@@ -3075,6 +3485,7 @@ mod tests {
                         groups: 0,
                     },
                     evicted: std::time::Instant::now(),
+                    claimed: false,
                 }
             }
 

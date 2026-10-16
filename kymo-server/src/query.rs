@@ -6872,10 +6872,26 @@ mod chart_admission_tests {
         extra: 0,
     };
 
+    /// The series cache of a [`chart_service`]: the server's default, whatever the environment says.
+    const TEST_CACHE_BYTES: usize = 256 << 20;
+
     fn chart_service(endpoint: &str, admission: ChartAdmission) -> Arc<QueryService> {
+        chart_service_with_cache(endpoint, admission, TEST_CACHE_BYTES)
+    }
+
+    /// [`chart_service`] with a series cache of `cache_bytes`.
+    fn chart_service_with_cache(
+        endpoint: &str,
+        admission: ChartAdmission,
+        cache_bytes: usize,
+    ) -> Arc<QueryService> {
         let (events, _) = tokio::sync::broadcast::channel(8);
         let mut service = QueryService::new(
-            Arc::new(ChClient::new(endpoint).unwrap()),
+            Arc::new(
+                ChClient::new(endpoint)
+                    .unwrap()
+                    .with_series_cache_budget(cache_bytes),
+            ),
             Arc::new(PgStore::test_store()),
             crate::ingest::BumpCoalescer::empty_for_test(),
             LifecycleGates::new(),
@@ -7292,7 +7308,7 @@ mod chart_admission_tests {
         assert_eq!(admission.bytes.in_use(), 0);
     }
 
-    /// A ClickHouse that answers each full read (`run_id IN [...]`) with run-`i`'s `rows[i]` rows as they are when it asks, steps from 0, and anything else (an increment) with no rows: its URL, and its task.
+    /// A ClickHouse that answers each full read (`run_id IN [...]`) with run-`i`'s `rows[i]` rows as they are when it asks, steps from 0, each stamped one past its step, and each increment (`run_id = 'run-i'`) with those stamped after its watermark: its URL, and its task.
     fn fake_clickhouse(
         rows: Arc<Vec<std::sync::atomic::AtomicUsize>>,
     ) -> (String, tokio::task::JoinHandle<()>) {
@@ -7306,22 +7322,45 @@ mod chart_admission_tests {
                 let sql = url::form_urlencoded::parse(uri.query().unwrap_or("").as_bytes())
                     .find(|(name, _)| name == "query")
                     .map_or(body, |(_, sql)| sql.into_owned());
-                let mut out = Vec::new();
-                let Some(list) = sql.split_once("run_id IN [").map(|(_, rest)| rest) else {
-                    return out;
+                let index = |run: &str| -> usize {
+                    run.trim()
+                        .trim_matches('\'')
+                        .strip_prefix("run-")
+                        .unwrap()
+                        .parse()
+                        .unwrap()
                 };
-                for run in list[..list.find(']').unwrap()].split(',') {
-                    let run = run.trim().trim_matches('\'');
-                    let index: usize = run.strip_prefix("run-").unwrap().parse().unwrap();
-                    // RowBinary: run_id, tag (empty), step, timestamp_ms, value, inserted_ms.
-                    for step in 0..rows[index].load(std::sync::atomic::Ordering::Relaxed) as i64 {
-                        out.push(run.len() as u8);
-                        out.extend(run.as_bytes());
+                let count =
+                    |index: usize| rows[index].load(std::sync::atomic::Ordering::Relaxed) as i64;
+                let mut out = Vec::new();
+                if let Some((_, rest)) = sql.split_once("run_id IN [") {
+                    for run in rest[..rest.find(']').unwrap()].split(',') {
+                        let run = run.trim().trim_matches('\'');
+                        // RowBinary: run_id, tag (empty), step, timestamp_ms, value, inserted_ms.
+                        for step in 0..count(index(run)) {
+                            out.push(run.len() as u8);
+                            out.extend(run.as_bytes());
+                            out.push(0);
+                            out.extend(step.to_le_bytes());
+                            out.extend(step.to_le_bytes());
+                            out.extend((step as f32).to_le_bytes());
+                            out.extend((step + 1).to_le_bytes());
+                        }
+                    }
+                } else if let (Some((_, run)), Some((_, after))) = (
+                    sql.split_once("run_id = "),
+                    sql.split_once("fromUnixTimestamp64Milli("),
+                ) {
+                    let run = index(&run[..run.find(" AND").unwrap()]);
+                    let after: i64 = after[..after.find(')').unwrap()].parse().unwrap();
+                    // RowBinary: tag (empty), step, timestamp_ms, value, is_value, inserted_ms.
+                    for step in after.max(0)..count(run) {
                         out.push(0);
                         out.extend(step.to_le_bytes());
                         out.extend(step.to_le_bytes());
                         out.extend((step as f32).to_le_bytes());
-                        out.extend(1i64.to_le_bytes());
+                        out.push(1);
+                        out.extend((step + 1).to_le_bytes());
                     }
                 }
                 out
@@ -7962,7 +8001,145 @@ mod chart_admission_tests {
         .await;
     }
 
-    /// Randomized: tabs poll random charts (memo on or off, held state off, `shadow` or `on`, audits, cancellations, small budgets, few build slots and scan units) while a writer appends; every byte, scan unit and build slot comes back, the budget never grants past its limit beside another charge (`count_grant`'s debug assertion, which a release run checks only built with `-C debug-assertions`), nothing deadlocks and no audit fails. In odd cases ClickHouse answers full reads ([`fake_clickhouse`]) of runs of 0 to 30,000 rows, cold at first, so prices miss both ways, the writer's rows land there, and tabs evict series between polls; in even ones it answers nothing and the series start cached. `KYMO_ADMISSION_FUZZ_CASES` lengthens it and `KYMO_ADMISSION_FUZZ_SEED` reseeds it.
+    /// A [`chart_service_with_cache`] with the memo on and held state `on`, reading from `url`.
+    fn memo_and_held_service(url: &str, cache_bytes: usize) -> Arc<QueryService> {
+        let mut service =
+            chart_service_with_cache(url, ChartAdmission::new(32, 1 << 30, 1), cache_bytes);
+        let unshared = Arc::get_mut(&mut service).expect("not yet shared");
+        unshared.chart_memo = Arc::new(memo::ChartMemo::new(true));
+        unshared.chart_held = Arc::new(held::HeldStore::new(held::HeldMode::On, usize::MAX));
+        service
+    }
+
+    /// A chart whose series the window refuses (its cache holds a hot entry and no room beside it) is read in full at every poll and answers every poll exactly as the same chart over a cache that holds the series: its first paint, an unchanged poll and the memo's answer to it (without a build slot), and after an append an advance of the held chart (without transients), on the lineage its recovery record restores at each read.
+    #[tokio::test]
+    async fn a_series_the_window_refuses_answers_and_continues_as_a_cached_one() {
+        const ROWS: usize = 1_000;
+        let rows = Arc::new(vec![
+            std::sync::atomic::AtomicUsize::new(0),
+            std::sync::atomic::AtomicUsize::new(ROWS),
+        ]);
+        let (url, server) = fake_clickhouse(rows.clone());
+        let blocker: Vec<_> = (0..ROWS as i64)
+            .map(|step| point("", step, step as f32, 1))
+            .collect();
+        let refusing = memo_and_held_service(
+            &url,
+            crate::series_cache::entry_charge(&SeriesKey::new("project", "run-0", "loss"), blocker),
+        );
+        cache_rows(&refusing, "run-0", ROWS as i64);
+        let holding = memo_and_held_service(&url, TEST_CACHE_BYTES);
+        let key = SeriesKey::new("project", "run-1", "loss");
+        let refused = |service: &QueryService| {
+            let sizes = service
+                .ch
+                .series_cache()
+                .sizes(&[key.clone(), SeriesKey::new("project", "run-0", "loss")]);
+            matches!(sizes[..], [CachedSize::Evicted(_), CachedSize::Cached(_)])
+        };
+        let request = proto::ChartRequest {
+            y_series: vec![series("run-1")],
+            target_resolution: 300,
+            ..Default::default()
+        };
+        let mut replies = Vec::new();
+        for service in [&refusing, &holding] {
+            let poll = |request| async {
+                admitted_with_charge(service, request)
+                    .await
+                    .0
+                    .await
+                    .unwrap()
+            };
+            let first = poll(request.clone()).await;
+            let unchanged = poll(continuation(&request, &first)).await;
+            assert!(unchanged.delta && unchanged.x_values.is_empty());
+            let blocker = service.chart_admission.builds.hold().await;
+            let memoized = poll(continuation(&request, &unchanged)).await;
+            drop(blocker);
+            rows[1].fetch_add(10, std::sync::atomic::Ordering::Relaxed);
+            service
+                .ch
+                .series_cache()
+                .note_bumps(std::iter::once("run-1"));
+            let (advance, _, charge) =
+                admitted_with_charge(service, continuation(&request, &memoized)).await;
+            let advanced = advance.await.unwrap();
+            assert!(advanced.delta && !advanced.x_values.is_empty());
+            let pinned = match &service.ch.series_cache().sizes(std::slice::from_ref(&key))[..] {
+                [CachedSize::Cached(rows)] => rows.bytes(),
+                [CachedSize::Evicted(record)] => record.bytes,
+                _ => unreachable!("the series was read"),
+            };
+            assert_eq!(
+                charge.items()[0],
+                pinned as u64,
+                "the held chart advanced, charging no transients"
+            );
+            rows[1].fetch_sub(10, std::sync::atomic::Ordering::Relaxed);
+            // Without the continuation stamps, which name each service's own lineages.
+            replies.push([first, unchanged, memoized, advanced].map(|mut reply| {
+                reply.frontiers.clear();
+                reply
+            }));
+        }
+        assert!(refused(&refusing), "the window refused every read");
+        assert!(!refused(&holding));
+        assert_eq!(replies[0], replies[1]);
+        server.abort();
+    }
+
+    /// A memo-served poll reads its series first, so they stay inside the window: a newcomer is still refused their room after they cooled and the memo answered.
+    #[tokio::test]
+    async fn a_memo_served_poll_keeps_its_series_hot() {
+        let service = chart_service_with_cache(
+            "http://127.0.0.1:9",
+            ChartAdmission::new(32, 1 << 30, 1),
+            2 * crate::series_cache::entry_charge(
+                &SeriesKey::new("project", "run-0", "loss"),
+                (0..1_000)
+                    .map(|step| point("", step, step as f32, 1))
+                    .collect(),
+            ),
+        );
+        let (runs, request) = cached_chart(&service, 2, 1_000);
+        let poll = |request| async {
+            admitted_with_charge(&service, request)
+                .await
+                .0
+                .await
+                .unwrap()
+        };
+        let unchanged = poll(continuation(&request, &poll(request.clone()).await)).await;
+        service.ch.series_cache().cool_for_test();
+        let blocker = service.chart_admission.builds.hold().await;
+        assert_eq!(poll(continuation(&request, &unchanged)).await, unchanged);
+        drop(blocker);
+        let cache = service.ch.series_cache();
+        let newcomer = SeriesKey::new("project", "run-9", "loss");
+        cache.insert_full(
+            newcomer.clone(),
+            (0..1_000)
+                .map(|step| point("", step, step as f32, 1))
+                .collect(),
+            std::time::Instant::now(),
+        );
+        let keys: Vec<_> = runs
+            .iter()
+            .map(|run| SeriesKey::new("project", run, "loss"))
+            .chain([newcomer])
+            .collect();
+        assert!(matches!(
+            cache.sizes(&keys)[..],
+            [
+                CachedSize::Cached(_),
+                CachedSize::Cached(_),
+                CachedSize::Evicted(_)
+            ]
+        ));
+    }
+
+    /// Randomized: tabs poll random charts (memo on or off, held state off, `shadow` or `on`, audits, cancellations, small budgets, few build slots and scan units) while a writer appends; every byte, scan unit and build slot comes back, the budget never grants past its limit beside another charge (`count_grant`'s debug assertion, which a release run checks only built with `-C debug-assertions`), nothing deadlocks and no audit fails. In odd cases ClickHouse answers full reads and increments ([`fake_clickhouse`]) of runs of 0 to 30,000 rows, cold at first, so prices miss both ways, the writer's rows land there, tabs evict series between polls, and the series cache often has room for only the smallest series, so its window refuses stores and refreshes evict to grow (both must happen); in even ones it answers nothing and the series start cached. `KYMO_ADMISSION_FUZZ_CASES` lengthens it and `KYMO_ADMISSION_FUZZ_SEED` reseeds it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn randomized_polls_return_every_byte_unit_and_slot() {
         let env = |name: &str, default: u64| {
@@ -7976,8 +8153,10 @@ mod chart_admission_tests {
             env("KYMO_ADMISSION_FUZZ_SEED", 1),
         );
         let mut tally = std::collections::BTreeMap::<String, usize>::new();
-        // Run alone (filtered to this test), its tally counts only its own polls' restarts.
+        // Run alone (filtered to this test), its tally counts only its own polls' restarts, refusals and growth evictions.
         RESTARTS.store(0, std::sync::atomic::Ordering::Relaxed);
+        crate::series_cache::TEST_REFUSALS.store(0, std::sync::atomic::Ordering::Relaxed);
+        crate::series_cache::TEST_GROWTH_EVICTIONS.store(0, std::sync::atomic::Ordering::Relaxed);
         for case in 0..cases {
             let mut rng = crate::Rng(
                 seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)
@@ -8004,11 +8183,28 @@ mod chart_admission_tests {
                     .collect(),
             );
             let clickhouse = answers.then(|| fake_clickhouse(read_rows.clone()));
-            let mut service = chart_service(
+            // Room for the 1 to 4 smallest series as they start, or for all: the window refuses the others while those are hot, and their growth evicts.
+            let cache_bytes = match (answers, rng.below(5) as usize) {
+                (true, smallest @ 0..4) => {
+                    let mut charges: Vec<usize> = (read_rows.iter())
+                        .map(|rows| rows.load(std::sync::atomic::Ordering::Relaxed) as i64)
+                        .map(|rows| {
+                            let rows = (0..rows).map(|step| point("", step, 0.0, step + 1));
+                            let key = SeriesKey::new("project", "run-0", "loss");
+                            crate::series_cache::entry_charge(&key, rows.collect())
+                        })
+                        .collect();
+                    charges.sort_unstable();
+                    charges[..=smallest].iter().sum()
+                }
+                _ => TEST_CACHE_BYTES,
+            };
+            let mut service = chart_service_with_cache(
                 clickhouse
                     .as_ref()
                     .map_or("http://127.0.0.1:9", |(url, _)| url),
                 ChartAdmission::new(units, budget_bytes, slots),
+                cache_bytes,
             );
             let unshared = Arc::get_mut(&mut service).expect("not yet shared");
             unshared.chart_memo = Arc::new(memo::ChartMemo::new(memo_on));
@@ -8160,9 +8356,17 @@ mod chart_admission_tests {
                 server.abort();
             }
         }
+        let refusals =
+            crate::series_cache::TEST_REFUSALS.load(std::sync::atomic::Ordering::Relaxed);
+        let growth =
+            crate::series_cache::TEST_GROWTH_EVICTIONS.load(std::sync::atomic::Ordering::Relaxed);
         eprintln!(
-            "ADMISSION FUZZ cases: {cases}, seed: {seed}, outcomes: {tally:?}, restarts: {}",
-            RESTARTS.load(std::sync::atomic::Ordering::Relaxed)
+            "ADMISSION FUZZ cases: {cases}, seed: {seed}, outcomes: {tally:?}, restarts: {}, refusals: {refusals}, growth evictions: {growth}",
+            RESTARTS.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        assert!(
+            refusals > 0 && growth > 0,
+            "the cases never reached the window's refusal or a growth eviction"
         );
     }
 }

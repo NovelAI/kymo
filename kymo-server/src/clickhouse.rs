@@ -663,6 +663,14 @@ impl ChClient {
         &self.series_cache
     }
 
+    /// This client with a series cache of `bytes`, whatever `KYMO_SERIES_CACHE_MB` says.
+    #[cfg(test)]
+    pub(crate) fn with_series_cache_budget(mut self, bytes: usize) -> Self {
+        self.series_cache =
+            std::sync::Arc::new(crate::series_cache::SeriesCache::with_budget(bytes));
+        self
+    }
+
     pub async fn ensure_schema(&self) -> Result<()> {
         let mut delay = std::time::Duration::from_secs(1);
         let max_delay = std::time::Duration::from_secs(30);
@@ -1643,8 +1651,11 @@ impl ChClient {
             }
         }
         .shared();
-        self.series_refresh_locks
-            .spawn_batch(elected, Arc::new(ctx), move |index, key| {
+        self.series_refresh_locks.spawn_batch(
+            &self.series_cache,
+            elected,
+            Arc::new(ctx),
+            move |index, key| {
                 let (read, ch, key) = (read.clone(), ch.clone(), key.clone());
                 async move {
                     let (fetch_started, series) = read.await.map_err(anyhow::Error::msg)?;
@@ -1655,7 +1666,8 @@ impl ChClient {
                         .expect("each run's rows are taken once, by its own task");
                     Ok(ch.store_full(key, rows, fetch_started, LineageOrigin::Miss))
                 }
-            })
+            },
+        )
     }
 
     // --- CDN queries ---
