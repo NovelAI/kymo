@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use dioxus::prelude::*;
 
@@ -8,47 +8,13 @@ use crate::components::options_editor::{
 };
 use crate::components::options_panel::OptionsPanel;
 use crate::components::sidebar::{sidebar_needs_run_ordinals, sidebar_run_label};
-use crate::grpc::proto::{metric_info::MetricType, MetricInfo, RunInfo};
+use crate::grpc::proto::{MetricInfo, RunInfo};
 use crate::state::layout_config::{
     run_ref_ids, CdnDisplayMode, DisplayType, MetricBinding, ProjectRef, RectConfig, RectOptions,
-    RunRef, ViewContext, XAxisMode,
+    RunRef, XAxisMode,
 };
+use crate::state::EditOutcome;
 use crate::util::{editor_trigger_id, is_app_escape, primary, use_live_apply};
-
-type XMetricSource = (String, String);
-type XMetricResult = (Option<XMetricSource>, Vec<String>);
-
-fn x_metric_discovery_source(
-    bindings: &[MetricBinding],
-    context: &ViewContext,
-) -> Option<XMetricSource> {
-    bindings.iter().find_map(|binding| {
-        let run_id = run_ref_ids(&binding.runs, context).first()?;
-        Some((
-            binding.project.id(&context.current_project).to_string(),
-            run_id.clone(),
-        ))
-    })
-}
-
-/// A run's numeric metrics, in ListMetrics order (one row per name: the registry's key).
-fn x_metric_names(metrics: Vec<MetricInfo>) -> Vec<String> {
-    metrics
-        .into_iter()
-        .filter(|metric| metric.metric_type == MetricType::Numeric as i32)
-        .map(|metric| metric.metric_name)
-        .collect()
-}
-
-fn matching_x_metric_names(
-    source: Option<&XMetricSource>,
-    result: Option<&XMetricResult>,
-) -> Vec<String> {
-    result
-        .filter(|(fetched_source, _)| fetched_source.as_ref() == source)
-        .map(|(_, names)| names.clone())
-        .unwrap_or_default()
-}
 
 fn binding_control_label(index: usize, control: &str) -> String {
     format!("Source {} {control}", index + 1)
@@ -141,8 +107,19 @@ fn specific_run_choices(checked: &[String], catalog: &[RunInfo]) -> Vec<(String,
 /// Name-sorted (`catalog_kind` binary-searches it), one type per name.
 type MetricCatalog = Vec<(String, DisplayType)>;
 
-/// By row id, so each row can gate on its siblings' chosen types.
-type RowCatalogs = HashMap<u64, MetricCatalog>;
+/// By row id, so each row can gate on its siblings' chosen types: each row's catalog, and whether it describes the row's source as it now is. A row refreshing its catalog keeps the previous one, which still names its X choices but gates no sibling.
+type RowCatalogs = HashMap<u64, (MetricCatalog, bool)>;
+
+/// The custom X choices: every name some source's catalog lists as numeric, sorted. The server maps each plotted run through its own X metric, so any source's numeric metric can be one.
+fn x_metric_names(catalogs: &RowCatalogs) -> Vec<String> {
+    let names: BTreeSet<&str> = catalogs
+        .values()
+        .flat_map(|(catalog, _)| catalog)
+        .filter(|(_, kind)| *kind == DisplayType::Numeric)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    names.into_iter().map(str::to_string).collect()
+}
 
 type CatalogKey = (String, Vec<String>, u64);
 const CACHED_CATALOGS: usize = 4;
@@ -227,7 +204,8 @@ fn required_kind(
         .enumerate()
         .filter(|(i, _)| *i != index)
         .filter_map(|(_, (row_id, binding))| {
-            catalog_kind(catalogs.get(row_id)?, &binding.metric_name)
+            let (catalog, _) = catalogs.get(row_id).filter(|(_, current)| *current)?;
+            catalog_kind(catalog, &binding.metric_name)
         });
     let first = kinds.next()?;
     kinds.all(|kind| kind == first).then_some(first)
@@ -321,8 +299,19 @@ pub fn BindingEditor(
     };
     let current_config = move || (draft(), draft_opts.read().clone());
     let unchanged = current_config() == initial;
+    let mut row_catalogs = use_signal(RowCatalogs::new);
+    let mut show = move |(bindings, options): (Vec<MetricBinding>, RectOptions)| {
+        if sources.peek().iter().map(|(_, b)| b).ne(&bindings) {
+            // Fresh row ids remount every source row, so no row keeps state from a source it no longer shows.
+            let first = *next_row_id.peek();
+            next_row_id.set(first + bindings.len() as u64);
+            sources.set((first..).zip(bindings).collect());
+            row_catalogs.write().clear();
+        }
+        draft_opts.set(options);
+    };
     // Each change (slider ticks included) applies live as one edit of just what changed: the sources as one, option fields as the defaults editors write theirs (`OptionsBaseline::write_fields`).
-    use_live_apply(current_config, {
+    use_live_apply(current_config, show, {
         let baseline = baseline.clone();
         move |previous: &(Vec<MetricBinding>, RectOptions), (bindings, options)| {
             // Options first: the sources edit can take the chart out of the layout (a Specific source was what kept it there), leaving an options edit after it nothing to edit.
@@ -333,23 +322,13 @@ pub fn BindingEditor(
                     }))
                     && (bindings == previous.0
                         || diff.edit_rect(base, &rect_id, |rect| rect.bindings = bindings))
-            });
+            }) != EditOutcome::Refused
         }
     });
 
-    let mut row_catalogs = use_signal(RowCatalogs::new);
     let revert = {
         let initial = initial.clone();
-        move |_| {
-            if sources.peek().iter().map(|(_, b)| b).ne(&initial.0) {
-                // Fresh row ids remount every source row, so no row keeps state from a source it no longer shows.
-                let first = *next_row_id.peek();
-                sources.set((first..).zip(initial.0.clone()).collect());
-                next_row_id.set(first + initial.0.len() as u64);
-                row_catalogs.write().clear();
-            }
-            draft_opts.set(initial.1.clone());
-        }
+        move |_| show(initial.clone())
     };
 
     // One project list for every source row.
@@ -362,38 +341,6 @@ pub fn BindingEditor(
             .await
         }
     });
-
-    let x_metric_source =
-        use_memo(move || x_metric_discovery_source(&draft(), &state.view_context()));
-    let current_x_metric_source = x_metric_source.read().clone();
-    let x_metric_version = crate::state::versions_key(
-        *state.resync_gen.read(),
-        current_x_metric_source
-            .iter()
-            .map(|(_, run_id)| run_id.as_str()),
-        &state.metrics_gen.read(),
-    );
-    let available_metrics = use_resource(use_reactive(
-        (&current_x_metric_source, &x_metric_version),
-        move |(source, _version)| {
-            let grpc = state.grpc.read().clone();
-            async move {
-                // The chart reads the custom X metric from its first source's run, so offer only that run's metrics.
-                let names = match &source {
-                    Some((project_id, run_id)) => {
-                        crate::state::visibility::retry_visible_run("X-axis metrics", async || {
-                            grpc.list_metrics(project_id, run_id).await
-                        })
-                        .await
-                        .map(x_metric_names)
-                        .unwrap_or_default()
-                    }
-                    None => Vec::new(),
-                };
-                (source, names)
-            }
-        },
-    ));
 
     rsx! {
         OptionsPanel {
@@ -484,10 +431,7 @@ pub fn BindingEditor(
                                 label { r#for: "{OPTIONS_ID_PREFIX}-x-metric", "X metric" }
                                 {
                                     let x_val = draft_opts.read().x_axis_metric.clone();
-                                    let mut opts = matching_x_metric_names(
-                                        current_x_metric_source.as_ref(),
-                                        available_metrics.read().as_ref(),
-                                    );
+                                    let mut opts = x_metric_names(&row_catalogs.read());
                                     if !x_val.is_empty() && !opts.contains(&x_val) {
                                         opts.insert(0, x_val.clone());
                                     }
@@ -606,15 +550,7 @@ pub fn BindingEditor(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn context(current_run: Option<&str>) -> ViewContext {
-        ViewContext::new(
-            "current-project".into(),
-            current_run.map(str::to_string),
-            &["run-a".to_string()].into_iter().collect(),
-            vec!["run-a".into(), "run-b".into()],
-        )
-    }
+    use crate::grpc::proto::metric_info::MetricType;
 
     #[test]
     fn mixed_cdn_sources_expose_only_the_source_editor() {
@@ -840,11 +776,13 @@ mod tests {
             ("samples", DisplayType::Cdn),
         ]);
         let catalogs: RowCatalogs = HashMap::from([
-            (10, current_runs.clone()),
-            (11, current_runs.clone()),
-            (12, current_runs),
+            (10, (current_runs.clone(), true)),
+            (11, (current_runs.clone(), true)),
+            (12, (current_runs, true)),
             // A source over other runs or another project types its names by its own discovery.
-            (20, catalog(&[("loss", DisplayType::TextStream)])),
+            (20, (catalog(&[("loss", DisplayType::TextStream)]), true)),
+            // One refreshing its catalog gates nothing with the previous one.
+            (21, (catalog(&[("loss", DisplayType::TextStream)]), false)),
         ]);
         let source = |metric_name: &str| MetricBinding {
             project: ProjectRef::Current,
@@ -859,8 +797,9 @@ mod tests {
             required_kind(&sources, &catalogs, index)
         };
 
-        // A lone source, or one whose siblings are empty, undiscovered, or not in their own catalog, may pick any type.
+        // A lone source, or one whose siblings are empty, undiscovered, refreshing, or not in their own catalog, may pick any type.
         assert_eq!(required(&[(10, "loss")], 0), None);
+        assert_eq!(required(&[(10, "lr"), (21, "loss")], 0), None);
         assert_eq!(required(&[(10, "samples"), (11, "")], 0), None);
         assert_eq!(required(&[(10, "samples"), (30, "loss")], 0), None);
         assert_eq!(required(&[(10, "loss"), (11, "not-logged")], 0), None);
@@ -937,52 +876,6 @@ mod tests {
     }
 
     #[test]
-    fn x_metric_discovery_follows_the_first_resolved_chart_source() {
-        let selected = MetricBinding {
-            project: ProjectRef::Current,
-            runs: RunRef::Selected,
-            metric_name: "loss".into(),
-        };
-        assert_eq!(
-            x_metric_discovery_source(&[selected], &context(Some("run-b"))),
-            Some(("current-project".into(), "run-b".into()))
-        );
-
-        let specific = MetricBinding {
-            project: ProjectRef::Specific("other-project".into()),
-            runs: RunRef::Specific(vec!["run-c".into()]),
-            metric_name: "accuracy".into(),
-        };
-        assert_eq!(
-            x_metric_discovery_source(&[specific], &context(None)),
-            Some(("other-project".into(), "run-c".into()))
-        );
-        assert_eq!(x_metric_discovery_source(&[], &context(None)), None);
-    }
-
-    #[test]
-    fn retained_x_metric_options_never_cross_source_changes() {
-        let result = (
-            Some(("project-a".to_string(), "run-a".to_string())),
-            vec!["epoch".to_string()],
-        );
-
-        assert_eq!(
-            matching_x_metric_names(Some(&("project-a".into(), "run-a".into())), Some(&result),),
-            ["epoch"]
-        );
-        assert!(matching_x_metric_names(
-            Some(&("project-b".into(), "run-a".into())),
-            Some(&result),
-        )
-        .is_empty());
-        assert!(matching_x_metric_names(None, Some(&result)).is_empty());
-        assert!(
-            matching_x_metric_names(Some(&("project-a".into(), "run-a".into())), None,).is_empty()
-        );
-    }
-
-    #[test]
     fn binding_select_values_do_not_reserve_valid_ids() {
         for project_id in ["__current__", CURRENT_PROJECT_VALUE, "id:project"] {
             let project = ProjectRef::Specific(project_id.into());
@@ -1035,21 +928,34 @@ mod tests {
         }
     }
 
+    /// A metric only a later source's runs log is still an X choice: the chart reads each run's X from that run. A source refreshing its catalog keeps its names listed meanwhile.
     #[test]
-    fn x_metric_names_include_only_numeric_metrics_in_order() {
-        assert_eq!(
-            x_metric_names(vec![
-                metric("image", MetricType::Cdn),
-                metric("epoch", MetricType::Numeric),
-                metric("logs", MetricType::TextStream),
-                MetricInfo {
-                    metric_name: "future_type".into(),
-                    metric_type: 999,
-                },
-                metric("learning_rate", MetricType::Numeric),
-            ]),
-            ["epoch", "learning_rate"]
-        );
+    fn x_metric_choices_cover_every_source() {
+        let catalogs = RowCatalogs::from([
+            (
+                0,
+                (
+                    metric_catalog(vec![
+                        metric("loss", MetricType::Numeric),
+                        metric("samples", MetricType::Cdn),
+                    ]),
+                    true,
+                ),
+            ),
+            (
+                1,
+                (
+                    metric_catalog(vec![
+                        metric("epoch", MetricType::Numeric),
+                        metric("loss", MetricType::Numeric),
+                        metric("logs", MetricType::TextStream),
+                    ]),
+                    false,
+                ),
+            ),
+        ]);
+        assert_eq!(x_metric_names(&catalogs), ["epoch", "loss"]);
+        assert!(x_metric_names(&RowCatalogs::new()).is_empty());
     }
 }
 
@@ -1135,12 +1041,18 @@ fn BindingRow(
                     })
                     .flatten();
                 if let Some(catalog) = cached {
-                    row_catalogs.write().insert(row_id, catalog.clone());
+                    row_catalogs.write().insert(row_id, (catalog.clone(), true));
                     return (project, discovery_run_ids, catalog);
                 }
-                // Invalidate sibling type gating while this source refreshes.
-                if row_catalogs.peek().contains_key(&row_id) {
-                    row_catalogs.write().remove(&row_id);
+                // While this source refreshes, its previous catalog gates no sibling's type, but its names stay X choices.
+                if row_catalogs
+                    .peek()
+                    .get(&row_id)
+                    .is_some_and(|(_, current)| *current)
+                {
+                    if let Some(entry) = row_catalogs.write().get_mut(&row_id) {
+                        entry.1 = false;
+                    }
                 }
                 let metrics = match crate::state::visibility::retry_visible_run(
                     "binding metrics",
@@ -1174,7 +1086,7 @@ fn BindingRow(
                         catalogs.truncate(CACHED_CATALOGS);
                     });
                 }
-                row_catalogs.write().insert(row_id, catalog.clone());
+                row_catalogs.write().insert(row_id, (catalog.clone(), true));
                 (project, discovery_run_ids, catalog)
             }
         },

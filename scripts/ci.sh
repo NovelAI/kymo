@@ -7,7 +7,9 @@ cd "$(dirname "$0")/.."
 root() {
     cargo fmt --all -- --check
     cargo clippy --locked --workspace --all-targets -- -D warnings
-    cargo test --locked --workspace
+    # One package per invocation: --workspace, or both --package flags in one command, gives kymo-server the frontend's serde_json features, which its builds never have.
+    cargo test --locked --package kymo-server
+    cargo test --locked --package kymo-frontend
     cargo test --locked --package kymo-frontend --features local-runtime
 }
 

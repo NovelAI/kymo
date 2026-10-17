@@ -977,6 +977,7 @@ class InitApiTests(unittest.TestCase):
             mock.patch.multiple(
                 client_module,
                 _exit_code=None,
+                _exit_code_by_sys_exit=False,
                 _interrupted_at=None,
                 _original_sys_exit=exits.append,
             ),
@@ -999,13 +1000,161 @@ class InitApiTests(unittest.TestCase):
             client_module._interrupted_at = time.monotonic() - 4
             client_module._exit_wrapper(0)
             thread = threading.Thread(
-                target=exit_handling, args=(KeyboardInterrupt(), 0)
+                target=exit_handling, args=(KeyboardInterrupt(), 3)
             )
             thread.start()
             thread.join()
             self.assertEqual(shutdowns, [{"signum": signal.SIGINT}] * 3)
+            # The main thread's last exit, not the thread's.
+            self.assertEqual(client_module._exit_code, 0)
+        self.assertEqual(exits, [1, 1, 0, 0, 0, 3])
+
+    @contextlib.contextmanager
+    def _finishing_run(self):
+        """An active run whose shutdown is mocked to return the exit code it would send."""
+        with (
+            mock.patch.multiple(
+                client_module,
+                _is_initialized=True,
+                _exit_code=None,
+                _exit_code_by_sys_exit=False,
+                _interrupted_at=None,
+                _terminated_at=None,
+                _worker_interrupted_at=None,
+                _original_sys_exit=lambda code: None,
+                _original_excepthook=lambda *args: None,
+            ),
+            mock.patch.object(
+                client_module,
+                "_drain_and_shutdown",
+                side_effect=lambda *args, **kwargs: client_module._exit_code,
+            ),
+        ):
+            yield
+
+    def test_a_code_only_sys_exit_recorded_gives_way_to_a_later_exit_a_signal_or_the_hook(
+        self,
+    ):
+        # A later sys.exit's, the exception hook's and a signal's, during a shutdown too: a Ctrl-C's replaces any code. No later sys.exit replaces the hook's or a signal's.
+        def signal_during_a_shutdown(signum):
+            shutdown = types.SimpleNamespace(
+                signum=None,
+                exiting=None,
+                ended=None,
+                bound=lambda end: None,
+                hand_off=lambda: None,
+            )
+            with (
+                self.assertLogs("kymo", level="WARNING")
+                if signum == signal.SIGTERM
+                else contextlib.nullcontext()
+            ):
+                client_module._signal_during_shutdown(shutdown, signum)
+
+        with self._finishing_run():
+            client_module._exit_wrapper(7)
+            client_module._exit_wrapper(0)
+            self.assertEqual(client_module._exit_code, 0)
+            client_module._excepthook(ValueError, ValueError(), None)
+            client_module._exit_wrapper(3)
             self.assertEqual(client_module._exit_code, 1)
-        self.assertEqual(exits, [1, 1, 0, 0, 0, 0])
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                client_module._exit_code = None
+                client_module._exit_wrapper(7)
+                signal_during_a_shutdown(signum)
+                client_module._exit_wrapper(0)
+                self.assertEqual(client_module._exit_code, 128 + signum)
+            # Once the interpreter's exit has begun (threading's atexit hooks, where the main thread still reads as alive, then the atexit hooks), the exit that ended the program stays: neither a sys.exit there, which Python ignores, nor a SIGTERM replaces it. After a normal end such an exit records nothing, nor does a SystemExit a chained signal handler raises.
+            for stage in (
+                mock.patch.object(threading, "_SHUTTING_DOWN", True),
+                mock.patch.object(
+                    threading.main_thread(), "is_alive", return_value=False
+                ),
+            ):
+                client_module._exit_code = None
+                client_module._exit_wrapper(7)
+                with stage:
+                    client_module._exit_wrapper(0)
+                    signal_during_a_shutdown(signal.SIGTERM)
+                    self.assertEqual(client_module._exit_code, 7)
+                    client_module._exit_code = None
+                    client_module._exit_wrapper(3)
+                    client_module._record_exit_code(5)
+                    self.assertIsNone(client_module._exit_code)
+
+    def test_a_signal_during_an_exit_code_check_keeps_its_code(self):
+        # A Ctrl-C handled during the calls of finish()'s drop check, or of a later sys.exit's (its liveness check, or the conversion of its code), records its 130 over the caught exit's code; the flag, read last, then says that code is no longer only sys.exit's.
+        def ctrl_c_lands():
+            client_module._exit_code, client_module._exit_code_by_sys_exit = 130, False
+            return True
+
+        class CodeConvertedAsCtrlCLands:
+            def __int__(self):
+                ctrl_c_lands()
+                return 0
+
+        codes = []
+        with self._finishing_run():
+            for act in (client_module.finish, lambda: client_module._exit_wrapper(0)):
+                client_module._exit_code, client_module._exit_code_by_sys_exit = 7, True
+                with mock.patch.object(
+                    threading.main_thread(), "is_alive", side_effect=ctrl_c_lands
+                ):
+                    act()
+                codes.append(client_module._exit_code)
+            client_module._exit_code, client_module._exit_code_by_sys_exit = 7, True
+            client_module._record_exit_code(
+                CodeConvertedAsCtrlCLands(), by_sys_exit=True
+            )
+            codes.append(client_module._exit_code)
+        self.assertEqual(codes, [130, 130, 130])
+
+    def test_a_finish_after_a_caught_exit_drops_its_code(self):
+        # A sys.exit the program catches (argparse inside a try, a notebook cell), then finish() on the main thread with no exception being handled: the run ends without that code. One called while the SystemExit propagates or is handled, or on another thread (a helper's, or an executor worker's, as the program exits), keeps it, and nothing drops the hook's code.
+        codes = []
+
+        def finish_elsewhere():
+            thread = threading.Thread(
+                target=lambda: codes.append(client_module.finish())
+            )
+            thread.start()
+            thread.join()
+
+        with self._finishing_run():
+            client_module._exit_wrapper(7)
+            codes.append(client_module.finish())
+            client_module._exit_wrapper(7)
+            with self.assertRaises(SystemExit):
+                try:
+                    raise SystemExit(7)
+                finally:
+                    codes.append(client_module.finish())
+            try:
+                raise SystemExit(7)
+            except SystemExit:
+                codes.append(client_module.finish())
+            finish_elsewhere()
+            # Nor once the interpreter's exit has begun, in threading's atexit hooks or the atexit hooks, where the code may be the exit that ended the program.
+            with mock.patch.object(threading, "_SHUTTING_DOWN", True):
+                codes.append(client_module.finish())
+            with mock.patch.object(
+                threading.main_thread(), "is_alive", return_value=False
+            ):
+                codes.append(client_module.finish())
+            # The hook's 1 replaces the caught exit's code, and stays.
+            client_module._excepthook(ValueError, ValueError(), None)
+            codes.append(client_module.finish())
+        self.assertEqual(codes, [None, 7, 7, 7, 7, 7, 1])
+
+    def test_a_run_finished_inside_an_unrelated_except_block_takes_no_code(self):
+        # A run retried in the handler of an earlier failure (`except OutOfMemoryError: run(batch_size // 2)`) that finishes cleanly is no crash.
+        codes = []
+        with self._finishing_run():
+            try:
+                raise MemoryError("the first attempt ran out of memory")
+            except MemoryError:
+                codes.append(client_module.finish())
+        self.assertEqual(codes, [None])
 
     def test_a_ctrl_c_only_the_worker_saw_times_the_runs_end(self):
         # A SIGINT handler the program installed after init() takes the Ctrl-C (one that exits, or SIG_DFL's kill), which kymo's never sees; the upload worker, which the terminal's Ctrl-C reaches with the rest of the group, notes it. An exit soon after it hands the run off, by the cap from the later Ctrl-C; one long after it, or after the interactive interpreter carried on from it, does not.
@@ -1080,22 +1229,23 @@ class InitApiTests(unittest.TestCase):
         self.assertEqual(exits, [0])
 
     def test_another_threads_exit_never_sets_the_runs_code(self):
-        # A thread's sys.exit() ends that thread alone: the run ends with the program's code, its crash's 1 here, not the thread's 0.
+        # A thread's sys.exit() ends that thread alone: the run ends with the program's code, its crash's 1 here, not the thread's 5.
         exits = []
         with mock.patch.multiple(
             client_module,
             _exit_code=None,
+            _exit_code_by_sys_exit=False,
             _interrupted_at=None,
             _original_sys_exit=exits.append,
             _original_excepthook=lambda *args: None,
         ):
-            thread = threading.Thread(target=client_module._exit_wrapper, args=(0,))
+            thread = threading.Thread(target=client_module._exit_wrapper, args=(5,))
             thread.start()
             thread.join()
             self.assertIsNone(client_module._exit_code)
             client_module._excepthook(ValueError, ValueError(), None)
             self.assertEqual(client_module._exit_code, 1)
-        self.assertEqual(exits, [0])
+        self.assertEqual(exits, [5])
 
     def test_the_atexit_flush_after_a_signal(self):
         # An exit soon after a Ctrl-C kymo saw, whatever ended the program (Lightning's teardown ends in sys.exit(1); a program can raise SystemExit itself): the run is handed off; long after it, an ordinary flush. After a SIGTERM a handler installed before init() took, the flush ends within the signal budget: from that SIGTERM while that budget lasts, since a scheduler's grace period also runs from it, and from the exit after that, since a requeue handler can exit long after it.
@@ -2161,6 +2311,44 @@ class RunMetadataTests(unittest.TestCase):
 
         self.assertEqual(calls, ["init", "shutdown"])
         self.assertNotIn("gpu_count", metadata["meta"]["system"])
+
+    def test_a_hung_git_drops_the_git_metadata_within_its_timeout(self):
+        # A git that a slow or hung filesystem stalls, first on PATH: one call times out, and the next, which would stall too, is not made. The calls are counted as made, which a child the timeout kills before it runs cannot miss.
+        calls = []
+        check_output = subprocess.check_output
+
+        def counted(args, **kwargs):
+            calls.append(args[3:])
+            return check_output(args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as bin_dir:
+            git = os.path.join(bin_dir, "git")
+            with open(git, "w") as script:
+                script.write("#!/bin/sh\nexec sleep 5\n")
+            os.chmod(git, 0o755)
+            with (
+                mock.patch.dict(
+                    os.environ, {"PATH": bin_dir + os.pathsep + os.environ["PATH"]}
+                ),
+                mock.patch.object(client_module, "_GIT_METADATA_TIMEOUT", 0.2),
+                mock.patch.object(
+                    client_module.subprocess, "check_output", side_effect=counted
+                ),
+                self.assertLogs("kymo", level="WARNING") as logs,
+            ):
+                started = time.monotonic()
+                metadata = client_module._collect_run_metadata(None)
+                elapsed = time.monotonic() - started
+
+        self.assertEqual(calls, [["remote", "get-url", "origin"]])
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn(
+            "git remote get-url origin took longer than 0.2 s",
+            logs.records[0].getMessage(),
+        )
+
+        self.assertNotIn("git", metadata["meta"])
+        self.assertLess(elapsed, 2.0)
 
     def test_git_remote_userinfo_is_not_persisted(self):
         self.assertEqual(
@@ -9540,7 +9728,7 @@ class ShutdownProofTests(unittest.TestCase):
             self.assertTrue(had_spool)
             self.assertTrue(os.path.exists(path))
             retire.assert_not_called()
-            self.assertIn("still open", "\n".join(logs.output))
+            self.assertIn("locked by its writer or a replay", "\n".join(logs.output))
 
     def test_unreadable_spool_directory_is_not_reported_as_empty(self):
         """A listing error must not read as proof that nothing is waiting — that
@@ -9751,6 +9939,142 @@ class PollerPublicationTests(unittest.TestCase):
             poller._poll_loop()
         failures = [line for line in logs.output if "poll failed" in line]
         self.assertEqual(len(failures), 2)
+
+    @staticmethod
+    def _fake_nvml(fails=(), *, limit_mw=700_000, total=80e9):
+        """A pynvml stand-in whose readings fail for a call named in fails, or for a (call, GPU index) pair in it; the healthy GPU is idle and error-free, so its zeros are true readings."""
+
+        def reading(call, value):
+            def read(handle, *_args):
+                if call in fails or (call, handle) in fails:
+                    raise RuntimeError("NVML_ERROR_NOT_SUPPORTED")
+                return value
+
+            return read
+
+        names = (
+            "NVML_TEMPERATURE_GPU",
+            "NVML_CLOCK_SM",
+            "NVML_CLOCK_MEM",
+            "NVML_MEMORY_ERROR_TYPE_UNCORRECTED",
+            "NVML_MEMORY_ERROR_TYPE_CORRECTED",
+            "NVML_VOLATILE_ECC",
+            "NVML_MEMORY_LOCATION_DEVICE_MEMORY",
+        )
+        return types.SimpleNamespace(
+            **{name: name for name in names},
+            nvmlDeviceGetUtilizationRates=reading(
+                "util", types.SimpleNamespace(gpu=0, memory=0)
+            ),
+            nvmlDeviceGetTemperature=reading("temp", 71),
+            nvmlDeviceGetPowerUsage=reading("power", 350_000),
+            nvmlDeviceGetEnforcedPowerLimit=reading("limit", limit_mw),
+            nvmlDeviceGetMemoryInfo=reading(
+                "mem", types.SimpleNamespace(used=60e9, total=total)
+            ),
+            nvmlDeviceGetClockInfo=reading("clock", 1980),
+            nvmlDeviceGetMemoryErrorCounter=reading("ecc", 0),
+        )
+
+    def test_a_failed_gpu_reading_is_a_nan_marker_at_its_gpus_tag(self):
+        nan = "nan"
+        healthy = {
+            "system/gpu_util_pct": 0.0,
+            "system/gpu_mem_util_pct": 0.0,
+            "system/gpu_temp_c": 71.0,
+            "system/gpu_power_w": 350.0,
+            "system/gpu_power_pct": 50.0,
+            "system/gpu_power_limit_w": 700.0,
+            "system/gpu_mem_used_bytes": 60e9,
+            "system/gpu_mem_used_pct": 75.0,
+            "system/gpu_sm_clock_mhz": 1980.0,
+            "system/gpu_mem_clock_mhz": 1980.0,
+            "system/gpu_ecc_uncorrected": 0.0,
+            "system/gpu_ecc_corrected": 0.0,
+        }
+        unread = dict.fromkeys(healthy, nan)
+        ecc = ("system/gpu_ecc_uncorrected", "system/gpu_ecc_corrected")
+        every_call = ("util", "temp", "power", "limit", "mem", "clock", "ecc")
+        # A pynvml without a name the ECC reads use costs those reads alone.
+        lacking = self._fake_nvml()
+        del lacking.NVML_MEMORY_LOCATION_DEVICE_MEMORY
+        for name, nvml, expected in (
+            (
+                "pynvml lacks a constant",
+                lacking,
+                [{**healthy, **dict.fromkeys(ecc, nan)}] * 2,
+            ),
+            (
+                "a memory total is no number",
+                self._fake_nvml(total=None),
+                [{**healthy, "system/gpu_mem_used_pct": nan}] * 2,
+            ),
+            ("every reading fails", self._fake_nvml(every_call), [unread, unread]),
+            (
+                "GPU 1 is lost",
+                self._fake_nvml([(call, 1) for call in every_call]),
+                [healthy, unread],
+            ),
+            (
+                "ECC is unsupported",
+                self._fake_nvml(["ecc"]),
+                [{**healthy, **dict.fromkeys(ecc, nan)}] * 2,
+            ),
+            (
+                "the power limit fails",
+                self._fake_nvml(["limit"]),
+                [
+                    {
+                        **healthy,
+                        "system/gpu_power_limit_w": nan,
+                        "system/gpu_power_pct": nan,
+                    }
+                ]
+                * 2,
+            ),
+            (
+                "the totals are zero",
+                self._fake_nvml(limit_mw=0, total=0),
+                [
+                    {
+                        **healthy,
+                        "system/gpu_power_limit_w": 0.0,
+                        "system/gpu_power_pct": nan,
+                        "system/gpu_mem_used_pct": nan,
+                    }
+                ]
+                * 2,
+            ),
+        ):
+            published = []
+            poller = SystemMetricsPoller(publish=published.extend)
+            poller._nvml_ok = True
+            poller._gpu_handles = [0, 1]
+            with (
+                self.subTest(name),
+                mock.patch.object(system_metrics_module, "pynvml", nvml, create=True),
+            ):
+                poller._poll_once()
+                (points,) = published
+                got = {}
+                for point in points:
+                    value = point[3]
+                    if math.isnan(value):
+                        # Encoded as the worker sends it, the marker reaches the wire.
+                        self.assertTrue(
+                            math.isnan(wire_module._tuple_to_point(point).value)
+                        )
+                        value = nan
+                    got[point[1], point[4]] = value
+                # One point per field and GPU, at that GPU's tag.
+                self.assertEqual(
+                    got,
+                    {
+                        (field, str(index)): value
+                        for index, fields in enumerate(expected)
+                        for field, value in fields.items()
+                    },
+                )
 
     def test_nvml_discovery_failure_balances_successful_initialization(self):
         calls = []
@@ -11120,7 +11444,7 @@ class WorkerResponsivenessTests(unittest.TestCase):
 
         def replay(path, **kwargs):
             self.assertTrue(kwargs["_writer_lock_held"])
-            replay_had_writer_lock.append(sync_module._writer_active(path))
+            replay_had_writer_lock.append(spool_module.writer_active(path))
             _header, records = read_spool(path)
             steps = [record[2] for record in records]
             replayed_steps.append(steps)

@@ -1,6 +1,8 @@
 """Focused checks for frame validation and causal spool replay."""
 
 import contextlib
+import errno
+import fcntl
 import hashlib
 import io
 import json
@@ -2188,7 +2190,7 @@ class SpoolDurabilityTests(unittest.TestCase):
             writer.write(point)
 
             writer.seal()
-            self.assertTrue(sync_module._writer_active(path))
+            self.assertTrue(spool_module.writer_active(path))
             with self.assertRaisesRegex(RuntimeError, "sealed spool"):
                 writer.write(numeric(2.0))
 
@@ -2693,6 +2695,324 @@ class ReplayTests(unittest.TestCase):
             connect.assert_called_once()
             self.assertIn("later files remain eligible", output.getvalue())
 
+    @staticmethod
+    def _gated_sends(gates: dict):
+        """A _send_tuples stand-in delivering into its .stored, by step, the last insert winning as in the server's storage; a replay on a thread named in gates first sets that gate's arrived event and waits for its go."""
+
+        def send(_stub, _project, _run, tuples):
+            gate = gates.get(threading.current_thread().name)
+            if gate is not None:
+                gate.arrived.set()
+                gate.go.wait(timeout=5)
+            for record in tuples:
+                send.stored[record[2]] = record[3]
+            return True
+
+        send.stored = {}
+        return send
+
+    @staticmethod
+    def _gate():
+        return types.SimpleNamespace(arrived=threading.Event(), go=threading.Event())
+
+    def test_a_spool_another_replay_holds_is_not_delivered_again(self):
+        # Two syncs of one spool at once. Once the first has retired it, the run, resumed, logs a newer value at its step, which the second's copy of the old value must not overwrite.
+        with tempfile.TemporaryDirectory() as spool_dir:
+            path = os.path.join(spool_dir, "old.mkspool")
+            self._write(path, [numeric(1.0, step=1)])
+            gates = {"first": self._gate(), "second": self._gate()}
+            send = self._gated_sends(gates)
+            results = {}
+            replays = {
+                name: threading.Thread(
+                    target=lambda name=name: results.update(
+                        {name: sync_module.replay_file(path)}
+                    ),
+                    name=name,
+                )
+                for name in gates
+            }
+            with (
+                mock.patch.object(
+                    sync_module, "_connect", return_value=(_Channel(), object())
+                ),
+                mock.patch.object(sync_module, "_send_tuples", side_effect=send),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                replays["first"].start()
+                self.assertTrue(gates["first"].arrived.wait(timeout=5))
+                replays["second"].start()
+                # As far as its send, if the first's claim lets it.
+                gates["second"].arrived.wait(timeout=0.5)
+                gates["first"].go.set()
+                replays["first"].join(timeout=5)
+                send.stored[1] = 99.0
+                gates["second"].go.set()
+                replays["second"].join(timeout=5)
+            self.assertEqual(results, {"first": True, "second": False})
+            self.assertEqual(send.stored, {1: 99.0})
+            self.assertTrue(os.path.exists(path + ".sent"))
+
+    def test_a_second_sync_of_a_directory_never_reorders_a_runs_segments(self):
+        # Two syncs over a directory holding a run's two segments, the later one's value at a step the newer. One that finds the older segment claimed must not deliver the newer one first, which the older one, delivered after it, would overwrite.
+        with tempfile.TemporaryDirectory() as spool_dir:
+            for name, value, created in (("first", 1.0, 1), ("second", 2.0, 2)):
+                self._write(
+                    os.path.join(spool_dir, f"{name}.mkspool"),
+                    [numeric(value, step=1)],
+                    created=created,
+                )
+            gates = {"A": self._gate()}
+            send = self._gated_sends(gates)
+            exits = {}
+            first_sync = threading.Thread(
+                target=lambda: exits.update(A=sync_module.main([spool_dir])), name="A"
+            )
+            with (
+                mock.patch.object(
+                    sync_module, "_connect", return_value=(_Channel(), object())
+                ),
+                mock.patch.object(sync_module, "_send_tuples", side_effect=send),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                first_sync.start()
+                self.assertTrue(gates["A"].arrived.wait(timeout=5))
+                exits["B"] = sync_module.main([spool_dir])
+                delivered_by_b = dict(send.stored)
+                gates["A"].go.set()
+                first_sync.join(timeout=5)
+            self.assertEqual(delivered_by_b, {})
+            self.assertEqual(exits, {"A": 0, "B": 1})
+            self.assertEqual(send.stored, {1: 2.0})
+            self.assertEqual(
+                sorted(os.listdir(spool_dir)),
+                ["first.mkspool.sent", "second.mkspool.sent"],
+            )
+
+    def test_a_claim_skips_a_held_spool_and_replays_unlocked_where_no_lock_can_be_had(
+        self,
+    ):
+        # Held: no claim. Any other flock error (NFS refusing a read-only replayer's exclusive lock, a file system without flock): the open file alone, with a warning, unless writer_active, whose shared lock NFS grants a reader, sees the writer.
+        with tempfile.TemporaryDirectory() as spool_dir:
+            path = os.path.join(spool_dir, "old.mkspool")
+            self._write(path, [numeric(1.0)])
+            open_fds = len(os.listdir("/dev/fd"))
+
+            def flock_failing(code, shared):
+                def flock(_fd, operation):
+                    if operation & fcntl.LOCK_UN:
+                        return
+                    if operation & fcntl.LOCK_SH:
+                        if shared is not None:
+                            raise OSError(shared, "flock")
+                        return
+                    raise OSError(code, "flock")
+
+                return flock
+
+            held = (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES)
+            for code, shared, claimed in (
+                *((code, None, False) for code in held),
+                *(
+                    (code, code, True)
+                    for code in (
+                        errno.EBADF,
+                        errno.ENOLCK,
+                        errno.EOPNOTSUPP,
+                        errno.ENOTSUP,
+                        errno.ENOSYS,
+                        errno.EINVAL,
+                        errno.EIO,
+                    )
+                ),
+                # NFS: a read-only replayer cannot lock the file exclusively, but its writer_active probe sees the live writer.
+                (errno.EBADF, errno.EWOULDBLOCK, False),
+            ):
+                with (
+                    self.subTest(errno=errno.errorcode[code], shared=shared),
+                    mock.patch("fcntl.flock", side_effect=flock_failing(code, shared)),
+                    self.assertLogs("kymo", level="WARNING")
+                    if claimed
+                    else contextlib.nullcontext(),
+                ):
+                    claim = spool_module.claim_spool(path)
+                    if claim is not None:
+                        claim.close()
+                    self.assertEqual(claim is not None, claimed)
+                    # Every outcome leaves no descriptor open.
+                    self.assertEqual(len(os.listdir("/dev/fd")), open_fds)
+
+    def test_a_claim_on_a_spool_retired_since_its_open_is_not_taken(self):
+        # Another replayer renamed the path away, or put another file there, between the open and the lock.
+        with tempfile.TemporaryDirectory() as spool_dir:
+            path = os.path.join(spool_dir, "old.mkspool")
+            other = os.path.join(spool_dir, "other.mkspool")
+            self._write(path, [numeric(1.0)])
+            self._write(other, [numeric(2.0)])
+            for name, named in (
+                ("gone", FileNotFoundError(2, "gone")),
+                ("replaced", os.stat(other)),
+            ):
+                with (
+                    self.subTest(name),
+                    mock.patch.object(spool_module.os, "stat", side_effect=[named]),
+                ):
+                    claim = spool_module.claim_spool(path)
+                    if claim is not None:
+                        claim.close()
+                    self.assertIsNone(claim)
+            # Any other error checking it raises, leaving no descriptor open, even while the exception, and so the frame it was raised in, lives.
+            open_fds = len(os.listdir("/dev/fd"))
+            with mock.patch.object(
+                spool_module.os,
+                "stat",
+                side_effect=OSError(errno.ESTALE, "Stale file handle"),
+            ):
+                try:
+                    spool_module.claim_spool(path)
+                except OSError:
+                    self.assertEqual(len(os.listdir("/dev/fd")), open_fds)
+                else:
+                    self.fail("an ESTALE checking the claim did not raise")
+
+    def test_a_claim_interrupted_after_its_open_releases_the_file(self):
+        # A Ctrl-C landing as flock() returns, in the writer_active fallback or in the identity check: the claim's file, and its lock, go with it, even while the program keeps the interruption's traceback, and so the frame it was raised in.
+        with tempfile.TemporaryDirectory() as spool_dir:
+            path = os.path.join(spool_dir, "old.mkspool")
+            self._write(path, [numeric(1.0)])
+            flock = fcntl.flock
+
+            def locked_then_interrupted(fd, operation):
+                flock(fd, operation)
+                raise KeyboardInterrupt
+
+            for name, patches in (
+                (
+                    "as flock() returns",
+                    [mock.patch("fcntl.flock", locked_then_interrupted)],
+                ),
+                (
+                    "in the writer_active fallback",
+                    [
+                        mock.patch(
+                            "fcntl.flock", side_effect=OSError(errno.ENOLCK, "flock")
+                        ),
+                        mock.patch.object(
+                            spool_module, "writer_active", side_effect=KeyboardInterrupt
+                        ),
+                    ],
+                ),
+                (
+                    "in the identity check",
+                    [
+                        mock.patch.object(
+                            spool_module.os, "stat", side_effect=KeyboardInterrupt
+                        )
+                    ],
+                ),
+            ):
+                with self.subTest(name):
+                    open_fds = len(os.listdir("/dev/fd"))
+                    kept = None
+                    try:
+                        with contextlib.ExitStack() as stack:
+                            for patch in patches:
+                                stack.enter_context(patch)
+                            spool_module.claim_spool(path)
+                    except KeyboardInterrupt as error:
+                        kept = error
+                    try:
+                        self.assertIsNotNone(kept)
+                        # The lock is free for the next replay, and the descriptor closed.
+                        claim = spool_module.claim_spool(path)
+                        if claim is not None:
+                            claim.close()
+                        self.assertIsNotNone(claim)
+                        self.assertEqual(len(os.listdir("/dev/fd")), open_fds)
+                    finally:
+                        kept = None
+
+    def test_a_replay_never_claims_a_spool_its_writer_is_creating(self):
+        # A new segment appears under its own name only once its writer holds its lock and has written its header: a claim in between would leave the writer unlocked for good, free for a later replay to retire under it.
+        with tempfile.TemporaryDirectory() as spool_dir:
+            path = os.path.join(spool_dir, "live.mkspool")
+            writer = SpoolWriter(path, spool_header())
+            claims = []
+            fchmod = os.fchmod
+
+            def fchmod_then_claim(fd, mode):
+                fchmod(fd, mode)
+                claims.append(spool_module.claim_spool(path))
+
+            with mock.patch.object(spool_module.os, "fchmod", fchmod_then_claim):
+                writer.open()
+            try:
+                for claim in claims:
+                    if claim is not None:
+                        claim.close()
+                self.assertEqual(claims, [None])
+                writer.write(numeric(1.0))
+                writer.flush()
+                self.assertTrue(spool_module.writer_active(path))
+                self.assertIsNone(spool_module.claim_spool(path))
+                self.assertEqual(os.listdir(spool_dir), ["live.mkspool"])
+            finally:
+                writer.close()
+
+    def test_a_spool_whose_rename_into_place_fails_leaves_nothing_behind(self):
+        # As for a header that cannot be written: the file under its .creating name goes, and the next write makes it again.
+        with tempfile.TemporaryDirectory() as spool_dir:
+            path = os.path.join(spool_dir, "live.mkspool")
+            writer = SpoolWriter(path, spool_header())
+            with (
+                mock.patch.object(
+                    spool_module.os, "rename", side_effect=OSError(errno.EIO, "EIO")
+                ),
+                self.assertRaises(OSError),
+            ):
+                writer.open()
+            self.assertEqual(os.listdir(spool_dir), [])
+            writer.write(numeric(1.0))
+            writer.close()
+            self.assertEqual(os.listdir(spool_dir), ["live.mkspool"])
+            self.assertEqual([record[3] for record in read_spool(path)[1]], [1.0])
+
+    def test_a_replayer_that_may_only_read_a_local_spool_still_claims_it(self):
+        with tempfile.TemporaryDirectory() as spool_dir:
+            path = os.path.join(spool_dir, "old.mkspool")
+            self._write(path, [numeric(1.0)])
+            os.chmod(path, 0o400)
+            claim = spool_module.claim_spool(path)
+            try:
+                self.assertIsNotNone(claim)
+                self.assertIsNone(spool_module.claim_spool(path))
+            finally:
+                claim.close()
+
+    def test_a_replayer_that_may_write_a_spool_claims_it_where_nfs_locks_it(self):
+        # NFS emulates flock with fcntl byte-range locks, refusing an exclusive one on a descriptor open only for reading (EBADF), as this stand-in does.
+        flock = fcntl.flock
+
+        def nfs_flock(fd, operation):
+            read_only = fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY
+            if operation & fcntl.LOCK_EX and read_only:
+                raise OSError(errno.EBADF, "Bad file descriptor")
+            flock(fd, operation)
+
+        with tempfile.TemporaryDirectory() as spool_dir:
+            path = os.path.join(spool_dir, "old.mkspool")
+            self._write(path, [numeric(1.0)])
+            with (
+                mock.patch("fcntl.flock", nfs_flock),
+                self.assertNoLogs("kymo", level="WARNING"),
+            ):
+                claim = spool_module.claim_spool(path)
+                try:
+                    self.assertIsNotNone(claim)
+                    self.assertIsNone(spool_module.claim_spool(path))
+                finally:
+                    claim.close()
+
     def test_unexpected_replay_error_closes_both_transports(self):
         with tempfile.TemporaryDirectory() as spool_dir:
             path = os.path.join(spool_dir, "rich.mkspool")
@@ -3051,6 +3371,50 @@ class ReplayTests(unittest.TestCase):
             self.assertTrue(os.path.exists(first + ".deleted"))
             self.assertTrue(os.path.exists(second + ".deleted"))
             stub.IngestMetrics.assert_called_once()
+
+    def test_a_terminal_runs_later_spool_is_retired_under_its_claim(self):
+        # No other sync can claim it while it is retired, and one that holds it keeps it.
+        with tempfile.TemporaryDirectory() as spool_dir:
+            first, second, third = (
+                os.path.join(spool_dir, f"{name}.mkspool")
+                for name in ("first", "second", "third")
+            )
+            for created, path in enumerate((first, second, third), 1):
+                self._write(path, [numeric(float(created))], created=created)
+            stub = mock.Mock()
+            stub.IngestMetrics.side_effect = _RunRejectedRpcError()
+            retire = sync_module.retire_deleted_spool
+            claimed_meanwhile = []
+
+            def retire_after_a_claim(path):
+                claim = spool_module.claim_spool(path)
+                claimed_meanwhile.append(claim is not None)
+                if claim is not None:
+                    claim.close()
+                return retire(path)
+
+            held = spool_module.claim_spool(third)
+            try:
+                with (
+                    mock.patch.object(
+                        sync_module, "_connect", return_value=(_Channel(), stub)
+                    ),
+                    mock.patch.object(
+                        sync_module, "retire_deleted_spool", retire_after_a_claim
+                    ),
+                    contextlib.redirect_stdout(io.StringIO()) as out,
+                ):
+                    self.assertEqual(sync_module.main([first, second, third]), 1)
+            finally:
+                held.close()
+            self.assertEqual(claimed_meanwhile, [False, False])
+            self.assertEqual(
+                sorted(os.listdir(spool_dir)),
+                ["first.mkspool.deleted", "second.mkspool.deleted", "third.mkspool"],
+            )
+            self.assertIn(
+                f"{third}: open by a live run or another sync", out.getvalue()
+            )
 
     def test_replay_windows_are_byte_bounded_and_stop_after_failure(self):
         with tempfile.TemporaryDirectory() as spool_dir:

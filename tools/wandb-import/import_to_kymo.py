@@ -20,7 +20,9 @@ checkout is at tag vX):
 Mapping (wandb -> kymo):
     project "foo bar"        -> project_id "wandb_foo_bar" (archive dir slug)
     run  <id> "name"         -> run_id "wandb_<proj_slug>_<id>", run_name "name"
-    history numeric cell     -> numeric_ts point (step=_step, ts=_timestamp)
+    history numeric cell     -> numeric_ts point (step=_step, ts=_timestamp);
+                                a finite value beyond float32 range is a NaN
+                                marker (counted as beyond_f32_as_nan)
     history string column    -> text_ts stream under the metric name
     other history column     -> skipped (lists, maps, timestamps...; counted as unsupported_cells)
     images/separated, image-file -> CDN image_gallery manifest at the step
@@ -91,6 +93,10 @@ Known limitations:
 - --prefix renames projects, not runs: run ids stay wandb_<slug>_<id>, which
   keeps imported runs apart from a server's own, and run ids are global, so
   the same runs cannot be imported under two prefixes.
+- The entity is not part of the target identity: runs of two entities with
+  the same project directory and run id import into one kymo run. Import
+  each entity under its own --prefix; a run id both share then fails with
+  ALREADY_EXISTS instead of merging.
 - Bookkeeping records what was sent, not what the target still holds: after
   the target is restored from a backup, or a local installation is copied,
   runs it lacks still skip (--force them).
@@ -131,9 +137,11 @@ from kymo._cdn import (
 from kymo._generated import kymo_pb2, kymo_pb2_grpc
 from kymo._local_runtime import ensure_local_endpoint, grpc_channel, http_client
 from kymo._wire import (
+    _F32_OVERFLOW,
     _MAX_POINTS_PER_MSG,
     _chunk_tuples,
     _is_permanent_upload_error,
+    _normalize_numeric_value,
     _upload_to_cdn,
 )
 from kymo.client import (
@@ -148,7 +156,6 @@ log = logging.getLogger("import")
 # Bump whenever what gets sent changes in a way that should invalidate the
 # per-run bookkeeping of earlier importers.
 IMPORTER_VERSION = 2
-F32_MAX = 3.4028234663852886e38
 TEXT_CHUNK_CHARS = 64_000
 # wandb's states for a run that has stopped (export_wandb.py's TERMINAL_STATES); a preempted run received SIGTERM.
 STATE_EXIT_CODES = {
@@ -804,13 +811,8 @@ def union_scalar(cell):
     scalar column whose type varied across rows — wandb stores non-finite
     floats as JSON strings ("Infinity", "NaN"), which forces the union."""
     for v in cell.values():
-        if isinstance(v, (int, float)):  # bool is an int
-            return float(v)
-        if isinstance(v, str):
-            try:
-                return float(v)
-            except ValueError:
-                return v
+        if isinstance(v, (int, float, str)):  # bool is an int; f32_value converts it
+            return v
     return None
 
 
@@ -819,16 +821,16 @@ def process_media_cell(sender, ctx, name, step, ts_ms, cell):
     c = sender.c
     if cell and all(k.startswith("_type_") for k in cell):
         v = union_scalar(cell)
-        if isinstance(v, float):
-            sender.queue(
-                ctx.project_id,
-                ctx.run_id,
-                [("numeric_ts", name, step, clamp_f32(v, c), ts_ms)],
-            )
-        elif v is None:
-            pass
-        else:
+        if v is None:
+            return
+        try:
+            value = f32_value(v, c)
+        except ValueError:  # a string member that is no number
             c["union_string_skipped"] += 1
+            return
+        sender.queue(
+            ctx.project_id, ctx.run_id, [("numeric_ts", name, step, value, ts_ms)]
+        )
         return
     mtype = cell.get("_type") or ""
     if mtype == "histogram":
@@ -837,10 +839,11 @@ def process_media_cell(sender, ctx, name, step, ts_ms, cell):
     if not mtype and STATS_FIELDS.issuperset(cell.keys()):
         pts = []
         for field, v in cell.items():
-            if isinstance(v, (int, float)) and math.isfinite(float(v)):
+            # A NaN or infinite field is a marker like any other; f32_value decides what float32 cannot hold.
+            if isinstance(v, (int, float)):
                 sub = STATS_RENAME.get(field, field.lower())
                 pts.append(
-                    ("numeric_ts", f"{name}/{sub}", step, clamp_f32(v, c), ts_ms)
+                    ("numeric_ts", f"{name}/{sub}", step, f32_value(v, c), ts_ms)
                 )
         if pts:
             sender.queue(ctx.project_id, ctx.run_id, pts)
@@ -870,12 +873,21 @@ def process_media_cell(sender, ctx, name, step, ts_ms, cell):
 # ------------------------------------------------------------ value handling
 
 
-def clamp_f32(v, c: Counters) -> float:
-    v = float(v)
-    if math.isfinite(v) and abs(v) > F32_MAX:
-        c["clamped_f32"] += 1
-        return math.copysign(F32_MAX, v)
-    return v
+def f32_value(v, c: Counters) -> float:
+    """v (a number, or a union's numeric string) as log() would send it; a finite value float32 cannot hold is the counted NaN marker. ValueError for a string that is no number."""
+    # log()'s own fast path: the full rule returns such a float unchanged.
+    if type(v) is float and -_F32_OVERFLOW < v < _F32_OVERFLOW:
+        return v
+    try:
+        value = _normalize_numeric_value(v)
+        # A numeric string beyond float64 ("1e400") parses to inf without naming one.
+        if not (isinstance(v, str) and math.isinf(value) and "inf" not in v.lower()):
+            return value
+    except OverflowError:  # beyond float32, which log() refuses, or an int beyond even float64 (JSON ints are unbounded)
+        pass
+    # A NaN marker keeps the point without inventing a value.
+    c["beyond_f32_as_nan"] += 1
+    return math.nan
 
 
 class RunContext:
@@ -1043,7 +1055,7 @@ def import_history(sender, ctx, run_dir, created_ms, deep):
                     c["string_cells"] += 1
             elif kind == "n":
                 pts = [
-                    ("numeric_ts", name, steps[row], clamp_f32(v, c), tss[row])
+                    ("numeric_ts", name, steps[row], f32_value(v, c), tss[row])
                     for row, v in enumerate(col.to_pylist())
                     if v is not None
                 ]
@@ -1126,7 +1138,7 @@ def import_scan_history(sender, ctx, scan_path, created_ms):
                         )
                         c["string_cells"] += 1
                 elif isinstance(v, (int, float)):
-                    pts.append(("numeric_ts", name, step, clamp_f32(v, c), ts))
+                    pts.append(("numeric_ts", name, step, f32_value(v, c), ts))
                 else:
                     c["unsupported_cells"] += 1
             sender.queue(ctx.project_id, ctx.run_id, pts)
@@ -1157,7 +1169,7 @@ def import_events(sender, ctx, run_dir):
                 if v is None or tss[row] is None:
                     continue
                 try:
-                    val = clamp_f32(v, c)
+                    val = f32_value(v, c)
                 except (TypeError, ValueError):
                     c["unconvertible_values"] += 1
                     continue

@@ -617,7 +617,7 @@ pub(crate) fn watermark_cap(fetch_started: Instant) -> i64 {
 }
 
 /// How long an entry serves without even the incremental query, counted from its fetch START. Long because each expiry costs a ClickHouse round trip per series, held under the chart request's admission units.
-/// Safety comes from the bump gate ([`SeriesCache::note_bumps`]), not the window. The window alone bounds writes nothing notes that stamp a fresh `inserted_at` (the incremental read's key): a manual INSERT, a failed insert that commits after its late re-note, or a legacy unversioned rich publish cancelled mid-insert. One that keeps old stamps (an in-place ALTER UPDATE/DELETE, an INSERT copying `inserted_at`) reaches a retained entry only through a full read: eviction or a restart.
+/// Safety comes from the bump gate ([`SeriesCache::note_bumps`]), not the window. The window alone bounds writes nothing notes that stamp a fresh `inserted_at` (the incremental read's key): a manual INSERT, or a failed insert that commits after its late re-note. One that keeps old stamps (an in-place ALTER UPDATE/DELETE, an INSERT copying `inserted_at`) reaches a retained entry only through a full read: eviction or a restart.
 const FRESH_WINDOW: Duration = Duration::from_secs(30 * 60);
 
 /// How long a note must survive: LONGER THAN ANY ROWS FETCHED BEFORE IT CAN STILL SERVE, which [`is_fresh`] bounds at [`FRESH_WINDOW`] after their fetch start; pruning the note sooner would serve rows that may predate it.

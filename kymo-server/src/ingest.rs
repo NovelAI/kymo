@@ -1033,6 +1033,14 @@ impl IngestService {
                 "rich mutation contains an unstorable identifier, resource id, or timestamp",
             ));
         }
+        let Some(mutation_version) = req
+            .mutation_version
+            .filter(|version| version >> 32 != 0 && *version as u32 != 0)
+        else {
+            return Err(Status::invalid_argument(
+                "mutation_version is required, with nonzero writer_epoch and mutation_seq fields",
+            ));
+        };
         let work = self.bumps.activity.begin_work();
 
         let metadata_row = MetricRow {
@@ -1046,21 +1054,6 @@ impl IngestService {
             cdn_key: Some(req.cdn_key.clone()),
             text_data: None,
         };
-        let Some(mutation_version) = req.mutation_version else {
-            let charge = ByteCharge::new(self.byte_budget.clone());
-            self.spawn_owned_flush(vec![metadata_row], None, None, work, charge)
-                .await
-                .map_err(insert_task_failed)??;
-            return Ok(Response::new(proto::PublishRichMutationResponse {
-                disposition: proto::RichMutationDisposition::RichMutationAccepted as i32,
-                stored_version: None,
-            }));
-        };
-        if mutation_version >> 32 == 0 || mutation_version as u32 == 0 {
-            return Err(Status::invalid_argument(
-                "mutation_version must contain nonzero writer_epoch and mutation_seq fields",
-            ));
-        }
         if self.bumps.is_draining() {
             return Err(Status::unavailable("server shutting down"));
         }
@@ -2660,6 +2653,39 @@ mod registry_tests {
         assert_eq!(error.code(), tonic::Code::Cancelled);
         assert!(!state.cut.is_empty());
         assert!(state.inflight.is_empty());
+    }
+
+    /// A rich mutation without a version, with a zero one, or with a zero epoch or sequence half, is refused before it reaches ClickHouse.
+    #[tokio::test]
+    async fn rich_mutation_needs_a_full_version() {
+        let clickhouse = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let service = IngestService::for_test(
+            Arc::new(
+                ChClient::new(&format!("http://{}", clickhouse.local_addr().unwrap())).unwrap(),
+            ),
+            Arc::new(PgStore::test_store()),
+            LifecycleGates::new(),
+            BumpCoalescer::empty_for_test(),
+            1,
+        );
+        for mutation_version in [None, Some(0), Some(1), Some(1_u64 << 32)] {
+            let request = proto::PublishRichMutationRequest {
+                project_id: "p".into(),
+                run_id: "r".into(),
+                metric_name: "samples".into(),
+                step: 1,
+                cdn_key: "abcd.json".into(),
+                timestamp_ms: 1,
+                mutation_version,
+                ..Default::default()
+            };
+            tokio::select! {
+                result = service.publish_rich_mutation(Request::new(request)) => {
+                    assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument, "{mutation_version:?}");
+                }
+                _ = clickhouse.accept() => panic!("{mutation_version:?} reached ClickHouse"),
+            }
+        }
     }
 
     #[tokio::test]

@@ -531,8 +531,13 @@ async fn merge_rows(
     Ok(())
 }
 
+/// PostgreSQL's deadline on the status watcher's statements: PostgreSQL ends a slow statement itself, rolled back, rather than run it on behind a connection the watcher dropped. The scan takes about a millisecond.
+pub(crate) const STATUS_WATCH_STATEMENT_TIMEOUT: Duration = Duration::from_secs(11);
+
 pub struct PgStore {
     pool: PgPool,
+    /// The status watcher's own connection, apart from `pool` so that neither a slow statement nor a peer that stopped answering holds a shared one ([`Self::watch_statement`]).
+    watch: tokio::sync::Mutex<Option<sqlx::PgConnection>>,
     registry: RegistryCache,
     /// [`Self::test_store`]'s lifecycle classes, which [`Self::classify_runs`] answers from instead of Postgres: every other run is active, and every run at version 0.
     #[cfg(test)]
@@ -571,6 +576,7 @@ impl PgStore {
             pool: PgPoolOptions::new()
                 .connect_lazy("postgres://localhost/mkdb2_test")
                 .expect("valid test Postgres URL"),
+            watch: Default::default(),
             registry: RegistryCache::new(),
             test_lifecycle: Some(std::sync::Mutex::default()),
         }
@@ -591,6 +597,7 @@ impl PgStore {
             .await?;
         let store = Self {
             pool,
+            watch: Default::default(),
             registry: RegistryCache::new(),
             #[cfg(test)]
             test_lifecycle: None,
@@ -1444,8 +1451,7 @@ impl PgStore {
     }
 
     /// Bump `projects.version` for each given project, returning the new
-    /// versions. Used by the status watcher for derived liveness transitions
-    /// and by delayed terminal-state ingest to refresh ListRuns timing.
+    /// versions. Used by delayed terminal-state ingest to refresh ListRuns timing.
     pub async fn bump_project_versions(
         &self,
         project_ids: &[String],
@@ -1464,22 +1470,84 @@ impl PgStore {
         Ok(rows.into_iter().map(|(p, v)| (p, v as u64)).collect())
     }
 
+    /// [`Self::bump_project_versions`] for the status watcher, never waiting on a row lock: a project whose row another transaction holds is skipped and returned with `None`, stalling only its own announcement; a project without a row is not returned.
+    pub async fn bump_unlocked_project_versions(
+        &self,
+        project_ids: &[String],
+    ) -> Result<Vec<(String, Option<u64>)>> {
+        if project_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // NO KEY UPDATE is the UPDATE's own row lock, so concurrent run writes' foreign-key checks (KEY SHARE) skip no project.
+        let rows: Vec<(String, Option<i64>)> = self
+            .watch_statement(async |connection| {
+                sqlx::query_as(
+                    "WITH bumped AS (
+                 UPDATE projects SET version = version + 1
+                 WHERE project_id IN (
+                     SELECT project_id FROM projects
+                     WHERE project_id = ANY($1)
+                     FOR NO KEY UPDATE SKIP LOCKED
+                 )
+                 RETURNING project_id, version
+             )
+             SELECT project_id, bumped.version
+             FROM projects LEFT JOIN bumped USING (project_id)
+             WHERE project_id = ANY($1)",
+                )
+                .bind(project_ids)
+                .fetch_all(connection)
+                .await
+            })
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(p, v)| (p, v.map(|v| v as u64)))
+            .collect())
+    }
+
     /// Runs whose derived liveness status can still change: no exit signal, and effective heartbeat (compute_status's sys → main → created fallback chain) inside the shared PRESUMED_DEAD window plus the independently named status-watch margin. Past that, status is pinned until new data or an exit signal — both push their own events.
     pub async fn status_watch_candidates(&self) -> Result<TimedRunRows> {
-        let rows: Vec<TimedRunInfoRow> = sqlx::query_as(run_info_sql!(
-            "SELECT",
-            ", (EXTRACT(EPOCH FROM statement_timestamp()) * 1000)::BIGINT
+        let rows: Vec<TimedRunInfoRow> = self
+            .watch_statement(async |connection| {
+                sqlx::query_as(run_info_sql!(
+                    "SELECT",
+                    ", (EXTRACT(EPOCH FROM statement_timestamp()) * 1000)::BIGINT
                  AS server_now_ms
              FROM runs
              WHERE exit_code IS NULL
                AND deleted_at IS NULL
                AND COALESCE(last_system_metric_at, last_main_metric_at, created_at)
                    > statement_timestamp() - make_interval(secs => $1::double precision)"
-        ))
-        .bind(STATUS_WATCH_WINDOW.as_secs_f64())
-        .fetch_all(&self.pool)
-        .await?;
+                ))
+                .bind(STATUS_WATCH_WINDOW.as_secs_f64())
+                .fetch_all(connection)
+                .await
+            })
+            .await?;
         Ok(split_timed_run_rows(rows))
+    }
+
+    /// Run one status-watcher statement on [`Self::watch`], opened first if there is none. The connection is kept while its statements succeed and dropped, closing it, on any error (a FATAL answer ends the session) or when the watcher abandons the statement at its deadline, so the next statement opens another.
+    async fn watch_statement<T>(
+        &self,
+        statement: impl AsyncFnOnce(&mut sqlx::PgConnection) -> sqlx::Result<T>,
+    ) -> Result<T> {
+        let mut held = self.watch.lock().await;
+        let mut connection = match held.take() {
+            Some(connection) => connection,
+            None => {
+                // The pool's options, with the statement deadline in the startup options, costing no statement.
+                let options = (*self.pool.connect_options()).clone().options([(
+                    "statement_timeout",
+                    STATUS_WATCH_STATEMENT_TIMEOUT.as_millis(),
+                )]);
+                <sqlx::PgConnection as sqlx::Connection>::connect_with(&options).await?
+            }
+        };
+        let result = statement(&mut connection).await?;
+        *held = Some(connection);
+        Ok(result)
     }
 
     /// Bump `runs.version` and roll forward the client-authored liveness clocks
@@ -2774,6 +2842,119 @@ mod lifecycle_tests {
 }
 
 #[cfg(test)]
+mod watch_connection_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// CommandComplete "SET", then ReadyForQuery.
+    const SET: &[u8] = b"C\0\0\0\x08SET\0Z\0\0\0\x05I";
+    /// ErrorResponse 57014 (a statement cancelled at its deadline), then ReadyForQuery.
+    const CANCELED: &[u8] = b"E\0\0\0\x24SERROR\0VERROR\0C57014\0Mcanceled\0\0Z\0\0\0\x05I";
+
+    /// A PostgreSQL that completes the startup handshake, gives each connection's simple queries the `replies` in turn, and then answers nothing, as a peer that stopped answering does; a store on it, and the connections it has accepted.
+    async fn fake_postgres(replies: &'static [&'static [u8]]) -> (PgStore, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("postgres://kymo@{}/kymo", listener.local_addr().unwrap());
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = accepted.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                count.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    loop {
+                        let mut len = [0; 4];
+                        socket.read_exact(&mut len).await?;
+                        let mut body = vec![0; u32::from_be_bytes(len) as usize - 4];
+                        socket.read_exact(&mut body).await?;
+                        // Decline an SSLRequest; anything else is the startup message.
+                        if body != 80_877_103u32.to_be_bytes() {
+                            break;
+                        }
+                        socket.write_all(b"N").await?;
+                    }
+                    // AuthenticationOk, BackendKeyData, ReadyForQuery.
+                    socket
+                        .write_all(&[
+                            b'R', 0, 0, 0, 8, 0, 0, 0, 0, b'K', 0, 0, 0, 12, 0, 0, 0, 1, 0, 0, 0,
+                            2, b'Z', 0, 0, 0, 5, b'I',
+                        ])
+                        .await?;
+                    for reply in replies {
+                        let mut head = [0; 5];
+                        socket.read_exact(&mut head).await?;
+                        let len = u32::from_be_bytes(head[1..].try_into().unwrap()) as usize;
+                        socket.read_exact(&mut vec![0; len - 4]).await?;
+                        socket.write_all(reply).await?;
+                    }
+                    let mut sink = [0; 4096];
+                    while socket.read(&mut sink).await? > 0 {}
+                    Ok::<_, std::io::Error>(())
+                });
+            }
+        });
+        let store = PgStore {
+            pool: PgPoolOptions::new().connect_lazy(&url).unwrap(),
+            ..PgStore::test_store()
+        };
+        (store, accepted)
+    }
+
+    /// A watcher statement the fake answers with its next reply.
+    async fn set(store: &PgStore) -> Result<sqlx::postgres::PgQueryResult> {
+        store
+            .watch_statement(async |connection| {
+                sqlx::Executor::execute(connection, "SET search_path TO public").await
+            })
+            .await
+    }
+
+    /// A watcher statement dropped unanswered, at the watcher's deadline, drops its connection: with every connection it opened gone silent, the watcher still opens another.
+    #[tokio::test]
+    async fn an_abandoned_watcher_statement_drops_its_connection() {
+        let (store, accepted) = fake_postgres(&[]).await;
+        let ids = ["p".to_string()];
+        for _ in 0..3 {
+            let scan = store.status_watch_candidates();
+            assert!(tokio::time::timeout(Duration::from_millis(300), scan)
+                .await
+                .is_err());
+            let bump = store.bump_unlocked_project_versions(&ids);
+            assert!(tokio::time::timeout(Duration::from_millis(300), bump)
+                .await
+                .is_err());
+        }
+        assert_eq!(accepted.load(Ordering::SeqCst), 6);
+    }
+
+    /// An answered watcher statement keeps its connection for the next.
+    #[tokio::test]
+    async fn an_answered_watcher_statement_keeps_its_connection() {
+        let (store, accepted) = fake_postgres(&[SET, SET]).await;
+        for _ in 0..2 {
+            set(&store).await.unwrap();
+        }
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    /// A watcher statement PostgreSQL answers with an error drops its connection, so the next opens another.
+    #[tokio::test]
+    async fn a_failed_watcher_statement_drops_its_connection() {
+        let (store, accepted) = fake_postgres(&[CANCELED, SET]).await;
+        let failed = set(&store).await.unwrap_err();
+        let code = match failed.downcast_ref() {
+            Some(sqlx::Error::Database(error)) => error.code(),
+            _ => None,
+        };
+        assert_eq!(code.as_deref(), Some("57014"), "{failed:?}");
+        let _ = set(&store).await;
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[cfg(test)]
 mod live_pg_tests {
     use super::*;
     use anyhow::Context as _;
@@ -3032,6 +3213,112 @@ mod live_pg_tests {
         let pg_url = live_test_url("KYMO_LIVE_TEST_DATABASE_URL")?;
         let store = PgStore::connect(&pg_url).await?;
         store.status_watch_candidates().await?;
+        let backend = async || {
+            store
+                .watch_statement(async |connection| {
+                    sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
+                        .fetch_one(connection)
+                        .await
+                })
+                .await
+        };
+        let first = backend().await?;
+        // PostgreSQL cancels a watcher statement at its deadline, and the next statement opens another connection.
+        let started = std::time::Instant::now();
+        let slept = store
+            .watch_statement(async |connection| {
+                sqlx::query("SELECT pg_sleep(30)").execute(connection).await
+            })
+            .await;
+        let code = slept.as_ref().err().and_then(|error| {
+            let error = error.downcast_ref::<sqlx::Error>()?.as_database_error()?;
+            Some(error.code()?.into_owned())
+        });
+        anyhow::ensure!(code.as_deref() == Some("57014"), "{slept:?}");
+        let elapsed = started.elapsed();
+        anyhow::ensure!(
+            (STATUS_WATCH_STATEMENT_TIMEOUT
+                ..STATUS_WATCH_STATEMENT_TIMEOUT + Duration::from_secs(2))
+                .contains(&elapsed),
+            "{elapsed:?}"
+        );
+        anyhow::ensure!(backend().await? != first);
+        Ok(())
+    }
+
+    /// A watcher connection PostgreSQL ended between statements (pg_terminate_backend, as a restart or failover does) fails one statement, and the next opens another.
+    #[tokio::test]
+    #[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL"]
+    async fn live_watcher_reconnects_after_a_terminated_backend() -> Result<()> {
+        let _suite_guard = live_database_suite_gate().lock().await;
+        let pg_url = live_test_url("KYMO_LIVE_TEST_DATABASE_URL")?;
+        let store = PgStore::connect(&pg_url).await?;
+        let backend = async || {
+            store
+                .watch_statement(async |connection| {
+                    sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
+                        .fetch_one(connection)
+                        .await
+                })
+                .await
+        };
+        let first = backend().await?;
+        let terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1, 5000)")
+            .bind(first)
+            .fetch_one(&store.pool)
+            .await?;
+        anyhow::ensure!(terminated);
+        let failed = backend().await;
+        anyhow::ensure!(failed.is_err(), "{failed:?}");
+        let next = backend().await;
+        anyhow::ensure!(next.as_ref().is_ok_and(|&pid| pid != first), "{next:?}");
+        Ok(())
+    }
+
+    /// The watcher's bump skips a project whose row a transaction holds rather than wait for it, bumps the rest, including a row under a foreign-key check's KEY SHARE lock, and leaves out a project without a row.
+    #[tokio::test]
+    #[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL"]
+    async fn live_watcher_bump_skips_held_project_rows() -> Result<()> {
+        let _suite_guard = live_database_suite_gate().lock().await;
+        let pg_url = live_test_url("KYMO_LIVE_TEST_DATABASE_URL")?;
+        let suffix = unique_suffix();
+        let free = format!("watch-free-{suffix}");
+        let held = format!("watch-held-{suffix}");
+        let store = PgStore::connect(&pg_url).await?;
+        for project in [&free, &held] {
+            sqlx::query("INSERT INTO projects (project_id, version) VALUES ($1, 7)")
+                .bind(project)
+                .execute(&store.pool)
+                .await?;
+        }
+        let ids = [
+            free.clone(),
+            held.clone(),
+            format!("watch-missing-{suffix}"),
+        ];
+        let mut holder = store.pool.begin().await?;
+        lock_project(&mut holder, &held).await?;
+        let mut checker = store.pool.begin().await?;
+        sqlx::query("SELECT 1 FROM projects WHERE project_id = $1 FOR KEY SHARE")
+            .bind(&free)
+            .execute(&mut *checker)
+            .await?;
+        let mut bumped = tokio::time::timeout(
+            Duration::from_secs(5),
+            store.bump_unlocked_project_versions(&ids),
+        )
+        .await
+        .context("the bump waited on a held row")??;
+        bumped.sort();
+        anyhow::ensure!(
+            bumped == [(free.clone(), Some(8)), (held.clone(), None)],
+            "{bumped:?}"
+        );
+        checker.commit().await?;
+        holder.commit().await?;
+        let bumped = store.bump_unlocked_project_versions(&ids[1..2]).await?;
+        anyhow::ensure!(bumped == [(held.clone(), Some(8))], "{bumped:?}");
+        store.delete_live_projects(&[free, held]).await?;
         Ok(())
     }
 
@@ -3398,6 +3685,7 @@ mod live_pg_tests {
         store.register_run_metrics(&rows).await?;
         let fresh = |budget| PgStore {
             pool: store.pool.clone(),
+            watch: Default::default(),
             registry: RegistryCache::with_budget(budget),
             test_lifecycle: None,
         };

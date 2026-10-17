@@ -364,8 +364,10 @@ _held_back: collections.deque = collections.deque()
 # Queue groups a publication took over but could not charge (_publish_held): those of a pending log() call and drained captured output, which earlier calls accepted. The main thread's next publication charges and puts them, after _held_back's; the shutdown salvages them, and a handoff drops them with a warning. Changed like _held_back.
 _uncharged: collections.deque = collections.deque()
 _last_capture_step: Optional[int] = None
-# Captured exit code (None = not yet observed; resolved at TerminateRun time), set by sys.excepthook, the wrapped sys.exit and shutdown signals: the first writer wins (_record_exit_code), except that a shutdown signal's 128 + signum replaces None or 0, and a Ctrl-C's 130 any code (_drain_and_shutdown, _signal_during_shutdown).
+# Captured exit code (None = not yet observed; resolved at TerminateRun time), set by sys.excepthook, the wrapped sys.exit and shutdown signals: the first writer wins (_record_exit_code), except that a Ctrl-C's 130 replaces any code and a SIGTERM's or SIGQUIT's 128 + signum None or 0 (_record_signal_code), and that, while the main thread runs the program (_main_thread_runs), a code only sys.exit recorded gives way to a later sys.exit's, a shutdown signal's and the exception hook's, and is dropped by a finish() the program calls after catching it.
 _exit_code: Optional[int] = None
+# Whether only the wrapped sys.exit recorded _exit_code, so the program may have caught that SystemExit.
+_exit_code_by_sys_exit = False
 # The shutdown in progress (_Shutdown) as "shutdown", claimed by one dict.setdefault, which no other thread can interleave (_claim_shutdown); kymo's signal handler reads it, perhaps while another thread runs it.
 _shutdown_claim: dict = {}
 # The control process of the run's last TerminateRun, if it was left running (_run_control_rpc), after which the run's next one goes out (_terminate_run), even when a handler kymo does not own raised out of that send, aborting its shutdown or swallowed by it. None for a new run (_start_run).
@@ -790,7 +792,8 @@ def init(
 
 def _start_run(process: multiprocessing.Process) -> None:
     """Start the upload worker (_start_worker) and, once it has a pid, make the run active and install the exit hooks, so a Ctrl-C or an error before init() returns ends the run as a later one would, rather than leave the worker, which carries on through a Ctrl-C, to multiprocessing's exit, which waits for it (forever under a SIGTERM the program owns). A held section (_HELD_SECTIONS): the signals are blocked across Process.start() on the main thread alone, so one the kernel gives another thread runs kymo's handler on the main thread inside the start, which defers it until the run is active. What a previous run recorded for the exit hooks and log-overhead tracking, which span the process, is cleared first."""
-    global _exit_code, _handed_off, _interrupted_at, _terminated_at, _left_control
+    global _exit_code, _exit_code_by_sys_exit, _handed_off, _interrupted_at
+    global _terminated_at, _left_control
     global _last_log_duration_ms, _system_poller, _is_initialized, _init_pid
     global _atexit_registered
     # Before the start: a signal deferred during it keeps the time its handling and the program's exit read, and a failed start's TerminateRun waits for no other run's.
@@ -799,7 +802,7 @@ def _start_run(process: multiprocessing.Process) -> None:
         _start_worker(process)
     finally:
         if process.pid is not None:
-            _exit_code = None
+            _exit_code, _exit_code_by_sys_exit = None, False
             _handed_off = False
             _last_log_duration_ms = 0.0
             _system_poller = None
@@ -1253,6 +1256,13 @@ def _decode_queue_item(item):
 def _on_main_thread() -> bool:
     """Whether this is the thread signal handlers run on (in a fork child, the thread that forked)."""
     return threading.get_ident() == threading.main_thread().ident
+
+
+def _main_thread_runs() -> bool:
+    """Whether the main thread still runs the program: alive, and the interpreter's exit not begun. threading._shutdown sets the private threading._SHUTTING_DOWN (3.10 to 3.14) before it runs threading's atexit hooks (concurrent.futures' join among them), while the main thread still reads as alive; without that attribute this falls back to is_alive alone."""
+    return threading.main_thread().is_alive() and not getattr(
+        threading, "_SHUTTING_DOWN", False
+    )
 
 
 def _held_sections(frame) -> int:
@@ -2120,15 +2130,40 @@ def finish(flush_timeout: Optional[float] = None) -> bool:
     within that budget of the signal, or of the call once the budget has
     passed.
 
+    A ``sys.exit()`` sets the run's exit code as it is called. Called on the
+    main thread with no exception being handled, while that thread runs the
+    program (not once the interpreter's exit has begun: an atexit hook, a
+    ``threading._register_atexit`` hook), finish() drops a code only
+    ``sys.exit()`` set, taking that ``SystemExit`` for caught. So does a
+    finish() in the teardown before that exit begins, with nothing being
+    handled: a ``__del__`` or ``weakref.finalize`` callback of an object an
+    uncaught ``sys.exit()`` frees, or the printing of a ``sys.exit()``
+    message. That run ends with no code.
+    A caught ``sys.exit()`` that the run outlives without such a finish() (a
+    normal end, or a finish() on another thread) still ends it with that code,
+    and a ``raise SystemExit`` (the ``exit()`` builtin's too) sets none. A
+    crash through ``try: ... finally: kymo.finish()`` ends the run as finished:
+    the exception hook's code comes after the run has ended.
+
     Returns True only if delivery was proven complete. Returns False if points
     were spooled or dropped, or the worker otherwise could not prove delivery.
     """
+    global _exit_code, _exit_code_by_sys_exit
     reject_legacy_client_env()
     if not _is_initialized:
         return not _handed_off
     if _follows_ctrl_c(sys.exc_info()[1]):
         # The program is ending, or handling, a Ctrl-C, or ends soon after one: its run is, too.
         return _drain_and_shutdown(signum=signal.SIGINT)
+    # The flag is read last: a signal handled during the calls before it may record its own code, which must stay.
+    if (
+        _on_main_thread()
+        and sys.exc_info()[1] is None
+        and _main_thread_runs()
+        and _exit_code_by_sys_exit
+    ):
+        # Taken for caught: the program carried on from the SystemExit whose code this is. Not once the interpreter's exit has begun, where it may be the exit that ended the program.
+        _exit_code, _exit_code_by_sys_exit = None, False
     if flush_timeout is None and _terminated_at is not None:
         # In or after a handler installed before init() that took a SIGTERM or SIGQUIT, within the signal budget, as the atexit flush (_ensure_metrics_uploaded): no worker policy bounds it, and the scheduler's grace period runs.
         flush_timeout = min(
@@ -2165,6 +2200,10 @@ def _strip_url_userinfo(value: str) -> str:
     if "@" not in parsed.netloc:
         return value
     return parsed._replace(netloc=parsed.netloc.rsplit("@", 1)[1]).geturl()
+
+
+# Bounds the git calls of the run metadata, which init() collects on the caller's thread: a git that a slow or hung filesystem stalls must not hold init() forever. A timeout drops the git fields from that call on, with a warning; any other git failure drops its own field quietly.
+_GIT_METADATA_TIMEOUT = 5.0
 
 
 def _collect_run_metadata(config: Optional[dict]) -> dict:
@@ -2227,27 +2266,32 @@ def _collect_run_metadata(config: Optional[dict]) -> dict:
         if sys.argv and os.path.isfile(sys.argv[0])
         else os.getcwd()
     )
-    try:
-        git["remote"] = _strip_url_userinfo(
-            subprocess.check_output(
-                ["git", "-C", repo_dir, "remote", "get-url", "origin"],
-                stderr=subprocess.DEVNULL,
+    for key, args in (
+        ("remote", ["remote", "get-url", "origin"]),
+        ("commit", ["rev-parse", "HEAD"]),
+    ):
+        try:
+            value = (
+                subprocess.check_output(
+                    ["git", "-C", repo_dir, *args],
+                    stderr=subprocess.DEVNULL,
+                    timeout=_GIT_METADATA_TIMEOUT,
+                )
+                .decode()
+                .strip()
             )
-            .decode()
-            .strip()
-        )
-    except Exception:
-        pass
-    try:
-        git["commit"] = (
-            subprocess.check_output(
-                ["git", "-C", repo_dir, "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
+            git[key] = _strip_url_userinfo(value) if key == "remote" else value
+        except subprocess.TimeoutExpired:
+            _log.warning(
+                "git %s took longer than %g s in %s: the run's metadata goes without the git fields from that call on",
+                " ".join(args),
+                _GIT_METADATA_TIMEOUT,
+                repo_dir,
             )
-            .decode()
-            .strip()
-        )
-    except Exception:
-        pass
+            # A file system that stalls one git call stalls the next.
+            break
+        except Exception:
+            pass
     if git:
         meta["git"] = git
 
@@ -2386,12 +2430,30 @@ def _restore_signal_handlers() -> None:
             signal.signal(sig, original)
 
 
-def _record_exit_code(code: int) -> None:
+def _record_exit_code(code: int, by_sys_exit: bool = False) -> None:
     """First writer wins — a signal handler shouldn't be overridden by a
-    later sys.exit cascade fired during cleanup."""
-    global _exit_code
-    if _exit_code is None:
-        _exit_code = int(code)
+    later sys.exit cascade fired during cleanup. A code only sys.exit
+    recorded (by_sys_exit, the wrapped sys.exit's) gives way while the main
+    thread runs the program (_main_thread_runs), since the program may have
+    caught that SystemExit. Once the interpreter's exit has begun nothing is
+    recorded: the code stays, and an exit then (a sys.exit, or a SystemExit
+    a chained signal handler raises), which Python ignores, sets none."""
+    global _exit_code, _exit_code_by_sys_exit
+    # Converted first, and the flag read last: a signal handled during either call may record its own code.
+    code = int(code)
+    if not _main_thread_runs():
+        return
+    if _exit_code is None or _exit_code_by_sys_exit:
+        _exit_code, _exit_code_by_sys_exit = code, by_sys_exit
+
+
+def _record_signal_code(signum: int) -> None:
+    """Record a shutdown signal's code, 128 + signum, after which the run never reads as finished, not even after a sys.exit(0). A Ctrl-C's 130 replaces any code, whatever ended the program; a SIGTERM's or SIGQUIT's replaces none or 0, and replaces a code only sys.exit recorded as a later sys.exit would (_record_exit_code): while the main thread runs the program, not once the interpreter's exit has begun."""
+    global _exit_code, _exit_code_by_sys_exit
+    if signum == signal.SIGINT or not _exit_code:
+        _exit_code, _exit_code_by_sys_exit = 128 + signum, False
+    else:
+        _record_exit_code(128 + signum)
 
 
 def _excepthook(exc_type, exc_value, exc_tb):
@@ -2428,7 +2490,7 @@ def _carries_on_interactively() -> bool:
 def _exit_wrapper(code=0):
     # Only the main thread's exit ends the program: another thread's sys.exit ends that thread alone, so it neither sets the run's code nor hands the run off.
     if _on_main_thread():
-        _record_exit_code(_system_exit_code(code))
+        _record_exit_code(_system_exit_code(code), by_sys_exit=True)
         # An exit that follows a Ctrl-C the program did not carry on from (Lightning's and click's sys.exit(1), an `except KeyboardInterrupt: sys.exit(0)`) hands the run off before the atexit hooks, and the process keeps its code.
         if _follows_ctrl_c(sys.exc_info()[1]):
             _drain_and_shutdown(signum=signal.SIGINT)
@@ -2520,17 +2582,14 @@ def _shut_down_on_signal(signum, frame):
 
 
 def _signal_during_shutdown(shutdown: "_Shutdown", signum: int) -> None:
-    """kymo's policy for a shutdown signal during a shutdown: a Ctrl-C ends it by the handoff's cap (_handoff_cap) and hands it off, and the shutdown returns at once (_Shutdown.hand_off); a SIGTERM or SIGQUIT bounds it by the signal budget (_Shutdown.bound). Either ends the run again with its code if the shutdown's own TerminateRun has gone out (_Shutdown.end_run): a Ctrl-C's 130 whatever the program's code, a SIGTERM's or SIGQUIT's in place of 0 only.
+    """kymo's policy for a shutdown signal during a shutdown: a Ctrl-C ends it by the handoff's cap (_handoff_cap) and hands it off, and the shutdown returns at once (_Shutdown.hand_off); a SIGTERM or SIGQUIT bounds it by the signal budget (_Shutdown.bound). Either ends the run again with its code if the shutdown's own TerminateRun has gone out (_Shutdown.end_run), as _record_signal_code records it.
 
     Once a signal has bounded or handed off the shutdown, a SIGTERM or SIGQUIT only bounds it again: torchrun and Slurm can send two SIGTERMs milliseconds apart. A Ctrl-C escalates: it hands the worker what is left of the shutdown, by the handoff's cap at the latest, even once handed off, ends the run with 130, and exits at once. It runs in a held round (_handle_deferred_signals), so a further signal waits for it to return.
     """
-    global _exit_code
     if shutdown.signum is not None and signum != signal.SIGINT:
         shutdown.bound(time.monotonic() + _signal_budget())
         return
-    # The run never reads as finished after it, not even after a sys.exit(0).
-    if signum == signal.SIGINT or not _exit_code:
-        _exit_code = 128 + signum
+    _record_signal_code(signum)
     if signum == signal.SIGINT:
         shutdown.bound(_handoff_cap())
         shutdown.hand_off()
@@ -2825,7 +2884,7 @@ def _retire_or_report_run_spools(
             if writer_active(path):
                 stranded.append(path)
                 _log.error(
-                    "lifecycle-rejected spool is still open by its writer; "
+                    "lifecycle-rejected spool is locked by its writer or a replay; "
                     "not retiring %s",
                     path,
                 )
@@ -3390,7 +3449,6 @@ def _drain_and_shutdown(
     """
     global \
         _is_initialized, \
-        _exit_code, \
         _run_metadata, \
         _mode, \
         _local_installation_uuid, \
@@ -3419,7 +3477,7 @@ def _drain_and_shutdown(
             if running.thread != threading.get_ident():
                 if signum == signal.SIGINT and not _handed_off:
                     # A Ctrl-C kymo's handler never saw (a SIGINT handler the program installed after init() took it) hands another thread's shutdown off as that handler would (_signal_during_shutdown), but for its escalation, so the wait below is for the handoff alone.
-                    _exit_code = 128 + signum
+                    _record_signal_code(signum)
                     running.bound(_handoff_cap())
                     running.hand_off()
                     if running.ended is not None:
@@ -3432,9 +3490,8 @@ def _drain_and_shutdown(
             # Another shutdown ended the run as this one was claimed.
             shutdown.result = not _handed_off
             return shutdown.result
-        if signum == signal.SIGINT or (signum is not None and not _exit_code):
-            # The run never reads as finished after it, not even after a sys.exit(0), and a Ctrl-C ends it with 130 whatever ended the program.
-            _exit_code = 128 + signum
+        if signum is not None:
+            _record_signal_code(signum)
         if at_exit and signum is None:
             # Claimed first: a signal while it logs, which a stalled stderr can hold up, bounds or hands off the flush.
             _log.info("shutting down — flushing remaining metrics…")

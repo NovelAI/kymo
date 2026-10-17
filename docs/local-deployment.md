@@ -196,7 +196,7 @@ Required automated or release-qualification coverage:
 7. Local dashboard/CDN/server listeners are loopback-only and refuse other Host names. Browser CDN serves media and `GET /alerts`, plus the media-cleanup answers (`POST` delete or keep, which need the dashboard's `Origin`), but no upload or WebSocket route; upload remains authenticated on its Unix socket.
 8. Local release bundle contains all fonts/scripts/styles/WASM, makes zero external requests with network disabled, and contains no hosted service endpoint. Hosted `/grpc-ws` and `/grpc-ws2` framing and unauthenticated hosted upload remain unchanged.
 9. Numeric, tagged, text, image, resource, metadata, Trash restore, purge, dashboard, spool replay, mutation ordering, and DATA_LOSS quarantine work locally.
-10. Legacy hosted clients that omit the additive writer/mutation fields retain legacy behavior. Checked-in Python protobuf stubs match the source.
+10. Legacy hosted clients, which send rich rows through unary IngestMetrics without the additive writer/mutation fields, retain legacy behavior. Checked-in Python protobuf stubs match the source.
 11. A newer compatible launcher/server/frontend cannot be downgraded by an older environment once it has started the stack (the version is recorded at start, so a running older generation keeps serving until its next start). Another build of the catalog's PostgreSQL major release is replaced at the next start that can install, with data, UUID, and ports intact; any other PostgreSQL, ClickHouse, or data-schema-generation change is refused before database startup.
 12. The supported Apple Silicon path preserves valid executable signatures and requires no undocumented security override.
 

@@ -42,10 +42,10 @@ const CHECKPOINT_BLOCK: usize = 64;
 const EXACT_X: u64 = 1 << 53;
 /// What one entry of the store's LRU order costs (a `BTreeMap` slot of tick and key, in nodes at least half full).
 const ORDER_ENTRY_BYTES: usize = 96;
-/// An irregular Savitzky-Golay advance's cost per sample in the windows of the outputs it recomputes, in units of the full build's per sample in the windows it fits: the advance walks each window from its output through the snapshot, where the full build's sweep moves a window's ends over a slice. Past the full build's cost, it answers in full ([`Fallback::Dense`]).
+/// An irregular Savitzky-Golay advance's cost per sample in the windows of the fits it recomputes, in units of the full build's per sample in the windows it fits: the advance walks each window from its output through the snapshot, where the full build's sweep moves a window's ends over a slice. Past the full build's cost, it answers in full ([`Fallback::Dense`]).
 const ADVANCE_WINDOW_COST: usize = 3;
 /// The rest of a full build per fetched row (prepare, the axis, the reply), in the same unit.
-const FULL_BUILD_ROW_COST: usize = 10;
+pub(super) const FULL_BUILD_ROW_COST: usize = 10;
 /// Shadow divergences remembered as logged ([`HeldStore::first_divergence`]).
 const LOGGED_MAX: usize = 1_024;
 
@@ -241,7 +241,7 @@ struct HeldSeries {
     plan: SmoothingPlan,
     /// Median plans: the gaps proving the median.
     gaps: MedianGaps,
-    /// Irregular Savitzky-Golay: the samples in the windows of all its fetched outputs, which the full build's fits read ([`Fallback::Dense`]); 0 otherwise.
+    /// Irregular Savitzky-Golay: the samples in the windows of all its fetched outputs' fits, one per distinct x, which the full build reads ([`Fallback::Dense`]); 0 otherwise.
     windows: usize,
     /// Causal smoothers' recorded states.
     checkpoints: Checkpoints,
@@ -466,7 +466,7 @@ impl<'a> TagView<'a> {
     }
 
     /// Rows [lo, hi), walking the chunks in order; an inverted range (`lo > hi`, as a zoomed fetch can ask for) is empty.
-    fn rows(&self, lo: usize, hi: usize) -> impl Iterator<Item = &'a CachedRow> + '_ {
+    fn rows(&self, lo: usize, hi: usize) -> impl Iterator<Item = &'a CachedRow> + Clone + '_ {
         let hi = hi.max(lo);
         let first = self.ends.partition_point(|&end| end <= lo);
         let mut start = if first == 0 { 0 } else { self.ends[first - 1] };
@@ -630,11 +630,23 @@ impl<'a> Source<'a> {
             }
             Smoother::SgIrregular { h_x, deg } => {
                 self.smoothed += to - from;
+                // Samples at one x share its fit, as in the full build's sweep ([`window_samples`] prices them so); each output is masked on its own.
+                let (mut fit_at, mut fit) = (f64::NAN, f64::NAN);
                 (from..to)
                     .map(|i| {
-                        let v =
-                            chart::savgol_x_at(&|j| self.xkey(j), &|j| self.y(j), n, i, h_x, deg);
-                        self.masked(i, v)
+                        let x = self.xkey(i);
+                        if x != fit_at {
+                            fit = chart::savgol_x_at(
+                                &|j| self.xkey(j),
+                                &|j| self.y(j),
+                                n,
+                                i,
+                                h_x,
+                                deg,
+                            );
+                            fit_at = x;
+                        }
+                        self.masked(i, fit)
                     })
                     .collect()
             }
@@ -715,32 +727,50 @@ fn emitted_range(source: &Source<'_>, p: &ChartParams) -> (usize, usize) {
     (lo, hi)
 }
 
-/// Irregular Savitzky-Golay window sizes over a series' ascending keys. `keys` are its keys from sample `from` on, and `lagging` its keys from sample `lo` on, the first sample within `h_x` below `from`. Returns two counts: the samples the windows of `outputs` (from `from` on) hold; and the samples that samples `new..` (`new` at least `from`) add to the windows of all outputs, each one's own window up to itself and itself in each earlier one's. A window holds the samples within `h_x` of its output, itself included, as [`chart::savgol_x_at`] finds them.
+/// Irregular Savitzky-Golay window sizes over a series' ascending keys, priced as the sweeps fit them: one window per distinct x, which the samples at it share ([`chart::savgol_x`], and [`Source::compute`] from the first output it computes). `keys` are its keys from sample `lo` on. Returns two counts: the samples the fits of `outputs` hold; and what appending samples `new..` adds to the fits: each appended sample joins every fit within `h_x` below it, its own included, and one that starts its x also holds the older samples of its window. A window holds the samples within `h_x` of its output, itself included, as [`chart::savgol_x_at`] finds them.
 fn window_samples(
-    keys: impl Iterator<Item = f64>,
-    mut lagging: impl Iterator<Item = f64>,
+    keys: impl Iterator<Item = f64> + Clone,
     mut lo: usize,
-    from: usize,
     outputs: std::ops::Range<usize>,
     new: usize,
     h_x: f64,
 ) -> (usize, usize) {
     let (mut windows, mut added) = (0, 0);
+    let mut lagging = keys.clone();
     let Some(mut x_lo) = lagging.next() else {
         return (0, 0);
     };
-    for (i, x) in (from..).zip(keys) {
+    // The distinct x among lo..=i (each one fit), and the fitted outputs among lo..i.
+    let (mut distinct, mut fitted) = (0, 0);
+    let mut previous = None;
+    let fits = |i: usize, starts_x: bool| outputs.contains(&i) && (i == outputs.start || starts_x);
+    let mut lo_starts_x = true;
+    for (i, x) in (lo..).zip(keys) {
+        let starts_x = previous != Some(x);
+        previous = Some(x);
+        distinct += usize::from(starts_x);
         while x - x_lo > h_x {
+            if fits(lo, lo_starts_x) {
+                fitted -= 1;
+            }
+            let next = lagging.next().expect("each sample is within h_x of itself");
             lo += 1;
-            x_lo = lagging.next().expect("each sample is within h_x of itself");
+            // lo's x leaves the window once the next sample has another.
+            lo_starts_x = next != x_lo;
+            distinct -= usize::from(lo_starts_x);
+            x_lo = next;
         }
-        // Samples lo..=i in i's window if it is one of `outputs`, and i in the windows of those of them from lo up to i.
-        if outputs.contains(&i) {
+        // Samples lo..=i in i's fit if it makes one, and i in the fits made among lo..i.
+        let fit = fits(i, starts_x);
+        if fit {
             windows += i + 1 - lo;
         }
-        windows += outputs.end.min(i).saturating_sub(lo.max(outputs.start));
+        windows += fitted;
         if i >= new {
-            added += 2 * (i - lo) + 1;
+            added += distinct + if starts_x { i - lo } else { 0 };
+        }
+        if fit {
+            fitted += 1;
         }
     }
     (windows, added)
@@ -890,7 +920,8 @@ pub(super) fn capture(
                 let gaps = MedianGaps::default().extended(f64::from_bits(bits), keys())?;
                 let windows = if p.algo == Algorithm::SavitzkyGolay {
                     let h_x = chart::savgol_x_half_width(p.window_size as usize, bits);
-                    window_samples(keys(), keys(), 0, 0, 0..0, 0, h_x).1
+                    // What every sample adds from the first: the full build's fit samples.
+                    window_samples(keys(), 0, 0..0, 0, h_x).1
                 } else {
                     0
                 };
@@ -973,7 +1004,7 @@ pub(super) struct Work {
     pub(super) rebuild: inc::RebuildWork,
     /// Causal replays from a held checkpoint.
     pub(super) replays: usize,
-    /// Samples in the windows of the irregular Savitzky-Golay outputs it recomputed, as [`Fallback::Dense`] priced them.
+    /// Samples in the windows of the irregular Savitzky-Golay fits it recomputed, as [`Fallback::Dense`] priced them.
     pub(super) windows: usize,
 }
 
@@ -1101,7 +1132,7 @@ pub(super) fn advance(
         return Err(Fallback::Tags);
     }
 
-    // Irregular Savitzky-Golay ([`Fallback::Dense`]): the full build's cost, the samples in the windows it fits (each series' held ones, then those its appended samples add) and its other work per fetched row, against the advance's, the samples in the windows of the outputs it recomputes.
+    // Irregular Savitzky-Golay ([`Fallback::Dense`]): the full build's cost, the samples in the windows it fits (each series' held ones, then those its appended samples add) and its other work per fetched row, against the advance's, the samples in the windows of the fits it recomputes.
     let mut full_cost: usize = held.series.iter().map(|hs| hs.windows).sum::<usize>()
         + FULL_BUILD_ROW_COST
             * identities
@@ -1179,7 +1210,7 @@ pub(super) fn advance(
             match hs.plan {
                 SmoothingPlan::NoState => {}
                 SmoothingPlan::Uniform => {
-                    // is_uniform's first gap, between held samples (a finite output means one is held).
+                    // is_uniform's first gap, from the first held sample (a finite output means one is held) to the next, appended when that one was held alone.
                     let d0 = source.xkey(1) - source.xkey(0);
                     let gaps = (held_n.max(1)..n).map(|i| source.xkey(i) - source.xkey(i - 1));
                     if !chart::same_gaps(d0, gaps) {
@@ -1248,12 +1279,9 @@ pub(super) fn advance(
                         if let Smoother::SgIrregular { h_x, .. } = source.smoother {
                             let x0 = source.xkey(reach_from);
                             let lo = inc::partition(0, reach_from, |i| x0 - source.xkey(i) > h_x);
-                            let keys = |from| (from..n).map(|i| source.xkey(i));
                             let (recomputed, added) = window_samples(
-                                keys(reach_from),
-                                keys(lo),
+                                (lo..n).map(|i| source.xkey(i)),
                                 lo,
-                                reach_from,
                                 outputs.clone(),
                                 held_n,
                                 h_x,
@@ -2127,4 +2155,62 @@ pub(super) fn build(
 /// A key's first bytes, for logs.
 fn short(key: &RequestKey) -> String {
     key[..6].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod window_samples_tests {
+    use super::*;
+
+    /// Samples within `h` of sample `i`, itself included: its fit's window.
+    fn window(keys: &[f64], i: usize, h: f64) -> usize {
+        keys.iter().filter(|&&x| (x - keys[i]).abs() <= h).count()
+    }
+
+    /// The full build's fit samples: one window per distinct x.
+    fn full(keys: &[f64], h: f64) -> usize {
+        (0..keys.len())
+            .filter(|&i| i == 0 || keys[i] != keys[i - 1])
+            .map(|i| window(keys, i, h))
+            .sum()
+    }
+
+    /// The pricing counts each fit's window as the sweeps fit: the full build's from the first sample, an advance's from the first output it computes, and what appended samples add to the full build's.
+    #[test]
+    fn window_samples_counts_the_windows_of_the_fits_made() {
+        let mut rng = crate::Rng(0x5eed_1234);
+        for _ in 0..300 {
+            let n = 1 + rng.below(40) as usize;
+            let mut x = 0.0;
+            let keys: Vec<f64> = (0..n)
+                .map(|_| {
+                    x += rng.pick(&[0.0, 0.0, 1.0, 2.0, 5.0]);
+                    x
+                })
+                .collect();
+            let h = rng.pick(&[0.5, 1.0, 3.0, 8.0, 100.0]);
+            assert_eq!(
+                window_samples(keys.iter().copied(), 0, 0..0, 0, h).1,
+                full(&keys, h),
+                "{keys:?} h={h}"
+            );
+            // As the advance calls it: held samples ..held_n, outputs from at least reach_from, the sweep from the first sample within h below it.
+            let held_n = 1 + rng.below(n as u64) as usize;
+            let reach_from = rng.below(held_n as u64) as usize;
+            let lo = (0..=reach_from)
+                .find(|&i| keys[reach_from] - keys[i] <= h)
+                .unwrap();
+            let start = reach_from + rng.below((n - reach_from + 1) as u64) as usize;
+            let end = start + rng.below((n - start + 1) as u64) as usize;
+            let (recomputed, added) =
+                window_samples(keys[lo..].iter().copied(), lo, start..end, held_n, h);
+            let fits = (start..end).filter(|&i| i == start || keys[i] != keys[i - 1]);
+            let case = format!("{keys:?} h={h} held {held_n} lo {lo} outputs {start}..{end}");
+            assert_eq!(
+                recomputed,
+                fits.map(|i| window(&keys, i, h)).sum::<usize>(),
+                "{case}"
+            );
+            assert_eq!(added, full(&keys, h) - full(&keys[..held_n], h), "{case}");
+        }
+    }
 }

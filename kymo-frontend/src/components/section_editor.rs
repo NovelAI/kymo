@@ -3,7 +3,7 @@ use dioxus::prelude::*;
 use crate::components::options_editor::{ChartOptionsForm, EditorSection, OPTIONS_ID_PREFIX};
 use crate::components::options_panel::OptionsPanel;
 use crate::state::layout_config::{RectOptions, MAX_SECTION_COLUMNS};
-use crate::state::{DashboardState, SectionConfig};
+use crate::state::{DashboardState, EditOutcome, SectionConfig};
 use crate::util::use_live_apply;
 
 /// The section settings this editor owns, as one draft.
@@ -55,9 +55,15 @@ pub fn SectionEditor(return_focus_id: String, config: SectionConfig) -> Element 
             chart_opts: draft_chart_opts.read().clone(),
         }
     };
-    let mut cleared = use_signal(Vec::new);
+    let cleared = use_signal(Vec::new);
     let unchanged = current() == initial && cleared.read().is_empty();
-    use_live_apply(current, {
+    let mut show = move |draft: SectionDraft| {
+        draft_display_name.set(draft.display_name);
+        draft_max_columns.set(draft.max_columns);
+        draft_rows_per_page.set(draft.rows_per_page);
+        draft_chart_opts.set(draft.chart_opts);
+    };
+    use_live_apply(current, show, {
         let chart_baseline = chart_baseline.clone();
         move |previous: &SectionDraft, draft: SectionDraft| {
             state.edit_section_settings(&name, |section| {
@@ -75,7 +81,7 @@ pub fn SectionEditor(return_focus_id: String, config: SectionConfig) -> Element 
                     &previous.chart_opts,
                     &draft.chart_opts,
                 );
-            });
+            }) != EditOutcome::Refused
         }
     });
 
@@ -89,11 +95,8 @@ pub fn SectionEditor(return_focus_id: String, config: SectionConfig) -> Element 
             on_revert: {
                 let initial = initial.clone();
                 move |_| {
-                    draft_display_name.set(initial.display_name.clone());
-                    draft_max_columns.set(initial.max_columns);
-                    draft_rows_per_page.set(initial.rows_per_page);
-                    draft_chart_opts.set(initial.chart_opts.clone());
-                    state.restore_overrides(&std::mem::take(&mut *cleared.write()));
+                    show(initial.clone());
+                    state.restore_overrides(cleared);
                 }
             },
             on_close: move |_| state.close_options_panel(),

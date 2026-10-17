@@ -90,6 +90,24 @@ class EnvironmentAliasTests(unittest.TestCase):
             ):
                 _env.boolean("KYMO_FLAG", "MKDB2_FLAG")
 
+    def test_duration_settings_must_be_positive_and_finite(self):
+        # 1e309 parses as inf.
+        for name in (
+            "KYMO_ACK_PROGRESS_TIMEOUT",
+            "KYMO_FLUSH_TIMEOUT",
+            "KYMO_SIGNAL_FLUSH_TIMEOUT",
+            "KYMO_LOCAL_ENSURE_TIMEOUT",
+        ):
+            for raw in ("nan", "inf", "-inf", "1e309", "0", "-1"):
+                with (
+                    self.subTest(name=name, raw=raw),
+                    mock.patch.dict(os.environ, {name: raw}, clear=True),
+                    self.assertRaisesRegex(ValueError, f"{name} must be"),
+                ):
+                    _env.validate_client_settings()
+            with mock.patch.dict(os.environ, {name: "0.5"}, clear=True):
+                _env.validate_client_settings()
+
     def test_import_kymo_rejects_legacy_names_before_package_side_effects(self):
         checkout = Path(__file__).parent.resolve()
         base = {

@@ -105,8 +105,8 @@ message PublishRichMutationRequest {
   int64 step = 5;
   int64 timestamp_ms = 6;
   string cdn_key = 7;
-  // Absence selects legacy arrival-order behavior. Version-aware writers use
-  // (writer_epoch << 32) | mutation_seq and never send zero.
+  // Required: (writer_epoch << 32) | mutation_seq, both halves nonzero. A
+  // request without it is refused with InvalidArgument.
   optional uint64 mutation_version = 8;
 }
 

@@ -167,7 +167,7 @@ def make_spool_path(
 
 
 def writer_active(path: str) -> bool:
-    """True if a live SpoolWriter still holds its advisory lock on the file (see SpoolWriter.open). Errs toward False where flock is unsupported or node-local — replay_file's size-growth check backs this up for active writers, but an idle live writer on such a mount goes undetected (accepted residual, see SpoolWriter.open)."""
+    """True if someone holds an exclusive lock on the file: its live SpoolWriter (see SpoolWriter.open), or a replay's claim (claim_spool). Errs toward False where flock is unsupported or node-local — replay_file's size-growth check backs this up for active writers, but an idle live writer on such a mount goes undetected (accepted residual, see SpoolWriter.open)."""
     try:
         import fcntl
     except ImportError:
@@ -183,6 +183,53 @@ def writer_active(path: str) -> bool:
     except OSError:
         pass
     return False
+
+
+def claim_spool(path: str):
+    """Take a spool's exclusive replay claim: the file open and flocked exclusively, still at path. The lock stays on the inode through a rename, until the file is closed.
+
+    None if its live writer or another replayer holds it (EWOULDBLOCK, EAGAIN, or EACCES from NFS's emulation), or if it is gone. On any other flock error (EBADF: NFS, for a replayer that may only read it; ENOLCK, ENOTSUP, ENOSYS: a file system without flock), the open file alone, with a warning, unless writer_active sees its writer or another replay's claim; where Python has no fcntl, the open file alone. Such a replay excludes no other replayer.
+    """
+    fh = None
+    # Any exception after the open closes the file, a Ctrl-C landing as flock() returns among them: a traceback the program keeps would otherwise keep the file, and its lock, open.
+    try:
+        try:
+            # Open for writing where allowed, never written: NFS emulates flock with fcntl byte-range locks, and an exclusive one needs a descriptor open for writing.
+            fh = open(path, "r+b", buffering=0)
+        except OSError as error:
+            if error.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
+                raise
+            # A replayer that may only read the file, as another uid may (SpoolWriter.open): a local file system locks it exclusively all the same, since flock ignores the open mode there.
+            fh = open(path, "rb", buffering=0)
+        try:
+            import fcntl
+        except ImportError:
+            return fh
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES) or (
+                writer_active(path)
+            ):
+                fh.close()
+                return None
+            _log.warning(
+                "%s goes without an exclusive claim, which cannot be taken here (%s): another sync may replay it at the same time",
+                path,
+                error.strerror,
+            )
+        # Another replayer may have retired the path between this open and the lock.
+        if os.path.samestat(os.fstat(fh.fileno()), os.stat(path)):
+            return fh
+    except FileNotFoundError:
+        pass
+    except BaseException:
+        if fh is not None:
+            fh.close()
+        raise
+    if fh is not None:
+        fh.close()
+    return None
 
 
 def run_spool_files(
@@ -348,7 +395,9 @@ class SpoolWriter:
         os.makedirs(spool_dir, mode=0o700, exist_ok=True)
         # Replay often runs as another uid (e.g. --container-remap-root jobs), so mirror the directory's group/other read bits; writes remain owner-only. The default 0700 directory widens nothing.
         mode = 0o600 | (os.stat(spool_dir).st_mode & 0o044)
-        fd = os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, mode)
+        # A new file is made under a name no replay picks up and renamed into place once it has its lock (which the rename keeps: it is on the inode) and its header: a replay claiming it in between would leave its writer unlocked for good, and could quarantine the still empty file.
+        name = self._path if os.path.exists(self._path) else self._path + ".creating"
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_APPEND, mode)
         try:
             # os.open's mode is still filtered through the process umask; the directory bits above are the operator's explicit sharing policy, so reapply them.
             fchmod = getattr(os, "fchmod", None)
@@ -379,22 +428,24 @@ class SpoolWriter:
         size = self._fh.tell()
         self._record_ends = [size]
         self._unsynced = True
-        if size == 0:
-            try:
+        try:
+            if size == 0:
                 pickle.dump(self._header, self._fh, protocol=pickle.HIGHEST_PROTOCOL)
                 # On disk at once, so a failed first record cannot take the header with it.
                 self._fh.flush()
                 self._record_ends = [self._fh.tell()]
-            except BaseException:
-                # The file holds no records, so remove it rather than leave a torn header, or a file the run would report as pending; the next write creates it again.
-                try:
-                    self._discard()
-                finally:
-                    fh, self._fh = self._fh, None
-                    fh.close()
-                    with contextlib.suppress(OSError):
-                        os.unlink(self._path)
-                raise
+            if name != self._path:
+                os.rename(name, self._path)
+        except BaseException:
+            # The file holds no records, so remove it rather than leave a torn header, or a file the run would report as pending; the next write creates it again.
+            try:
+                self._discard()
+            finally:
+                fh, self._fh = self._fh, None
+                fh.close()
+                with contextlib.suppress(OSError):
+                    os.unlink(name)
+            raise
 
     def write(self, record: tuple) -> None:
         if self._sealed:

@@ -1,5 +1,6 @@
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::rc::Rc;
 
 use dioxus::prelude::*;
 use dioxus::web::WebEventExt;
@@ -11,7 +12,7 @@ use crate::components::metric_rect::CdnRunData;
 use crate::route::Route;
 use crate::state::layout_config::CdnDisplayMode;
 use crate::state::panel_cache::Store;
-use crate::state::visibility::retry_visible;
+use crate::state::visibility::RETRY_WAIT;
 use crate::util::{primary, set_if_changed};
 
 thread_local! {
@@ -212,13 +213,23 @@ enum GalleryPresentation {
     Content,
 }
 
-/// The status line for sources whose key at the step is still a placeholder: a live run's images may still arrive; an ended run's placeholder is an upload that did not finish.
-fn pending_status(live: &[&str], ended: &[&str]) -> Option<String> {
-    let clauses: Vec<String> = [("Not uploaded yet", live), ("Upload did not finish", ended)]
-        .into_iter()
-        .filter(|(_, labels)| !labels.is_empty())
-        .map(|(prefix, labels)| format!("{prefix}: {}", labels.join(", ")))
-        .collect();
+/// The status line for sources whose key at the step is still a placeholder: a live run's images may still arrive; an ended run's placeholder is an upload that did not finish. It also names the sources whose manifest failed to load, each asked again RETRY_WAIT after its failure, and those still loading past the grace.
+fn pending_status(
+    live: &[&str],
+    ended: &[&str],
+    failed: &[&str],
+    loading: &[&str],
+) -> Option<String> {
+    let clauses: Vec<String> = [
+        ("Not uploaded yet", live),
+        ("Upload did not finish", ended),
+        ("Failed to load, retrying", failed),
+        ("Still loading", loading),
+    ]
+    .into_iter()
+    .filter(|(_, labels)| !labels.is_empty())
+    .map(|(prefix, labels)| format!("{prefix}: {}", labels.join(", ")))
+    .collect();
     (!clauses.is_empty()).then(|| clauses.join(" · "))
 }
 
@@ -324,15 +335,183 @@ fn classify_manifests(run_manifests: &[RunManifest]) -> Option<CdnManifestClass>
         })
 }
 
-type ManifestFetchKey = (RunManifest, String);
-type ManifestFetchResult = (Vec<ManifestFetchKey>, Vec<RunManifest>);
+/// What one source's manifest is fetched as: its run and metric, and its CDN key at the shown step. Label and color stay out, so a rename or recolor neither refetches nor blanks the panel; render attaches them.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ManifestSource {
+    project_id: String,
+    run_id: String,
+    metric_name: String,
+    key: String,
+}
 
-fn current_manifest_results<'a>(
-    current_keys: &[ManifestFetchKey],
-    result: Option<&'a ManifestFetchResult>,
-) -> Option<&'a [RunManifest]> {
-    let (source_keys, run_manifests) = result?;
-    (source_keys == current_keys).then_some(run_manifests)
+/// A source's last answer: settled (None for nothing usable at its key, or a placeholder key), failed, which is asked again, or still out when its fetches' MANIFEST_GRACE passed.
+#[derive(Clone, Debug, PartialEq)]
+enum Fetched {
+    Settled(Option<Manifest>),
+    Failed,
+    Waiting,
+}
+
+/// How long a step's manifest fetches hold their answers so they land in one render: past it, what has loaded is shown and each later answer as it lands, so one slow or stalled manifest holds no other source back. It divides none of RETRY_WAIT (5 s), the Near prefetch cap (2 s) or the offline notice's grace (3 s).
+const MANIFEST_GRACE: std::time::Duration = std::time::Duration::from_millis(1100);
+
+/// Fetches every source in `asking` at once, each failure asked again on its own after `retry` (RETRY_WAIT, on a visible page) until it settles. Answers within `grace` are published together, with every source still out marked Waiting, and each later answer as it lands. A deadline abort doubles that source's next deadline, up to MANIFEST_DEADLINE_CAP_MS; deadlines start over when this call does (a change to the step's sources, or a remount).
+async fn fetch_sources<R>(
+    asking: Vec<ManifestSource>,
+    fetch: impl AsyncFn(&ManifestSource, u32) -> (Fetched, bool),
+    retry: impl Fn() -> R,
+    grace: impl std::future::Future<Output = ()>,
+    mut publish: impl FnMut(Vec<(ManifestSource, Fetched)>),
+) where
+    R: std::future::Future<Output = ()>,
+{
+    use futures::{FutureExt, StreamExt};
+    let (fetch, retry) = (&fetch, &retry);
+    // A source's answers: each failure is followed by a retry, and the first settled answer ends them.
+    let answers_of = |source: ManifestSource| {
+        Box::pin(futures::stream::unfold(
+            Some((source, false, MANIFEST_DEADLINE_MS)),
+            move |state| async move {
+                let (source, failed_before, deadline) = state?;
+                if failed_before {
+                    retry().await;
+                }
+                let (answer, at_deadline) = fetch(&source, deadline).await;
+                let deadline = if at_deadline {
+                    (deadline * 2).min(MANIFEST_DEADLINE_CAP_MS)
+                } else {
+                    deadline
+                };
+                let again = (answer == Fetched::Failed).then(|| (source.clone(), true, deadline));
+                Some(((source, answer), again))
+            },
+        ))
+    };
+    let mut out = futures::stream::select_all(asking.iter().cloned().map(answers_of));
+    let mut grace = std::pin::pin!(grace.fuse());
+    let mut held = HashMap::new();
+    while held.len() < asking.len() {
+        futures::select! {
+            answer = out.next() => match answer {
+                Some((source, answer)) => { held.insert(source, answer); }
+                None => break,
+            },
+            () = grace => break,
+        }
+    }
+    let waiting: Vec<_> = asking
+        .into_iter()
+        .filter(|source| !held.contains_key(source))
+        .map(|source| (source, Fetched::Waiting))
+        .collect();
+    publish(held.into_iter().chain(waiting).collect());
+    while let Some(answer) = out.next().await {
+        publish(vec![answer]);
+    }
+}
+
+type FetchedManifests = HashMap<ManifestSource, Fetched>;
+
+/// Whether publishing `answers` would change `fetched`, which only `current` (this step's sources) may keep: an answer it doesn't hold, or another step's answer to drop. A source failing again answers Failed again, and fetches with nothing to ask answer nothing; neither needs a render.
+fn publish_changes(
+    fetched: &FetchedManifests,
+    current: &HashSet<ManifestSource>,
+    answers: &[(ManifestSource, Fetched)],
+) -> bool {
+    fetched.keys().any(|source| !current.contains(source))
+        || answers
+            .iter()
+            .any(|(source, answer)| fetched.get(source) != Some(answer))
+}
+
+/// The sources a step's fetches ask: every one not yet settled.
+fn unsettled_sources(
+    sources: &[ManifestSource],
+    fetched: &FetchedManifests,
+) -> Vec<ManifestSource> {
+    sources
+        .iter()
+        .filter(|source| !matches!(fetched.get(*source), Some(Fetched::Settled(_))))
+        .cloned()
+        .collect()
+}
+
+/// A source's run and metric, which a preview's image belongs to at every step.
+type SourceIdentity = (String, String, String);
+
+/// What the open preview shows, per source identity: its last settled image manifest, for the shown step's `sources` only. A run with no key at this step has none; an answer settling with an image gallery replaces its run's, one settling without removes it (the step has none), and one still out or failing leaves the previous step's up. `fetched` can still hold the previous step's answers, which count for nothing. Returns what it holds, in `sources`' order.
+fn latch_settled(
+    latched: &mut HashMap<SourceIdentity, (ManifestSource, Manifest)>,
+    sources: &[ManifestSource],
+    fetched: &FetchedManifests,
+) -> Vec<(ManifestSource, Manifest)> {
+    let identity = |source: &ManifestSource| {
+        (
+            source.project_id.clone(),
+            source.run_id.clone(),
+            source.metric_name.clone(),
+        )
+    };
+    let present: HashSet<SourceIdentity> = sources.iter().map(identity).collect();
+    latched.retain(|held, _| present.contains(held));
+    for source in sources {
+        match fetched.get(source) {
+            Some(Fetched::Settled(Some(manifest))) if manifest.is_image_gallery() => {
+                if latched.get(&identity(source)).map(|(held, _)| held) != Some(source) {
+                    latched.insert(identity(source), (source.clone(), manifest.clone()));
+                }
+            }
+            Some(Fetched::Settled(_)) => {
+                latched.remove(&identity(source));
+            }
+            Some(Fetched::Failed | Fetched::Waiting) | None => {}
+        }
+    }
+    sources
+        .iter()
+        .filter_map(|source| latched.get(&identity(source)).cloned())
+        .collect()
+}
+
+/// Whether the open image's own source at the shown step has yet to settle (not asked yet, waiting, or failing), and whether its last answer failed, so it is asked again.
+fn open_source_state(
+    open: &LightboxImage,
+    sources: &[ManifestSource],
+    fetched: &FetchedManifests,
+) -> (bool, bool) {
+    let answer = sources
+        .iter()
+        .find(|source| {
+            (&source.project_id, &source.run_id, &source.metric_name)
+                == (&open.project_id, &open.run_id, &open.metric_name)
+        })
+        .map(|source| fetched.get(source));
+    (
+        !matches!(answer, None | Some(Some(Fetched::Settled(_)))),
+        answer == Some(Some(&Fetched::Failed)),
+    )
+}
+
+/// `shown` (the step's sources as drawn, aligned with `sources`) with their manifests, once every source has answered or their grace passed; a failed or waiting source draws as having none.
+fn current_manifests(
+    shown: &[RunManifest],
+    sources: &[ManifestSource],
+    fetched: &FetchedManifests,
+) -> Option<Vec<RunManifest>> {
+    shown
+        .iter()
+        .zip(sources)
+        .map(|(run_manifest, source)| {
+            let manifest = match fetched.get(source)? {
+                Fetched::Settled(manifest) => manifest.clone(),
+                Fetched::Failed | Fetched::Waiting => None,
+            };
+            Some(RunManifest {
+                manifest,
+                ..run_manifest.clone()
+            })
+        })
+        .collect()
 }
 
 fn metadata_columns(
@@ -378,25 +557,53 @@ fn file_groups(run_manifests: &[RunManifest]) -> Vec<(&str, &str, &[ManifestItem
         .collect()
 }
 
+/// How long a manifest fetch may first take, headers through body, before it is aborted and retried, so a stalled response can't hold its source, and one of the browser's six HTTP/1.1 connections to the CDN, forever. The wait for a connection counts too. Chromium gives a fetch to the CDN, another origin, without credentials connections apart from the gallery's images, but WebKit queues it behind them (4.7 s behind six images stalled for 5 s), so on a slow link a manifest can run out its deadline before it is sent; each deadline abort doubles that source's next one, up to MANIFEST_DEADLINE_CAP_MS. 47 s is no multiple of RETRY_WAIT (5 s), the socket's 20 s keepalive ping, the series cache's 40 s hot window or 60 s (the socket's request timeout and several other clocks).
+const MANIFEST_DEADLINE_MS: u32 = 47_000;
+
+/// The longest a source's fetch gets after deadline aborts, 47 s doubled twice: a manifest still queued behind images that long is on a link too slow to show them, and each fetch of a hung request is capped at 188 s, a multiple of none of those clocks.
+const MANIFEST_DEADLINE_CAP_MS: u32 = 4 * MANIFEST_DEADLINE_MS;
+
+/// Aborts its fetch when dropped, so a step change or an unmount cancels the manifest requests still in flight rather than leaving them on the CDN origin's connections.
+struct AbortOnDrop(web_sys::AbortController);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Ok(None) is settled knowledge — a 404 (nothing at that key), a 400 (the
 /// hosted route's answer to a malformed key, which ingest stores unvalidated)
 /// or unparseable content, none of which heals on retry. Err (a network
 /// failure or any other status) must be retried: a finished run's keys never
-/// change, so a failure settled into the manifests resource would never be
+/// change, so a failure taken as settled would never be
 /// refetched.
-async fn fetch_manifest(cdn_key: &str) -> Result<Option<Manifest>, String> {
+/// The Err also says whether `deadline_ms` ran out.
+async fn fetch_manifest(
+    cdn_key: &str,
+    deadline_ms: u32,
+) -> Result<Option<Manifest>, (String, bool)> {
     let url = crate::runtime::cdn_url(cdn_key);
+    let abort =
+        AbortOnDrop(web_sys::AbortController::new().map_err(|e| (format!("{e:?}"), false))?);
+    let _deadline = gloo_timers::callback::Timeout::new(deadline_ms, {
+        let abort = abort.0.clone();
+        move || abort.abort()
+    });
+    // Only the deadline aborts the request while this runs.
+    let failed = |error: String| (error, abort.0.signal().aborted());
     let resp = gloo_net::http::Request::get(&url)
+        .abort_signal(Some(&abort.0.signal()))
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| failed(e.to_string()))?;
     if matches!(resp.status(), 400 | 404) {
         return Ok(None);
     }
     if !resp.ok() {
-        return Err(format!("{} for {url}", resp.status()));
+        return Err(failed(format!("{} for {url}", resp.status())));
     }
-    let text = resp.text().await.map_err(|e| e.to_string())?;
+    let text = resp.text().await.map_err(|e| failed(e.to_string()))?;
     Ok(serde_json::from_str(&text).ok())
 }
 
@@ -450,33 +657,19 @@ pub fn CdnGallery(
     });
     // Held here rather than in GalleryRenderer, which unmounts whenever the step or its manifests are refetched.
     let mut lightbox = use_signal(|| None::<LightboxImage>);
+    let latched = use_hook(|| Rc::new(RefCell::new(HashMap::new())));
 
-    if all_steps.is_empty() {
-        set_if_changed(cdn_class, None);
-        set_if_changed(lightbox, None);
-        return rsx! {
-            div { class: "cdn-gallery",
-                div { class: "cdn-gallery-empty", "No CDN data" }
-            }
-        };
-    }
-
+    // The shown step, or none while the panel has no CDN data.
     let selected = *selected_step.read();
-    let idx = selected_step_index(&all_steps, selected);
-    let step = all_steps[idx];
-    let previous_step = idx.checked_sub(1).map(|i| all_steps[i]);
-    let next_step = all_steps.get(idx + 1).copied();
-    let current_step = idx + 1;
-    let step_value_text = format!("Step {step}, {current_step} of {total_steps}");
-    if selected.is_none() {
-        selected_step.set(Some(step));
-    }
+    let idx = (!all_steps.is_empty()).then(|| selected_step_index(&all_steps, selected));
+    let step = idx.map(|idx| all_steps[idx]);
 
-    // Pair the fetch key with the manifest metadata it will populate. `ended` stays out of the key, so a status change doesn't refetch manifests.
-    let mut run_keys: Vec<ManifestFetchKey> = Vec::new();
+    // Each source as drawn, with the fetch identity it is answered under. `ended` stays out of the identity, so a status change doesn't refetch manifests.
+    let mut shown: Vec<RunManifest> = Vec::new();
+    let mut sources: Vec<ManifestSource> = Vec::new();
     let (mut pending_live, mut pending_ended) = (Vec::new(), Vec::new());
     for run in &runs {
-        let Some((_, key)) = run.keys.iter().find(|(s, _)| *s == step) else {
+        let Some((_, key)) = run.keys.iter().find(|(s, _)| Some(*s) == step) else {
             continue;
         };
         if key.starts_with("pending:") {
@@ -487,64 +680,123 @@ pub fn CdnGallery(
             };
             group.push(run.label.as_str());
         }
-        run_keys.push((
-            RunManifest {
-                project_id: run.project_id.clone(),
-                run_id: run.run_id.clone(),
-                metric_name: run.metric_name.clone(),
-                label: run.label.clone(),
-                color: run.color.clone(),
-                manifest: None,
-            },
-            key.clone(),
-        ));
-    }
-    let status = pending_status(&pending_live, &pending_ended);
-
-    // Fetch this step's manifests concurrently, retrying each until it settles; the step publishes once every source has settled.
-    let manifests = use_resource(use_reactive((&run_keys,), move |(keys,)| async move {
-        let source_keys = keys.clone();
-        let futs = keys.into_iter().map(|(mut run_manifest, key)| async move {
-            let manifest = if key.starts_with("pending:") {
-                None
-            } else {
-                retry_visible("manifest", async || fetch_manifest(&key).await).await
-            };
-            run_manifest.manifest = manifest;
-            run_manifest
+        shown.push(RunManifest {
+            project_id: run.project_id.clone(),
+            run_id: run.run_id.clone(),
+            metric_name: run.metric_name.clone(),
+            label: run.label.clone(),
+            color: run.color.clone(),
+            manifest: None,
         });
-        (source_keys, futures::future::join_all(futs).await)
+        sources.push(ManifestSource {
+            project_id: run.project_id.clone(),
+            run_id: run.run_id.clone(),
+            metric_name: run.metric_name.clone(),
+            key: key.clone(),
+        });
+    }
+
+    // Fetch this step's unsettled manifests (fetch_sources), so a source that fails shows as failed beside the ones that loaded. The resource is keyed on the sources and only peeks the answers it writes, so publishing restarts nothing; a step change drops the fetches, aborting their requests, and so does data that leaves no step, whose empty sources run before the panel says so.
+    let mut fetched = use_signal(FetchedManifests::new);
+    let _fetch = use_resource(use_reactive((&sources,), move |(sources,)| async move {
+        let current: HashSet<ManifestSource> = sources.iter().cloned().collect();
+        let asking = unsettled_sources(&sources, &fetched.peek());
+        if !asking.is_empty() {
+            crate::grpc::wait_until_page_visible().await;
+        }
+        let fetch = async |source: &ManifestSource, deadline_ms: u32| {
+            if source.key.starts_with("pending:") {
+                return (Fetched::Settled(None), false);
+            }
+            match fetch_manifest(&source.key, deadline_ms).await {
+                Ok(manifest) => (Fetched::Settled(manifest), false),
+                Err((error, at_deadline)) => {
+                    crate::util::warn(&format!("[manifest] failed: {error}; retrying"));
+                    (Fetched::Failed, at_deadline)
+                }
+            }
+        };
+        let retry = || async {
+            gloo_timers::future::sleep(RETRY_WAIT).await;
+            crate::grpc::wait_until_page_visible().await;
+        };
+        // Only this step's answers stay; the open preview latches what it shows (latch_settled).
+        let publish = |answers: Vec<(ManifestSource, Fetched)>| {
+            if !publish_changes(&fetched.peek(), &current, &answers) {
+                return;
+            }
+            let mut fetched = fetched.write();
+            fetched.retain(|source, _| current.contains(source));
+            fetched.extend(answers);
+        };
+        let grace = gloo_timers::future::sleep(MANIFEST_GRACE);
+        fetch_sources(asking, fetch, retry, grace, publish).await;
     }));
 
-    // Publish the settled step's CDN sub-type upward so the BindingEditor only shows applicable panels.
-    let class_keys = run_keys.clone();
-    use_effect(move || {
-        let read = manifests.read();
-        let next = current_manifest_results(&class_keys, read.as_ref())
-            .and_then(classify_manifests)
-            .map(|class| class.as_str().to_string());
-        set_if_changed(cdn_class, next);
-    });
+    let Some(idx) = idx else {
+        set_if_changed(cdn_class, None);
+        set_if_changed(lightbox, None);
+        return rsx! {
+            div { class: "cdn-gallery",
+                div { class: "cdn-gallery-empty", "No CDN data" }
+            }
+        };
+    };
+    let step = all_steps[idx];
+    let previous_step = idx.checked_sub(1).map(|i| all_steps[i]);
+    let next_step = all_steps.get(idx + 1).copied();
+    let current_step = idx + 1;
+    let step_value_text = format!("Step {step}, {current_step} of {total_steps}");
+    if selected.is_none() {
+        selected_step.set(Some(step));
+    }
 
-    let (presentation, run_manifests, lightbox_view) = {
-        let read = manifests.read();
-        let current = current_manifest_results(&run_keys, read.as_ref());
-        let parsed_manifest_count = current.map(|run_manifests| {
+    let (status, presentation, run_manifests, lightbox_view) = {
+        let fetched = fetched.read();
+        let current = current_manifests(&shown, &sources, &fetched);
+        let labels = |answer: Fetched| -> Vec<&str> {
+            shown
+                .iter()
+                .zip(&sources)
+                .filter(|(_, source)| fetched.get(*source) == Some(&answer))
+                .map(|(run_manifest, _)| run_manifest.label.as_str())
+                .collect()
+        };
+        let status = pending_status(
+            &pending_live,
+            &pending_ended,
+            &labels(Fetched::Failed),
+            &labels(Fetched::Waiting),
+        );
+        let parsed_manifest_count = current.as_ref().map(|run_manifests| {
             run_manifests
                 .iter()
                 .filter(|run_manifest| run_manifest.manifest.is_some())
                 .count()
         });
-        // An open lightbox shows the last settled manifests, current or not, so its image stays up while the next step loads.
-        let lightbox_view = lightbox()
-            .zip(read.as_ref())
-            .map(|(open, (_, settled))| (open, settled.clone(), current.is_none()));
+        // An open lightbox shows each run's last settled image manifest, so its image stays up while the next step's is still out, and loads until the open image's own source settles. Closing it forgets them.
+        let lightbox_view = match lightbox() {
+            Some(open) => {
+                let shown = latch_settled(&mut latched.borrow_mut(), &sources, &fetched);
+                let (loading, failing) = open_source_state(&open, &sources, &fetched);
+                Some((open, shown, loading, failing))
+            }
+            None => {
+                latched.borrow_mut().clear();
+                None
+            }
+        };
+        let presentation = gallery_presentation(status.is_some(), parsed_manifest_count);
         (
-            gallery_presentation(status.is_some(), parsed_manifest_count),
-            current.map(<[RunManifest]>::to_vec).unwrap_or_default(),
+            status,
+            presentation,
+            current.unwrap_or_default(),
             lightbox_view,
         )
     };
+    // Publish the shown step's CDN sub-type upward so the BindingEditor only shows applicable panels.
+    let class = classify_manifests(&run_manifests).map(|class| class.as_str().to_string());
+    set_if_changed(cdn_class, class);
     let effective_mode = if runs.len() <= 1 {
         CdnDisplayMode::GroupByRun
     } else {
@@ -639,12 +891,13 @@ pub fn CdnGallery(
                 }
             }
 
-            if let Some((open, shown, loading)) = lightbox_view {
+            if let Some((open, shown, loading, failing)) = lightbox_view {
                 GalleryLightbox {
                     open,
                     runs,
                     shown,
                     loading,
+                    failing,
                     mode: effective_mode,
                     step,
                     lightbox,
@@ -667,9 +920,12 @@ enum LightboxMove {
 fn GalleryLightbox(
     open: LightboxImage,
     runs: Vec<CdnRunData>,
-    /// The last settled manifests; another step's while `loading`.
-    shown: Vec<RunManifest>,
+    /// Each run's last settled image manifest; another step's while its own is still out.
+    shown: Vec<(ManifestSource, Manifest)>,
+    /// The open image's own source at `step` has yet to settle.
     loading: bool,
+    /// Its last answer failed: it is asked again, and the step says so.
+    failing: bool,
     mode: CdnDisplayMode,
     /// The panel's step, which ↑/↓ move.
     step: i64,
@@ -683,18 +939,17 @@ fn GalleryLightbox(
             lightbox.set(None);
         }
     });
-    // Each run's settled image manifest at the shown step, aligned with `runs`. A metric can log resources at other steps (the panel lists those as files).
+    // `shown` aligned with `runs`.
     let manifests: Vec<Option<&Manifest>> = runs
         .iter()
         .map(|run| {
             shown
                 .iter()
-                .find(|settled| {
+                .find(|(settled, _)| {
                     (&settled.project_id, &settled.run_id, &settled.metric_name)
                         == (&run.project_id, &run.run_id, &run.metric_name)
                 })
-                .and_then(|settled| settled.manifest.as_ref())
-                .filter(|manifest| manifest.is_image_gallery())
+                .map(|(_, manifest)| manifest)
         })
         .collect();
     let source = runs.iter().position(|run| {
@@ -871,7 +1126,9 @@ fn GalleryLightbox(
                 }
                 span { class: "cdn-lightbox-step",
                     {previous_step}
-                    if loading {
+                    if failing {
+                        "step {step} failed to load, retrying…"
+                    } else if loading {
                         "loading step {step}…"
                     } else {
                         "step {step}"
@@ -1096,10 +1353,11 @@ fn InterleavedView(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_manifests, current_manifest_results, file_groups, gallery_file_link_label,
-        gallery_presentation, gallery_thumbnail_label, metadata_columns, pending_status,
-        selected_step_index, CdnManifestClass, GalleryPresentation, Manifest, ManifestFetchKey,
-        ManifestItem, RunManifest,
+        classify_manifests, current_manifests, fetch_sources, file_groups, gallery_file_link_label,
+        gallery_presentation, gallery_thumbnail_label, latch_settled, metadata_columns,
+        open_source_state, pending_status, publish_changes, selected_step_index, unsettled_sources,
+        CdnManifestClass, Fetched, FetchedManifests, GalleryPresentation, LightboxImage, Manifest,
+        ManifestItem, ManifestSource, RunManifest,
     };
     use dioxus::html::Modifiers;
 
@@ -1302,18 +1560,26 @@ mod tests {
 
     #[test]
     fn pending_status_names_sources_by_run_liveness() {
-        assert_eq!(pending_status(&[], &[]), None);
+        assert_eq!(pending_status(&[], &[], &[], &[]), None);
         assert_eq!(
-            pending_status(&["a", "b"], &[]).as_deref(),
+            pending_status(&["a", "b"], &[], &[], &[]).as_deref(),
             Some("Not uploaded yet: a, b")
         );
         assert_eq!(
-            pending_status(&[], &["a"]).as_deref(),
+            pending_status(&[], &["a"], &[], &[]).as_deref(),
             Some("Upload did not finish: a")
         );
         assert_eq!(
-            pending_status(&["live"], &["old"]).as_deref(),
+            pending_status(&["live"], &["old"], &[], &[]).as_deref(),
             Some("Not uploaded yet: live · Upload did not finish: old")
+        );
+        assert_eq!(
+            pending_status(&[], &[], &["broken"], &[]).as_deref(),
+            Some("Failed to load, retrying: broken")
+        );
+        assert_eq!(
+            pending_status(&[], &[], &[], &["slow"]).as_deref(),
+            Some("Still loading: slow")
         );
     }
 
@@ -1377,28 +1643,416 @@ mod tests {
         );
     }
 
+    fn drawn(run_id: &str, label: &str) -> RunManifest {
+        RunManifest {
+            project_id: "project".to_string(),
+            run_id: run_id.to_string(),
+            metric_name: "gallery".to_string(),
+            label: label.to_string(),
+            color: "#123456".to_string(),
+            manifest: None,
+        }
+    }
+
+    fn source(run_id: &str, key: &str) -> ManifestSource {
+        ManifestSource {
+            project_id: "project".to_string(),
+            run_id: run_id.to_string(),
+            metric_name: "gallery".to_string(),
+            key: key.to_string(),
+        }
+    }
+
+    fn image_manifest() -> Manifest {
+        Manifest {
+            v: 1,
+            class: "image_gallery".into(),
+            items: vec![ManifestItem {
+                resource: "resource".into(),
+                filename: None,
+                caption: None,
+            }],
+            data: None,
+        }
+    }
+
     #[test]
-    fn retained_results_do_not_cross_manifest_key_generations() {
-        fn fetch_key(key: &str) -> ManifestFetchKey {
-            (
-                RunManifest {
-                    project_id: "project".to_string(),
-                    run_id: "run".to_string(),
-                    metric_name: "gallery".to_string(),
-                    label: "run".to_string(),
-                    color: "#123456".to_string(),
-                    manifest: None,
-                },
-                key.to_string(),
-            )
+    fn retained_answers_do_not_cross_manifest_key_generations() {
+        let shown = [drawn("run", "run")];
+        let fetched = FetchedManifests::from([(source("run", "old.json"), Fetched::Settled(None))]);
+
+        assert!(current_manifests(&shown, &[source("run", "pending:new")], &fetched).is_none());
+        assert!(current_manifests(&shown, &[source("run", "old.json")], &fetched).is_some());
+    }
+
+    /// A source that keeps failing must not withhold the ones that loaded: it answers as failed, the panel draws the others and names it, and only it is asked again.
+    #[test]
+    fn a_failed_manifest_shows_beside_the_settled_ones_and_is_asked_again() {
+        let shown = [drawn("healthy", "Healthy"), drawn("broken", "Broken")];
+        let sources = [source("healthy", "a.json"), source("broken", "b.json")];
+        let mut fetched = FetchedManifests::new();
+        assert_eq!(unsettled_sources(&sources, &fetched), sources);
+
+        fetched.insert(sources[0].clone(), Fetched::Settled(Some(image_manifest())));
+        assert!(
+            current_manifests(&shown, &sources, &fetched).is_none(),
+            "one source has not answered"
+        );
+        fetched.insert(sources[1].clone(), Fetched::Failed);
+
+        let current = current_manifests(&shown, &sources, &fetched).expect("every source answered");
+        assert_eq!(current[0].manifest, Some(image_manifest()));
+        assert_eq!(current[1].manifest, None);
+        assert_eq!(current[1].label, "Broken");
+        let parsed = current.iter().filter(|run| run.manifest.is_some()).count();
+        assert_eq!(
+            gallery_presentation(true, Some(parsed)),
+            GalleryPresentation::Content
+        );
+        assert_eq!(
+            unsettled_sources(&sources, &fetched),
+            [sources[1].clone()],
+            "only the failed source is asked again"
+        );
+    }
+
+    type Shared<T> = std::rc::Rc<std::cell::RefCell<T>>;
+
+    /// fetch_sources driven by hand: `answer` resolves a source's fetch still out, `pass_retries` every retry wait under way, `pass_grace` the grace.
+    struct Fetches {
+        pool: futures::executor::LocalPool,
+        /// Each source's fetch still out, answered with (its answer, whether its deadline ran out).
+        out: Shared<
+            std::collections::HashMap<String, futures::channel::oneshot::Sender<(Fetched, bool)>>,
+        >,
+        /// Each fetch asked, as (run id, deadline).
+        asked: Shared<Vec<(String, u32)>>,
+        retries: Shared<Vec<futures::channel::oneshot::Sender<()>>>,
+        grace: Option<futures::channel::oneshot::Sender<()>>,
+        /// Each publication, as (run id, answer) pairs.
+        published: Shared<Vec<Vec<(String, Fetched)>>>,
+        done: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+
+    impl Fetches {
+        fn start(sources: &[ManifestSource]) -> Self {
+            use futures::task::LocalSpawnExt;
+            let pool = futures::executor::LocalPool::new();
+            let out = std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
+            let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let retries = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let (grace_tx, grace_rx) = futures::channel::oneshot::channel::<()>();
+            let published = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let done = std::rc::Rc::new(std::cell::Cell::new(false));
+            let (fetches, asking_log, waits, sink, finished) = (
+                out.clone(),
+                asked.clone(),
+                retries.clone(),
+                published.clone(),
+                done.clone(),
+            );
+            let asking = sources.to_vec();
+            pool.spawner()
+                .spawn_local(async move {
+                    let fetch = async |source: &ManifestSource, deadline: u32| {
+                        let (tx, rx) = futures::channel::oneshot::channel();
+                        fetches.borrow_mut().insert(source.run_id.clone(), tx);
+                        asking_log
+                            .borrow_mut()
+                            .push((source.run_id.clone(), deadline));
+                        rx.await.unwrap()
+                    };
+                    let retry = || {
+                        let (tx, rx) = futures::channel::oneshot::channel::<()>();
+                        waits.borrow_mut().push(tx);
+                        async move {
+                            let _ = rx.await;
+                        }
+                    };
+                    let grace = async move {
+                        let _ = grace_rx.await;
+                    };
+                    let publish = |answers: Vec<(ManifestSource, Fetched)>| {
+                        sink.borrow_mut()
+                            .push(answers.into_iter().map(|(s, a)| (s.run_id, a)).collect())
+                    };
+                    fetch_sources(asking, fetch, retry, grace, publish).await;
+                    finished.set(true);
+                })
+                .unwrap();
+            let mut fetches = Fetches {
+                pool,
+                out,
+                asked,
+                retries,
+                grace: Some(grace_tx),
+                published,
+                done,
+            };
+            fetches.pool.run_until_stalled();
+            fetches
         }
 
-        let old_keys = vec![fetch_key("old.json")];
-        let current_keys = vec![fetch_key("pending:new")];
-        let result = (old_keys.clone(), vec![old_keys[0].0.clone()]);
+        fn answer(&mut self, run_id: &str, answer: Fetched) {
+            self.reply(run_id, (answer, false));
+        }
 
-        assert!(current_manifest_results(&current_keys, Some(&result)).is_none());
-        assert!(current_manifest_results(&old_keys, Some(&result)).is_some());
+        /// The source's fetch still out runs out its deadline.
+        fn time_out(&mut self, run_id: &str) {
+            self.reply(run_id, (Fetched::Failed, true));
+        }
+
+        fn reply(&mut self, run_id: &str, reply: (Fetched, bool)) {
+            self.out
+                .borrow_mut()
+                .remove(run_id)
+                .unwrap()
+                .send(reply)
+                .unwrap();
+            self.pool.run_until_stalled();
+        }
+
+        fn pass_retries(&mut self) {
+            for wait in self.retries.borrow_mut().drain(..) {
+                let _ = wait.send(());
+            }
+            self.pool.run_until_stalled();
+        }
+
+        fn pass_grace(&mut self) {
+            self.grace.take().unwrap().send(()).unwrap();
+            self.pool.run_until_stalled();
+        }
+
+        fn published(&self) -> Vec<Vec<(String, Fetched)>> {
+            self.published.borrow().clone()
+        }
+
+        fn asks(&self, run_id: &str) -> usize {
+            self.deadlines(run_id).len()
+        }
+
+        fn deadlines(&self, run_id: &str) -> Vec<u32> {
+            self.asked
+                .borrow()
+                .iter()
+                .filter(|(asked, _)| asked == run_id)
+                .map(|(_, deadline)| *deadline)
+                .collect()
+        }
+    }
+
+    /// Answers that land within the grace render once, together.
+    #[test]
+    fn answers_within_the_grace_publish_once() {
+        let mut fetches = Fetches::start(&[source("a", "a.json"), source("b", "b.json")]);
+        fetches.answer("b", Fetched::Settled(None));
+        assert!(
+            fetches.published().is_empty(),
+            "nothing shows before every source answered"
+        );
+        fetches.answer("a", Fetched::Settled(Some(image_manifest())));
+        let published = fetches.published();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].len(), 2);
+        assert!(fetches.done.get());
+    }
+
+    /// A stalled source holds the others back only for the grace: then they show, it is marked Waiting, and its answer lands on its own.
+    #[test]
+    fn past_the_grace_what_loaded_shows_and_then_each_answer() {
+        let mut fetches = Fetches::start(&[source("a", "a.json"), source("stalled", "s.json")]);
+        fetches.answer("a", Fetched::Settled(Some(image_manifest())));
+        assert!(fetches.published().is_empty());
+        fetches.pass_grace();
+        assert_eq!(
+            fetches.published(),
+            [vec![
+                ("a".to_string(), Fetched::Settled(Some(image_manifest()))),
+                ("stalled".to_string(), Fetched::Waiting),
+            ]]
+        );
+        fetches.answer("stalled", Fetched::Failed);
+        assert_eq!(
+            fetches.published()[1],
+            [("stalled".to_string(), Fetched::Failed)]
+        );
+        // A failed source is asked again once its retry wait passes.
+        assert_eq!(fetches.asks("stalled"), 1);
+        fetches.pass_retries();
+        assert_eq!(fetches.asks("stalled"), 2);
+        assert!(!fetches.done.get());
+        // Drawn: the loaded source beside the waiting one, which counts as answered.
+        let shown = [drawn("a", "A"), drawn("stalled", "Stalled")];
+        let sources = [source("a", "a.json"), source("stalled", "s.json")];
+        let fetched = FetchedManifests::from([
+            (sources[0].clone(), Fetched::Settled(Some(image_manifest()))),
+            (sources[1].clone(), Fetched::Waiting),
+        ]);
+        let current = current_manifests(&shown, &sources, &fetched).expect("drawn past the grace");
+        assert_eq!(current[1].manifest, None);
+        assert_eq!(
+            unsettled_sources(&sources, &fetched),
+            [sources[1].clone()],
+            "a waiting source is asked again if the fetches restart"
+        );
+    }
+
+    /// A source aborted at its deadline gets twice the time on its next ask, up to the cap; a plain failure keeps its deadline.
+    #[test]
+    fn a_deadline_abort_doubles_that_sources_next_deadline() {
+        let mut fetches = Fetches::start(&[source("queued", "q.json"), source("fails", "f.json")]);
+        for _ in 0..3 {
+            fetches.time_out("queued");
+            fetches.answer("fails", Fetched::Failed);
+            fetches.pass_retries();
+        }
+        assert_eq!(
+            fetches.deadlines("queued"),
+            [47_000, 94_000, 188_000, 188_000]
+        );
+        assert_eq!(fetches.deadlines("fails"), [47_000; 4]);
+    }
+
+    /// A failing source is asked again on its own clock: a sibling still out holds back neither its retry nor its answer.
+    #[test]
+    fn a_failing_source_retries_while_a_sibling_stalls() {
+        let mut fetches = Fetches::start(&[source("fails", "f.json"), source("stalled", "s.json")]);
+        fetches.answer("fails", Fetched::Failed);
+        fetches.pass_grace();
+        assert_eq!(
+            fetches.published(),
+            [vec![
+                ("fails".to_string(), Fetched::Failed),
+                ("stalled".to_string(), Fetched::Waiting),
+            ]]
+        );
+        fetches.pass_retries();
+        assert_eq!(
+            fetches.asks("fails"),
+            2,
+            "asked again with its sibling still out"
+        );
+        fetches.answer("fails", Fetched::Settled(Some(image_manifest())));
+        assert_eq!(
+            fetches.published()[1],
+            [(
+                "fails".to_string(),
+                Fetched::Settled(Some(image_manifest()))
+            )]
+        );
+        assert!(!fetches.done.get());
+        fetches.answer("stalled", Fetched::Settled(None));
+        assert!(fetches.done.get());
+    }
+
+    /// An open preview keeps the previous step's image while the next step's manifest for its run is out, waiting or failing, and says there is none only once that manifest settles without one, or at once for a run with no key at the step.
+    #[test]
+    fn the_preview_keeps_its_image_until_the_next_step_settles() {
+        let image = |resource: &str| Manifest {
+            items: vec![ManifestItem {
+                resource: resource.into(),
+                filename: None,
+                caption: None,
+            }],
+            ..image_manifest()
+        };
+        let open = LightboxImage {
+            project_id: "project".into(),
+            run_id: "run".into(),
+            metric_name: "gallery".into(),
+            item: 0,
+        };
+        let shows = |latched: &std::collections::HashMap<_, (ManifestSource, Manifest)>| {
+            latched
+                .values()
+                .map(|(_, manifest)| manifest.items[0].resource.clone())
+                .collect::<Vec<_>>()
+        };
+        let (step5, step6) = ([source("run", "k5.json")], [source("run", "k6.json")]);
+        let mut latched = std::collections::HashMap::new();
+        let mut fetched =
+            FetchedManifests::from([(step5[0].clone(), Fetched::Settled(Some(image("five"))))]);
+        latch_settled(&mut latched, &step5, &fetched);
+        assert_eq!(shows(&latched), ["five"]);
+        assert_eq!(open_source_state(&open, &step5, &fetched), (false, false));
+        // Stepped to 6: not asked yet, then waiting past the grace, then failing.
+        latch_settled(&mut latched, &step6, &fetched);
+        assert_eq!(open_source_state(&open, &step6, &fetched), (true, false));
+        for answer in [Fetched::Waiting, Fetched::Failed] {
+            fetched = FetchedManifests::from([(step6[0].clone(), answer.clone())]);
+            latch_settled(&mut latched, &step6, &fetched);
+            assert_eq!(shows(&latched), ["five"], "the previous image stays up");
+            assert_eq!(
+                open_source_state(&open, &step6, &fetched),
+                (true, answer == Fetched::Failed),
+                "a failing source says so"
+            );
+        }
+        // Settled without a manifest: a true absence.
+        fetched = FetchedManifests::from([(step6[0].clone(), Fetched::Settled(None))]);
+        latch_settled(&mut latched, &step6, &fetched);
+        assert!(shows(&latched).is_empty());
+        assert_eq!(open_source_state(&open, &step6, &fetched), (false, false));
+        fetched =
+            FetchedManifests::from([(step6[0].clone(), Fetched::Settled(Some(image("six"))))]);
+        latch_settled(&mut latched, &step6, &fetched);
+        assert_eq!(shows(&latched), ["six"]);
+
+        // Runs log at different steps: A at 1, B at 1 and 2. At step 2 A has no image, whatever step 1's answers `fetched` still holds; B's stays up until its own answer settles.
+        let (step1, step2) = (
+            [source("a", "a1.json"), source("b", "b1.json")],
+            [source("b", "b2.json")],
+        );
+        latched.clear();
+        fetched = FetchedManifests::from([
+            (step1[0].clone(), Fetched::Settled(Some(image("a1")))),
+            (step1[1].clone(), Fetched::Settled(Some(image("b1")))),
+        ]);
+        latch_settled(&mut latched, &step1, &fetched);
+        let mut held = shows(&latched);
+        held.sort();
+        assert_eq!(held, ["a1", "b1"]);
+        latch_settled(&mut latched, &step2, &fetched);
+        assert_eq!(shows(&latched), ["b1"]);
+        fetched = FetchedManifests::from([(step2[0].clone(), Fetched::Settled(Some(image("b2"))))]);
+        latch_settled(&mut latched, &step2, &fetched);
+        assert_eq!(shows(&latched), ["b2"]);
+    }
+
+    /// Publishing writes the panel's answers, and so renders it, only when they change: not for a source that fails again, nor for fetches that asked nothing.
+    #[test]
+    fn publishing_writes_only_answers_that_change_something() {
+        let (a, b) = (source("a", "a.json"), source("b", "b.json"));
+        let current: std::collections::HashSet<_> = [a.clone(), b.clone()].into();
+        let fetched = FetchedManifests::from([
+            (a.clone(), Fetched::Settled(Some(image_manifest()))),
+            (b.clone(), Fetched::Failed),
+        ]);
+        let changes =
+            |answers: &[(ManifestSource, Fetched)]| publish_changes(&fetched, &current, answers);
+        assert!(!changes(&[(b.clone(), Fetched::Failed)]));
+        assert!(!changes(&[]));
+        assert!(changes(&[(b.clone(), Fetched::Waiting)]));
+        assert!(changes(&[(b.clone(), Fetched::Settled(None))]));
+        assert!(changes(&[(source("c", "c.json"), Fetched::Failed)]));
+        // Another step's answers still held are dropped, which is a change.
+        let next_step: std::collections::HashSet<_> = [b.clone()].into();
+        assert!(publish_changes(&fetched, &next_step, &[]));
+    }
+
+    /// A rename or recolor changes only what is drawn: the fetch identity stays, so nothing refetches, and the answers held under it take the new label.
+    #[test]
+    fn a_relabeled_source_keeps_its_answer_and_takes_the_new_label() {
+        let sources = [source("run", "a.json")];
+        let fetched = FetchedManifests::from([(
+            sources[0].clone(),
+            Fetched::Settled(Some(image_manifest())),
+        )]);
+        let current = current_manifests(&[drawn("run", "renamed")], &sources, &fetched).unwrap();
+        assert_eq!(current[0].label, "renamed");
+        assert_eq!(current[0].manifest, Some(image_manifest()));
+        assert!(unsettled_sources(&sources, &fetched).is_empty());
     }
 
     #[test]

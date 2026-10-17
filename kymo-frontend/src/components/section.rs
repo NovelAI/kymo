@@ -56,6 +56,7 @@ pub fn Section(
     // Immutable id — keys rect ids; the label is what the user sees.
     let section_id = config.name.clone();
     let trigger_id = editor_trigger_id("section", &section_id);
+    let body_id = format!("{trigger_id}-body");
     let section_label = config.display_name().to_string();
     let state = use_context::<DashboardState>();
     let mut panel_filter = state.panel_filter;
@@ -140,8 +141,16 @@ pub fn Section(
                     ondragend: move |_| drag.end(state),
                     GripIcon {}
                 }
-                span { class: "section-name", "{section_label}" }
-                span { class: "section-count", "{display_rects.len()}" }
+                // The toggle's keyboard face, with no handler of its own: a press bubbles to the bar's mousedown, and Enter or Space on it reaches the same handler through KB_ACTIVATE_JS (main.rs).
+                button {
+                    r#type: "button",
+                    class: "section-toggle",
+                    aria_expanded: !collapsed,
+                    // A collapsed section renders no body, so there is nothing to point at then.
+                    aria_controls: (!collapsed).then(|| body_id.clone()),
+                    span { class: "section-name", "{section_label}" }
+                    span { class: "section-count", "{display_rects.len()}" }
+                }
                 button {
                     class: "section-action icon-button",
                     title: "Add metric",
@@ -273,7 +282,7 @@ pub fn Section(
             }
 
             if !collapsed {
-                div { class: "section-grid", style: "{grid_style}",
+                div { id: "{body_id}", class: "section-grid", style: "{grid_style}",
                     for i in visible_indices.iter().copied() {
                         {
                             let rect = display_rects[i].clone();

@@ -620,8 +620,8 @@ async fn trash_before_drain(fixture: &mut Fixture, run: &str) -> Result<()> {
     Ok(())
 }
 
-/// A rich mutation, versioned or legacy, whose RPC is cancelled once its ClickHouse insert has started keeps the run's gate until the insert ends, so Trash cannot commit under a row still landing, and queues its bump then.
-async fn cancelled_rich_insert(fixture: &mut Fixture, run: &str, versioned: bool) -> Result<()> {
+/// A rich mutation whose RPC is cancelled once its ClickHouse insert has started keeps the run's gate until the insert ends, so Trash cannot commit under a row still landing, and queues its bump then.
+async fn cancelled_rich_insert(fixture: &mut Fixture, run: &str) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     fixture.init(run).await?;
     ensure!(!fixture.bumps.state.lock().unwrap().has_pending_work());
@@ -644,7 +644,7 @@ async fn cancelled_rich_insert(fixture: &mut Fixture, run: &str, versioned: bool
         step: 1,
         cdn_key: "abcd.json".into(),
         timestamp_ms: 1,
-        mutation_version: versioned.then_some((1 << 32) | 1),
+        mutation_version: Some((1 << 32) | 1),
         ..Default::default()
     };
     let rpc = tokio::spawn(async move {
@@ -759,13 +759,7 @@ async fn trash_retains_pending_ingest_timing() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL and KYMO_LIVE_TEST_CLICKHOUSE_URL"]
 async fn cancelled_rich_insert_keeps_its_run_gate() -> Result<()> {
-    with_fixture(async |fixture, run| cancelled_rich_insert(fixture, run, true).await).await
-}
-
-#[tokio::test]
-#[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL and KYMO_LIVE_TEST_CLICKHOUSE_URL"]
-async fn cancelled_legacy_rich_insert_keeps_its_run_gate() -> Result<()> {
-    with_fixture(async |fixture, run| cancelled_rich_insert(fixture, run, false).await).await
+    with_fixture(async |fixture, run| cancelled_rich_insert(fixture, run).await).await
 }
 
 /// Numeric reads return only numeric rows and the CDN lookup only media rows, for a metric name that logged all three payload types; a SELECT alias must not shadow the column a filter tests.

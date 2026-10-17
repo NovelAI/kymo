@@ -26,7 +26,7 @@ Archive layout:
           _manifest.json             artifact metadata + file entries (always)
           _complete.json             marker: version fully exported
           files/...                  artifact content (unless --manifest-only-artifacts)
-        runs/<run_id>__<name_slug>/
+        runs/<run_id>__<name_slug>/  (plus -<6 hex digits of the id's sha1> where another run's directory has the name)
           run.json                   config, summary, tags, notes, state, user, ...
           _export.json               exporter bookkeeping (resume state; exported_at: the run's last export, or a later metadata change)
           history/*.parquet          full metric history (latest run-<id>-history artifact)
@@ -55,14 +55,17 @@ Known limitations:
 - A run's console log is held whole in memory before it is written.
 - A run resumed after it finished can keep its older history parquet when
   the re-export runs before wandb has generated the new one.
-- A run whose id is another's plus "__..." (abc and abc__x) can take over
-  that run's directory.
 - wandb identity-token (OIDC) logins carry no API key, so console-log fetches
   fail; log in with an API key.
 - Reports stop at 500 per project (logged).
+- A run renamed after an export that stopped before writing its first
+  run.json leaves that directory behind, holding no exported data: one
+  without run.json could be any run's, so it is not taken over. The importer
+  skips it with a warning.
 """
 
 import argparse
+import glob
 import gzip
 import hashlib
 import json
@@ -269,16 +272,61 @@ def run_metadata(run):
     }
 
 
+class RunDirConflict(Exception):
+    """A run's directory cannot be used: its run.json cannot be read or names no run, or both of the run's names hold other runs."""
+
+
+# Nothing rewrites a run.json that cannot tell whose directory it is, so the run fails on every pass until someone does.
+REPAIR = "repair that run.json, or delete it if the directory is this run's"
+
+
+def stored_run(run_dir):
+    """run_dir's run.json; None when there is none (no directory, or a first export interrupted before writing it). RunDirConflict when it cannot be read or names no run."""
+    try:
+        with open(run_dir / "run.json") as f:
+            stored = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        raise RunDirConflict(
+            f"its directory {run_dir.name} has a run.json that cannot be read ({e}); {REPAIR}"
+        ) from e
+    if not isinstance(stored, dict) or stored.get("id") is None:
+        raise RunDirConflict(
+            f"its directory {run_dir.name} has a run.json without a run id; {REPAIR}"
+        )
+    return stored
+
+
 def resolve_run_dir(runs_root, run_id, run_name):
-    """Find or create the directory for a run, renaming if the display name changed."""
+    """(directory, its run.json or None) for a run, renaming the directory if the display name changed; RunDirConflict if it has no usable one. The caller compares that run.json with fresh metadata, so it is parsed once."""
     want = runs_root / f"{run_id}__{slug(run_name)}"
-    existing = sorted(runs_root.glob(f"{run_id}__*"))  # empty when runs_root is missing
-    if existing and existing[0] != want:
-        try:
-            existing[0].rename(want)
-        except OSError:
-            return existing[0]
-    return want
+    # Slugs keep "_", so a name cannot tell abc's "x__old" from abc__x's "old" (the glob below matches both for abc): the stored id decides.
+    stored = stored_run(want)
+    if stored and stored["id"] != run_id:
+        # Another run's directory: this run takes the name plus a hash of its own id, the same on every pass.
+        alt = want.with_name(
+            f"{want.name}-{hashlib.sha1(run_id.encode()).hexdigest()[:6]}"
+        )
+        stored = stored_run(alt)
+        if stored and stored["id"] != run_id:
+            raise RunDirConflict(
+                f"its directories {want.name} and {alt.name} hold other runs"
+            )
+        want = alt
+    if stored:
+        return want, stored
+    # A directory holding this id under another name wins over an id-less one here (an export stopped before its first run.json).
+    # Empty when runs_root is missing; escaped because wandb run ids may contain glob characters such as "[".
+    for old in sorted(runs_root.glob(f"{glob.escape(run_id)}__*")):
+        stored = read_json(old / "run.json")
+        if isinstance(stored, dict) and stored.get("id") == run_id:
+            try:
+                old.rename(want)
+            except OSError:  # such as an id-less directory here that is not empty
+                return old, stored
+            return want, stored
+    return want, None
 
 
 def run_needs_heavy(prev, state, heartbeat, hlc, cfg):
@@ -842,7 +890,12 @@ def produce(q, cfg, stats):
                     continue
                 seen.add(run.id)
                 stats.add(p.name, "runs_total")
-                run_dir = resolve_run_dir(runs_root, run.id, run.name)
+                try:
+                    run_dir, stored = resolve_run_dir(runs_root, run.id, run.name)
+                except RunDirConflict as e:
+                    stats.add(p.name, "runs_failed")
+                    stats.error(p.name, f"run {run.id} FAILED: {e}")
+                    continue
                 a = run._attrs
                 prev = read_json(run_dir / "_export.json")
                 heavy = run_needs_heavy(
@@ -853,9 +906,7 @@ def produce(q, cfg, stats):
                     cfg,
                 )
                 meta = run_metadata(run)
-                meta_changed = canonical(read_json(run_dir / "run.json")) != canonical(
-                    meta
-                )
+                meta_changed = canonical(stored) != canonical(meta)
                 if heavy and prev and prev.get("complete"):
                     # The run's data is about to be replaced, starting with run.json below (the refresh also removes history before its new version downloads), so a kill before the refresh finishes must not leave the old completion standing.
                     write_json(run_dir / "_export.json", {**prev, "complete": False})
@@ -936,6 +987,8 @@ def main():
         "completes for this many seconds",
     )
     cfg = ap.parse_args()
+    if min(cfg.workers, cfg.file_threads, cfg.stall_timeout) < 1:
+        ap.error("--workers, --file-threads and --stall-timeout must be >= 1")
 
     logdir = cfg.archive / "_logs"
     logdir.mkdir(parents=True, exist_ok=True)

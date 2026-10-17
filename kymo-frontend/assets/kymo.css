@@ -941,19 +941,27 @@ input[type="checkbox"]:checked::before {
     padding: var(--spacing-sm) var(--spacing-md);
 }
 
+/* Keyboard focus anywhere in the header shows its actions; a mouse press on the collapse toggle, which focuses it in Chromium, does not keep them up. */
 .section-header:hover .section-action,
-.section-header:focus-within .section-action { opacity: 1; }
+.section-header:has(:focus-visible) .section-action { opacity: 1; }
 
 .section-name {
     font-family: var(--font-heading);
     font-size: var(--font-size-15);
     font-weight: 600;
     color: var(--text-headings);
-    cursor: pointer;
 }
 .section-name:hover { color: var(--text-main); }
 
 .section-count { font-size: var(--font-size-11); color: var(--text-disabled); margin-left: var(--spacing-xs); }
+
+.section-toggle {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-sm);
+    font: inherit;
+    cursor: pointer;
+}
 
 .section-action {
     font-size: var(--font-size-14);
@@ -2095,13 +2103,17 @@ input[type="checkbox"]:checked::before {
 }
 button.editor-section-toggle {
     width: 100%;
+    text-align: left;
+}
+button.editor-section-toggle,
+.section-toggle {
     padding: 0;
     border: 0;
     background: none;
-    text-align: left;
 }
 .editor-section-toggle:hover { color: var(--text-main); }
-button.editor-section-toggle:focus-visible {
+button.editor-section-toggle:focus-visible,
+.section-toggle:focus-visible {
     outline: 2px solid var(--text-headings);
     outline-offset: 2px;
 }

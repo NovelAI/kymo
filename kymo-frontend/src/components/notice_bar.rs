@@ -1,4 +1,4 @@
-//! App-root notices the user must see — a server connection that stays down, chart-delta protocol failures (`protocol_alert`), and server alerts polled from `GET /alerts` (Prometheus's `audience=user` rules, or without Prometheus the CDN collector's own conditions) — rendered above the router so they cover every page; dismissal lasts this tab's session and is keyed by identity, so a new occurrence reappears.
+//! App-root notices the user must see — a server connection that stays down, chart-delta protocol failures (`protocol_alert`), layout edits the browser refused to store (`layout_unsaved`), and server alerts polled from `GET /alerts` (Prometheus's `audience=user` rules, or without Prometheus the CDN collector's own conditions) — rendered above the router so they cover every page; dismissal lasts this tab's session and is keyed by identity, so a new occurrence reappears.
 
 use std::time::Duration;
 
@@ -63,6 +63,16 @@ fn offline_notice(generation: u64) -> Notice {
         title: "Charts stop updating until the connection is back; waiting requests resume then."
             .to_owned(),
         question: None,
+    }
+}
+
+/// Whether a layout edit the browser refused to store is unacknowledged: a refusal shows the notice, dismissing it clears this, and the next refusal shows it again.
+static LAYOUT_UNSAVED: GlobalSignal<bool> = Signal::global(|| false);
+
+/// Record a layout edit the browser refused to store (storage full or blocked), which was therefore not applied. A notice already up stays as it is, so a slider's run of refusals is announced once.
+pub fn layout_unsaved() {
+    if !*LAYOUT_UNSAVED.peek() {
+        *LAYOUT_UNSAVED.write() = true;
     }
 }
 
@@ -147,6 +157,10 @@ fn dismiss(key: &str) {
         *PROTOCOL.write() = Default::default();
         return;
     }
+    if key == "layout-unsaved" {
+        *LAYOUT_UNSAVED.write() = false;
+        return;
+    }
     let mut dismissed = DISMISSED.write();
     if dismissed.iter().any(|k| k == key) {
         return;
@@ -200,6 +214,15 @@ pub fn NoticeBar() -> Element {
             key: "protocol".to_owned(),
             text: format!("⚠ {} chart-delta failure(s) — see console", protocol.count),
             title: protocol.last.clone(),
+            question: None,
+        });
+    }
+    if *LAYOUT_UNSAVED.read() {
+        notices.push(Notice {
+            key: "layout-unsaved".to_owned(),
+            text: "Layout change not saved: browser storage is full or blocked".to_owned(),
+            title: "The change was undone. Free or allow this site's storage, then make it again."
+                .to_owned(),
             question: None,
         });
     }

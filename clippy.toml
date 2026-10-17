@@ -2,3 +2,7 @@
 # satisfy Clippy's generic size heuristic would add indirection throughout the
 # service without shrinking the wire or request state.
 large-error-threshold = 256
+
+disallowed-methods = [
+    { path = "dioxus_document::Eval::send", reason = "under serde_json's arbitrary_precision every number sent breaks (kymo-frontend/Cargo.toml)" },
+]

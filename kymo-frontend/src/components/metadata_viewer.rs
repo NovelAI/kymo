@@ -361,7 +361,7 @@ fn difference_tints<T: Eq + Hash>(values: &[T]) -> Vec<bool> {
         .collect()
 }
 
-/// A leaf's per-run values under the diff's notion of equality, as canonical JSON (serde_json maps are sorted), so a row groups in linear time.
+/// A leaf's per-run values under the diff's notion of equality, as JSON text (serde_json maps are sorted; numbers stay as written, but for serde_json's spelling of an exponent and of -0), so a row groups in linear time.
 fn comparable_row(columns: &[MetadataColumn], path: &str) -> Vec<Option<String>> {
     columns
         .iter()
@@ -863,6 +863,76 @@ mod tests {
                 KeyNode::Leaf("object".to_string()),
             ]
         );
+    }
+
+    /// Numbers serde_json's default f64 parse loses: 10^400 and int(float max) fail it; 2^256 and a decimal longer than 17 digits print back rounded.
+    fn numbers_beyond_f64() -> [String; 4] {
+        [
+            format!("1{}", "0".repeat(400)),
+            format!("{:.0}", f64::MAX),
+            "115792089237316195423570985008687907853269984665640564039457584007913129639936"
+                .to_string(),
+            "3.14159265358979323846264338327950288".to_string(),
+        ]
+    }
+
+    #[test]
+    fn numbers_render_and_copy_as_logged() {
+        for logged in numbers_beyond_f64() {
+            let data: Value = serde_json::from_str(&format!(r#"{{"n": {logged}}}"#)).unwrap();
+            let displays = format_row_values(&[Some(&data["n"])]);
+            assert_eq!(displays, vec![logged.clone()]);
+            assert_eq!(copy_payload(&data["n"], &displays[0]), logged);
+        }
+    }
+
+    #[test]
+    fn numbers_keep_their_text_but_for_serde_jsons_exponent_and_zero() {
+        for (written, shown) in [
+            ("1.50", "1.50"),
+            ("0.000", "0.000"),
+            ("1e-08", "1e-08"),
+            ("1e+30", "1e+30"),
+            ("1E5", "1e+5"),
+            ("1e5", "1e+5"),
+            ("2.5E-3", "2.5e-3"),
+            ("-0", "0"),
+            ("-0.0", "-0.0"),
+        ] {
+            let data: Value = serde_json::from_str(&format!(r#"{{"n": {written}}}"#)).unwrap();
+            assert_eq!(format_row_values(&[Some(&data["n"])]), [shown], "{written}");
+        }
+    }
+
+    #[test]
+    fn numbers_compare_as_logged() {
+        // Each pair differs only in its last digit, below f64's precision.
+        for logged in numbers_beyond_f64() {
+            let neighbour = format!("{}1", &logged[..logged.len() - 1]);
+            let runs = columns(
+                [logged, neighbour]
+                    .into_iter()
+                    .map(|n| {
+                        let data = serde_json::from_str(&format!(r#"{{"n": {n}}}"#)).unwrap();
+                        (n, data)
+                    })
+                    .collect(),
+            );
+            let keys = collect_all_keys(
+                &runs
+                    .iter()
+                    .map(|column| column.data.clone())
+                    .collect::<Vec<_>>(),
+            );
+            assert_eq!(
+                filter_diff_only(&keys, &runs, ""),
+                vec![KeyNode::Leaf("n".to_string())]
+            );
+            assert_eq!(
+                difference_tints(&comparable_row(&runs, "/n")),
+                vec![true, true]
+            );
+        }
     }
 
     #[test]

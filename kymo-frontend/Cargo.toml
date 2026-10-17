@@ -14,8 +14,13 @@ dioxus = { version = "0.7", features = ["web", "router"] }
 tonic = { version = "0.14", default-features = false, features = ["codegen"] }
 prost = "0.14"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-web-sys = { version = "0.3", features = ["AbortSignal", "CssStyleDeclaration", "Document", "Element", "HtmlElement", "HtmlInputElement", "Node", "Window", "Storage", "StorageEvent", "Performance", "ResizeObserver", "ResizeObserverEntry", "DomRect", "DomRectReadOnly", "HtmlDialogElement", "ToggleEvent", "Event", "EventTarget", "MouseEvent", "Navigator", "Selection", "Location", "Range", "DomRectList", "DragEvent", "DataTransfer", "MediaQueryList", "Blob", "ReadableStream", "ReadableWritablePair", "Response"] }
+# Numbers keep the text they were written with, so metadata shows them as logged, but for serde_json's spelling of an exponent and of -0 (1E5 reads 1e+5, -0 reads 0), which the Python client's json.dumps already uses.
+# Without it a number near or past f64's limit fails its whole manifest, and an integer above 2^64 or a long decimal shows rounded.
+# It breaks numbers other than 64-bit integers inside flattened, untagged, internally or adjacently tagged types and in custom Deserialize impls that read them through `deserialize_any`, and every number sent to JS with `eval(..).send`, which serde_wasm_bindgen gets as serde_json's private Number struct. The frontend's active paths have none (nothing sends through `eval`): Dioxus's flattened and untagged event types are compiled out of the web build, and hot reload's internally tagged templates carry only strings and integer ids.
+# A workspace build unifies it into kymo-server, so CI tests each package alone, as each is built.
+# Known limit: an object whose first key is serde_json's own `$serde_json::private::Number` reads as the number its value names, or fails its whole manifest.
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+web-sys = { version = "0.3", features = ["AbortController", "AbortSignal", "CssStyleDeclaration", "Document", "Element", "HtmlElement", "HtmlInputElement", "Node", "Window", "Storage", "StorageEvent", "Performance", "ResizeObserver", "ResizeObserverEntry", "DomRect", "DomRectReadOnly", "HtmlDialogElement", "ToggleEvent", "Event", "EventTarget", "MouseEvent", "Navigator", "Selection", "Location", "Range", "DomRectList", "DragEvent", "DataTransfer", "MediaQueryList", "Blob", "ReadableStream", "ReadableWritablePair", "Response"] }
 wasm-bindgen = "0.2"
 futures = "0.3"
 tokio = { version = "1", default-features = false, features = ["sync"] }

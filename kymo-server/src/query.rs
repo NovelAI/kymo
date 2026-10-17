@@ -2363,73 +2363,236 @@ fn assemble_cdn_series(
 ///
 /// These transitions are caused by the ABSENCE of events — a run going silent — so the server must watch the clock: one 5s scan, bounded to runs still inside the transition window (`status_watch_candidates`). Push is the prompt signal; a visible tab's one-minute PollVersions loop backs up missed delivery.
 ///
-/// Transitions bump `projects.version` first, then push the returned value (pushed versions are real versions). A run APPEARING in the candidate set also counts as a transition: a revival re-enters the window with no lifecycle RPC (for a new run this occasionally doubles InitRun's bump — one redundant ListRuns). The first scan seeds silently: a restart already forces reconnect resyncs.
+/// Transitions bump `projects.version` first, then push the returned value (pushed versions are real versions). A run APPEARING in the candidate set also counts as a transition: a revival re-enters the window with no lifecycle RPC (for a new run this occasionally doubles InitRun's bump — one redundant ListRuns). A clean first scan seeds silently: a restart already forces reconnect resyncs. After a failed one, the first healthy scan heals instead, since transitions since those resyncs went unannounced.
 pub fn spawn_status_watcher(pg: Arc<PgStore>, events: crate::events::EventSender) {
     tokio::spawn(async move {
-        let mut prev: std::collections::HashMap<(String, String), proto::RunStatus> =
-            std::collections::HashMap::new();
-        let mut seeded = false;
-        // A failed tick (scan or bump) may have lost transitions — including runs that aged out of the window during the gap. The next healthy tick heals by bumping every project seen on either side of the gap once.
-        let mut degraded = false;
+        let mut watch = StatusWatch::default();
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
-            let timed_rows = match pg.status_watch_candidates().await {
-                Ok(rows) => rows,
-                Err(e) => {
-                    tracing::warn!("status watcher scan failed: {e}");
-                    degraded = true;
-                    continue;
-                }
-            };
-            let mut cur = std::collections::HashMap::with_capacity(timed_rows.rows.len());
-            let mut changed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-            for row in timed_rows.rows {
-                let status = compute_status(
-                    timed_rows.server_now_ms,
-                    row.created_at_ms,
-                    row.last_main_metric_at_ms,
-                    row.last_system_metric_at_ms,
-                    row.exit_code,
-                );
-                if prev.get(&(row.project_id.clone(), row.run_id.clone())) != Some(&status) {
-                    changed.insert(row.project_id.clone());
-                }
-                cur.insert((row.project_id, row.run_id), status);
-            }
-            if !seeded {
-                seeded = true;
-                degraded = false;
-                prev = cur;
-                continue;
-            }
-            if degraded {
-                changed.extend(prev.keys().chain(cur.keys()).map(|(p, _)| p.clone()));
-            }
-            if changed.is_empty() {
-                // Dropping runs that left the window loses nothing on a healthy tick: they transitioned to their pinned state while still inside it (the 1-minute margin covers a missed tick). prev advances only when announcements succeeded, so failed ticks re-detect. (Empty while degraded = no watched runs on either side of the gap.)
-                prev = cur;
-                degraded = false;
-                continue;
-            }
-            let ids: Vec<String> = changed.into_iter().collect();
-            match pg.bump_project_versions(&ids).await {
+            let bump = async |ids: Vec<String>| pg.bump_unlocked_project_versions(&ids).await;
+            match watch.tick(pg.status_watch_candidates(), bump).await {
+                Ok(projects) if projects.is_empty() => {}
                 Ok(projects) => {
                     let _ = events.send(crate::events::VersionEvent {
                         projects,
                         ..Default::default()
                     });
-                    prev = cur;
-                    degraded = false;
                 }
-                Err(e) => {
-                    tracing::warn!("status watcher project bump failed: {e}");
-                    degraded = true;
-                }
+                Err(e) => tracing::warn!("{e:#}"),
             }
         }
     });
+}
+
+/// Deadline on each status-watcher store call, connecting included, for a connection that died without a reset and never answers. It exceeds PostgreSQL's 11 s statement deadline, so a slow statement on an open connection fails there first. Neither is 60 s or a multiple of the 2, 4, 5, 10 or 12 s clocks.
+const STATUS_WATCH_STORE_TIMEOUT: Duration = Duration::from_secs(13);
+const _: () = assert!(
+    STATUS_WATCH_STORE_TIMEOUT.as_secs() > crate::pg::STATUS_WATCH_STATEMENT_TIMEOUT.as_secs()
+);
+
+/// What the status watcher carries from one tick to the next.
+#[derive(Default)]
+struct StatusWatch {
+    prev: std::collections::HashMap<(String, String), proto::RunStatus>,
+    seeded: bool,
+    /// A failed tick (scan or bump) may have lost transitions — including runs that aged out of the window during the gap. The next healthy tick heals by bumping every project seen on either side of the gap once.
+    degraded: bool,
+    /// Projects whose rows the last bump skipped as held ([`PgStore::bump_unlocked_project_versions`]), bumped again each tick until one takes.
+    owed: std::collections::BTreeSet<String>,
+}
+
+impl StatusWatch {
+    /// One tick over the scanned candidates: bump the projects whose runs changed status, returning the versions to push. A store call that fails or times out leaves `prev` and `seeded` as they were and the watch degraded, so the next healthy tick detects its transitions again and re-bumps any that a timed-out bump committed.
+    async fn tick(
+        &mut self,
+        scan: impl std::future::Future<Output = anyhow::Result<TimedRunRows>>,
+        bump: impl AsyncFnOnce(Vec<String>) -> anyhow::Result<Vec<(String, Option<u64>)>>,
+    ) -> anyhow::Result<Vec<(String, u64)>> {
+        use anyhow::Context as _;
+        // Degraded until the tick completes.
+        let degraded = std::mem::replace(&mut self.degraded, true);
+        let secs = STATUS_WATCH_STORE_TIMEOUT.as_secs();
+        let timed_rows = tokio::time::timeout(STATUS_WATCH_STORE_TIMEOUT, scan)
+            .await
+            .map_err(|_| anyhow::anyhow!("status watcher scan: no answer in {secs}s"))?
+            .context("status watcher scan")?;
+        let mut cur = std::collections::HashMap::with_capacity(timed_rows.rows.len());
+        let mut changed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for row in timed_rows.rows {
+            let status = compute_status(
+                timed_rows.server_now_ms,
+                row.created_at_ms,
+                row.last_main_metric_at_ms,
+                row.last_system_metric_at_ms,
+                row.exit_code,
+            );
+            if self.prev.get(&(row.project_id.clone(), row.run_id.clone())) != Some(&status) {
+                changed.insert(row.project_id.clone());
+            }
+            cur.insert((row.project_id, row.run_id), status);
+        }
+        let mut announced = Vec::new();
+        // A clean first scan seeds silently; one after a failed scan heals. Dropping runs that left the window loses nothing on a healthy tick: they transitioned to their pinned state while still inside it (the 1-minute margin covers a missed tick). (Empty while degraded = no watched runs on either side of the gap.)
+        if self.seeded || degraded {
+            if degraded {
+                changed.extend(self.prev.keys().chain(cur.keys()).map(|(p, _)| p.clone()));
+            }
+            changed.extend(self.owed.iter().cloned());
+            if !changed.is_empty() {
+                let bump = bump(changed.into_iter().collect());
+                let projects = tokio::time::timeout(STATUS_WATCH_STORE_TIMEOUT, bump)
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "status watcher project bump: no answer in {secs}s, outcome unknown"
+                        )
+                    })?
+                    .context("status watcher project bump")?;
+                self.owed.clear();
+                for (project, version) in projects {
+                    match version {
+                        Some(version) => announced.push((project, version)),
+                        None => {
+                            self.owed.insert(project);
+                        }
+                    }
+                }
+            }
+        }
+        self.seeded = true;
+        self.prev = cur;
+        self.degraded = false;
+        Ok(announced)
+    }
+}
+
+#[cfg(test)]
+mod status_watch_tests {
+    use super::*;
+
+    type Bumped = anyhow::Result<Vec<(String, Option<u64>)>>;
+
+    /// A scan at `server_now_ms` of runs that logged a main metric at 0.
+    async fn scan(server_now_ms: i64, runs: &[(&str, &str)]) -> anyhow::Result<TimedRunRows> {
+        let rows = runs
+            .iter()
+            .map(|&(project_id, run_id)| RunInfoRow {
+                project_id: project_id.into(),
+                run_id: run_id.into(),
+                run_name: String::new(),
+                ordinal: 1,
+                created_at_ms: 0,
+                last_main_metric_at_ms: Some(0),
+                last_system_metric_at_ms: None,
+                last_ingested_at_ms: None,
+                terminated_at_ms: None,
+                exit_code: None,
+            })
+            .collect();
+        Ok(TimedRunRows {
+            rows,
+            server_now_ms,
+        })
+    }
+
+    fn no_bump(ids: Vec<String>) -> std::future::Ready<Bumped> {
+        panic!("unexpected bump of {ids:?}")
+    }
+
+    /// A tick with one stalled store call, the other answering at once: it must end by that call's deadline. (A tick whose scan answers late and whose bump then stalls can take both deadlines.)
+    async fn ended<T>(tick: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(STATUS_WATCH_STORE_TIMEOUT + Duration::from_secs(1), tick)
+            .await
+            .expect("the tick outlived its store deadline")
+    }
+
+    /// A store call that never answers fails its tick at the deadline, keeping what the watch had seen; the next healthy tick, the first scan included, re-bumps every project seen, a skipped project stays owed until a bump takes it (a tick that skips every project pushes nothing), and nothing is bumped once all are announced.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_store_call_fails_its_tick_and_the_next_heals() {
+        let mut watch = StatusWatch::default();
+        let state = |watch: &StatusWatch| (watch.seeded, watch.degraded, watch.prev.len());
+        let started = tokio::time::Instant::now();
+        assert!(ended(watch.tick(std::future::pending(), no_bump))
+            .await
+            .is_err());
+        assert_eq!(started.elapsed(), STATUS_WATCH_STORE_TIMEOUT);
+        assert_eq!(state(&watch), (false, true, 0));
+        // After a failed first scan the first healthy one heals: the restart's resyncs predate its transitions.
+        let healed = watch.tick(scan(20_000, &[("p", "r")]), |ids| {
+            assert_eq!(ids, ["p"]);
+            std::future::ready(Ok(vec![("p".into(), Some(1))]))
+        });
+        assert_eq!(healed.await.unwrap(), [("p".into(), 1)]);
+        assert_eq!(state(&watch), (true, false, 1));
+        let quiet = watch.tick(scan(20_000, &[("p", "r")]), no_bump);
+        assert!(quiet.await.unwrap().is_empty());
+        // A clean first scan seeds silently.
+        let mut clean = StatusWatch::default();
+        let seeded = clean.tick(scan(0, &[("p", "r")]), no_bump);
+        assert!(seeded.await.unwrap().is_empty());
+        assert_eq!(state(&clean), (true, false, 1));
+
+        assert!(ended(watch.tick(std::future::pending(), no_bump))
+            .await
+            .is_err());
+        assert_eq!(state(&watch), (true, true, 1));
+        let mut asked = Vec::new();
+        let hung = watch.tick(scan(0, &[("p", "r")]), |ids| {
+            asked = ids;
+            std::future::pending::<Bumped>()
+        });
+        assert!(ended(hung).await.is_err());
+        assert_eq!(asked, ["p"]);
+        assert_eq!(state(&watch), (true, true, 1));
+
+        let pushed = watch.tick(scan(20_000, &[("p", "r"), ("q", "s")]), |ids| {
+            assert_eq!(ids, ["p", "q"]);
+            std::future::ready(Ok(vec![("p".into(), Some(4)), ("q".into(), None)]))
+        });
+        assert_eq!(pushed.await.unwrap(), [("p".into(), 4)]);
+        let skipped = watch.tick(scan(20_000, &[("p", "r"), ("q", "s")]), |ids| {
+            assert_eq!(ids, ["q"]);
+            std::future::ready(Ok(vec![("q".into(), None)]))
+        });
+        assert!(skipped.await.unwrap().is_empty());
+        assert_eq!(state(&watch), (true, false, 2));
+        let pushed = watch.tick(scan(20_000, &[("p", "r"), ("q", "s")]), |ids| {
+            assert_eq!(ids, ["q"]);
+            std::future::ready(Ok(vec![("q".into(), Some(9))]))
+        });
+        assert_eq!(pushed.await.unwrap(), [("q".into(), 9)]);
+        let quiet = watch.tick(scan(20_000, &[("p", "r"), ("q", "s")]), no_bump);
+        assert!(quiet.await.unwrap().is_empty());
+    }
+
+    /// A bump that fails leaves owed what it owed, a project no longer watched included.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_bump_keeps_what_it_owed() {
+        let mut watch = StatusWatch::default();
+        let seeded = watch.tick(scan(0, &[("p", "r"), ("q", "s")]), no_bump);
+        assert!(seeded.await.unwrap().is_empty());
+        assert!(ended(watch.tick(std::future::pending(), no_bump))
+            .await
+            .is_err());
+        // q's run has left the window; the heal bumps p and q, and q's row is held.
+        let healed = watch.tick(scan(0, &[("p", "r")]), |ids| {
+            assert_eq!(ids, ["p", "q"]);
+            std::future::ready(Ok(vec![("p".into(), Some(1)), ("q".into(), None)]))
+        });
+        assert_eq!(healed.await.unwrap(), [("p".into(), 1)]);
+        let failed = watch.tick(scan(0, &[("p", "r")]), |ids| {
+            assert_eq!(ids, ["q"]);
+            std::future::ready(Err(anyhow::anyhow!("lost")))
+        });
+        assert!(failed.await.is_err());
+        let healed = watch.tick(scan(0, &[("p", "r")]), |ids| {
+            assert_eq!(ids, ["p", "q"]);
+            std::future::ready(Ok(vec![("p".into(), Some(2)), ("q".into(), Some(5))]))
+        });
+        assert_eq!(healed.await.unwrap(), [("p".into(), 2), ("q".into(), 5)]);
+    }
 }
 
 #[cfg(test)]

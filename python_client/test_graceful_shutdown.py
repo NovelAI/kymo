@@ -50,6 +50,25 @@ fake kymo server):
                           reports the galleries lost and exits by itself
  24. tracker's mask    → spawn's resource tracker keeps the group signals it
                           does not ignore blocked; the worker blocks none
+ 25. helper's finish   → a finish() on another thread, or on a
+                          ThreadPoolExecutor's worker, as the program exits
+                          with sys.exit(7), which joins it before atexit:
+                          the run ends with 7
+ 26. caught sys.exit   → a program that catches a sys.exit(7) and carries
+                          on to finish(): the run ends with 0
+ 27. atexit finish()   → finish() registered with atexit, then an uncaught
+                          sys.exit(7): the run ends with 7
+ 28. atexit sys.exit   → an atexit hook's sys.exit(0), which Python ignores,
+                          after an uncaught sys.exit(7): the run ends with 7
+ 29. caught, SIGTERM   → a caught sys.exit(7), then a SIGTERM: the run ends
+                          with 143, as the process does
+ 30. SIGTERM at exit   → a SIGTERM during concurrent.futures' join of a running
+                          job, after an uncaught sys.exit(7): the run ends with 7
+ 31. atexit sys.exit   → an atexit hook's sys.exit(3), which Python ignores,
+     after a normal end   after a normal end: the run ends with 0
+ 32. handler's exit at  → a SIGTERM handler installed before init() that calls
+     the exit             sys.exit(1), its SIGTERM sent from a threading atexit
+                          hook after a normal end: the run ends with 0
 
 Run:  python3 test_graceful_shutdown.py
 """
@@ -397,6 +416,9 @@ DRIVER = textwrap.dedent("""
     if cfg.get("ignore_sigterm"):
         import signal
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    if cfg.get("sigterm_exits"):
+        import signal
+        signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(cfg["sigterm_exits"]))
     kymo.init(
         server_address=cfg["grpc"], cdn_address=cfg["cdn"],
         project_id="shutdown-test", run_name=cfg["run_name"],
@@ -447,6 +469,56 @@ DRIVER = textwrap.dedent("""
             sys.exit(0)  # a Ctrl-C the program catches and exits on, as click and Lightning do
     if cfg.get("hang_after_log"):
         time.sleep(3600)  # wait to be signalled
+    if cfg.get("exit_with_helper_finish"):
+        # Another thread's finish() once the program has called sys.exit: the interpreter's exit joins that thread, or concurrent.futures' exit hook joins an executor's worker, before the atexit flush.
+        import threading
+        import kymo.client
+        def finish_after_the_exit():
+            while kymo.client._exit_code is None:
+                time.sleep(0.001)
+            kymo.finish()
+        if cfg.get("helper_executor"):
+            import concurrent.futures
+            concurrent.futures.ThreadPoolExecutor(max_workers=1).submit(finish_after_the_exit)
+        else:
+            threading.Thread(target=finish_after_the_exit).start()
+        sys.exit(cfg["exit_with_helper_finish"])
+    if cfg.get("atexit_finish"):
+        import atexit
+        atexit.register(kymo.finish)
+        sys.exit(cfg["atexit_finish"])
+    if cfg.get("atexit_exit"):
+        import atexit
+        atexit.register(sys.exit, 0)  # ignored by Python: the process exits with the uncaught exit's code
+        sys.exit(cfg["atexit_exit"])
+    if cfg.get("executor_sigterm"):
+        # A job still running as the program exits: concurrent.futures' threading atexit hook joins it, the main thread still alive, as a SIGTERM lands.
+        import concurrent.futures, signal, threading
+        def job():
+            while not getattr(threading, "_SHUTTING_DOWN", False):
+                time.sleep(0.001)
+            os.kill(os.getpid(), signal.SIGTERM)
+            time.sleep(3)
+        concurrent.futures.ThreadPoolExecutor(max_workers=1).submit(job)
+        sys.exit(cfg["executor_sigterm"])
+    if cfg.get("sigterm_at_threading_exit"):
+        # Once the interpreter's exit has begun, which ignores the handler's exit.
+        import signal, threading
+        threading._register_atexit(os.kill, os.getpid(), signal.SIGTERM)
+        raise SystemExit  # ends as a normal end does: no code, status 0
+    if cfg.get("atexit_exit_after_end"):
+        import atexit
+        atexit.register(sys.exit, cfg["atexit_exit_after_end"])  # ignored by Python
+        raise SystemExit  # ends as a normal end does: no code, status 0
+    if cfg.get("caught_exit"):
+        try:
+            sys.exit(cfg["caught_exit"])
+        except SystemExit:
+            pass  # caught, as argparse's or a notebook cell's is: the program carries on
+    if cfg.get("sigterm_after"):
+        import signal
+        os.kill(os.getpid(), signal.SIGTERM)
+        time.sleep(60)  # kymo's handler ends the run and exits
     if cfg.get("skip_finish"):
         sys.exit()  # the atexit flush ends the run
     print("DRIVER_FINISHING", flush=True)
@@ -1415,6 +1487,65 @@ def scenario_ctrl_c_during_atexit_flush(spool_dir):
     )
 
 
+def exit_code_scenario(spool_dir, name, cfg, exits, code):
+    """Run the driver with cfg against a fresh fake server: the program exits with exits, and the run ends with one TerminateRun(code)."""
+    servicer, grpc_addr, cdn_addr, stop = start_fake_server()
+    run_id = uuid.uuid4().hex
+    rc, _wall, out = run_driver(
+        {
+            "grpc": grpc_addr,
+            "cdn": cdn_addr,
+            "run_name": name,
+            "run_id": run_id,
+            "steps": 20,
+            "metrics": 5,
+            "flush_timeout": 30,
+            "spool_dir": spool_dir,
+            **cfg,
+        },
+        timeout=60,
+    )
+    stop()
+    assert rc == exits, f"exit {rc}\n{out}"
+    assert [c for rid, c in servicer.terminates if rid == run_id] == [code], (
+        f"expected one TerminateRun({code}), got {servicer.terminates}\n{out}"
+    )
+    print(f"    OK — {name}: exit {exits}, TerminateRun({code})")
+
+
+# Scenarios 25-32, which the module docstring describes: the driver's cfg, the program's exit status and the code its run ends with.
+EXIT_CODE_SCENARIOS = (
+    (25, "helper-finish", {"exit_with_helper_finish": 7}, 7, 7),
+    (
+        25,
+        "executor-finish",
+        {"exit_with_helper_finish": 7, "helper_executor": True},
+        7,
+        7,
+    ),
+    (26, "caught-exit", {"caught_exit": 7}, 0, 0),
+    (27, "atexit-finish", {"atexit_finish": 7}, 7, 7),
+    (28, "atexit-exit", {"atexit_exit": 7}, 7, 7),
+    (29, "caught-exit-sigterm", {"caught_exit": 7, "sigterm_after": True}, 143, 143),
+    (30, "exit-executor-sigterm", {"executor_sigterm": 7}, 7, 7),
+    (31, "atexit-exit-after-end", {"atexit_exit_after_end": 3}, 0, 0),
+    (
+        32,
+        "handler-exit-at-threading-exit",
+        {"sigterm_exits": 1, "sigterm_at_threading_exit": True},
+        0,
+        0,
+    ),
+)
+
+
+def scenario_exit_codes(spool_dir):
+    for number, name, cfg, exits, code in EXIT_CODE_SCENARIOS:
+        print(f"=== {number}. {name} ===")
+        exit_code_scenario(spool_dir, name, cfg, exits, code)
+        print()
+
+
 def scenario_ctrl_c_caught_then_exit(spool_dir):
     print("=== 22. Ctrl-C the program catches and exits on: handed off ===")
     ctrl_c_scenario(
@@ -1686,6 +1817,7 @@ def main():
             scenario_ctrl_c_caught_then_exit(spool_dir)
             scenario_ctrl_c_during_the_encoder_wait(spool_dir)
             scenario_resource_tracker_mask(spool_dir)
+            scenario_exit_codes(spool_dir)
         finally:
             # A failed scenario never reaches its own stop(), and a handler parked in a long call_delay would hold the interpreter's exit until it ends.
             for stop in list(_RUNNING_SERVERS):

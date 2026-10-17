@@ -1,5 +1,6 @@
 """Canonical kymo client environment with loud retired-name rejection."""
 
+import math
 import os
 from typing import Callable, Optional, TypeVar
 
@@ -96,8 +97,9 @@ def validate_worker_settings() -> None:
     integer("KYMO_MAX_BUFFER_BYTES", "MKDB2_MAX_BUFFER_BYTES", 0)
     integer("KYMO_MAX_RICH_BUFFER_BYTES", "MKDB2_MAX_RICH_BUFFER_BYTES", 0)
     timeout = number("KYMO_ACK_PROGRESS_TIMEOUT", "MKDB2_ACK_PROGRESS_TIMEOUT", 1.0)
-    if timeout <= 0:
-        raise ValueError("KYMO_ACK_PROGRESS_TIMEOUT must be positive")
+    # float() also reads nan and inf, and an infinite timeout would turn the watchdog off.
+    if not 0 < timeout < math.inf:
+        raise ValueError("KYMO_ACK_PROGRESS_TIMEOUT must be a positive finite number")
 
 
 def validate_client_settings() -> None:
@@ -112,6 +114,7 @@ def validate_client_settings() -> None:
         ("KYMO_SIGNAL_FLUSH_TIMEOUT", "MKDB2_SIGNAL_FLUSH_TIMEOUT", 10.0),
         ("KYMO_LOCAL_ENSURE_TIMEOUT", "MKDB2_LOCAL_ENSURE_TIMEOUT", 600.0),
     ):
-        if number(canonical, legacy, default) <= 0:
-            raise ValueError(f"{canonical} must be positive")
+        # Shutdown would turn a non-finite flush budget into a zero one, spooling every point, and the ensure would refuse a non-finite timeout only later.
+        if not 0 < number(canonical, legacy, default) < math.inf:
+            raise ValueError(f"{canonical} must be a positive finite number")
     validate_worker_settings()

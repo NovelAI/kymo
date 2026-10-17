@@ -21,7 +21,7 @@ Nothing in hosted mode authenticates. Anyone who can reach the gRPC port can rea
 
 Local mode runs PostgreSQL 17 and ClickHouse 25.3 LTS, the tested versions. ClickHouse must be 25.3 or later: the media collector turns off a setting older versions reject. The server creates and upgrades its schema at startup and opens its listeners only after that finishes:
 
-- **PostgreSQL**: tables, indexes, and constraints in the `DATABASE_URL` database, so its role must be able to create and alter them.
+- **PostgreSQL**: tables, indexes, and constraints in the `DATABASE_URL` database, so its role must be able to create and alter them. A connection pooler in front of it must pass the `options` startup parameter: the status watcher sets its statement timeout there, and a pooler that refuses it refuses the watcher's connection, so run liveness changes (running to stuck and on) are not pushed to dashboards and the server logs a warning every 5 s.
 - **ClickHouse**: the database `mkdb2` (a fixed name), with tables and materialized views. The user needs full rights on `mkdb2.*` (create, alter, rename, drop, insert, select, truncate; the rename and drop are for one-time schema migrations), `SYSTEM FLUSH ASYNC INSERT QUEUE`, read access to `system` tables, and permission to set the `async_insert` settings, so no read-only or constrained profile. Hosted mode reaches ClickHouse over plain HTTP.
 
 ## Server settings

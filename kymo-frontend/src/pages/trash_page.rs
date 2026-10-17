@@ -26,6 +26,17 @@ fn run_key(project_id: &str, run_id: &str) -> String {
         .expect("trash row identity contains only JSON strings")
 }
 
+/// The page's count of Restore, Load more and Retry presses. Only the reply to the last one moves focus (a Retry's moves none): a pressed button disables itself while its request is pending, and Chromium then drops focus to the page, where an earlier press's reply, or its move waiting frames for its row to go, would otherwise find it and take it from the control pressed since.
+const PRESS_COUNT: &str = "window.__kymoTrashPresses";
+
+/// Count a press; its number, which its reply's focus move must still find the count at.
+fn note_press() -> i64 {
+    js_sys::eval(&format!("{PRESS_COUNT}=({PRESS_COUNT}|0)+1"))
+        .ok()
+        .and_then(|count| count.as_f64())
+        .map_or(0, |count| count as i64)
+}
+
 fn record_is(record: &RunRecord, project_id: &str, run_id: &str) -> bool {
     record
         .run
@@ -88,12 +99,16 @@ async fn list_trash_prefix(min_rows: usize) -> Result<ListTrashResponse, tonic::
     }
 }
 
-async fn focus_after_final_page(previous_count: usize) {
+/// Once the final page's rows land, focus moves from the vanished Load more to the first new row's Restore (else the last earlier one, else the back link), and only if it went with Load more, `press` still the last press: still on it, or left on the page when it vanished. Focus the user moved while the page loaded stays.
+async fn focus_after_final_page(previous_count: usize, press: i64) {
     let script = format!(
         "(()=>{{\
             let attempts=0;\
             const focus=()=>{{\
+                if(({PRESS_COUNT}|0)!=={press})return;\
                 if(document.querySelector('.trash-load-more button')&&attempts++<10){{requestAnimationFrame(focus);return}}\
+                const active=document.activeElement;\
+                if(active&&active!==document.body&&!active.closest('.trash-load-more'))return;\
                 const rows=[...document.querySelectorAll('tr.trash-run')];\
                 const action=row=>row.querySelector('.trash-run-action button:not(:disabled)');\
                 const target=rows.slice({previous_count}).map(action).find(Boolean)\
@@ -107,8 +122,10 @@ async fn focus_after_final_page(previous_count: usize) {
     let _ = document::eval(&script).await;
 }
 
+/// Removes the row, moving focus from it to the next row's Restore (else the previous row's, else Load more or the back link) only if focus went with it: the row's Restore, `press`, is still the last press, and focus is still inside the row (on its own disabled Restore) or was left on the page when the row went. Focus the user moved while the request was pending stays, on another control or on another row's Restore that their press disabled.
 async fn remove_trash_row_with_focus(
     mut data: Signal<TrashPageData>,
+    press: i64,
     project_id: &str,
     run_id: &str,
 ) {
@@ -126,9 +143,13 @@ async fn remove_trash_row_with_focus(
             const removed=()=>[...document.querySelectorAll('tr.trash-run')].find(row=>row.dataset.projectId==={encoded_project_id}&&row.dataset.runId==={encoded_run_id});\
             const otherRestore=()=>[...document.querySelectorAll('tr.trash-run')].filter(row=>row.dataset.projectId!=={encoded_project_id}||row.dataset.runId!=={encoded_run_id}).map(row=>row.querySelector('.trash-run-action button:not(:disabled)')).find(Boolean);\
             const fallback=()=>otherRestore()||document.querySelector('.trash-load-more button:not(:disabled)')||document.querySelector('.trash-back-link');\
+            const row=i>=0?rows[i]:null;\
             let attempts=0;\
             const focus=()=>{{\
+                if(({PRESS_COUNT}|0)!=={press})return;\
                 if(removed()&&attempts++<10){{requestAnimationFrame(focus);return}}\
+                const active=document.activeElement;\
+                if(active&&active!==document.body&&!row?.contains(active))return;\
                 if(target?.isConnected&&!target.disabled)target.focus();\
                 else fallback()?.focus();\
             }};\
@@ -298,7 +319,10 @@ pub fn TrashPage() -> Element {
                         button {
                             class: "btn btn-ghost",
                             disabled: page.loading,
-                            onmousedown: primary(move |_| request_refresh(refresh)),
+                            onmousedown: primary(move |_| {
+                                note_press();
+                                request_refresh(refresh);
+                            }),
                             "Retry"
                         }
                     }
@@ -371,6 +395,7 @@ pub fn TrashPage() -> Element {
                                     if data.peek().loading_more || data.peek().loading {
                                         return;
                                     }
+                                    let press = note_press();
                                     {
                                         let mut page = data.write();
                                         page.loading_more = true;
@@ -404,7 +429,7 @@ pub fn TrashPage() -> Element {
                                                 page.loading_more = false;
                                                 drop(page);
                                                 if final_page {
-                                                    focus_after_final_page(previous_count).await;
+                                                    focus_after_final_page(previous_count, press).await;
                                                 }
                                             }
                                             Ok(_) => {
@@ -539,6 +564,7 @@ fn trash_row(
                                 return;
                             }
                             restoring.write().insert(key.clone());
+                            let press = note_press();
                             action_message.set(String::new());
                             let project_id = project_id.clone();
                             let run_id = run_id.clone();
@@ -554,6 +580,7 @@ fn trash_row(
                                     {
                                         remove_trash_row_with_focus(
                                             data,
+                                            press,
                                             &project_id,
                                             &run_id,
                                         )
@@ -563,6 +590,7 @@ fn trash_row(
                                     Ok(response) if response.outcome() == RestoreRunOutcome::NotFound => {
                                         remove_trash_row_with_focus(
                                             data,
+                                            press,
                                             &project_id,
                                             &run_id,
                                         )
@@ -604,6 +632,7 @@ fn trash_row(
                                                 } else {
                                                     remove_trash_row_with_focus(
                                                         data,
+                                                        press,
                                                         &project_id,
                                                         &run_id,
                                                     )

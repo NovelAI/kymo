@@ -5,17 +5,17 @@ use crate::proto::smoothing_config::Algorithm;
 /// Server-side cap on the smoothing window: chart_params clamps the wire value to it, and the smoothers and delta planner rely on that bound.
 pub(crate) const MAX_SMOOTHING_WINDOW: u32 = 4096;
 
-/// Whether all x gaps agree within float tolerance. Contiguous integer steps compare exactly and take index-space Savitzky–Golay; irregular grids use the x-aware fit.
+/// Whether all x gaps agree within float tolerance. Contiguous integer steps compare exactly and take index-space Savitzky–Golay; irregular grids, and a series at one x (index distance would set apart samples at the same time), use the x-aware fit.
 fn is_uniform(xs: &[f64]) -> bool {
     #[cfg(test)]
     SPACING_DERIVATIONS.with(|counts| counts.set((counts.get().0 + 1, counts.get().1)));
     xs.len() < 2 || same_gaps(xs[1] - xs[0], xs.windows(2).map(|w| w[1] - w[0]))
 }
 
-/// Whether every gap agrees with the first, `d0`, within [`is_uniform`]'s float tolerance.
+/// Whether the first gap, `d0`, is positive and every gap is within d0 * 1e-9 of it. Requiring `d0 > 0` is sound because a smoothed series' x ascend (the smoothers' contract): a zero or negative first gap is no uniform spacing.
 pub(crate) fn same_gaps(d0: f64, mut gaps: impl Iterator<Item = f64>) -> bool {
-    let tol = d0.abs() * 1e-9 + 1e-12;
-    !gaps.any(|gap| (gap - d0).abs() > tol)
+    let tol = d0 * 1e-9;
+    d0 > 0.0 && !gaps.any(|gap| (gap - d0).abs() > tol)
 }
 
 /// Median interval between consecutive distinct x values — the x-unit the window scales are quoted in
@@ -519,13 +519,18 @@ fn fit_from_moments(mw: &[f64; 5], sw: &[f64; 3], deg: usize) -> f64 {
 /// [`savitzky_golay`], but with offsets measured in real x. Window
 /// half-width `h_x` is in x units; membership and weights come from
 /// x-distance, so a logging gap narrows the effective window instead of
-/// silently widening it like index counting would. O(n·k) direct fits — the
+/// silently widening it like index counting would. One O(k) fit per distinct x — the
 /// price of irregularity; uniform grids take the O(n) prefix-sum path.
 fn savgol_x(xs: &[f64], y: &[f64], h_x: f64, deg: usize) -> Vec<f64> {
     let n = y.len();
     let mut out = vec![f64::NAN; n];
     let (mut lo, mut hi) = (0usize, 0usize);
     for i in 0..n {
+        // A sample at its predecessor's x has the same window at the same offsets, so the same fit (holes are masked after the sweep): a stalled clock costs one fit, not one per sample over a window that holds them all.
+        if i > 0 && xs[i] == xs[i - 1] {
+            out[i] = out[i - 1];
+            continue;
+        }
         while xs[i] - xs[lo] > h_x {
             lo += 1;
         }
@@ -535,9 +540,17 @@ fn savgol_x(xs: &[f64], y: &[f64], h_x: f64, deg: usize) -> Vec<f64> {
         while hi + 1 < n && xs[hi + 1] - xs[i] <= h_x {
             hi += 1;
         }
+        #[cfg(test)]
+        SAVGOL_X_READS.with(|reads| reads.set(reads.get() + hi + 1 - lo));
         out[i] = biweight_fit((lo..=hi).map(|j| ((xs[j] - xs[i]) / h_x, y[j])), deg);
     }
     out
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Samples the fits of [`savgol_x`] and [`savgol_x_at`] have read.
+    pub(crate) static SAVGOL_X_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// One output of [`savgol_x`] over a series of `n` samples read through `x` and `y`: the window the whole-series sweep reaches at index `i` (x is ascending, so its two pointers stop where these scans do) and the same fit over it.
@@ -559,6 +572,8 @@ pub(crate) fn savgol_x_at(
     while hi + 1 < n && x(hi + 1) - xi <= h_x {
         hi += 1;
     }
+    #[cfg(test)]
+    SAVGOL_X_READS.with(|reads| reads.set(reads.get() + hi + 1 - lo));
     biweight_fit((lo..=hi).map(|j| ((x(j) - xi) / h_x, y(j))), deg)
 }
 
@@ -2532,7 +2547,10 @@ pub(crate) fn smooth_run_with_plan(
 
 #[cfg(test)]
 mod smooth_run_tests {
-    use super::{median_dx, savgol_dependency_start, savgol_geometry, smooth_run};
+    use super::{
+        median_dx, savgol_dependency_start, savgol_geometry, smooth_run, smoothing_plan,
+        SmoothingPlan, SAVGOL_X_READS,
+    };
     use crate::proto::smoothing_config::Algorithm;
 
     const ALGOS: [Algorithm; 3] = [
@@ -2953,6 +2971,75 @@ mod smooth_run_tests {
             assert!(out.iter().all(|v| v.is_finite()), "{algo:?}: {out:?}");
             assert_ne!(out[6], y[6], "{algo:?} returned the raw last sample");
         }
+    }
+
+    /// Savitzky–Golay over a series at one x weighs its samples by x distance, which is zero for all of them, not by their order: every output is the mean of the finite samples, at any degree, and holes stay holes.
+    #[test]
+    fn savgol_at_one_x_is_the_x_aware_fit() {
+        let xs = [1000.0; 3];
+        assert_eq!(
+            smoothing_plan(&xs, Algorithm::SavitzkyGolay, false),
+            SmoothingPlan::Median(1f64.to_bits())
+        );
+        for order in 0..=2 {
+            let out = smooth_run(
+                &xs,
+                &[0.0, 0.0, 10.0],
+                Algorithm::SavitzkyGolay,
+                3,
+                0.0,
+                order,
+                false,
+            );
+            assert!(
+                out.iter().all(|v| (v - 10.0 / 3.0).abs() < 1e-12),
+                "{order}: {out:?}"
+            );
+        }
+        let out = smooth_run(
+            &[5.0; 5],
+            &[f64::NAN, 0.0, f64::NAN, 10.0, 2.0],
+            Algorithm::SavitzkyGolay,
+            3,
+            0.0,
+            2,
+            false,
+        );
+        assert!(out[0].is_nan() && out[2].is_nan(), "{out:?}");
+        assert!(
+            [1, 3, 4].iter().all(|&i| (out[i] - 4.0).abs() < 1e-12),
+            "{out:?}"
+        );
+        // A repeated x is no uniform spacing at any scale.
+        assert_ne!(
+            smoothing_plan(&[0.0, 5e-13, 5e-13], Algorithm::SavitzkyGolay, false),
+            SmoothingPlan::Uniform
+        );
+        // A positive uniform spacing, or one sample, keeps the index-space kernel.
+        for xs in [&[0.0, 2.0, 4.0][..], &[7.0]] {
+            assert_eq!(
+                smoothing_plan(xs, Algorithm::SavitzkyGolay, false),
+                SmoothingPlan::Uniform
+            );
+        }
+    }
+
+    /// Samples at one x share one fit, so a stalled clock's run costs one window, not one per sample.
+    #[test]
+    fn savgol_fits_a_stall_once() {
+        let n = 2_000;
+        let y: Vec<f64> = (0..n).map(|i| (i % 7) as f64).collect();
+        SAVGOL_X_READS.with(|reads| reads.set(0));
+        smooth_run(
+            &vec![0.0; n],
+            &y,
+            Algorithm::SavitzkyGolay,
+            20,
+            0.0,
+            1,
+            false,
+        );
+        assert_eq!(SAVGOL_X_READS.with(|reads| reads.get()), n);
     }
 }
 

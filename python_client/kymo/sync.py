@@ -77,6 +77,7 @@ from kymo.spool import (
     SPOOL_SUFFIX,
     SpoolCorruptionError,
     UnsupportedSpoolVersion,
+    claim_spool,
     default_replay_dirs,
     read_spool,
     read_spool_header,
@@ -85,7 +86,6 @@ from kymo.spool import (
     retire_deleted_spool,
     retire_sent_spool,
     sync_after_retirement,
-    writer_active as _writer_active,
 )
 
 _POINT_KINDS = ("numeric_ts", "numeric_tagged_ts", "text_ts", "cdn_ts", "cdn")
@@ -581,6 +581,33 @@ def _validate_spool_record(record, known_kinds: set[str]) -> str:
 
 def replay_file(
     path: str,
+    *args,
+    _writer_lock_held: bool = False,
+    **kwargs,
+) -> bool:
+    """Replay one spool file; return False for pending or quarantined input (_replay_file).
+
+    The replay holds the file's exclusive claim (kymo.spool.claim_spool) from before its first read until after its retirement: a second replay that delivered it again, once a resumed run had logged newer values at its steps, or after a later segment of its run, would overwrite those. A run's worker holds the same lock while it keeps its spool open and appends to it, so a live file is skipped too: replaying to the current EOF and renaming to .sent would strand every later append in the .sent inode where no sync looks. The claim covers one file: main() holds a run's later segments back behind one it could not claim, but a later segment named alone is replayed whatever holds an earlier one. Where no exclusive lock can be had (claim_spool), only writer_active guards the replay.
+
+    ``_writer_lock_held`` is for the live worker's sealed-spool handoff only:
+    that worker owns the still-open ``SpoolWriter`` descriptor, so external sync
+    processes see the file as claimed while this replay safely reads its immutable
+    contents.
+    """
+    if _writer_lock_held:
+        return _replay_file(path, *args, **kwargs)
+    claim = claim_spool(path)
+    if claim is None:
+        print(
+            f"  {os.path.basename(path)}: open by a live run or another sync, or gone — skipped (sync again after it exits)"
+        )
+        return False
+    with claim:
+        return _replay_file(path, *args, **kwargs)
+
+
+def _replay_file(
+    path: str,
     server: str = "",
     cdn: str = "",
     delete: bool = False,
@@ -589,26 +616,14 @@ def replay_file(
     quarantined_files: set[str] | None = None,
     *,
     reduced_galleries: list[tuple[str, int]] | None = None,
-    _writer_lock_held: bool = False,
     _local_endpoint=None,
 ) -> bool:
-    """Replay one spool file; return False for pending or quarantined input.
+    """replay_file's replay, under its claim.
 
     ``reduced_galleries`` collects the (name, step) of each gallery it published without items the CDN rejected, once per gallery, two at one step included.
-
-    ``_writer_lock_held`` is for the live worker's sealed-spool handoff only:
-    that worker owns the still-open ``SpoolWriter`` descriptor, so external sync
-    processes see the file as active while this replay safely reads its immutable
-    contents.
     """
     if quarantined_files is None:
         quarantined_files = set()
-    # A run's worker keeps its spool open (and appends to it) for the run's whole lifetime. Replaying to the current EOF and renaming to .sent would strand every later append in the .sent inode where no sync looks — skip live files entirely.
-    if not _writer_lock_held and _writer_active(path):
-        print(
-            f"  {os.path.basename(path)}: still open by a live run — skipped (sync again after it exits)"
-        )
-        return False
     size_before = os.stat(path).st_size
     header = None
     try:
@@ -1062,17 +1077,19 @@ def main(argv=None) -> int:
                 # replay_file diagnoses/quarantines a static malformed header.
                 pass
             if run_key is not None and run_key in terminal_runs:
-                if _writer_active(f):
+                claim = claim_spool(f)
+                if claim is None:
                     print(
-                        f"  {f}: still open by a live run; an earlier spool "
+                        f"  {f}: open by a live run or another sync, or gone; an earlier spool "
                         "for this identity was rejected, so it was not replayed"
                     )
                 else:
-                    _retire_deleted(
-                        f,
-                        os.stat(f).st_size,
-                        "an earlier spool for this run was rejected",
-                    )
+                    with claim:
+                        _retire_deleted(
+                            f,
+                            os.stat(f).st_size,
+                            "an earlier spool for this run was rejected",
+                        )
                 all_ok = False
                 continue
             if run_key is not None and run_key in blocked_runs:

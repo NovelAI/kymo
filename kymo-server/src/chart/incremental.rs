@@ -30,7 +30,7 @@ pub(crate) enum Fallback {
     Duplicates,
     /// An x (step, or timestamp as the axis uses it) beyond the integers f64 holds exactly.
     InexactX,
-    /// Irregular Savitzky-Golay outputs to recompute whose windows cost more than the full build's (repeated or clustered timestamps, an appended stall, a window wide against its series), which the full build computes faster.
+    /// Irregular Savitzky-Golay fits to recompute whose windows cost more than the full build's (clustered timestamps, a window wide against its series), which the full build computes faster.
     Dense,
     /// No plottable point.
     Empty,
@@ -941,6 +941,32 @@ mod tests {
                     let one = savgol_x_at(&|j| x[j], &|j| y[j], x.len(), i, h_x, deg);
                     assert_eq!(one.to_bits(), whole[i].to_bits(), "h_x={h_x} i={i}");
                 }
+            }
+        }
+    }
+
+    /// The sweep reuses a fit across samples at one x; each output still equals that sample's own fit, holes among them included.
+    #[test]
+    fn savgol_x_outputs_at_repeated_x_match_their_own_fits() {
+        let mut rng = crate::Rng(7);
+        let mut x = 0.0;
+        let (x, y): (Vec<f64>, Vec<f64>) = (0..2_000)
+            .map(|_| {
+                let r = rng.next();
+                // Runs of about eight samples at each x, a fifth of them holes.
+                x += if r.is_multiple_of(8) { 3.0 } else { 0.0 };
+                let y = if r % 5 == 1 {
+                    f64::NAN
+                } else {
+                    ((r >> 16) % 1_000) as f64
+                };
+                (x, y)
+            })
+            .unzip();
+        for (h_x, deg) in [(1.5, 2), (6.0, 1), (40.0, 0)] {
+            for (i, swept) in savgol_x(&x, &y, h_x, deg).into_iter().enumerate() {
+                let one = savgol_x_at(&|j| x[j], &|j| y[j], x.len(), i, h_x, deg);
+                assert_eq!(one.to_bits(), swept.to_bits(), "h_x={h_x} i={i}");
             }
         }
     }

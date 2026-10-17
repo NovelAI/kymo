@@ -5,6 +5,7 @@ Polls GPU (via pynvml), CPU, memory, disk, and network (via psutil)
 every N seconds and publishes timestamped points through the client publisher.
 """
 
+import math
 import os
 import threading
 import time
@@ -29,6 +30,14 @@ try:
     _HAS_PSUTIL = True
 except ImportError:
     _HAS_PSUTIL = False
+
+
+def _nvml(read) -> float:
+    """One value's NVML reading through its own lambda, read, or a NaN marker (a hole in the chart, never an invented 0) where NVML cannot give it (an unsupported field, a lost GPU) or the installed pynvml lacks a name read uses."""
+    try:
+        return float(read())
+    except Exception:
+        return math.nan
 
 
 class SystemMetricsPoller:
@@ -199,6 +208,7 @@ class SystemMetricsPoller:
     # ------------------------------------------------------------------
 
     def _poll_gpu(self, metrics: dict):
+        # A reading NVML could not give (_nvml), or a percentage of a zero total, is a NaN marker at its GPU's tag.
         gpu_util = []
         gpu_mem_util = []
         gpu_temp = []
@@ -213,92 +223,74 @@ class SystemMetricsPoller:
         gpu_ecc_corrected = []
 
         for handle in self._gpu_handles:
-            # Utilization
+            # One query for both utilizations, and one for both memory figures.
             try:
                 util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-                gpu_util.append(float(util.gpu))
-                gpu_mem_util.append(float(util.memory))
             except Exception:
-                gpu_util.append(0.0)
-                gpu_mem_util.append(0.0)
+                util = None
+            gpu_util.append(_nvml(lambda: util.gpu))
+            gpu_mem_util.append(_nvml(lambda: util.memory))
 
-            # Temperature
-            try:
-                temp = pynvml.nvmlDeviceGetTemperature(
-                    handle, pynvml.NVML_TEMPERATURE_GPU
+            gpu_temp.append(
+                _nvml(
+                    lambda: pynvml.nvmlDeviceGetTemperature(
+                        handle, pynvml.NVML_TEMPERATURE_GPU
+                    )
                 )
-                gpu_temp.append(float(temp))
-            except Exception:
-                gpu_temp.append(0.0)
+            )
 
-            # Power
-            try:
-                power_mw = pynvml.nvmlDeviceGetPowerUsage(handle)
-                limit_mw = pynvml.nvmlDeviceGetEnforcedPowerLimit(handle)
-                power_w = power_mw / 1000.0
-                limit_w = limit_mw / 1000.0
-                gpu_power.append(power_w)
-                gpu_power_limit.append(limit_w)
-                gpu_power_pct.append(power_w / limit_w * 100.0 if limit_w > 0 else 0.0)
-            except Exception:
-                gpu_power.append(0.0)
-                gpu_power_limit.append(0.0)
-                gpu_power_pct.append(0.0)
+            # Power, kept when only the limit fails
+            power_w = _nvml(lambda: pynvml.nvmlDeviceGetPowerUsage(handle)) / 1000.0
+            limit_w = (
+                _nvml(lambda: pynvml.nvmlDeviceGetEnforcedPowerLimit(handle)) / 1000.0
+            )
+            gpu_power.append(power_w)
+            gpu_power_limit.append(limit_w)
+            gpu_power_pct.append(power_w / limit_w * 100.0 if limit_w > 0 else math.nan)
 
-            # Memory
             try:
                 mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                gpu_mem_used.append(float(mem.used))
-                gpu_mem_used_pct.append(
-                    mem.used / mem.total * 100.0 if mem.total > 0 else 0.0
-                )
             except Exception:
-                gpu_mem_used.append(0.0)
-                gpu_mem_used_pct.append(0.0)
+                mem = None
+            gpu_mem_used.append(_nvml(lambda: mem.used))
+            gpu_mem_used_pct.append(
+                _nvml(
+                    lambda: mem.used / mem.total * 100.0 if mem.total > 0 else math.nan
+                )
+            )
 
-            # Clocks
-            try:
-                gpu_sm_clock.append(
-                    float(pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_SM))
+            gpu_sm_clock.append(
+                _nvml(
+                    lambda: pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_SM)
                 )
-            except Exception:
-                gpu_sm_clock.append(0.0)
-
-            try:
-                gpu_mem_clock.append(
-                    float(pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_MEM))
+            )
+            gpu_mem_clock.append(
+                _nvml(
+                    lambda: pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_MEM)
                 )
-            except Exception:
-                gpu_mem_clock.append(0.0)
+            )
 
             # ECC errors (may not be supported on consumer GPUs)
-            try:
-                gpu_ecc_uncorrected.append(
-                    float(
-                        pynvml.nvmlDeviceGetMemoryErrorCounter(
-                            handle,
-                            pynvml.NVML_MEMORY_ERROR_TYPE_UNCORRECTED,
-                            pynvml.NVML_VOLATILE_ECC,
-                            pynvml.NVML_MEMORY_LOCATION_DEVICE_MEMORY,
-                        )
+            gpu_ecc_uncorrected.append(
+                _nvml(
+                    lambda: pynvml.nvmlDeviceGetMemoryErrorCounter(
+                        handle,
+                        pynvml.NVML_MEMORY_ERROR_TYPE_UNCORRECTED,
+                        pynvml.NVML_VOLATILE_ECC,
+                        pynvml.NVML_MEMORY_LOCATION_DEVICE_MEMORY,
                     )
                 )
-            except Exception:
-                gpu_ecc_uncorrected.append(0.0)
-
-            try:
-                gpu_ecc_corrected.append(
-                    float(
-                        pynvml.nvmlDeviceGetMemoryErrorCounter(
-                            handle,
-                            pynvml.NVML_MEMORY_ERROR_TYPE_CORRECTED,
-                            pynvml.NVML_VOLATILE_ECC,
-                            pynvml.NVML_MEMORY_LOCATION_DEVICE_MEMORY,
-                        )
+            )
+            gpu_ecc_corrected.append(
+                _nvml(
+                    lambda: pynvml.nvmlDeviceGetMemoryErrorCounter(
+                        handle,
+                        pynvml.NVML_MEMORY_ERROR_TYPE_CORRECTED,
+                        pynvml.NVML_VOLATILE_ECC,
+                        pynvml.NVML_MEMORY_LOCATION_DEVICE_MEMORY,
                     )
                 )
-            except Exception:
-                gpu_ecc_corrected.append(0.0)
+            )
 
         metrics["system/gpu_util_pct"] = gpu_util
         metrics["system/gpu_mem_util_pct"] = gpu_mem_util
