@@ -8153,10 +8153,9 @@ mod chart_admission_tests {
             env("KYMO_ADMISSION_FUZZ_SEED", 1),
         );
         let mut tally = std::collections::BTreeMap::<String, usize>::new();
-        // Run alone (filtered to this test), its tally counts only its own polls' restarts, refusals and growth evictions.
+        // Run alone (filtered to this test), its tally counts only its own polls' restarts; its caches count their own refusals and growth evictions.
         RESTARTS.store(0, std::sync::atomic::Ordering::Relaxed);
-        crate::series_cache::TEST_REFUSALS.store(0, std::sync::atomic::Ordering::Relaxed);
-        crate::series_cache::TEST_GROWTH_EVICTIONS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let (mut refusals, mut growth) = (0, 0);
         for case in 0..cases {
             let mut rng = crate::Rng(
                 seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)
@@ -8355,11 +8354,10 @@ mod chart_admission_tests {
             if let Some((_, server)) = clickhouse {
                 server.abort();
             }
+            let (refused, evicted) = service.ch.series_cache().tallies();
+            refusals += refused;
+            growth += evicted;
         }
-        let refusals =
-            crate::series_cache::TEST_REFUSALS.load(std::sync::atomic::Ordering::Relaxed);
-        let growth =
-            crate::series_cache::TEST_GROWTH_EVICTIONS.load(std::sync::atomic::Ordering::Relaxed);
         eprintln!(
             "ADMISSION FUZZ cases: {cases}, seed: {seed}, outcomes: {tally:?}, restarts: {}, refusals: {refusals}, growth evictions: {growth}",
             RESTARTS.load(std::sync::atomic::Ordering::Relaxed),

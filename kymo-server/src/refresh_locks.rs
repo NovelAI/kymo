@@ -78,6 +78,11 @@ impl<K: Eq + Hash, State> RefreshLease<K, State> {
         self.slot.lock().await
     }
 
+    /// The key whose slot this lease holds.
+    pub fn key(&self) -> &K {
+        &self.key
+    }
+
     /// The slot's lock if it is free right now, owned so a caller can hold several slots without borrowing their leases.
     pub fn try_lock_owned(&self) -> Option<tokio::sync::OwnedMutexGuard<State>> {
         self.slot.clone().try_lock_owned().ok()
@@ -87,10 +92,8 @@ impl<K: Eq + Hash, State> RefreshLease<K, State> {
 impl<K: Eq + Hash, State> Drop for RefreshLease<K, State> {
     fn drop(&mut self) {
         let mut registry = self.registry.lock().unwrap();
-        let owns_entry = registry.get(&self.key).is_some_and(|stored| {
-            stored.ptr_eq(&Arc::downgrade(&self.slot)) && Arc::strong_count(&self.slot) == 1
-        });
-        if owns_entry {
+        // A live slot's entry is its own: lease_for replaces only a dead one.
+        if Arc::strong_count(&self.slot) == 1 {
             registry.remove(&self.key);
         }
     }

@@ -525,16 +525,12 @@ impl SeriesKey {
     }
 }
 
-/// Counts what the window refused and what growth evicted in this test binary, for the randomized admission test's tally.
-#[cfg(test)]
-pub(crate) static TEST_REFUSALS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-#[cfg(test)]
-pub(crate) static TEST_GROWTH_EVICTIONS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
 /// Bounded, process-local history of LRU victims and of series not retained (too large, or refused for hot entries' room), at most this many; neither rows nor tags are retained, and a restart discards it.
-const EVICTED_LINEAGE_LIMIT: usize = 4096;
+///
+/// Records drop oldest first, so a refused cycle of more series than this finds none of its own: each read is then priced at the miss estimate and starts a new lineage.
+///
+/// This many take 10-26 MB at most (300-800 bytes a record, as the cache charges its key and slot).
+const EVICTED_LINEAGE_LIMIT: usize = 32_768;
 
 #[derive(Clone)]
 struct EvictedLineage {
@@ -543,7 +539,8 @@ struct EvictedLineage {
     origin: LineageOrigin,
     content: u64,
     size: EvictedSize,
-    evicted: Instant,
+    /// The order records were written in ([`Inner::record_evicted`]), which drops the earliest.
+    written: u64,
     /// A full read has claimed the lineage and is hashing its rows: no other read restores it, and stage 2 still prices the series from it ([`SeriesCache::insert_full_with_origin`]).
     claimed: bool,
 }
@@ -558,8 +555,8 @@ pub(crate) struct EvictedSize {
 }
 
 impl EvictedLineage {
-    /// The record an LRU victim, or a series not retained, leaves.
-    fn of(rows: &SeriesSnapshot) -> Self {
+    /// The record an LRU victim, or a series not retained, leaves: the `written`th.
+    fn of(rows: &SeriesSnapshot, written: u64) -> Self {
         let (mut steps, mut tagged) = ((i64::MAX, i64::MIN), 0);
         for tag in rows.tags() {
             steps = (steps.0.min(tag.first_step()), steps.1.max(tag.last_step()));
@@ -577,7 +574,7 @@ impl EvictedLineage {
                 // Its tagged groups, else its scalar one; an empty record's 1 is never read, its steps an empty range.
                 groups: tagged.max(1),
             },
-            evicted: Instant::now(),
+            written,
             claimed: false,
         }
     }
@@ -630,7 +627,10 @@ const _: () = assert!(FRESH_WINDOW.as_secs() < BUMP_RETENTION.as_secs());
 /// Pruning scans every note and every insert notes, so it runs at most this often; retention is only a lower bound.
 const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 
-/// An entry read within this window keeps its room: a series the cache does not hold, whose retention would evict one, is served without being retained ([`SeriesCache::insert_full_with_origin`]). LRU alone misses every lookup of a dashboard cycling through more series than fit; refusing the newcomers keeps a stable share. A panel's polls start at least 5 s apart (the frontend's refresh floor) and wait for the previous answer, so an open panel's series stay hot while its polls answer within about 40 s; series no poll reads (a panel scrolled away, a hidden or closed tab, a finished run) give up their room 40 s after their last read.
+/// An entry read within this window keeps its room: a series the cache does not hold, whose retention would evict one, is served without being retained ([`SeriesCache::insert_full_with_origin`]). LRU alone misses every lookup of a dashboard cycling through more series than fit; refusing the newcomers keeps a stable share.
+///
+/// A panel polls when its runs gain rows, at least 5 s after its previous poll (the frontend's refresh floor) and not before that one answered. Its series stay hot while those polls come within about 40 s of each other. A panel whose runs log less often is left to the LRU. Series no poll reads (a panel scrolled away, a hidden or closed tab, a finished run) give up their room 40 s after their last read.
+///
 /// Not 60 s, the period of the frontend's chart request deadline and version backstop, the local socket's keepalive timeout and [`PRUNE_INTERVAL`]: the window bounds an entry's age and has no phase, but a read cadence one of those clocks set would sit at its edge.
 const HOT_WINDOW: Duration = Duration::from_secs(40);
 
@@ -754,25 +754,36 @@ pub struct Entry {
 struct Inner {
     map: HashMap<SeriesKey, Entry>,
     evicted: HashMap<SeriesKey, EvictedLineage>,
-    /// Every entry's [`entry_bytes`], and [`table_bytes`] of `table_capacity`.
-    total_bytes: usize,
+    /// Every entry's [`entry_bytes`]; the cache charges these and its table ([`Inner::total_bytes`]).
+    entries: usize,
     /// The largest capacity `map` has reported since it last shrank ([`hash_table_bytes`]).
     table_capacity: usize,
     /// run_id → the run's latest note ([`SeriesCache::note_bumps`]). Notes must outlive any fetch that started before them (see [`BUMP_RETENTION`]); pruned every [`PRUNE_INTERVAL`], the map self-bounds at "runs written in the last hour".
     bumps: HashMap<String, Instant>,
     last_prune: Option<Instant>,
+    /// Recovery records written so far, which number them ([`EvictedLineage::written`]).
+    records_written: u64,
+    /// Stores this cache's window refused ([`SeriesCache::tallies`]).
+    #[cfg(test)]
+    refused: u64,
+    /// Entries this cache's growth evicted ([`SeriesCache::tallies`]).
+    #[cfg(test)]
+    growth_evicted: u64,
 }
 
 impl Inner {
-    /// Record `rows`, the snapshot last handed out for `key` and no longer retained, for lineage recovery and stage 2's pricing ([`SeriesCache::sizes`]). Past [`EVICTED_LINEAGE_LIMIT`] records the oldest eighth (ties included) go at once, so the scan that finds them runs once per 512 records.
+    /// Record `rows`, the snapshot last handed out for `key` and no longer retained, for lineage recovery and stage 2's pricing ([`SeriesCache::sizes`]).
+    ///
+    /// Past [`EVICTED_LINEAGE_LIMIT`] records exactly the earliest written eighth go at once, so the pass that finds them runs once per 4,096 records.
     fn record_evicted(&mut self, key: SeriesKey, rows: &SeriesSnapshot) {
-        self.evicted.insert(key, EvictedLineage::of(rows));
+        self.records_written += 1;
+        let record = EvictedLineage::of(rows, self.records_written);
+        self.evicted.insert(key, record);
         if self.evicted.len() > EVICTED_LINEAGE_LIMIT {
-            let mut ages: Vec<Instant> =
-                self.evicted.values().map(|record| record.evicted).collect();
-            let (_, &mut newest_dropped, _) = ages.select_nth_unstable(EVICTED_LINEAGE_LIMIT / 8);
-            self.evicted
-                .retain(|_, record| record.evicted > newest_dropped);
+            let mut written: Vec<u64> =
+                self.evicted.values().map(|record| record.written).collect();
+            let (_, &mut last, _) = written.select_nth_unstable(EVICTED_LINEAGE_LIMIT / 8 - 1);
+            self.evicted.retain(|_, record| record.written > last);
         }
     }
 
@@ -785,7 +796,7 @@ impl Inner {
         bytes: usize,
     ) {
         let max_inserted_ms = rows.maximum.unwrap_or(0).min(watermark_cap(started));
-        self.total_bytes += bytes;
+        self.entries += bytes;
         let entry = Entry {
             rows: rows.clone(),
             max_inserted_ms,
@@ -793,14 +804,20 @@ impl Inner {
             last_access: Instant::now(),
             bytes,
         };
-        self.map.insert(key, entry);
+        let replaced = self.map.insert(key, entry);
+        debug_assert!(replaced.is_none(), "a store removes the entry it replaces");
+    }
+
+    /// What the cache charges: every entry, and its table at `table_capacity` ([`table_bytes`]).
+    fn total_bytes(&self) -> usize {
+        self.entries + table_bytes(self.table_capacity)
     }
 
     /// Whether retaining a new entry of `bytes` must evict an entry read within [`HOT_WINDOW`]: the hot entries, the new one and the smallest table holding them exceed `budget`. Otherwise [`SeriesCache::settle`] evicts every older entry before a hot one, and compacts the table before it would. With nothing hot this is the oversized test: a cache with nothing hot evicts as the LRU does.
     /// The pass over the entries runs only when the store needs room at all: every entry, the new one, and the table as charged or, if larger, the smallest holding one more (an insert can double it).
     fn evicts_hot(&self, bytes: usize, budget: usize) -> bool {
-        let table = table_bytes(self.table_capacity);
-        if self.total_bytes - table + bytes + table.max(table_bytes(self.map.len() + 1)) <= budget {
+        let table = table_bytes(self.table_capacity).max(table_bytes(self.map.len() + 1));
+        if self.entries + bytes + table <= budget {
             return false;
         }
         let now = Instant::now();
@@ -825,10 +842,7 @@ pub struct SeriesCache {
 /// after the last leader/waiter is gone. The slot briefly publishes a leader's
 /// successful Arc to the waiters that were already in flight, whether or not
 /// the cache retains it.
-#[derive(Clone, Default)]
-pub struct SeriesRefreshLocks {
-    locks: crate::refresh_locks::RefreshLocks<SeriesKey, SlotState>,
-}
+pub type SeriesRefreshLocks = crate::refresh_locks::RefreshLocks<SeriesKey, SlotState>;
 
 #[derive(Clone)]
 struct PublishedRefresh {
@@ -839,7 +853,7 @@ struct PublishedRefresh {
 type RunningOutcome = Result<PublishedRefresh, RefreshError>;
 
 #[derive(Default)]
-struct SlotState {
+pub(crate) struct SlotState {
     published: Option<PublishedRefresh>,
     /// A detached refresh in flight for this key; waiters attach here instead
     /// of electing a second leader.
@@ -847,20 +861,6 @@ struct SlotState {
 }
 
 impl SeriesRefreshLocks {
-    fn lease_for(&self, key: &SeriesKey) -> SeriesRefreshLease {
-        self.locks.lease_for(key)
-    }
-
-    #[cfg(test)]
-    fn registry_len(&self) -> usize {
-        self.locks.registry_len()
-    }
-
-    #[cfg(test)]
-    fn lease_count(&self, key: &SeriesKey) -> usize {
-        self.locks.lease_count(key)
-    }
-
     /// Return a fresh entry or elect exactly one refresher for this key. Every
     /// waiter repeats the cache lookup after acquiring the key lock: it can use
     /// the leader's newly stored Arc, while a bump that arrived during the
@@ -921,6 +921,8 @@ impl SeriesRefreshLocks {
                         return Ok(rows);
                     }
                 }
+                // Released before the replacement read: nobody after this caller can use it either (a bump outdated it, or the cache holds the series), and once its requester is done only the slot would pin it, charged nowhere.
+                state.published = None;
                 SeriesCache::record_lookup(&needs_refresh);
                 // Conservatively predate the loader invocation. A bump after
                 // this point makes a pass-through result ineligible for
@@ -940,9 +942,7 @@ impl SeriesRefreshLocks {
                         Self::await_running(&mut state).await
                     }
                 };
-                if let Ok(published) = &done {
-                    state.published = Some(published.clone());
-                }
+                state.published = done.as_ref().ok().cloned();
                 done.map(|published| published.rows)
             }
         }
@@ -958,7 +958,7 @@ impl SeriesRefreshLocks {
         started: Instant,
     ) -> tokio::task::JoinHandle<RunningOutcome> {
         let task_lease = self.lease_for(key);
-        let (cache, key) = (cache.clone(), key.clone());
+        let cache = cache.clone();
         tokio::spawn(async move {
             // Locals drop in reverse: the lease, the slot's last owner, retires before `_detach` releases the run guard, so a writer taking the gate (finalize or purge evicting the run) never finds an attachable slot holding a pre-eviction result.
             let _detach = ctx;
@@ -978,7 +978,7 @@ impl SeriesRefreshLocks {
             .increment(1);
             // A requester or attached waiter awaits the result holding the slot's lock.
             if let (Ok(rows), Some(_)) = (&outcome, lease.try_lock_owned()) {
-                cache.retain_orphan(&key, rows, started);
+                cache.retain_orphan(lease.key(), rows, started);
             }
             outcome.map(|rows| PublishedRefresh { rows, started })
         })
@@ -1003,7 +1003,7 @@ impl SeriesRefreshLocks {
                 continue;
             }
             let lease = self.lease_for(key);
-            let Some(state) = lease.try_lock_owned() else {
+            let Some(mut state) = lease.try_lock_owned() else {
                 continue;
             };
             // The checks get_or_refresh makes once it holds the lock.
@@ -1015,6 +1015,8 @@ impl SeriesRefreshLocks {
             if covered || !matches!(cache.lookup_untracked(key), Lookup::Miss) {
                 continue;
             }
+            // As in get_or_refresh: an outdated publication is released before its replacement is read.
+            state.published = None;
             SeriesCache::record_lookup(&Lookup::Miss);
             elected.push(ElectedMiss {
                 key: key.clone(),
@@ -1033,7 +1035,7 @@ impl SeriesRefreshLocks {
     pub(crate) fn spawn_batch<D, Fut>(
         &self,
         cache: &Arc<SeriesCache>,
-        elected: Vec<ElectedMiss>,
+        mut elected: Vec<ElectedMiss>,
         ctx: D,
         mut refresh: impl FnMut(usize, &SeriesKey) -> Fut,
     ) -> impl std::future::Future<Output = Result<Vec<(SeriesKey, Arc<SeriesSnapshot>)>, RefreshError>>
@@ -1042,19 +1044,14 @@ impl SeriesRefreshLocks {
         Fut: std::future::Future<Output = RefreshOutcome> + Send + 'static,
     {
         let started = Instant::now();
-        let running: Vec<ElectedMiss> = elected
-            .into_iter()
-            .enumerate()
-            .map(|(index, mut miss)| {
-                let fut = refresh(index, &miss.key);
-                miss.state.running =
-                    Some(self.spawn_detached(cache, &miss.key, ctx.clone(), fut, started));
-                miss
-            })
-            .collect();
+        for (index, miss) in elected.iter_mut().enumerate() {
+            let fut = refresh(index, &miss.key);
+            miss.state.running =
+                Some(self.spawn_detached(cache, &miss.key, ctx.clone(), fut, started));
+        }
         async move {
-            let mut rows = Vec::with_capacity(running.len());
-            for mut miss in running {
+            let mut rows = Vec::with_capacity(elected.len());
+            for mut miss in elected {
                 let published = Self::await_running(&mut miss.state).await?;
                 miss.state.published = Some(published.clone());
                 rows.push((miss.key, published.rows));
@@ -1070,11 +1067,7 @@ impl SeriesRefreshLocks {
     /// caller.
     async fn await_running(state: &mut SlotState) -> RunningOutcome {
         let handle = state.running.as_mut().expect("caller checked running");
-        let done = match handle.await {
-            Ok(outcome) => outcome,
-            // The task died without a result (panic or runtime shutdown).
-            Err(_) => Err(RefreshError::Died),
-        };
+        let done = handle.await.unwrap_or(Err(RefreshError::Died));
         state.running = None;
         done
     }
@@ -1253,7 +1246,7 @@ impl SeriesCache {
         let cached = inner
             .map
             .remove(&key)
-            .inspect(|old| inner.total_bytes -= old.bytes)
+            .inspect(|old| inner.entries -= old.bytes)
             .is_some();
         // An entry larger than the whole budget (with the smallest table) is never retained — eviction can't save a sole entry, so once stored it would sit over budget for as long as it's read. Serving it pass-through makes the budget a hard bound on retained memory, at ablated-mode read cost for just this series. It leaves a recovery record as an LRU victim does, so its size is known.
         if bytes + table_bytes(1) > self.budget_bytes {
@@ -1267,7 +1260,9 @@ impl SeriesCache {
         if !cached && inner.evicts_hot(bytes, self.budget_bytes) {
             metrics::counter!("mkdb2_series_cache_oversized_total", "reason" => "hot").increment(1);
             #[cfg(test)]
-            TEST_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            {
+                inner.refused += 1;
+            }
             inner.record_evicted(key, &rows);
             return rows;
         }
@@ -1277,7 +1272,7 @@ impl SeriesCache {
         Self::settle(&mut inner, self.budget_bytes);
         #[cfg(test)]
         if cached {
-            Self::count_growth_evictions(held, &inner);
+            inner.growth_evicted += (held - inner.map.len()) as u64;
         }
         rows
     }
@@ -1315,7 +1310,7 @@ impl SeriesCache {
             metrics::counter!("mkdb2_series_cache_oversized_total", "reason" => "budget")
                 .increment(1);
             let e = inner.map.remove(key).unwrap();
-            inner.total_bytes -= e.bytes;
+            inner.entries -= e.bytes;
             inner.record_evicted(key.clone(), &merged);
             Self::settle(&mut inner, self.budget_bytes);
             return Ok(merged);
@@ -1335,22 +1330,25 @@ impl SeriesCache {
         e.bytes = new_bytes;
         e.started = e.started.max(fetch_started);
         let rows = e.rows.clone();
-        inner.total_bytes = inner.total_bytes + new_bytes - old_bytes;
+        inner.entries = inner.entries + new_bytes - old_bytes;
         #[cfg(test)]
         let held = inner.map.len();
         Self::settle(&mut inner, self.budget_bytes);
         #[cfg(test)]
-        Self::count_growth_evictions(held, &inner);
+        {
+            inner.growth_evicted += (held - inner.map.len()) as u64;
+        }
         Ok(rows)
     }
 
+    /// The stores this cache's window refused and the entries its growth evicted, for the randomized admission test, which reads its own services' caches.
     #[cfg(test)]
-    fn count_growth_evictions(held: usize, inner: &Inner) {
-        let evicted = held - inner.map.len();
-        TEST_GROWTH_EVICTIONS.fetch_add(evicted as u64, std::sync::atomic::Ordering::Relaxed);
+    pub(crate) fn tallies(&self) -> (u64, u64) {
+        let inner = self.inner.lock().unwrap();
+        (inner.refused, inner.growth_evicted)
     }
 
-    /// Retain `rows`, a detached read's result that nobody awaited, which the window refused (the series' recovery record holds these rows), as the LRU would, evicting the least recently read: the re-poll after a cancelled or timed-out request then finds it (docs/admission-control.md Stage R). `started` predates the read, as its store's fetch start does, so the watermark and fresh window it stamps are no later than the store's. A series cached since (whose store removed its record), a record a later read replaced or a purge removed, and a series larger than the budget are left as they are.
+    /// Retain `rows`, a detached read's result that nobody awaited, which the window refused (its unclaimed recovery record still matches this snapshot), as the LRU would, evicting the least recently read: the re-poll after a cancelled or timed-out request then finds it (docs/admission-control.md Stage R). `started` predates the read, as its store's fetch start does, so the watermark and fresh window it stamps are no later than the store's. A series cached since (whose store removed its record), a record a later read replaced or a purge removed, and a series larger than the budget are left as they are.
     fn retain_orphan(&self, key: &SeriesKey, rows: &Arc<SeriesSnapshot>, started: Instant) {
         let mut inner = self.inner.lock().unwrap();
         let refused = inner.evicted.get(key).is_some_and(|record| {
@@ -1372,7 +1370,7 @@ impl SeriesCache {
     pub(crate) fn evict_for_test(&self, key: &SeriesKey) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(e) = inner.map.remove(key) {
-            inner.total_bytes -= e.bytes;
+            inner.entries -= e.bytes;
             inner.record_evicted(key.clone(), &e.rows);
         }
     }
@@ -1410,7 +1408,7 @@ impl SeriesCache {
         inner
             .evicted
             .retain(|key, _| !runs.contains(&(key.project_id.as_str(), key.run_id.as_str())));
-        inner.total_bytes -= removed_bytes;
+        inner.entries -= removed_bytes;
         Self::settle(&mut inner, self.budget_bytes);
         removed
     }
@@ -1419,33 +1417,31 @@ impl SeriesCache {
     fn settle(inner: &mut Inner, budget: usize) {
         let mut compacted = false;
         loop {
-            let charged = table_bytes(inner.table_capacity);
             shrink_table(&mut inner.map, &mut inner.table_capacity);
-            inner.total_bytes = inner.total_bytes - charged + table_bytes(inner.table_capacity);
-            if inner.total_bytes <= budget {
+            if inner.total_bytes() <= budget {
                 break;
             }
             let Some((key, entry)) = inner.map.iter().min_by_key(|(_, e)| e.last_access) else {
                 break;
             };
-            if !compacted
-                && entry.last_access.elapsed() < HOT_WINDOW
-                && table_bytes(inner.map.len()) < table_bytes(inner.table_capacity)
+            let hot = entry.last_access.elapsed() < HOT_WINDOW;
+            if !compacted && hot && table_bytes(inner.map.len()) < table_bytes(inner.table_capacity)
             {
                 compacted = true;
-                let charged = table_bytes(inner.table_capacity);
                 inner.map.shrink_to_fit();
                 inner.table_capacity = inner.map.capacity();
-                inner.total_bytes = inner.total_bytes - charged + table_bytes(inner.table_capacity);
                 continue;
             }
             let key = key.clone();
             let e = inner.map.remove(&key).unwrap();
-            inner.total_bytes -= e.bytes;
+            inner.entries -= e.bytes;
             inner.record_evicted(key, &e.rows);
-            metrics::counter!("mkdb2_series_cache_evictions_total").increment(1);
+            // Only growth and orphans evict hot entries (the window refuses a new series first), which the window counts on being rare.
+            let victim = if hot { "hot" } else { "cold" };
+            metrics::counter!("mkdb2_series_cache_evictions_total", "victim" => victim)
+                .increment(1);
         }
-        metrics::gauge!("mkdb2_series_cache_bytes").set(inner.total_bytes as f64);
+        metrics::gauge!("mkdb2_series_cache_bytes").set(inner.total_bytes() as f64);
         metrics::gauge!("mkdb2_series_cache_entries").set(inner.map.len() as f64);
     }
 }
@@ -1789,7 +1785,7 @@ mod tests {
     #[test]
     fn oversized_results_leave_recovery_records() {
         let cache = eviction_cache(1);
-        let retained_bytes = || cache.inner.lock().unwrap().total_bytes;
+        let retained_bytes = || cache.inner.lock().unwrap().total_bytes();
         let recorded = |key: &SeriesKey| match cache.sizes(std::slice::from_ref(key))[..] {
             [CachedSize::Evicted(record)] => Some(record.rows),
             _ => None,
@@ -1889,7 +1885,7 @@ mod tests {
     }
 
     #[test]
-    fn eviction_records_are_single_use_bounded_and_purged_by_exact_run() {
+    fn eviction_records_are_single_use_and_purged_by_exact_run() {
         let cache = eviction_cache(1);
         let key = SeriesKey::new("p", "r", "m");
         let first = cache.insert_full(key.clone(), vec![row("", 0, 1.0, 100)], Instant::now());
@@ -1905,19 +1901,43 @@ mod tests {
         assert!(!cache.inner.lock().unwrap().evicted.contains_key(&key));
         let reloaded = cache.insert_full(other_project, first.to_vec(), Instant::now());
         assert_eq!(reloaded.lineage(), other.lineage());
-        for n in 0..=EVICTED_LINEAGE_LIMIT + 1 {
-            cache.insert_full(
-                SeriesKey::new("p", format!("bounded-{n}"), "m"),
-                first.to_vec(),
-                Instant::now(),
-            );
+    }
+
+    /// Past the cap the earliest written eighth go, exactly: records written back to back (which an `Instant` often cannot order) lose no more.
+    #[test]
+    fn the_record_cap_drops_exactly_the_earliest_eighth() {
+        let mut inner = Inner::default();
+        let snapshot = SeriesSnapshot::full(filler(1));
+        let key = |i: usize| SeriesKey::new("p", format!("r{i}"), "m");
+        for i in 0..=EVICTED_LINEAGE_LIMIT {
+            inner.record_evicted(key(i), &snapshot);
         }
-        let evicted = &cache.inner.lock().unwrap().evicted;
-        // Past the cap the oldest eighth go at once.
-        assert!((EVICTED_LINEAGE_LIMIT * 7 / 8..=EVICTED_LINEAGE_LIMIT).contains(&evicted.len()));
-        assert!(!evicted.contains_key(&SeriesKey::new("p", "bounded-0", "m")));
-        let newest = SeriesKey::new("p", format!("bounded-{EVICTED_LINEAGE_LIMIT}"), "m");
-        assert!(evicted.contains_key(&newest));
+        let dropped = EVICTED_LINEAGE_LIMIT / 8;
+        assert_eq!(inner.evicted.len(), EVICTED_LINEAGE_LIMIT + 1 - dropped);
+        assert!(!inner.evicted.contains_key(&key(dropped - 1)));
+        assert!(inner.evicted.contains_key(&key(dropped)));
+        assert!(inner.evicted.contains_key(&key(EVICTED_LINEAGE_LIMIT)));
+    }
+
+    /// A refused cycle of 8,192 series, twice the 4,096 records the cache once kept, finds its records at every later read: each is priced from its record and keeps its lineage.
+    #[test]
+    fn a_refused_cycle_of_eight_thousand_series_keeps_its_records() {
+        let (cache, k) = guard_cache(1, 100, 1);
+        cache.insert_full(k[0].clone(), filler(100), Instant::now());
+        let keys: Vec<_> = (0..8_192)
+            .map(|i| SeriesKey::new("p", format!("refused-{i}"), "m"))
+            .collect();
+        let mut lineages = vec![0; keys.len()];
+        for wave in 0..3 {
+            for (key, lineage) in keys.iter().zip(&mut lineages) {
+                let priced = cache.sizes(std::slice::from_ref(key));
+                assert_eq!(matches!(priced[..], [CachedSize::Evicted(_)]), wave > 0);
+                let rows = cache.insert_full(key.clone(), filler(10), Instant::now());
+                assert!(wave == 0 || rows.lineage() == *lineage, "wave {wave}");
+                *lineage = rows.lineage();
+            }
+        }
+        assert!(matches!(cache.lookup(&k[0]), Lookup::Fresh(_)));
     }
 
     #[test]
@@ -2323,7 +2343,7 @@ mod tests {
         assert!(matches!(cache.lookup(&k2), Lookup::Fresh(_)));
         let inner = cache.inner.lock().unwrap();
         assert!(inner.evicted.contains_key(&k1));
-        assert!(inner.total_bytes <= cache.budget_bytes);
+        assert!(inner.total_bytes() <= cache.budget_bytes);
     }
 
     /// The map's bucket array is charged at its capacity, which removals never shrink by themselves: a filled-then-purged cache shrinks its table and charges nothing, and a full one charges every bucket it holds.
@@ -2345,7 +2365,7 @@ mod tests {
             let table = table_bytes(inner.table_capacity);
             assert_eq!(table, table_bytes(inner.map.capacity()));
             assert!(table >= inner.map.capacity() * std::mem::size_of::<(SeriesKey, Entry)>());
-            assert_eq!(inner.total_bytes, entries + table);
+            assert_eq!(inner.total_bytes(), entries + table);
         }
         assert_eq!(
             cache.purge_runs(runs.iter().map(|run| ("p", run.as_str()))),
@@ -2353,7 +2373,7 @@ mod tests {
         );
         let inner = cache.inner.lock().unwrap();
         assert_eq!(inner.map.capacity(), 0, "an emptied table is given back");
-        assert_eq!(inner.total_bytes, 0);
+        assert_eq!(inner.total_bytes(), 0);
     }
 
     /// A tag's rows in a step range, counted by binary searches over its chunks, are the rows a scan finds.
@@ -2492,12 +2512,12 @@ mod tests {
         cache.insert_full(k[4].clone(), filler(100), Instant::now());
         assert_eq!(cached_keys(&cache), ["r1", "r3", "r4"]);
         // Every entry is hot: r5 is served and not retained, and the cache is unchanged.
-        let total = cache.inner.lock().unwrap().total_bytes;
+        let total = cache.inner.lock().unwrap().total_bytes();
         let refused = cache.insert_full(k[5].clone(), filler(100), Instant::now());
         assert_eq!(refused.len(), 100);
         assert!(matches!(cache.lookup(&k[5]), Lookup::Miss));
         assert_eq!(cached_keys(&cache), ["r1", "r3", "r4"]);
-        assert_eq!(cache.inner.lock().unwrap().total_bytes, total);
+        assert_eq!(cache.inner.lock().unwrap().total_bytes(), total);
         assert!(matches!(
             cache.sizes(std::slice::from_ref(&k[5]))[..],
             [CachedSize::Evicted(EvictedSize { rows: 100, bytes, .. })] if bytes == refused.bytes()
@@ -2537,6 +2557,29 @@ mod tests {
                 cache.sizes(std::slice::from_ref(&k[0]))[..],
                 [CachedSize::Evicted(_)]
             ));
+        }
+    }
+
+    /// Evictions say whether their victim was read within the window: growth's (and orphans') take hot entries, a new series only cold ones.
+    #[test]
+    fn evictions_count_hot_and_cold_victims() {
+        let ((), rendered) = crate::with_metrics(|| {
+            let (cache, k) = guard_cache(2, 100, 3);
+            for key in &k[..2] {
+                cache.insert_full(key.clone(), filler(100), Instant::now());
+            }
+            assert!(matches!(cache.lookup(&k[1]), Lookup::Fresh(_)));
+            let base = base_of(&cache, &k[1]);
+            cache
+                .apply_increment(&k[1], vec![row("", 100, 0.0, 1)], Instant::now(), &base)
+                .unwrap();
+            cache.cool_for_test();
+            cache.insert_full(k[2].clone(), filler(100), Instant::now());
+            assert_eq!(cached_keys(&cache), ["r2"]);
+        });
+        for victim in ["hot", "cold"] {
+            let line = format!("mkdb2_series_cache_evictions_total{{victim=\"{victim}\"}} 1");
+            assert!(rendered.contains(&line), "{line} in {rendered}");
         }
     }
 
@@ -2655,7 +2698,7 @@ mod tests {
         let inner = cache.inner.lock().unwrap();
         assert_eq!(inner.map.len(), 2);
         assert_eq!(
-            inner.total_bytes,
+            inner.total_bytes(),
             inner.map.values().map(|entry| entry.bytes).sum::<usize>()
                 + table_bytes(inner.table_capacity)
         );
@@ -2803,6 +2846,42 @@ mod tests {
                 if cancelled { 1 } else { 2 },
                 "cancelled {cancelled}"
             );
+        }
+    }
+
+    /// A publication a bump outdated is released before the next read of its series, a request's or a batch's: once its requester is done, nothing else holds a refused result, so the slot would otherwise pin a whole snapshot, charged nowhere, beside its replacement's.
+    #[tokio::test]
+    async fn an_outdated_publication_is_released_before_its_replacement_is_read() {
+        for batch in [false, true] {
+            let (cache, k) = guard_cache(1, 1_000, 2);
+            let (cache, locks) = (Arc::new(cache), SeriesRefreshLocks::default());
+            cache.insert_full(k[0].clone(), filler(1_000), Instant::now());
+            // A queued request keeps the slot, and its publication, alive.
+            let _queued = locks.lease_for(&k[1]);
+            let (store, key) = (cache.clone(), k[1].clone());
+            let rows = locks
+                .get_or_refresh(&cache, &k[1], no_detach, move |_| async move {
+                    Ok(store.insert_full(key, filler(1_000), Instant::now()))
+                })
+                .await
+                .unwrap();
+            // Refused, and its requester is done: only the slot's publication still holds it.
+            let published = Arc::downgrade(&rows);
+            cache.note_bumps(std::iter::once("r1"));
+            drop(rows);
+            assert!(published.upgrade().is_some());
+            if batch {
+                assert_eq!(locks.elect_misses(&cache, &k[1..], 1).len(), 1);
+                assert!(published.upgrade().is_none(), "released at election");
+            } else {
+                locks
+                    .get_or_refresh(&cache, &k[1], no_detach, move |_| async move {
+                        assert!(published.upgrade().is_none(), "released before the read");
+                        Ok(Arc::new(SeriesSnapshot::full(filler(1_000))))
+                    })
+                    .await
+                    .unwrap();
+            }
         }
     }
 
@@ -3484,7 +3563,7 @@ mod tests {
                         steps: (i64::MAX, i64::MIN),
                         groups: 0,
                     },
-                    evicted: std::time::Instant::now(),
+                    written: 0,
                     claimed: false,
                 }
             }
@@ -3786,7 +3865,7 @@ mod tests {
             let choice = rng.below(100);
             if choice >= 88 {
                 // LRU eviction, possibly a change in the source, then a full reload against each side's record.
-                let (old_record, new_record) = (old.evicted(), EvictedLineage::of(&new));
+                let (old_record, new_record) = (old.evicted(), EvictedLineage::of(&new, 0));
                 match rng.below(4) {
                     0 => {
                         let tag = rng.pick(tags);
@@ -4063,7 +4142,7 @@ mod tests {
         let first = cache.insert_full(key.clone(), rows, Instant::now());
         assert_eq!(first.chunks.len(), 2);
         assert_eq!(
-            cache.inner.lock().unwrap().total_bytes,
+            cache.inner.lock().unwrap().total_bytes(),
             entry_bytes(&key, &first) + table_bytes(1)
         );
         // The overlap re-read plus ten new scalar rows.
@@ -4087,7 +4166,7 @@ mod tests {
         );
         // The cache charges the snapshot it retains, the shared chunks once; the replaced snapshot is charged by whoever still pins it.
         assert_eq!(
-            cache.inner.lock().unwrap().total_bytes,
+            cache.inner.lock().unwrap().total_bytes(),
             entry_bytes(&key, &second) + table_bytes(1)
         );
         // Chart admission reads the same record.
@@ -4422,10 +4501,10 @@ mod tests {
                 "BENCH memory tags={} budget_bytes={BUDGET} entries={} rows={rows} accounted_bytes={} allocator_bytes={} allocator_per_row={:.1} accounted_per_row={:.1}",
                 tags.len(),
                 inner.map.len(),
-                inner.total_bytes,
+                inner.total_bytes(),
                 real.map_or("n/a".into(), |real| real.to_string()),
                 real.map_or(f64::NAN, |real| real as f64 / rows as f64),
-                inner.total_bytes as f64 / rows as f64,
+                inner.total_bytes() as f64 / rows as f64,
             );
         }
     }
