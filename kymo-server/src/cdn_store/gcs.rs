@@ -99,11 +99,15 @@ impl GcsStore {
             // duration. Known residual (reviewed, accepted): h2 flow control can leave an armed
             // timer unpolled across a slow-consumer pause on objects larger than the h2 window,
             // so the timer can fire without a real stall — the crate then transparently resumes
-            // with an etag-pinned ranged GET (always valid under write-once; ~10 resumes/3min
-            // budget), so only a consumer repeatedly stalling >60s on a large object ever sees
-            // an abort, and a refetch heals it. Metadata HEADs (Suffix(0), range-rejection
-            // recovery) ride this same client and get the same progress bound; federated token
-            // exchanges have their own bounded client.
+            // with an etag-pinned ranged GET (always valid under write-once; at most 10 retries,
+            // none once 3 minutes have passed since the first GET), so a consumer stalling >60s
+            // on a large object sees an abort once that budget is spent, and a refetch heals it.
+            // Metadata HEADs (Suffix(0), range-rejection recovery) ride this same client and get
+            // the same progress bound; federated token exchanges have their own bounded client.
+            // reqwest 0.13.5 starts the timer when a frame arrives instead of when the next read
+            // starts, so every consumer pause counts against it: the workspace Cargo.lock holds
+            // 0.13.4 (local mode keeps media on disk) while `read_timeout_ignores_a_consumer_pause`
+            // fails on newer releases.
             .with_client_options(
                 object_store::ClientOptions::new()
                     .with_timeout_disabled()
@@ -1154,6 +1158,50 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("past its promised length"));
+    }
+
+    /// A consumer pausing longer than the read timeout, with the rest of the body already buffered, still gets it (`GcsStore::new`). This server ignores ranges, so a resumed GET fails the read too.
+    #[tokio::test]
+    async fn read_timeout_ignores_a_consumer_pause() {
+        use axum::http::header;
+
+        let app = axum::Router::new().route(
+            "/{bucket}/{key}",
+            axum::routing::get(|| async {
+                (
+                    [
+                        (header::ETAG, "\"1\""),
+                        (header::LAST_MODIFIED, "Sun, 18 Oct 2026 00:00:00 GMT"),
+                    ],
+                    "first second",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let store = GoogleCloudStorageBuilder::new()
+            .with_base_url(&base_url)
+            .with_bucket_name("test-bucket")
+            .with_credentials(static_credentials("test-token"))
+            .with_client_options(
+                object_store::ClientOptions::new()
+                    .with_read_timeout(Duration::from_secs(1))
+                    .with_allow_http(true),
+            )
+            .build()
+            .unwrap();
+        let mut body = store
+            .get(&ObjectPath::from("key"))
+            .await
+            .unwrap()
+            .into_stream();
+        let mut read = body.next().await.unwrap().unwrap().to_vec();
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        while let Some(frame) = body.next().await {
+            read.extend_from_slice(&frame.expect("a pause ended the read"));
+        }
+        assert_eq!(read, b"first second");
     }
 
     #[test]

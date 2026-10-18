@@ -2,6 +2,6 @@
 members = ["kymo-server", "kymo-frontend"]
 resolver = "2"
 
-# Upstream's router macro writes a bare `?` for an empty query; the fork tag is v0.7.9 plus the unmerged fix DioxusLabs/dioxus#5845. Drop this once upstream releases the fix.
+# Upstream's router macro writes a bare `?` for an empty query; the fork tag is v0.7.9 plus DioxusLabs/dioxus#5845, which upstream merged for 0.8 (no 0.7 release has it). Drop this once a stable release carries the fix.
 [patch.crates-io]
 dioxus-router-macro = { git = "https://github.com/ad8e/dioxus", tag = "kymo-v0.7.9-1" }

@@ -361,7 +361,7 @@ fn difference_tints<T: Eq + Hash>(values: &[T]) -> Vec<bool> {
         .collect()
 }
 
-/// A leaf's per-run values under the diff's notion of equality, as JSON text (serde_json maps are sorted; numbers stay as written, but for serde_json's spelling of an exponent and of -0), so a row groups in linear time.
+/// A leaf's per-run values under the diff's notion of equality, as JSON text (serde_json maps are sorted; numbers stay as written, but for serde_json's spelling of an exponent), so a row groups in linear time.
 fn comparable_row(columns: &[MetadataColumn], path: &str) -> Vec<Option<String>> {
     columns
         .iter()
@@ -887,8 +887,15 @@ mod tests {
 
     #[test]
     fn numbers_keep_the_text_json_dumps_writes() {
-        // Python's json.dumps writes floats by repr, ints by str. serde_json's default parse would read 198136.40638684994 one ulp off, showing 198136.4063868499.
-        for written in ["1e-08", "1e+30", "-0.0", "100000.0", "198136.40638684994"] {
+        // Python's json.dumps writes floats by repr, ints by str. serde_json's default parse would read 198136.40638684994 one ulp off, showing 198136.4063868499. An integer -0, which json.dumps never writes, keeps its sign too.
+        for written in [
+            "1e-08",
+            "1e+30",
+            "-0.0",
+            "-0",
+            "100000.0",
+            "198136.40638684994",
+        ] {
             let data: Value = serde_json::from_str(&format!(r#"{{"n": {written}}}"#)).unwrap();
             assert_eq!(format_row_values(&[Some(&data["n"])]), [written]);
         }
