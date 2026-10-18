@@ -599,7 +599,7 @@ def replay_file(
     claim = claim_spool(path)
     if claim is None:
         print(
-            f"  {os.path.basename(path)}: open by a live run or another sync, or gone — skipped (sync again after it exits)"
+            f"  {os.path.basename(path)}: open by a live run or another sync — skipped (sync again after it exits)"
         )
         return False
     with claim:
@@ -1080,7 +1080,7 @@ def main(argv=None) -> int:
                 claim = claim_spool(f)
                 if claim is None:
                     print(
-                        f"  {f}: open by a live run or another sync, or gone; an earlier spool "
+                        f"  {f}: open by a live run or another sync; an earlier spool "
                         "for this identity was rejected, so it was not replayed"
                     )
                 else:

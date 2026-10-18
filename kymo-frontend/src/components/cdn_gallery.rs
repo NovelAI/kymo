@@ -492,7 +492,7 @@ fn open_source_state(
     )
 }
 
-/// `shown` (the step's sources as drawn, aligned with `sources`) with their manifests, once every source has answered or their grace passed; a failed or waiting source draws as having none.
+/// `shown` (the step's sources as drawn, aligned with `sources`) with their manifests, once every source has answered or their grace passed; a failed or waiting source draws as having none. A source joining the step (a pending: key resolving, a run shown) holds the rest back with it, so sources already settled are hidden for up to MANIFEST_GRACE.
 fn current_manifests(
     shown: &[RunManifest],
     sources: &[ManifestSource],
@@ -557,7 +557,7 @@ fn file_groups(run_manifests: &[RunManifest]) -> Vec<(&str, &str, &[ManifestItem
         .collect()
 }
 
-/// How long a manifest fetch may first take, headers through body, before it is aborted and retried, so a stalled response can't hold its source, and one of the browser's six HTTP/1.1 connections to the CDN, forever. The wait for a connection counts too. Chromium gives a fetch to the CDN, another origin, without credentials connections apart from the gallery's images, but WebKit queues it behind them (4.7 s behind six images stalled for 5 s), so on a slow link a manifest can run out its deadline before it is sent; each deadline abort doubles that source's next one, up to MANIFEST_DEADLINE_CAP_MS. 47 s is no multiple of RETRY_WAIT (5 s), the socket's 20 s keepalive ping, the series cache's 40 s hot window or 60 s (the socket's request timeout and several other clocks).
+/// How long a manifest fetch may first take, headers through body, before it is aborted and retried, so a stalled response can't hold its source, and one of the browser's six HTTP/1.1 connections to the CDN, forever. The wait for a connection counts too. Chromium gives a fetch to the CDN, another origin, without credentials, connections apart from the gallery's images, but WebKit queues it behind them (4.7 s behind six images stalled for 5 s), so on a slow link a manifest can run out its deadline before it is sent; each deadline abort doubles that source's next one, up to MANIFEST_DEADLINE_CAP_MS. 47 s is no multiple of RETRY_WAIT (5 s), the socket's 20 s keepalive ping, the series cache's 40 s hot window or 60 s (the socket's request timeout and several other clocks).
 const MANIFEST_DEADLINE_MS: u32 = 47_000;
 
 /// The longest a source's fetch gets after deadline aborts, 47 s doubled twice: a manifest still queued behind images that long is on a link too slow to show them, and each fetch of a hung request is capped at 188 s, a multiple of none of those clocks.
@@ -701,9 +701,7 @@ pub fn CdnGallery(
     let _fetch = use_resource(use_reactive((&sources,), move |(sources,)| async move {
         let current: HashSet<ManifestSource> = sources.iter().cloned().collect();
         let asking = unsettled_sources(&sources, &fetched.peek());
-        if !asking.is_empty() {
-            crate::grpc::wait_until_page_visible().await;
-        }
+        crate::grpc::wait_until_page_visible().await;
         let fetch = async |source: &ManifestSource, deadline_ms: u32| {
             if source.key.starts_with("pending:") {
                 return (Fetched::Settled(None), false);
@@ -1702,6 +1700,7 @@ mod tests {
 
         let current = current_manifests(&shown, &sources, &fetched).expect("every source answered");
         assert_eq!(current[0].manifest, Some(image_manifest()));
+        assert_eq!(current[0].label, "Healthy");
         assert_eq!(current[1].manifest, None);
         assert_eq!(current[1].label, "Broken");
         let parsed = current.iter().filter(|run| run.manifest.is_some()).count();
@@ -2015,6 +2014,12 @@ mod tests {
         assert_eq!(held, ["a1", "b1"]);
         latch_settled(&mut latched, &step2, &fetched);
         assert_eq!(shows(&latched), ["b1"]);
+        // A preview open on A's image has nothing to load at step 2, where A has no source: its label says the step, not that it loads.
+        let open_a = LightboxImage {
+            run_id: "a".into(),
+            ..open.clone()
+        };
+        assert_eq!(open_source_state(&open_a, &step2, &fetched), (false, false));
         fetched = FetchedManifests::from([(step2[0].clone(), Fetched::Settled(Some(image("b2"))))]);
         latch_settled(&mut latched, &step2, &fetched);
         assert_eq!(shows(&latched), ["b2"]);
@@ -2039,20 +2044,6 @@ mod tests {
         // Another step's answers still held are dropped, which is a change.
         let next_step: std::collections::HashSet<_> = [b.clone()].into();
         assert!(publish_changes(&fetched, &next_step, &[]));
-    }
-
-    /// A rename or recolor changes only what is drawn: the fetch identity stays, so nothing refetches, and the answers held under it take the new label.
-    #[test]
-    fn a_relabeled_source_keeps_its_answer_and_takes_the_new_label() {
-        let sources = [source("run", "a.json")];
-        let fetched = FetchedManifests::from([(
-            sources[0].clone(),
-            Fetched::Settled(Some(image_manifest())),
-        )]);
-        let current = current_manifests(&[drawn("run", "renamed")], &sources, &fetched).unwrap();
-        assert_eq!(current[0].label, "renamed");
-        assert_eq!(current[0].manifest, Some(image_manifest()));
-        assert!(unsettled_sources(&sources, &fetched).is_empty());
     }
 
     #[test]

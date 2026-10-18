@@ -980,16 +980,14 @@ fn edit_object(value: &mut Value, edit: impl FnOnce(&mut serde_json::Map<String,
     }
 }
 
-/// Store `patch` as `key`'s one entry among `entries`, in the place of the first one stored for it, dropping any others (an older or foreign writer's), and the entry itself when `patch` is `Null`. In place, so an edit that changes nothing leaves the diff as stored, order included.
+/// Store `patch` as `key`'s one entry among `entries`, dropping any others for it (an older or foreign writer's), and the entry itself when `patch` is `Null`.
 fn store_patch(entries: &mut Vec<ConfigPatch>, key: &str, patch: Value) {
-    let at = entries.iter().position(|ov| ov.key == key);
     entries.retain(|ov| ov.key != key);
     if !patch.is_null() {
-        let entry = ConfigPatch {
+        entries.push(ConfigPatch {
             key: key.to_string(),
             patch,
-        };
-        entries.insert(at.unwrap_or(entries.len()), entry);
+        });
     }
 }
 
@@ -1884,31 +1882,6 @@ mod cascade_tests {
         assert!(!diff.edit_rect(&base, "train/loss", |r| r.options.log_y = false));
         assert!(diff.apply(&base).find_rect("train/loss").is_none());
         assert!(diff.rect_overrides.is_empty());
-    }
-
-    /// An edit that changes nothing (an unchanged rename) leaves the diff as stored, entry order included: with storage full, a diff that differs from the stored one is reported refused.
-    #[test]
-    fn an_edit_that_changes_nothing_leaves_the_diff_as_stored() {
-        let mut base = base_with_one_rect();
-        let mut acc = base.sections[0].rects[0].clone();
-        acc.id = "train/acc".to_string();
-        base.sections[0].rects.push(acc);
-        let mut diff = LayoutDiff::default();
-        assert!(diff.edit_rect(&base, "train/loss", |r| r.options.log_y = true));
-        assert!(diff.edit_rect(&base, "train/acc", |r| r.options.log_x = true));
-        let stored = diff.clone();
-        assert!(diff.edit_rect(&base, "train/loss", |r| r.label = r.label.clone()));
-        assert_eq!(diff, stored);
-        // Its entry is the one reads apply, so a duplicate a foreign writer left after it goes, and clearing the patch drops the entry.
-        diff.rect_overrides.push(ConfigPatch {
-            key: "train/loss".to_string(),
-            patch: serde_json::json!({ "label": "foreign" }),
-        });
-        assert!(diff.edit_rect(&base, "train/loss", |r| r.label = r.label.clone()));
-        assert_eq!(diff, stored);
-        assert!(diff.edit_rect(&base, "train/loss", |r| r.options.log_y = false));
-        assert_eq!(diff.rect_overrides.len(), 1);
-        assert_eq!(diff.rect_overrides[0].key, "train/acc");
     }
 
     /// The chart editor writes a chart's own options as the defaults editors write theirs: a field back at the value it opened with takes its stored entry again, so a pin at the inherited value survives a Revert.
@@ -3050,15 +3023,14 @@ impl LayoutDiff {
     }
 
     /// Persist; an empty diff clears storage so reverting all edits returns
-    /// the project to pure auto-generation. False when the browser refused
-    /// the write (storage full or blocked).
-    pub fn save(&self, project_id: &str) -> bool {
+    /// the project to pure auto-generation.
+    pub fn save(&self, project_id: &str) {
         let key = diff_key(project_id);
         if self.is_empty() {
-            let removed = local_storage::remove(&key);
+            local_storage::remove(&key);
             remove_owned_legacy_diff(project_id);
             remove_owned_legacy(project_id);
-            return removed;
+            return;
         }
         let written = Self {
             format_version: self.storage_version(),
@@ -3072,16 +3044,14 @@ impl LayoutDiff {
                 // rollback state survives an ordinary visit.
                 remove_owned_legacy_diff(project_id);
                 remove_owned_legacy(project_id);
-                return true;
             }
         }
-        false
     }
 
     /// Distinguishes "no saved diff" from "saved but unparsable" so callers
     /// can route to a settings-error page rather than silently regenerating.
     pub fn load_strict(project_id: &str) -> LoadResult {
-        // A store the browser won't let the page read reads as no stored layout: with storage blocked after the page loaded the stored one, an edit would act on the generated layout. Nothing plausible gets there, so it is not handled.
+        // Limit: storage the browser refuses (blocked, or full) is not handled (save() drops local_storage::set's refusal): a refused write shows its edit until the next edit, a layout refresh or a reload, and an editor opened meanwhile opens its options on the stored value while the chart still shows the edit; a refused read is no stored layout. Run selections save as their sorted ids: even every run selected in all 167 projects imported from W&B (33,504 runs) measured under WebKit's 5 MB, so only storage blocked from the start plausibly gets here.
         let json = local_storage::get(&diff_key(project_id)).or_else(|| {
             local_storage::get(&legacy_diff_key(project_id))
                 .filter(|value| !is_legacy_layout(value))

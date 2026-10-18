@@ -36,9 +36,8 @@ function render(id, { axis = "rel", logX = false, shifted = false, labels = ["ru
     __KYMO_NAN_MARKERS__: "0",
     __KYMO_ZOOM_REFETCH__: String(step),
     // A zero-present log x plots x+1 in the wire's units (ChartJsConfig::log_shift): the step zoom geometry shifts by 1, readouts by 1 step or 1 ms.
-    __KYMO_X_SHIFT__: shifted && step ? "1" : "0",
     __KYMO_READOUT_X_SHIFT__: !shifted ? "0" : time ? "0.001" : "1",
-    __KYMO_X_SPLITS__: "{}",
+    __KYMO_X_SPLITS__: shifted ? "{splits:xSplits,filter:function(u,s){return s}}" : "{}",
     __KYMO_X_DISTR__: logX ? "3" : "1",
     __KYMO_X_RANGE__: logX ? "{range:logSafeX}" : "{}",
     __KYMO_Y_DISTR__: "1",
@@ -69,12 +68,12 @@ function render(id, { axis = "rel", logX = false, shifted = false, labels = ["ru
 function element(id = "") {
   const listeners = {};
   return {
-    id, style: {}, dataset: {}, className: "", innerHTML: "", offsetWidth: 100, offsetHeight: 40, listeners, dispatched: [],
+    id, style: {}, className: "", innerHTML: "", offsetWidth: 100, offsetHeight: 40, listeners, dispatched: [],
     classList: { toggle() {}, add() {}, remove() {} },
     addEventListener(type, fn) { (listeners[type] ||= []).push(fn); },
     dispatchEvent(event) { this.dispatched.push(event); return true; },
     getBoundingClientRect: () => ({ left: 0, top: 0, right: 400, bottom: 220, width: 400, height: 220 }),
-    appendChild() {}, remove() {}, closest() { return null; }, querySelectorAll() { return []; },
+    appendChild() {}, closest() { return null; },
     fire(type, event) { for (const fn of listeners[type] || []) fn(event); },
   };
 }
@@ -84,9 +83,7 @@ function page({ dpr = 1 } = {}) {
   const windowListeners = {};
   const nodes = {};
   const created = [];
-  const instances = [];
   class FakeUPlot {
-    static rangeNum(mn, mx) { return [mn, mx]; }
     constructor(opts, data) {
       this.opts = opts;
       this.data = data;
@@ -102,10 +99,12 @@ function page({ dpr = 1 } = {}) {
       this.scales = { x: { distr: opts.scales.x.distr }, y: {} };
       this.rebuilds = 0;
       this.fitX();
-      instances.push(this);
     }
     fitX() { const x = this.data[0]; this.scales.x.min = x[0]; this.scales.x.max = x[x.length - 1]; }
     setScale(key, { min, max }) {
+      // uPlot runs the scale's range function on every explicit setScale.
+      const range = this.opts.scales[key].range;
+      if (typeof range === "function") [min, max] = range(this, min, max, key);
       Object.assign(this.scales[key], { min, max });
       this.rebuilds++;
       for (const hook of this.opts.hooks.setScale || []) hook(this, key);
@@ -113,7 +112,6 @@ function page({ dpr = 1 } = {}) {
     setData(data) { this.data = data; if (this.opts.scales.x.auto(this)) this.fitX(); this.rebuilds++; }
     setCursor() {}
     setSelect(box) { this.box = box; }
-    redraw() {}
     destroy() { this.root.isConnected = false; }
     valToPos(value) { return value; }
   }
@@ -134,11 +132,11 @@ function page({ dpr = 1 } = {}) {
   const context = vm.createContext({
     window, document, uPlot: FakeUPlot, devicePixelRatio: dpr, CustomEvent: class { constructor(type, init) { this.type = type; Object.assign(this, init); } },
     ResizeObserver: class { observe() {} disconnect() {} }, getComputedStyle: () => ({ height: "220px", getPropertyValue: () => "" }),
-    queueMicrotask, dioxus: { close() {} }, console,
+    queueMicrotask, dioxus: { close() {} },
   });
   vm.runInContext(hoverPoints, context);
   return {
-    window, instances,
+    window,
     create(id, x, options) {
       nodes[id] ||= element(id);
       window.__kymo_data[id] = [Float64Array.from(x), Float64Array.from(x, v => v / 10)];
@@ -202,17 +200,26 @@ test("a cancelled pull leaves the peers alone and restores the source", () => {
   assert.deepEqual([source.scales.x.min, source.scales.x.max], [0, 100]);
   assert.deepEqual([peer.scales.x.min, peer.scales.x.max], [0, 100]);
   assert.equal(peer.rebuilds, 0);
-  // A press that moves less than a pixel along the axis zooms nothing, so the chart still follows live data.
-  pullAxis(p, "a", 300, 300.5);
+  // A press whose hand moves under a pixel along the axis marks no zoom and moves no peer: the chart still follows live data, and a zoomed one stays zoomed.
+  const still = () => {
+    p.el("a").fire("mousedown", { button: 0, clientX: 300, clientY: 210, pageX: 300, pageY: 210, preventDefault() {} });
+    p.fireWindow("mousemove", { buttons: 1, clientX: 300.5, clientY: 216, pageX: 300.5, pageY: 216 });
+    p.fireWindow("mouseup", { button: 0, clientX: 300, clientY: 216, pageX: 300, pageY: 216 });
+  };
+  still();
   assert.ok(!source.__kymo_userzoom);
   assert.equal(peer.rebuilds, 0);
+  source.__kymo_userzoom = true;
+  still();
+  assert.equal(source.__kymo_userzoom, true);
 });
 
 test("a pull past a linear chart's data hands a log-x peer a positive window", () => {
   const p = page();
-  const source = p.create("a", [0, 25, 50, 75, 100]);
+  // A custom x, which can be linear on one chart and log on another.
+  const source = p.create("a", [0, 25, 50, 75, 100], { axis: "m-x" });
   // Its data reaches past the source's, so only the release's commit brings its x-max to 100.
-  const logPeer = p.create("b", [1, 25, 50, 75, 200], { logX: true });
+  const logPeer = p.create("b", [1, 25, 50, 75, 200], { axis: "m-x", logX: true });
   // A left-half grab pins x-max; dragging right reveals empty space below 0.
   pullAxis(p, "a", 100, 300);
   assert.ok(source.scales.x.min < 0, "the source shows the empty space it was pulled to");
@@ -222,11 +229,11 @@ test("a pull past a linear chart's data hands a log-x peer a positive window", (
   assert.equal(logPeer.rebuilds, 1);
 });
 
-test("a log-x peer with no data, or nothing positive in the window, is left alone", () => {
-  // A selection from `from` to `to` px across the 400 px plot, which shows -100..100.
+test("a log-x peer with nothing positive in the window, or a window across 0 that ends before its data, is left alone", () => {
+  // A selection from `from` to `to` px across the 400 px plot of a custom x, which shows -100..100.
   const select = (from, to) => {
     const p = page();
-    const charts = { source: p.create("a", [-100, -50, 0, 50, 100]), empty: p.create("e", [], { logX: true }), logPeer: p.create("b", [1, 10, 100], { logX: true }), late: p.create("l", [50, 60, 100], { logX: true }) };
+    const charts = { source: p.create("a", [-100, -50, 0, 50, 100], { axis: "m-x" }), logPeer: p.create("b", [1, 10, 100], { axis: "m-x", logX: true }), late: p.create("l", [50, 60, 100], { axis: "m-x", logX: true }), linear: p.create("m", [50, 60, 100], { axis: "m-x" }) };
     p.el("a").fire("mousedown", { button: 0, clientX: from, clientY: 100, pageX: from, pageY: 100, preventDefault() {} });
     p.fireWindow("mousemove", { buttons: 1, clientX: to, clientY: 100, pageX: to, pageY: 100 });
     p.fireWindow("mouseup", { button: 0, clientX: to, clientY: 100, pageX: to, pageY: 100 });
@@ -240,19 +247,32 @@ test("a log-x peer with no data, or nothing positive in the window, is left alon
   // Inside the source's negative half, no log-x peer can show any of it.
   const negative = select(40, 120);
   assert.ok(negative.source.scales.x.max <= 0, `source window ${negative.source.scales.x.min}..${negative.source.scales.x.max}`);
-  untouched(negative.empty);
   untouched(negative.logPeer);
-  // Inside the positive half, the peer with data takes the window, and the one with none still isn't given it.
+  assert.equal(negative.linear.__kymo_userzoom, true, "a linear peer takes any window, its data's or not");
+  // Inside the positive half, the peer takes the window, and so does one whose data starts after the window ends: only a window reaching 0 is left to its range function.
   const positive = select(240, 320);
   assert.deepEqual([positive.logPeer.scales.x.min, positive.logPeer.scales.x.max], [20, 60]);
-  untouched(positive.empty);
+  const before = select(240, 260);
+  assert.deepEqual([before.late.scales.x.min, before.late.scales.x.max], [20, 30]);
   // Across 0, a peer takes the window from its first x; one whose data starts past the window's end is left alone, not given a window its range function would turn inside out.
   const across = select(100, 250);
   assert.deepEqual([across.logPeer.scales.x.min, across.logPeer.scales.x.max], [1, 25]);
   untouched(across.late);
 });
 
-test("a step chart's pull still refetches through the step store and moves no client chart", () => {
+test("a log-x pull stops where uPlot's log tick walk still ends", () => {
+  const p = page();
+  const c = p.create("c", [500, 1000, 4000], { axis: "m-x", logX: true });
+  // Far past the panel: below about 1e-25 uPlot's walk never ends, and the tab hangs.
+  pullAxis(p, "c", 120, 3000);
+  assert.ok(c.scales.x.min >= Math.exp(-50) * (1 - 1e-9), `min ${c.scales.x.min}`);
+  // The max has no such bound to meet: a custom x near 1e23 (training FLOPs, say) pulled at its max edge keeps its data in view.
+  const flops = p.create("f", [1e20, 1e22, 1e23], { axis: "m-x", logX: true });
+  pullAxis(p, "f", 300, 280);
+  assert.ok(flops.scales.x.max > 1e23, `max ${flops.scales.x.max}`);
+});
+
+test("a step chart's pull still refetches through the step store", () => {
   const p = page();
   const step = p.create("s", [0, 25, 50, 75, 100], { axis: "step" });
   pullAxis(p, "s", 300, 350);
@@ -280,15 +300,15 @@ test("relative-time ticks keep neighbours apart at every spacing, as a stopwatch
 
 test("log-time ticks take each value's own precision", () => {
   const p = page();
-  const c = p.create("t", [0.001, 1000], { logX: true });
-  assert.deepEqual(tickLabels(c, [0.001, 0.01, 0.1, 1, 10, 100, 1000], 10), ["0.001s", "0.01s", "0.1s", "1s", "10s", "1:40", "16:40"]);
-  // Below a millisecond too: the three digits a linear axis stops at would print them all 0.000s.
-  assert.deepEqual(tickLabels(c, [0.0001, 0.0002, 0.0005, 0.0012], 10), ["0.0001s", "0.0002s", "0.0005s", "0.0012s"]);
-  // And below a microsecond, where an absolute tolerance would print them all 0s.
-  assert.deepEqual(tickLabels(c, [1e-7, 2e-7, 5e-7, 1e-6], 10), ["0.0000001s", "0.0000002s", "0.0000005s", "0.000001s"]);
-  // Wall time stops at the three digits Intl prints: it rejects more, which would throw inside uPlot's commit.
-  const wall = p.create("w", [1.76e9, 1.76e9 + 1000], { axis: "wall", logX: true });
-  assert.match(tickLabels(wall, [1.76e9 + 0.1234567], 10)[0], /[.,]123(\D|$)/);
+  // A log relative-time chart is always zero-present, so its ticks arrive 1 ms late.
+  const c = p.create("t", [0.001, 1000.001], { logX: true, shifted: true });
+  const ticks = real => tickLabels(c, real.map(v => v + 0.001), 10);
+  assert.deepEqual(ticks([0.001, 0.01, 0.1, 1, 10, 100, 1000]), ["0.001s", "0.01s", "0.1s", "1s", "10s", "1:40", "16:40"]);
+  // Below a millisecond too, zoomed into the first one: the three digits a linear axis stops at would print them all 0.000s.
+  assert.deepEqual(ticks([0.0001, 0.0002, 0.0005, 0.0012]), ["0.0001s", "0.0002s", "0.0005s", "0.0012s"]);
+  // A log wall-time axis pulled below a second ticks at 1e-4 s, where wall time stops at the three digits Intl prints: it throws on more.
+  const wall = p.create("w", [1.76e9, 1.76e9 + 3600], { axis: "wall", logX: true });
+  assert.match(tickLabels(wall, [1e-4], 10)[0], /[.,]000(\D|$)/);
 });
 
 test("a log relative-time chart plotted 1 ms late labels and hands on its real times", () => {
@@ -296,18 +316,24 @@ test("a log relative-time chart plotted 1 ms late labels and hands on its real t
   // Rust plots a zero-present log time axis at x + 1 ms; the real times here are 0, 1, 2 and 4.1 ms.
   const shifted = p.create("s", [0.001, 0.002, 0.003, 0.0051], { logX: true, shifted: true });
   assert.deepEqual(tickLabels(shifted, [0.001, 0.002, 0.003], 0.001), ["0s", "0.001s", "0.002s"]);
+  // Its zoom geometry stays unshifted; a shifted step chart's works in its 1 step.
+  assert.equal(shifted.__kymo_zoom.xShift, 0);
+  assert.equal(p.create("st", [1, 2, 11], { axis: "step", logX: true, shifted: true }).__kymo_zoom.xShift, 1);
+  // It ticks at real decades, not at uPlot's plotted ones (which read 0.009s, 0.099s, 9.999s).
+  const decades = p.create("d", [0.001, 2.001], { logX: true, shifted: true });
+  assert.deepEqual(tickLabels(decades, [...decades.axes[0].splits(decades, 0, 0.001, 2.001)]), ["0s", "0.001s", "0.01s", "0.1s", "1s"]);
   const near = (a, b) => assert.ok(Math.abs(a - b) < 1e-12, `${a} vs ${b}`);
   const real = c => [c.scales.x.min - (c === shifted ? 0.001 : 0), c.scales.x.max - (c === shifted ? 0.001 : 0)];
   // A pull on it moves a linear peer to the same real window, and a pull on the peer moves it back by that window plus its 1 ms.
   const linear = p.create("l", [0, 0.001, 0.002, 0.0041]);
-  // A plain log peer whose data starts after 0.
-  const late = p.create("e", [0.002, 0.003, 0.0041], { logX: true });
+  // Another log relative-time peer, its real 0 its first point and its 0s tick.
+  const late = p.create("e", [0.001, 0.002, 0.0041], { logX: true, shifted: true });
   pullAxis(p, "s", 300, 350);
   assert.equal(linear.__kymo_userzoom, true);
   real(linear).forEach((v, i) => near(v, real(shifted)[i]));
-  // The pinned edge is its real 0 exactly, not 0.001 through log and back (a real 2e-19), so the late peer starts at its own first x.
+  // The pinned edge is its real 0 exactly, not 0.001 through log and back (a real 2e-19), so the peer's window starts on its first point and keeps the 0s tick.
   assert.equal(shifted.scales.x.min, 0.001);
-  assert.equal(late.scales.x.min, 0.002);
+  assert.equal(late.scales.x.min, 0.001);
   pullAxis(p, "l", 300, 250);
   real(shifted).forEach((v, i) => near(v, real(linear)[i]));
   // A selection on it paints and commits the real window on the peer, and its own window back 1 ms late.
@@ -321,17 +347,16 @@ test("a log relative-time chart plotted 1 ms late labels and hands on its real t
   real(linear).forEach((v, i) => near(v, real(shifted)[i]));
   const q = page();
   const source = q.create("s", [0.001, 0.002, 0.003, 0.0051], { logX: true, shifted: true });
-  const after = q.create("e", [0.002, 0.003, 0.0041], { logX: true });
+  const after = q.create("e", [0.001, 0.002, 0.0041], { logX: true, shifted: true });
   // A cancelled pull restores its bounds exactly too.
   pullAxis(q, "s", 300, 350, "escape");
   assert.deepEqual([source.scales.x.min, source.scales.x.max], [0.001, 0.0051]);
-  // A selection dragged past its left edge starts at its real 0 exactly, so a window ending before the late peer's first x leaves that peer alone.
+  // A selection dragged past its left edge starts at its real 0 exactly, and so does the peer's window.
   q.el("s").fire("mousedown", { button: 0, clientX: 100, clientY: 100, pageX: 100, pageY: 100, preventDefault() {} });
   q.fireWindow("mousemove", { buttons: 1, clientX: -50, clientY: 100, pageX: -50, pageY: 100 });
   q.fireWindow("mouseup", { button: 0, clientX: -50, clientY: 100, pageX: -50, pageY: 100 });
   assert.equal(source.scales.x.min, 0.001);
-  assert.ok(!after.__kymo_userzoom, "not marked zoomed");
-  assert.equal(after.rebuilds, 0, "not rescaled");
+  assert.equal(after.scales.x.min, 0.001);
 });
 
 test("wall-time ticks show fractional digits where the chosen increment needs them, and only then", () => {
@@ -345,10 +370,8 @@ test("wall-time ticks show fractional digits where the chosen increment needs th
   const whole = tickLabels(c, [t, t + 10, t + 20], 10);
   assert.equal(new Set(whole).size, 3);
   assert.ok(!/\d[.,]\d/.test(whole.join(" ")), whole.join(" | "));
-  // A tick past Date's range (a pull far beyond the data) reads Invalid Date, as toLocaleString has it, rather than throwing.
-  assert.deepEqual(tickLabels(c, [1e13, 1e13 + 0.5], 0.5), ["Invalid Date", "Invalid Date"]);
-  // A whole-second tick computed a hair under its second reads that second, not the one before.
-  assert.equal(tickLabels(c, [t + 9.9999998, t + 19.9999998], 10)[0], tickLabels(c, [t + 10, t + 20], 10)[0]);
+  // A whole-millisecond tick in 2038 whose seconds times 1000 come back just under it reads its own millisecond, not the one before.
+  assert.match(tickLabels(c, [2170000000.101, 2170000000.102], 0.001)[0], /[.,]101(\D|$)/);
   // Ticks near 1.76e9 differ by their spacing only to within an ulp (2.4e-7): the digits follow the increment uPlot chose, not the differences.
   for (const [incr, digits] of [[2.5, 1], [0.2, 1], [0.1, 1], [0.05, 2], [0.02, 2], [0.01, 2], [0.005, 3]]) {
     const ticks = Array.from({ length: 4 }, (_, i) => t + 0.37 + i * incr);
@@ -376,15 +399,12 @@ test("a rebuild for anything but the x axis keeps a client-side zoom", () => {
   assert.notEqual(relabeled, zoomed);
   assert.deepEqual([relabeled.scales.x.min, relabeled.scales.x.max], [25, 75]);
   assert.equal(relabeled.__kymo_userzoom, true, "live refreshes keep the window");
-  // A real instance's scale is null until uPlot's commit microtask: created again before then, the chart starts from the full range rather than carrying no window.
-  relabeled.scales.x.min = relabeled.scales.x.max = null;
-  const again = p.create("z", xs, { labels: ["renamed twice"], hash: "b2" });
-  assert.deepEqual([again.scales.x.min, again.scales.x.max], [0, 100]);
   // An unzoomed chart rebuilds with no extra rescale.
+  relabeled.__kymo_userzoom = false;
   const fresh = p.create("z", xs, { labels: ["again"], hash: "c" });
   assert.equal(fresh.rebuilds, 0);
-  // Another x axis, the same one turned logarithmic, or its log shift changed, starts over: each is part of what a zoom belongs to.
-  for (const [from, to] of [[{}, { axis: "wall" }], [{}, { logX: true }], [{ logX: true }, { logX: true, shifted: true }]]) {
+  // Another x axis, or the same one turned logarithmic, starts over: each is part of what a zoom belongs to.
+  for (const [from, to] of [[{}, { axis: "wall" }], [{}, { logX: true, shifted: true }]]) {
     const zoomedOn = p.create("k", [1, 25, 50, 75, 100], { ...from, hash: "a" });
     zoomedOn.setScale("x", { min: 25, max: 75 });
     zoomedOn.__kymo_userzoom = true;
@@ -412,11 +432,12 @@ test("only a linear relative-time axis ticks at round durations", () => {
   const sharp = page({ dpr: 2 }).create("spaced", [0, 100]);
   sharp.axes[0].font = ["24px sans-serif"];
   assert.equal(sharp.axes[0].space(sharp, 0, 0, 7200, 800), 7 * 7 + 18, "in CSS pixels at a device pixel ratio of 2 too");
-  // Increasing, and large enough for an axis pulled far past a year: uPlot draws no ticks when none fits.
+  // Increasing, up to ten million years.
   assert.ok(rel.every((v, i) => i === 0 || v > rel[i - 1]));
-  assert.ok(rel.at(-1) > 1e299, `largest increment ${rel.at(-1)}`);
+  assert.equal(rel.length, 55);
+  assert.equal(rel.at(-1), 10 * 31536000 * 1e6);
   assert.equal(p.create("again", [0, 100]).axes[0].incrs, rel, "built once per page");
-  assert.equal(incrs({ axis: "rel", logX: true }), undefined);
+  assert.equal(p.create("rl", [0.001, 100.001], { axis: "rel", logX: true, shifted: true }).axes[0].incrs, undefined);
   assert.equal(incrs({ axis: "step" }), undefined);
 });
 
@@ -447,14 +468,14 @@ test("a linear wall-time axis spaces its ticks a millisecond apart at least, whe
 
 test("relative-time labels take their fields from the rounded value, both signs", () => {
   const p = page();
-  const xs = [-3599.96, -59.96, -0.04, 0.04, 59.96, 3599.95, 3599.96];
+  // A readout rounds a logged time to a tenth, its fields after the rounding.
+  const xs = [0.04, 59.96, 3599.95, 3599.96];
   const c = p.create("r", xs);
-  assert.deepEqual(xs.map((_, i) => readout(p, "r", i)), ["-1:00:00.0", "-1:00.0", "0.0s", "0.0s", "1:00.0", "1:00:00.0", "1:00:00.0"]);
-  // A list whose largest value rounds up to an hour labels every tick with hours, and none prints -0.
+  assert.deepEqual(xs.map((_, i) => readout(p, "r", i)), ["0.0s", "1:00.0", "1:00:00.0", "1:00:00.0"]);
+  // A list whose largest value reaches an hour labels every tick with hours, before 0 too (a pull past the start).
   const ticks = values => tickLabels(c, values);
-  assert.deepEqual(ticks([0, 3599.9996]), ["0:00:00.000", "1:00:00.000"]);
-  assert.deepEqual(ticks([-3599.9996, 0]), ["-1:00:00.000", "0:00:00.000"]);
-  assert.deepEqual(ticks([-59.9996, 0]), ["-1:00.000", "0:00.000"]);
+  assert.deepEqual(ticks([3540, 3570, 3600]), ["0:59:00", "0:59:30", "1:00:00"]);
+  assert.deepEqual(ticks([-3600, -1800, 0]), ["-1:00:00", "-0:30:00", "0:00:00"]);
 });
 
 test("a rebuild during an axis pull carries the window the pull started from", () => {

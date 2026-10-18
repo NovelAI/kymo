@@ -33,7 +33,7 @@ except ImportError:
 
 
 def _nvml(read) -> float:
-    """One value's NVML reading through its own lambda, read, or a NaN marker (a hole in the chart, never an invented 0) where NVML cannot give it (an unsupported field, a lost GPU) or the installed pynvml lacks a name read uses."""
+    """One value's NVML reading through its own lambda, read, or a NaN marker (a hole in the chart, never an invented 0) wherever read raises: where NVML cannot give the value (an unsupported field, a lost GPU), and where a percentage's total is zero. Guarding each field alone costs about 1 µs of Python per GPU per poll."""
     try:
         return float(read())
     except Exception:
@@ -208,7 +208,6 @@ class SystemMetricsPoller:
     # ------------------------------------------------------------------
 
     def _poll_gpu(self, metrics: dict):
-        # A reading NVML could not give (_nvml), or a percentage of a zero total, is a NaN marker at its GPU's tag.
         gpu_util = []
         gpu_mem_util = []
         gpu_temp = []
@@ -246,18 +245,14 @@ class SystemMetricsPoller:
             )
             gpu_power.append(power_w)
             gpu_power_limit.append(limit_w)
-            gpu_power_pct.append(power_w / limit_w * 100.0 if limit_w > 0 else math.nan)
+            gpu_power_pct.append(_nvml(lambda: power_w / limit_w * 100.0))
 
             try:
                 mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
             except Exception:
                 mem = None
             gpu_mem_used.append(_nvml(lambda: mem.used))
-            gpu_mem_used_pct.append(
-                _nvml(
-                    lambda: mem.used / mem.total * 100.0 if mem.total > 0 else math.nan
-                )
-            )
+            gpu_mem_used_pct.append(_nvml(lambda: mem.used / mem.total * 100.0))
 
             gpu_sm_clock.append(
                 _nvml(

@@ -58,17 +58,15 @@ fake kymo server):
                           on to finish(): the run ends with 0
  27. atexit finish()   → finish() registered with atexit, then an uncaught
                           sys.exit(7): the run ends with 7
- 28. atexit sys.exit   → an atexit hook's sys.exit(0), which Python ignores,
-                          after an uncaught sys.exit(7): the run ends with 7
- 29. caught, SIGTERM   → a caught sys.exit(7), then a SIGTERM: the run ends
+ 28. caught, SIGTERM   → a caught sys.exit(7), then a SIGTERM: the run ends
                           with 143, as the process does
- 30. SIGTERM at exit   → a SIGTERM during concurrent.futures' join of a running
+ 29. SIGTERM at exit   → a SIGTERM during concurrent.futures' join of a running
                           job, after an uncaught sys.exit(7): the run ends with 7
- 31. atexit sys.exit   → an atexit hook's sys.exit(3), which Python ignores,
-     after a normal end   after a normal end: the run ends with 0
- 32. handler's exit at  → a SIGTERM handler installed before init() that calls
-     the exit             sys.exit(1), its SIGTERM sent from a threading atexit
-                          hook after a normal end: the run ends with 0
+ 30. pre-init handler  → a SIGTERM handler installed before init() that calls
+     at the exit          sys.exit(1), or raises KeyboardInterrupt, its SIGTERM
+                          sent from a threading atexit hook after a normal end,
+                          where Python ignores what it raises: the run ends
+                          with 143, as kymo's own handling would end it
 
 Run:  python3 test_graceful_shutdown.py
 """
@@ -419,6 +417,9 @@ DRIVER = textwrap.dedent("""
     if cfg.get("sigterm_exits"):
         import signal
         signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(cfg["sigterm_exits"]))
+    if cfg.get("sigterm_interrupts"):
+        import signal
+        signal.signal(signal.SIGTERM, signal.default_int_handler)  # SIGTERM as a Ctrl-C
     kymo.init(
         server_address=cfg["grpc"], cdn_address=cfg["cdn"],
         project_id="shutdown-test", run_name=cfg["run_name"],
@@ -487,10 +488,6 @@ DRIVER = textwrap.dedent("""
         import atexit
         atexit.register(kymo.finish)
         sys.exit(cfg["atexit_finish"])
-    if cfg.get("atexit_exit"):
-        import atexit
-        atexit.register(sys.exit, 0)  # ignored by Python: the process exits with the uncaught exit's code
-        sys.exit(cfg["atexit_exit"])
     if cfg.get("executor_sigterm"):
         # A job still running as the program exits: concurrent.futures' threading atexit hook joins it, the main thread still alive, as a SIGTERM lands.
         import concurrent.futures, signal, threading
@@ -505,10 +502,6 @@ DRIVER = textwrap.dedent("""
         # Once the interpreter's exit has begun, which ignores the handler's exit.
         import signal, threading
         threading._register_atexit(os.kill, os.getpid(), signal.SIGTERM)
-        raise SystemExit  # ends as a normal end does: no code, status 0
-    if cfg.get("atexit_exit_after_end"):
-        import atexit
-        atexit.register(sys.exit, cfg["atexit_exit_after_end"])  # ignored by Python
         raise SystemExit  # ends as a normal end does: no code, status 0
     if cfg.get("caught_exit"):
         try:
@@ -1513,7 +1506,7 @@ def exit_code_scenario(spool_dir, name, cfg, exits, code):
     print(f"    OK — {name}: exit {exits}, TerminateRun({code})")
 
 
-# Scenarios 25-32, which the module docstring describes: the driver's cfg, the program's exit status and the code its run ends with.
+# Scenarios 25-30, which the module docstring describes: the driver's cfg, the program's exit status and the code its run ends with.
 EXIT_CODE_SCENARIOS = (
     (25, "helper-finish", {"exit_with_helper_finish": 7}, 7, 7),
     (
@@ -1525,16 +1518,21 @@ EXIT_CODE_SCENARIOS = (
     ),
     (26, "caught-exit", {"caught_exit": 7}, 0, 0),
     (27, "atexit-finish", {"atexit_finish": 7}, 7, 7),
-    (28, "atexit-exit", {"atexit_exit": 7}, 7, 7),
-    (29, "caught-exit-sigterm", {"caught_exit": 7, "sigterm_after": True}, 143, 143),
-    (30, "exit-executor-sigterm", {"executor_sigterm": 7}, 7, 7),
-    (31, "atexit-exit-after-end", {"atexit_exit_after_end": 3}, 0, 0),
+    (28, "caught-exit-sigterm", {"caught_exit": 7, "sigterm_after": True}, 143, 143),
+    (29, "exit-executor-sigterm", {"executor_sigterm": 7}, 7, 7),
     (
-        32,
+        30,
         "handler-exit-at-threading-exit",
         {"sigterm_exits": 1, "sigterm_at_threading_exit": True},
         0,
+        143,
+    ),
+    (
+        30,
+        "handler-interrupt-at-threading-exit",
+        {"sigterm_interrupts": True, "sigterm_at_threading_exit": True},
         0,
+        143,
     ),
 )
 

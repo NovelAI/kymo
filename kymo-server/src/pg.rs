@@ -1227,10 +1227,6 @@ impl PgStore {
             mutation_version,
             public_resource_id,
         } = candidate;
-        anyhow::ensure!(
-            mutation_version >> 32 != 0 && mutation_version as u32 != 0,
-            "mutation version must contain nonzero epoch and sequence fields"
-        );
         let version = mutation_version.to_string();
         let mut tx = self.pool.begin().await?;
         let current_epoch: i64 = sqlx::query_scalar(
@@ -1475,9 +1471,6 @@ impl PgStore {
         &self,
         project_ids: &[String],
     ) -> Result<Vec<(String, Option<u64>)>> {
-        if project_ids.is_empty() {
-            return Ok(Vec::new());
-        }
         // NO KEY UPDATE is the UPDATE's own row lock, so concurrent run writes' foreign-key checks (KEY SHARE) skip no project.
         let rows: Vec<(String, Option<i64>)> = self
             .watch_statement(async |connection| {

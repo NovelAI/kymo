@@ -13,7 +13,6 @@ use crate::state::layout_config::{
     run_ref_ids, CdnDisplayMode, DisplayType, MetricBinding, ProjectRef, RectConfig, RectOptions,
     RunRef, XAxisMode,
 };
-use crate::state::EditOutcome;
 use crate::util::{editor_trigger_id, is_app_escape, primary, use_live_apply};
 
 fn binding_control_label(index: usize, control: &str) -> String {
@@ -111,6 +110,7 @@ type MetricCatalog = Vec<(String, DisplayType)>;
 type RowCatalogs = HashMap<u64, (MetricCatalog, bool)>;
 
 /// The custom X choices: every name some source's catalog lists as numeric, sorted. The server maps each plotted run through its own X metric, so any source's numeric metric can be one.
+/// Cost: each render of a Step-mode editor builds this union over every source's catalog and clones its names.
 fn x_metric_names(catalogs: &RowCatalogs) -> Vec<String> {
     let names: BTreeSet<&str> = catalogs
         .values()
@@ -299,19 +299,8 @@ pub fn BindingEditor(
     };
     let current_config = move || (draft(), draft_opts.read().clone());
     let unchanged = current_config() == initial;
-    let mut row_catalogs = use_signal(RowCatalogs::new);
-    let mut show = move |(bindings, options): (Vec<MetricBinding>, RectOptions)| {
-        if sources.peek().iter().map(|(_, b)| b).ne(&bindings) {
-            // Fresh row ids remount every source row, so no row keeps state from a source it no longer shows.
-            let first = *next_row_id.peek();
-            next_row_id.set(first + bindings.len() as u64);
-            sources.set((first..).zip(bindings).collect());
-            row_catalogs.write().clear();
-        }
-        draft_opts.set(options);
-    };
     // Each change (slider ticks included) applies live as one edit of just what changed: the sources as one, option fields as the defaults editors write theirs (`OptionsBaseline::write_fields`).
-    use_live_apply(current_config, show, {
+    use_live_apply(current_config, {
         let baseline = baseline.clone();
         move |previous: &(Vec<MetricBinding>, RectOptions), (bindings, options)| {
             // Options first: the sources edit can take the chart out of the layout (a Specific source was what kept it there), leaving an options edit after it nothing to edit.
@@ -322,13 +311,23 @@ pub fn BindingEditor(
                     }))
                     && (bindings == previous.0
                         || diff.edit_rect(base, &rect_id, |rect| rect.bindings = bindings))
-            }) != EditOutcome::Refused
+            });
         }
     });
 
+    let mut row_catalogs = use_signal(RowCatalogs::new);
     let revert = {
         let initial = initial.clone();
-        move |_| show(initial.clone())
+        move |_| {
+            if sources.peek().iter().map(|(_, b)| b).ne(&initial.0) {
+                // Fresh row ids remount every source row, so no row keeps state from a source it no longer shows.
+                let first = *next_row_id.peek();
+                sources.set((first..).zip(initial.0.clone()).collect());
+                next_row_id.set(first + initial.0.len() as u64);
+                row_catalogs.write().clear();
+            }
+            draft_opts.set(initial.1.clone());
+        }
     };
 
     // One project list for every source row.

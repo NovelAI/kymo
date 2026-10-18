@@ -865,14 +865,13 @@ mod tests {
         );
     }
 
-    /// Numbers serde_json's default f64 parse loses: 10^400 and int(float max) fail it; 2^256 and a decimal longer than 17 digits print back rounded.
-    fn numbers_beyond_f64() -> [String; 4] {
+    /// Numbers serde_json's default f64 parse loses: 10^400 and int(float max) fail it; 2^256 prints back rounded.
+    fn numbers_beyond_f64() -> [String; 3] {
         [
             format!("1{}", "0".repeat(400)),
             format!("{:.0}", f64::MAX),
             "115792089237316195423570985008687907853269984665640564039457584007913129639936"
                 .to_string(),
-            "3.14159265358979323846264338327950288".to_string(),
         ]
     }
 
@@ -887,20 +886,11 @@ mod tests {
     }
 
     #[test]
-    fn numbers_keep_their_text_but_for_serde_jsons_exponent_and_zero() {
-        for (written, shown) in [
-            ("1.50", "1.50"),
-            ("0.000", "0.000"),
-            ("1e-08", "1e-08"),
-            ("1e+30", "1e+30"),
-            ("1E5", "1e+5"),
-            ("1e5", "1e+5"),
-            ("2.5E-3", "2.5e-3"),
-            ("-0", "0"),
-            ("-0.0", "-0.0"),
-        ] {
+    fn numbers_keep_the_text_json_dumps_writes() {
+        // Python's json.dumps writes floats by repr, ints by str. serde_json's default parse would read 198136.40638684994 one ulp off, showing 198136.4063868499.
+        for written in ["1e-08", "1e+30", "-0.0", "100000.0", "198136.40638684994"] {
             let data: Value = serde_json::from_str(&format!(r#"{{"n": {written}}}"#)).unwrap();
-            assert_eq!(format_row_values(&[Some(&data["n"])]), [shown], "{written}");
+            assert_eq!(format_row_values(&[Some(&data["n"])]), [written]);
         }
     }
 

@@ -2434,7 +2434,7 @@ impl StatusWatch {
             cur.insert((row.project_id, row.run_id), status);
         }
         let mut announced = Vec::new();
-        // A clean first scan seeds silently; one after a failed scan heals. Dropping runs that left the window loses nothing on a healthy tick: they transitioned to their pinned state while still inside it (the 1-minute margin covers a missed tick). (Empty while degraded = no watched runs on either side of the gap.)
+        // A clean first scan seeds silently; one after a failed scan heals. Dropping runs that left the window loses nothing on a healthy tick: they transitioned to their pinned state while still inside it (the 1-minute margin covers a missed tick).
         if self.seeded || degraded {
             if degraded {
                 changed.extend(self.prev.keys().chain(cur.keys()).map(|(p, _)| p.clone()));
@@ -2501,7 +2501,7 @@ mod status_watch_tests {
         panic!("unexpected bump of {ids:?}")
     }
 
-    /// A tick with one stalled store call, the other answering at once: it must end by that call's deadline. (A tick whose scan answers late and whose bump then stalls can take both deadlines.)
+    /// A tick with one stalled store call, the other answering at once: it must end by that call's deadline.
     async fn ended<T>(tick: impl std::future::Future<Output = T>) -> T {
         tokio::time::timeout(STATUS_WATCH_STORE_TIMEOUT + Duration::from_secs(1), tick)
             .await

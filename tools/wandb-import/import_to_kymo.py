@@ -21,8 +21,8 @@ Mapping (wandb -> kymo):
     project "foo bar"        -> project_id "wandb_foo_bar" (archive dir slug)
     run  <id> "name"         -> run_id "wandb_<proj_slug>_<id>", run_name "name"
     history numeric cell     -> numeric_ts point (step=_step, ts=_timestamp);
-                                a finite value beyond float32 range is a NaN
-                                marker (counted as beyond_f32_as_nan)
+                                a finite value that float32 rounds to infinity
+                                is a NaN marker (counted as beyond_f32_as_nan)
     history string column    -> text_ts stream under the metric name
     other history column     -> skipped (lists, maps, timestamps...; counted as unsupported_cells)
     images/separated, image-file -> CDN image_gallery manifest at the step
@@ -874,20 +874,16 @@ def process_media_cell(sender, ctx, name, step, ts_ms, cell):
 
 
 def f32_value(v, c: Counters) -> float:
-    """v (a number, or a union's numeric string) as log() would send it; a finite value float32 cannot hold is the counted NaN marker. ValueError for a string that is no number."""
+    """v (a number, or a union's numeric string, such as wandb's "NaN" and "Infinity") as log() would send it; a finite value that float32 rounds to infinity is the counted NaN marker. ValueError for a string that is no number. A numeric string beyond float64 (text logged under a key that also held numbers) is sent as an infinity, uncounted."""
     # log()'s own fast path: the full rule returns such a float unchanged.
     if type(v) is float and -_F32_OVERFLOW < v < _F32_OVERFLOW:
         return v
     try:
-        value = _normalize_numeric_value(v)
-        # A numeric string beyond float64 ("1e400") parses to inf without naming one.
-        if not (isinstance(v, str) and math.isinf(value) and "inf" not in v.lower()):
-            return value
-    except OverflowError:  # beyond float32, which log() refuses, or an int beyond even float64 (JSON ints are unbounded)
-        pass
-    # A NaN marker keeps the point without inventing a value.
-    c["beyond_f32_as_nan"] += 1
-    return math.nan
+        return _normalize_numeric_value(v)
+    except OverflowError:  # a finite value float32 rounds to infinity, which log() refuses, or an int beyond even float64 (JSON ints are unbounded)
+        # A NaN marker keeps the point without inventing a value.
+        c["beyond_f32_as_nan"] += 1
+        return math.nan
 
 
 class RunContext:

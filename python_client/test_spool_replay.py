@@ -2842,115 +2842,30 @@ class ReplayTests(unittest.TestCase):
                     # Every outcome leaves no descriptor open.
                     self.assertEqual(len(os.listdir("/dev/fd")), open_fds)
 
-    def test_a_claim_on_a_spool_retired_since_its_open_is_not_taken(self):
-        # Another replayer renamed the path away, or put another file there, between the open and the lock.
-        with tempfile.TemporaryDirectory() as spool_dir:
-            path = os.path.join(spool_dir, "old.mkspool")
-            other = os.path.join(spool_dir, "other.mkspool")
-            self._write(path, [numeric(1.0)])
-            self._write(other, [numeric(2.0)])
-            for name, named in (
-                ("gone", FileNotFoundError(2, "gone")),
-                ("replaced", os.stat(other)),
-            ):
-                with (
-                    self.subTest(name),
-                    mock.patch.object(spool_module.os, "stat", side_effect=[named]),
-                ):
-                    claim = spool_module.claim_spool(path)
-                    if claim is not None:
-                        claim.close()
-                    self.assertIsNone(claim)
-            # Any other error checking it raises, leaving no descriptor open, even while the exception, and so the frame it was raised in, lives.
-            open_fds = len(os.listdir("/dev/fd"))
-            with mock.patch.object(
-                spool_module.os,
-                "stat",
-                side_effect=OSError(errno.ESTALE, "Stale file handle"),
-            ):
-                try:
-                    spool_module.claim_spool(path)
-                except OSError:
-                    self.assertEqual(len(os.listdir("/dev/fd")), open_fds)
-                else:
-                    self.fail("an ESTALE checking the claim did not raise")
-
-    def test_a_claim_interrupted_after_its_open_releases_the_file(self):
-        # A Ctrl-C landing as flock() returns, in the writer_active fallback or in the identity check: the claim's file, and its lock, go with it, even while the program keeps the interruption's traceback, and so the frame it was raised in.
-        with tempfile.TemporaryDirectory() as spool_dir:
-            path = os.path.join(spool_dir, "old.mkspool")
-            self._write(path, [numeric(1.0)])
-            flock = fcntl.flock
-
-            def locked_then_interrupted(fd, operation):
-                flock(fd, operation)
-                raise KeyboardInterrupt
-
-            for name, patches in (
-                (
-                    "as flock() returns",
-                    [mock.patch("fcntl.flock", locked_then_interrupted)],
-                ),
-                (
-                    "in the writer_active fallback",
-                    [
-                        mock.patch(
-                            "fcntl.flock", side_effect=OSError(errno.ENOLCK, "flock")
-                        ),
-                        mock.patch.object(
-                            spool_module, "writer_active", side_effect=KeyboardInterrupt
-                        ),
-                    ],
-                ),
-                (
-                    "in the identity check",
-                    [
-                        mock.patch.object(
-                            spool_module.os, "stat", side_effect=KeyboardInterrupt
-                        )
-                    ],
-                ),
-            ):
-                with self.subTest(name):
-                    open_fds = len(os.listdir("/dev/fd"))
-                    kept = None
-                    try:
-                        with contextlib.ExitStack() as stack:
-                            for patch in patches:
-                                stack.enter_context(patch)
-                            spool_module.claim_spool(path)
-                    except KeyboardInterrupt as error:
-                        kept = error
-                    try:
-                        self.assertIsNotNone(kept)
-                        # The lock is free for the next replay, and the descriptor closed.
-                        claim = spool_module.claim_spool(path)
-                        if claim is not None:
-                            claim.close()
-                        self.assertIsNotNone(claim)
-                        self.assertEqual(len(os.listdir("/dev/fd")), open_fds)
-                    finally:
-                        kept = None
-
-    def test_a_replay_never_claims_a_spool_its_writer_is_creating(self):
-        # A new segment appears under its own name only once its writer holds its lock and has written its header: a claim in between would leave the writer unlocked for good, free for a later replay to retire under it.
+    def test_a_new_spool_takes_its_name_only_once_locked_with_its_header_on_disk(
+        self,
+    ):
+        # A sync lists a spool by its name: one that saw it before its writer held its lock and had written its header could quarantine it as headerless, the writer then writing on under the quarantined name, which no sync replays.
         with tempfile.TemporaryDirectory() as spool_dir:
             path = os.path.join(spool_dir, "live.mkspool")
             writer = SpoolWriter(path, spool_header())
-            claims = []
-            fchmod = os.fchmod
+            renamed = []
+            rename = os.rename
 
-            def fchmod_then_claim(fd, mode):
-                fchmod(fd, mode)
-                claims.append(spool_module.claim_spool(path))
+            def rename_checked(src, dst):
+                try:
+                    on_disk = read_spool_header(src)
+                except Exception:
+                    on_disk = None
+                renamed.append(
+                    (os.path.exists(dst), spool_module.writer_active(src), on_disk)
+                )
+                rename(src, dst)
 
-            with mock.patch.object(spool_module.os, "fchmod", fchmod_then_claim):
+            with mock.patch.object(spool_module.os, "rename", rename_checked):
                 writer.open()
             try:
-                for claim in claims:
-                    if claim is not None:
-                        claim.close()
-                self.assertEqual(claims, [None])
+                self.assertEqual(renamed, [(False, True, writer._header)])
                 writer.write(numeric(1.0))
                 writer.flush()
                 self.assertTrue(spool_module.writer_active(path))

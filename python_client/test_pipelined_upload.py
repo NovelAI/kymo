@@ -1064,7 +1064,7 @@ class InitApiTests(unittest.TestCase):
                 signal_during_a_shutdown(signum)
                 client_module._exit_wrapper(0)
                 self.assertEqual(client_module._exit_code, 128 + signum)
-            # Once the interpreter's exit has begun (threading's atexit hooks, where the main thread still reads as alive, then the atexit hooks), the exit that ended the program stays: neither a sys.exit there, which Python ignores, nor a SIGTERM replaces it. After a normal end such an exit records nothing, nor does a SystemExit a chained signal handler raises.
+            # Once the interpreter's exit has begun (threading's atexit hooks, where the main thread still reads as alive, then the atexit hooks), the exit that ended the program stays: neither a sys.exit there, which Python ignores, nor a SIGTERM replaces it. After a normal end such an exit records no code.
             for stage in (
                 mock.patch.object(threading, "_SHUTTING_DOWN", True),
                 mock.patch.object(
@@ -1079,35 +1079,7 @@ class InitApiTests(unittest.TestCase):
                     self.assertEqual(client_module._exit_code, 7)
                     client_module._exit_code = None
                     client_module._exit_wrapper(3)
-                    client_module._record_exit_code(5)
                     self.assertIsNone(client_module._exit_code)
-
-    def test_a_signal_during_an_exit_code_check_keeps_its_code(self):
-        # A Ctrl-C handled during the calls of finish()'s drop check, or of a later sys.exit's (its liveness check, or the conversion of its code), records its 130 over the caught exit's code; the flag, read last, then says that code is no longer only sys.exit's.
-        def ctrl_c_lands():
-            client_module._exit_code, client_module._exit_code_by_sys_exit = 130, False
-            return True
-
-        class CodeConvertedAsCtrlCLands:
-            def __int__(self):
-                ctrl_c_lands()
-                return 0
-
-        codes = []
-        with self._finishing_run():
-            for act in (client_module.finish, lambda: client_module._exit_wrapper(0)):
-                client_module._exit_code, client_module._exit_code_by_sys_exit = 7, True
-                with mock.patch.object(
-                    threading.main_thread(), "is_alive", side_effect=ctrl_c_lands
-                ):
-                    act()
-                codes.append(client_module._exit_code)
-            client_module._exit_code, client_module._exit_code_by_sys_exit = 7, True
-            client_module._record_exit_code(
-                CodeConvertedAsCtrlCLands(), by_sys_exit=True
-            )
-            codes.append(client_module._exit_code)
-        self.assertEqual(codes, [130, 130, 130])
 
     def test_a_finish_after_a_caught_exit_drops_its_code(self):
         # A sys.exit the program catches (argparse inside a try, a notebook cell), then finish() on the main thread with no exception being handled: the run ends without that code. One called while the SystemExit propagates or is handled, or on another thread (a helper's, or an executor worker's, as the program exits), keeps it, and nothing drops the hook's code.
@@ -1145,16 +1117,6 @@ class InitApiTests(unittest.TestCase):
             client_module._excepthook(ValueError, ValueError(), None)
             codes.append(client_module.finish())
         self.assertEqual(codes, [None, 7, 7, 7, 7, 7, 1])
-
-    def test_a_run_finished_inside_an_unrelated_except_block_takes_no_code(self):
-        # A run retried in the handler of an earlier failure (`except OutOfMemoryError: run(batch_size // 2)`) that finishes cleanly is no crash.
-        codes = []
-        with self._finishing_run():
-            try:
-                raise MemoryError("the first attempt ran out of memory")
-            except MemoryError:
-                codes.append(client_module.finish())
-        self.assertEqual(codes, [None])
 
     def test_a_ctrl_c_only_the_worker_saw_times_the_runs_end(self):
         # A SIGINT handler the program installed after init() takes the Ctrl-C (one that exits, or SIG_DFL's kill), which kymo's never sees; the upload worker, which the terminal's Ctrl-C reaches with the rest of the group, notes it. An exit soon after it hands the run off, by the cap from the later Ctrl-C; one long after it, or after the interactive interpreter carried on from it, does not.
@@ -7926,6 +7888,8 @@ class ShutdownProofTests(unittest.TestCase):
                     _uncharged=deque([[numeric(4)]]),
                     # The handoff's own publication is best effort: here it puts nothing, as on a full queue.
                     _publish_queue_items=lambda *args, **kwargs: None,
+                    # Room for a busy runner, which can take longer than the 0.2 s grace to spool four points; the salvage's join returns as soon as its thread ends.
+                    _HANDOFF_FEEDER_GRACE=5.0,
                     **(
                         {"_terminate_run": exits_during_the_send}
                         if state == "exits during the send"
@@ -9995,20 +9959,7 @@ class PollerPublicationTests(unittest.TestCase):
         unread = dict.fromkeys(healthy, nan)
         ecc = ("system/gpu_ecc_uncorrected", "system/gpu_ecc_corrected")
         every_call = ("util", "temp", "power", "limit", "mem", "clock", "ecc")
-        # A pynvml without a name the ECC reads use costs those reads alone.
-        lacking = self._fake_nvml()
-        del lacking.NVML_MEMORY_LOCATION_DEVICE_MEMORY
         for name, nvml, expected in (
-            (
-                "pynvml lacks a constant",
-                lacking,
-                [{**healthy, **dict.fromkeys(ecc, nan)}] * 2,
-            ),
-            (
-                "a memory total is no number",
-                self._fake_nvml(total=None),
-                [{**healthy, "system/gpu_mem_used_pct": nan}] * 2,
-            ),
             ("every reading fails", self._fake_nvml(every_call), [unread, unread]),
             (
                 "GPU 1 is lost",

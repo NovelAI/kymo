@@ -2064,7 +2064,7 @@ fn a_shadow_divergence_serves_the_full_build_and_keeps_shadow_on() {
     assert_eq!(counted.get("shadow_match"), Some(&1), "{counted:?}");
 }
 
-/// Irregular Savitzky-Golay fits every sample within its half-width in x, so under repeated timestamps an appended row's recomputed outputs reach back over every repeat, each fitting them all: the advance answers in full, bit for bit the full build, instead of paying more than the full build's quadratic cost again. So does an advance recomputing most of the outputs, a window wide against its series, unless a longer series beside it, which the append does not reach, carries most of the full build's cost; both count `dense`.
+/// An irregular Savitzky-Golay advance costing more than the full build answers in full, bit for bit the full build, and counts `dense`: one with 2,000 repeats of the appended row's timestamp, which every fit it recomputes holds, and one recomputing most of the outputs, a window wide against its series, unless a longer series beside it, which the append does not reach, carries most of the full build's cost.
 #[test]
 fn dense_irregular_savitzky_golay_history_answers_in_full() {
     for (repeats, window, beside, dense) in [

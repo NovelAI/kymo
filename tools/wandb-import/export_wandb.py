@@ -62,6 +62,17 @@ Known limitations:
   run.json leaves that directory behind, holding no exported data: one
   without run.json could be any run's, so it is not taken over. The importer
   skips it with a warning.
+- A run.json damaged outside the exporter counts as none: the run whose
+  wanted name the directory has takes it over, files included, and rewrites
+  run.json. That run may be another one sharing the name: abc named "x__old"
+  takes abc__x's abc__x__old, whose files then import as abc's, and abc__x
+  exports again from scratch into abc__x__old-<hex>, so its data imports
+  twice. If a directory elsewhere holds the run's id, that one wins and the
+  damaged directory is left as it is.
+- Archives exported before 0015ba95d may mix two runs' files in one
+  directory (abc exported into abc__x's, or into one its glob characters
+  matched); the importer imports it into the run its run.json names, so the
+  other run's leftover data lands there.
 """
 
 import argparse
@@ -272,34 +283,14 @@ def run_metadata(run):
     }
 
 
-class RunDirConflict(Exception):
-    """A run's directory cannot be used: its run.json cannot be read or names no run, or both of the run's names hold other runs."""
-
-
-# Nothing rewrites a run.json that cannot tell whose directory it is, so the run fails on every pass until someone does.
-REPAIR = "repair that run.json, or delete it if the directory is this run's"
-
-
 def stored_run(run_dir):
-    """run_dir's run.json; None when there is none (no directory, or a first export interrupted before writing it). RunDirConflict when it cannot be read or names no run."""
-    try:
-        with open(run_dir / "run.json") as f:
-            stored = json.load(f)
-    except FileNotFoundError:
-        return None
-    except (OSError, ValueError) as e:
-        raise RunDirConflict(
-            f"its directory {run_dir.name} has a run.json that cannot be read ({e}); {REPAIR}"
-        ) from e
-    if not isinstance(stored, dict) or stored.get("id") is None:
-        raise RunDirConflict(
-            f"its directory {run_dir.name} has a run.json without a run id; {REPAIR}"
-        )
-    return stored
+    """run_dir's run.json if it names a run, else None: there is none yet, or it was damaged outside the exporter, which always writes one whole (write_json replaces it atomically, every copy with an id)."""
+    stored = read_json(run_dir / "run.json")
+    return stored if isinstance(stored, dict) and stored.get("id") is not None else None
 
 
 def resolve_run_dir(runs_root, run_id, run_name):
-    """(directory, its run.json or None) for a run, renaming the directory if the display name changed; RunDirConflict if it has no usable one. The caller compares that run.json with fresh metadata, so it is parsed once."""
+    """(directory, its run.json or None) for a run, renaming the directory if the display name changed. The caller compares that run.json with fresh metadata, so it is parsed once."""
     want = runs_root / f"{run_id}__{slug(run_name)}"
     # Slugs keep "_", so a name cannot tell abc's "x__old" from abc__x's "old" (the glob below matches both for abc): the stored id decides.
     stored = stored_run(want)
@@ -310,8 +301,9 @@ def resolve_run_dir(runs_root, run_id, run_name):
         )
         stored = stored_run(alt)
         if stored and stored["id"] != run_id:
-            raise RunDirConflict(
-                f"its directories {want.name} and {alt.name} hold other runs"
+            # Only a 24-bit sha1 prefix collision or a crafted name gets here; refusing beats mixing two runs.
+            raise RuntimeError(
+                f"run {run_id}: its directories {want.name} and {alt.name} hold other runs"
             )
         want = alt
     if stored:
@@ -319,8 +311,8 @@ def resolve_run_dir(runs_root, run_id, run_name):
     # A directory holding this id under another name wins over an id-less one here (an export stopped before its first run.json).
     # Empty when runs_root is missing; escaped because wandb run ids may contain glob characters such as "[".
     for old in sorted(runs_root.glob(f"{glob.escape(run_id)}__*")):
-        stored = read_json(old / "run.json")
-        if isinstance(stored, dict) and stored.get("id") == run_id:
+        stored = stored_run(old)
+        if stored and stored["id"] == run_id:
             try:
                 old.rename(want)
             except OSError:  # such as an id-less directory here that is not empty
@@ -890,12 +882,7 @@ def produce(q, cfg, stats):
                     continue
                 seen.add(run.id)
                 stats.add(p.name, "runs_total")
-                try:
-                    run_dir, stored = resolve_run_dir(runs_root, run.id, run.name)
-                except RunDirConflict as e:
-                    stats.add(p.name, "runs_failed")
-                    stats.error(p.name, f"run {run.id} FAILED: {e}")
-                    continue
+                run_dir, stored = resolve_run_dir(runs_root, run.id, run.name)
                 a = run._attrs
                 prev = read_json(run_dir / "_export.json")
                 heavy = run_needs_heavy(

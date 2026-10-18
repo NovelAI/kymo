@@ -36,7 +36,7 @@ pub(super) struct ChartJsConfig {
     /// markers — the tooltip appends "×N" on those rows when N > 1.
     pub(super) xnan_counts: Vec<u32>,
     pub(super) axis: ShownAxis,
-    /// Zero-present log x on a step or time axis renders log(x+1) in the wire's units (steps, ms), matching the server's bucket ladder: the data is shifted before uPlot. A step chart's splits, formatters and zoom dispatches convert back to real steps; tooltip and copy readouts undo the shift (+1 step, +0.001 s).
+    /// Zero-present log x on a step or time axis renders log(x+1) in the wire's units (steps, ms), matching the server's bucket ladder: the data is shifted before uPlot. Its splits and formatters convert back to real values (steps, or ms on a time axis) and a step chart's zoom dispatches to real steps; tooltip and copy readouts undo the shift (+1 step, +0.001 s).
     pub(super) log_shift: bool,
     pub(super) log_y: bool,
     /// Canvas font/gutter input included in the structural config.
@@ -129,7 +129,6 @@ fn sync_key(axis: &ShownAxis) -> String {
 pub(super) fn build_create_js(id: &str, cfg: &ChartJsConfig) -> String {
     let log_x = cfg.axis.log_x;
     let zoom_refetch = cfg.axis.step_axis();
-    let x_shift = cfg.log_shift && zoom_refetch;
     // This hash is an ephemeral same-page equality token only; it is never persisted or sent over the wire, so cross-process stability is deliberately unnecessary.
     let cfg_hash = {
         use std::hash::{Hash, Hasher};
@@ -243,7 +242,8 @@ pub(super) fn build_create_js(id: &str, cfg: &ChartJsConfig) -> String {
         })
         .collect();
 
-    let x_splits = if x_shift {
+    // Zero-present log x, on a step or a relative-time axis, ticks at nice real values (xSplits).
+    let x_splits = if cfg.log_shift {
         "{splits:xSplits,filter:function(u,s){return s}}"
     } else {
         "{}"
@@ -264,7 +264,7 @@ pub(super) fn build_create_js(id: &str, cfg: &ChartJsConfig) -> String {
     let y_axis_min_size = 11 + cfg.font_size.scale_px(24);
     // Cursor sync exchanges real x: every step chart defines a derived syncX scale over original steps whose fwd/bwd reproduce its plotted pixel geometry, so linear, plain-log, and log(x+1) charts meet in one native sync group.
     let sync_scale = if zoom_refetch {
-        if x_shift {
+        if cfg.log_shift {
             "{syncX:{from:'x',distr:100,fwd:v=>Math.log10(v+1),bwd:v=>Math.pow(10,v)-1,range:(u,mn,mx)=>[mn-1,mx-1]}}"
         } else if log_x {
             // Identity domain, but the geometry must match the plotted distr-3 log scale — a bare `from` scale defaults to linear and would misplace the mirrored crosshair.
@@ -295,7 +295,6 @@ pub(super) fn build_create_js(id: &str, cfg: &ChartJsConfig) -> String {
         ("__KYMO_HAS_XRANGE__", cfg.has_xrange.to_string()),
         ("__KYMO_NAN_MARKERS__", cfg.nan_markers.to_string()),
         ("__KYMO_ZOOM_REFETCH__", zoom_refetch.to_string()),
-        ("__KYMO_X_SHIFT__", u8::from(x_shift).to_string()),
         (
             "__KYMO_READOUT_X_SHIFT__",
             if !cfg.log_shift {
@@ -514,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_present_log_time_keeps_zoom_unshifted_and_restores_readout_x() {
+    fn zero_present_log_time_restores_readout_x() {
         let mut config = minimal_config();
         // Only relative time starts at zero.
         config.axis.wall = false;
@@ -522,8 +521,9 @@ mod tests {
         config.log_shift = true;
         let js = build_create_js("chart-7", &config);
 
-        assert!(js.contains("let xShift=0;"));
         assert!(js.contains("let readoutXShift=0.001;"));
+        // Ticks at real decades, as a step chart's are.
+        assert!(js.contains("...{splits:xSplits,"));
     }
 
     /// AI-1429: a custom axis syncs only with its own metric, never with one differing only in punctuation nor, when named "step", with the step charts.

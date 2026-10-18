@@ -221,17 +221,6 @@ pub fn request_refresh(mut refresh: Signal<u64>) {
     }
 }
 
-/// What became of one layout edit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EditOutcome {
-    /// Made and stored.
-    Saved,
-    /// Not made: its intent found nothing to edit (its element gone from the stored layout) or nothing to change.
-    NotMade,
-    /// Not stored: the browser refused it, and the layout shown is the stored one, or the stored diff couldn't be parsed, and the page has gone to its recovery page.
-    Refused,
-}
-
 #[derive(Clone, Copy)]
 pub struct DashboardState {
     pub project_id: Signal<String>,
@@ -469,66 +458,45 @@ impl DashboardState {
     /// binding editor's live-apply effect) to the very signal this method
     /// writes. Since `Signal::set` notifies even for equal values, that
     /// turns one edit into an infinite effect → set → effect loop.
-    fn record_edit(&self, f: impl FnOnce(&mut LayoutDiff, &LayoutConfig)) -> EditOutcome {
+    fn record_edit(&self, f: impl FnOnce(&mut LayoutDiff, &LayoutConfig)) {
         self.record_edit_if_changed(|diff, base| {
             f(diff, base);
             true
-        })
+        });
     }
 
-    /// Saves the diff when `f` returns true (it made the edit). `f` must leave the diff as it found it when it returns false, since the layout shown is refreshed from the diff either way.
+    /// Saves the diff when `f` returns true (it made the edit), and returns that; false also when the stored diff can't be read. `f` must leave the diff as it found it when it returns false, since the layout shown is refreshed from the diff either way.
     fn record_edit_if_changed(
         &self,
         f: impl FnOnce(&mut LayoutDiff, &LayoutConfig) -> bool,
-    ) -> EditOutcome {
+    ) -> bool {
         let project_id = self.project_id.peek().clone();
         let base = self.base_layout.peek().clone();
         // Mid-session corruption (another tab running a different build?):
         // drop this one edit and surface the recovery page.
         let Some(mut diff) = load_diff_or_route(&project_id, "edit dropped") else {
-            return EditOutcome::Refused;
+            return false;
         };
         // Ahead of the metrics sweep (a panel opened early), an edit goes against the empty base: one needing a discovered chart finds nothing to edit, the rest saves, and the sweep's layout, which reads the diff after it, shows it.
         let changed = match &base {
             Some(base) => f(&mut diff, base),
             None => f(&mut diff, &LayoutConfig::auto_generate(&[])),
         };
-        let mut outcome = if changed {
-            EditOutcome::Saved
-        } else {
-            EditOutcome::NotMade
-        };
-        // A change the browser refuses to store (storage full or blocked) is not shown: the next edit re-reads the stored diff and would undo it, and a reload would lose it. The layout shown stays the stored one, and the bar says why.
-        if changed && !diff.save(&project_id) {
-            let Some(stored) = load_diff_or_route(&project_id, "edit refused") else {
-                return EditOutcome::Refused;
-            };
-            // An edit that left the diff as stored lost nothing to the refusal.
-            if stored != diff {
-                warn(&format!(
-                    "[layout] the browser refused to store an edit for {project_id}; not applied"
-                ));
-                crate::components::notice_bar::layout_unsaved();
-                diff = stored;
-                outcome = EditOutcome::Refused;
-            }
+        if changed {
+            diff.save(&project_id);
         }
         if let Some(base) = base {
             let mut layout_signal = self.layout_config;
             layout_signal.set(Some(diff.apply(&base)));
         }
-        outcome
+        changed
     }
 
     /// Edit some of `name`'s settings on the section as stored, leaving the others as they are: the options panel stays open beside the grid, so a collapse or chart-height drag made meanwhile must survive its edits. A section the stored layout no longer shows (deleted, perhaps in another tab) records nothing, and the refreshed layout drops it.
-    pub fn edit_section_settings(
-        &self,
-        name: &str,
-        edit: impl FnOnce(&mut SectionConfig),
-    ) -> EditOutcome {
+    pub fn edit_section_settings(&self, name: &str, edit: impl FnOnce(&mut SectionConfig)) {
         self.record_element_edit(&format!("section {name}"), |diff, base| {
             diff.edit_section_settings(base, name, edit)
-        })
+        });
     }
 
     /// [`Self::record_edit_if_changed`] for an edit to the one layout element `what` names, which returns false, recording nothing, once the stored layout no longer shows it; that also warns in the console.
@@ -536,7 +504,7 @@ impl DashboardState {
         &self,
         what: &str,
         edit: impl FnOnce(&mut LayoutDiff, &LayoutConfig) -> bool,
-    ) -> EditOutcome {
+    ) -> bool {
         self.record_edit_if_changed(|diff, base| {
             let applied = edit(diff, base);
             if !applied {
@@ -643,30 +611,21 @@ impl DashboardState {
         self.record_edit_if_changed(|_, _| false);
     }
 
-    /// Record `edit`'s [`LayoutDiff::edit_rect`]/[`LayoutDiff::edit_rect_options`] calls on rect `id` as one edit; `edit` returns what they return, false once the diff no longer shows the rect. A maximized chart that can't take the edit closes instead of pretending it applied; one whose edit the browser refused to store stays as stored; one that took it has its snapshot follow, which the overlay shows while the layout doesn't hold the chart (ahead of the sweep, or its runs hidden).
-    pub fn edit_rect(
-        &self,
-        id: &str,
-        edit: impl FnOnce(&mut LayoutDiff, &LayoutConfig) -> bool,
-    ) -> EditOutcome {
-        let outcome = self.record_element_edit(&format!("rect {id}"), edit);
+    /// Record `edit`'s [`LayoutDiff::edit_rect`]/[`LayoutDiff::edit_rect_options`] calls on rect `id` as one edit; `edit` returns what they return, false once the diff no longer shows the rect. A maximized chart that can't take the edit closes instead of pretending it applied; one that took it has its snapshot follow, which the overlay shows while the layout doesn't hold the chart (ahead of the sweep, or its runs hidden).
+    pub fn edit_rect(&self, id: &str, edit: impl FnOnce(&mut LayoutDiff, &LayoutConfig) -> bool) {
+        let applied = self.record_element_edit(&format!("rect {id}"), edit);
         if !self.maximized.peek().as_ref().is_some_and(|m| m.id == id) {
-            return outcome;
+            return;
         }
-        match outcome {
-            EditOutcome::NotMade => {
-                crate::route::focus_chart(None);
-                return outcome;
-            }
-            EditOutcome::Refused => return outcome,
-            EditOutcome::Saved => {}
+        if !applied {
+            crate::route::focus_chart(None);
+            return;
         }
         // An edit can take the chart out of the layout (a sources edit, when a Specific source was what kept it there): the saved diff then resolves it as a chart link ahead of the sweep does.
         let fresh = self.fresh_rect(id);
         if fresh.is_some() {
             set_if_changed(self.maximized, fresh);
         }
-        outcome
     }
 
     /// The freshest picture of rect `id`: the loaded layout's, else the saved diff's local resolve without one (ahead of the metrics sweep). Peeks: callers re-resolve on their own triggers (an edit, a `?chart=` change), never per layout write.
@@ -712,32 +671,27 @@ impl DashboardState {
     }
 
     /// Edit the project's chart-defaults patch (the coarsest cascade level) as storage holds it.
-    pub fn edit_project_chart_defaults(
-        &self,
-        edit: impl FnOnce(&mut serde_json::Value),
-    ) -> EditOutcome {
-        self.record_edit(|diff, _base| edit(&mut diff.project_chart_defaults))
+    pub fn edit_project_chart_defaults(&self, edit: impl FnOnce(&mut serde_json::Value)) {
+        self.record_edit(|diff, _base| edit(&mut diff.project_chart_defaults));
     }
 
     /// Clear the pin an override chip shows, so its field re-inherits.
-    pub fn clear_option_pin(&self, pin: &OptionOverride) -> EditOutcome {
+    pub fn clear_option_pin(&self, pin: &OptionOverride) {
         self.record_edit_if_changed(|diff, base| {
             diff.set_option_pin(base, &pin.target, &pin.field, &serde_json::Value::Null)
-        })
+        });
     }
 
-    /// Put back the pins the override chips cleared (`cleared`), as they were stored, in one edit; earliest last, so a pin cleared twice gets its first value. Targets gone from the layout get nothing. The list stays when the browser refuses to store them, so a later Revert can try again.
-    pub fn restore_overrides(&self, mut cleared: Signal<Vec<OptionOverride>>) {
-        let pins = std::mem::take(&mut *cleared.write());
-        if !pins.is_empty()
-            && self.record_edit(|diff, base| {
-                for pin in pins.iter().rev() {
-                    diff.set_option_pin(base, &pin.target, &pin.field, &pin.value);
-                }
-            }) == EditOutcome::Refused
-        {
-            cleared.set(pins);
+    /// Put back pins the override chips cleared, as they were stored, in one edit; earliest last, so a pin cleared twice gets its first value. Targets gone from the layout get nothing.
+    pub fn restore_overrides(&self, pins: &[OptionOverride]) {
+        if pins.is_empty() {
+            return;
         }
+        self.record_edit(|diff, base| {
+            for pin in pins.iter().rev() {
+                diff.set_option_pin(base, &pin.target, &pin.field, &pin.value);
+            }
+        });
     }
 
     /// The options level a chart editor opens on, as storage holds it: rect `id`'s own options patch over what it inherits from its section and the project.

@@ -13,7 +13,7 @@ pub mod zones;
 pub use app_state::{
     heal_loading, load_diff_or_route, rewrite_label_with_run_name, stamp_covers,
     use_version_bridge, versions_key, versions_of, DashboardState, DirectRunLoad, DirectRunView,
-    EditOutcome, OpenPanel, PanelTarget,
+    OpenPanel, PanelTarget,
 };
 pub use layout_config::{
     resolve_capped_bindings, DisplayType, LayoutConfig, LayoutDiff, RectConfig, SectionConfig,

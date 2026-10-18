@@ -186,50 +186,37 @@ def writer_active(path: str) -> bool:
 
 
 def claim_spool(path: str):
-    """Take a spool's exclusive replay claim: the file open and flocked exclusively, still at path. The lock stays on the inode through a rename, until the file is closed.
+    """Take a spool's exclusive replay claim: the file open and flocked exclusively. The lock stays on the inode through a rename, until the file is closed.
 
-    None if its live writer or another replayer holds it (EWOULDBLOCK, EAGAIN, or EACCES from NFS's emulation), or if it is gone. On any other flock error (EBADF: NFS, for a replayer that may only read it; ENOLCK, ENOTSUP, ENOSYS: a file system without flock), the open file alone, with a warning, unless writer_active sees its writer or another replay's claim; where Python has no fcntl, the open file alone. Such a replay excludes no other replayer.
+    None if its live writer or another replayer holds it (EWOULDBLOCK, EAGAIN, or EACCES from NFS's emulation). On any other flock error (EBADF: NFS, for a replayer that may only read it; ENOLCK, ENOTSUP, ENOSYS: a file system without flock), the open file alone, with a warning, unless writer_active sees its writer or another replay's claim; where Python has no fcntl, the open file alone. Such a replay excludes no other replayer.
     """
-    fh = None
-    # Any exception after the open closes the file, a Ctrl-C landing as flock() returns among them: a traceback the program keeps would otherwise keep the file, and its lock, open.
     try:
-        try:
-            # Open for writing where allowed, never written: NFS emulates flock with fcntl byte-range locks, and an exclusive one needs a descriptor open for writing.
-            fh = open(path, "r+b", buffering=0)
-        except OSError as error:
-            if error.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
-                raise
-            # A replayer that may only read the file, as another uid may (SpoolWriter.open): a local file system locks it exclusively all the same, since flock ignores the open mode there.
-            fh = open(path, "rb", buffering=0)
-        try:
-            import fcntl
-        except ImportError:
-            return fh
-        try:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as error:
-            if error.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES) or (
-                writer_active(path)
-            ):
-                fh.close()
-                return None
-            _log.warning(
-                "%s goes without an exclusive claim, which cannot be taken here (%s): another sync may replay it at the same time",
-                path,
-                error.strerror,
-            )
-        # Another replayer may have retired the path between this open and the lock.
-        if os.path.samestat(os.fstat(fh.fileno()), os.stat(path)):
-            return fh
-    except FileNotFoundError:
-        pass
-    except BaseException:
-        if fh is not None:
+        # Open for writing where allowed, never written: NFS emulates flock with fcntl byte-range locks, and an exclusive one needs a descriptor open for writing.
+        fh = open(path, "r+b", buffering=0)
+    except OSError as error:
+        if error.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
+            raise
+        # A replayer that may only read the file, as another uid may (SpoolWriter.open): a local file system locks it exclusively all the same, since flock ignores the open mode there.
+        fh = open(path, "rb", buffering=0)
+    try:
+        import fcntl
+    except ImportError:
+        return fh
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        if error.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES) or (
+            writer_active(path)
+        ):
             fh.close()
-        raise
-    if fh is not None:
-        fh.close()
-    return None
+            return None
+        _log.warning(
+            "%s goes without an exclusive claim, which cannot be taken here (%s): another sync may replay it at the same time",
+            path,
+            error.strerror,
+        )
+    # Limit: a claim that opened the file just before another replayer retired it, and locked it just after, holds the retired file; its replay then fails on the vanished path, sending nothing.
+    return fh
 
 
 def run_spool_files(
@@ -395,7 +382,7 @@ class SpoolWriter:
         os.makedirs(spool_dir, mode=0o700, exist_ok=True)
         # Replay often runs as another uid (e.g. --container-remap-root jobs), so mirror the directory's group/other read bits; writes remain owner-only. The default 0700 directory widens nothing.
         mode = 0o600 | (os.stat(spool_dir).st_mode & 0o044)
-        # A new file is made under a name no replay picks up and renamed into place once it has its lock (which the rename keeps: it is on the inode) and its header: a replay claiming it in between would leave its writer unlocked for good, and could quarantine the still empty file.
+        # A new file is made under a name no replay picks up and renamed into place once it has its lock (which the rename keeps: it is on the inode) and its header: a replay claiming it in between could quarantine the still empty file, whose writer would then write on under the quarantined name, which no sync replays, or leave its writer unlocked for good. On NFS the calls in between are round trips.
         name = self._path if os.path.exists(self._path) else self._path + ".creating"
         fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_APPEND, mode)
         try:

@@ -7,7 +7,7 @@ use crate::state::layout_config::{
     ema_time_constant, finer_overrides, OptionOverride, OverrideTarget, RectOptions,
     SmoothingAlgorithm,
 };
-use crate::state::{DashboardState, EditOutcome};
+use crate::state::DashboardState;
 use crate::util::{primary, use_live_apply};
 
 /// Field-id prefix for every options editor; one panel is open at a time.
@@ -104,10 +104,8 @@ fn override_chips(
                             class: "override-chip",
                             title: "{title}",
                             onmousedown: primary(move |_| {
-                                // Only a cleared pin is Revert's to put back.
-                                if state.clear_option_pin(&o) == EditOutcome::Saved {
-                                    cleared.write().push(o.clone());
-                                }
+                                state.clear_option_pin(&o);
+                                cleared.write().push(o.clone());
                             }),
                             "{text}"
                             span { class: "override-chip-x", CloseIcon {} }
@@ -125,13 +123,13 @@ pub fn ProjectDefaultsEditor(return_focus_id: String) -> Element {
     let state = use_context::<DashboardState>();
     let baseline = use_hook(|| state.chart_defaults_baseline(None));
     let mut draft = use_signal(|| baseline.opened.clone());
-    let cleared = use_signal(Vec::new);
-    use_live_apply(move || draft.read().clone(), move |opts| draft.set(opts), {
+    let mut cleared = use_signal(Vec::new);
+    use_live_apply(move || draft.read().clone(), {
         let baseline = baseline.clone();
         move |previous: &RectOptions, opts: RectOptions| {
             state.edit_project_chart_defaults(|stored| {
                 baseline.write_fields(stored, previous, &opts)
-            }) != EditOutcome::Refused
+            });
         }
     });
     let unchanged = *draft.read() == baseline.opened && cleared.read().is_empty();
@@ -145,7 +143,7 @@ pub fn ProjectDefaultsEditor(return_focus_id: String) -> Element {
                 let opened = baseline.opened.clone();
                 move |_| {
                     draft.set(opened.clone());
-                    state.restore_overrides(cleared);
+                    state.restore_overrides(&std::mem::take(&mut *cleared.write()));
                 }
             },
             on_close: move |_| state.close_options_panel(),

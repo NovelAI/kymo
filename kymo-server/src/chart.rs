@@ -5,17 +5,17 @@ use crate::proto::smoothing_config::Algorithm;
 /// Server-side cap on the smoothing window: chart_params clamps the wire value to it, and the smoothers and delta planner rely on that bound.
 pub(crate) const MAX_SMOOTHING_WINDOW: u32 = 4096;
 
-/// Whether all x gaps agree within float tolerance. Contiguous integer steps compare exactly and take index-space Savitzky–Golay; irregular grids, and a series at one x (index distance would set apart samples at the same time), use the x-aware fit.
+/// Whether all x gaps are equal. Contiguous integer steps take index-space Savitzky–Golay; irregular grids, and a series at one x (index distance would set apart samples at the same time), use the x-aware fit.
 fn is_uniform(xs: &[f64]) -> bool {
     #[cfg(test)]
     SPACING_DERIVATIONS.with(|counts| counts.set((counts.get().0 + 1, counts.get().1)));
     xs.len() < 2 || same_gaps(xs[1] - xs[0], xs.windows(2).map(|w| w[1] - w[0]))
 }
 
-/// Whether the first gap, `d0`, is positive and every gap is within d0 * 1e-9 of it. Requiring `d0 > 0` is sound because a smoothed series' x ascend (the smoothers' contract): a zero or negative first gap is no uniform spacing.
+/// Whether the first gap, `d0`, is positive and every gap equals it. Requiring `d0 > 0` is sound because a smoothed series' x ascend (the smoothers' contract): a zero or negative first gap is no uniform spacing.
+/// Smoothed x are whole steps or milliseconds (query.rs, held.rs), whose gaps f64 holds exactly below 2^53, so equal spacing needs no tolerance.
 pub(crate) fn same_gaps(d0: f64, mut gaps: impl Iterator<Item = f64>) -> bool {
-    let tol = d0 * 1e-9;
-    d0 > 0.0 && !gaps.any(|gap| (gap - d0).abs() > tol)
+    d0 > 0.0 && gaps.all(|gap| gap == d0)
 }
 
 /// Median interval between consecutive distinct x values — the x-unit the window scales are quoted in
@@ -3009,11 +3009,6 @@ mod smooth_run_tests {
         assert!(
             [1, 3, 4].iter().all(|&i| (out[i] - 4.0).abs() < 1e-12),
             "{out:?}"
-        );
-        // A repeated x is no uniform spacing at any scale.
-        assert_ne!(
-            smoothing_plan(&[0.0, 5e-13, 5e-13], Algorithm::SavitzkyGolay, false),
-            SmoothingPlan::Uniform
         );
         // A positive uniform spacing, or one sample, keeps the index-space kernel.
         for xs in [&[0.0, 2.0, 4.0][..], &[7.0]] {

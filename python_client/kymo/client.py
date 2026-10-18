@@ -792,8 +792,7 @@ def init(
 
 def _start_run(process: multiprocessing.Process) -> None:
     """Start the upload worker (_start_worker) and, once it has a pid, make the run active and install the exit hooks, so a Ctrl-C or an error before init() returns ends the run as a later one would, rather than leave the worker, which carries on through a Ctrl-C, to multiprocessing's exit, which waits for it (forever under a SIGTERM the program owns). A held section (_HELD_SECTIONS): the signals are blocked across Process.start() on the main thread alone, so one the kernel gives another thread runs kymo's handler on the main thread inside the start, which defers it until the run is active. What a previous run recorded for the exit hooks and log-overhead tracking, which span the process, is cleared first."""
-    global _exit_code, _exit_code_by_sys_exit, _handed_off, _interrupted_at
-    global _terminated_at, _left_control
+    global _exit_code, _handed_off, _interrupted_at, _terminated_at, _left_control
     global _last_log_duration_ms, _system_poller, _is_initialized, _init_pid
     global _atexit_registered
     # Before the start: a signal deferred during it keeps the time its handling and the program's exit read, and a failed start's TerminateRun waits for no other run's.
@@ -802,7 +801,7 @@ def _start_run(process: multiprocessing.Process) -> None:
         _start_worker(process)
     finally:
         if process.pid is not None:
-            _exit_code, _exit_code_by_sys_exit = None, False
+            _exit_code = None
             _handed_off = False
             _last_log_duration_ms = 0.0
             _system_poller = None
@@ -2132,13 +2131,12 @@ def finish(flush_timeout: Optional[float] = None) -> bool:
 
     A ``sys.exit()`` sets the run's exit code as it is called. Called on the
     main thread with no exception being handled, while that thread runs the
-    program (not once the interpreter's exit has begun: an atexit hook, a
-    ``threading._register_atexit`` hook), finish() drops a code only
-    ``sys.exit()`` set, taking that ``SystemExit`` for caught. So does a
-    finish() in the teardown before that exit begins, with nothing being
-    handled: a ``__del__`` or ``weakref.finalize`` callback of an object an
-    uncaught ``sys.exit()`` frees, or the printing of a ``sys.exit()``
-    message. That run ends with no code.
+    program (not once the interpreter's exit has begun, as in an atexit hook),
+    finish() drops a code only ``sys.exit()`` set, taking that ``SystemExit``
+    for caught. So does a finish() in the teardown before that exit begins,
+    with nothing being handled: a ``__del__`` or ``weakref.finalize``
+    callback of an object an uncaught ``sys.exit()`` frees, or the printing
+    of a ``sys.exit()`` message. That run ends with no code.
     A caught ``sys.exit()`` that the run outlives without such a finish() (a
     normal end, or a finish() on another thread) still ends it with that code,
     and a ``raise SystemExit`` (the ``exit()`` builtin's too) sets none. A
@@ -2155,7 +2153,6 @@ def finish(flush_timeout: Optional[float] = None) -> bool:
     if _follows_ctrl_c(sys.exc_info()[1]):
         # The program is ending, or handling, a Ctrl-C, or ends soon after one: its run is, too.
         return _drain_and_shutdown(signum=signal.SIGINT)
-    # The flag is read last: a signal handled during the calls before it may record its own code, which must stay.
     if (
         _on_main_thread()
         and sys.exc_info()[1] is None
@@ -2435,11 +2432,10 @@ def _record_exit_code(code: int, by_sys_exit: bool = False) -> None:
     later sys.exit cascade fired during cleanup. A code only sys.exit
     recorded (by_sys_exit, the wrapped sys.exit's) gives way while the main
     thread runs the program (_main_thread_runs), since the program may have
-    caught that SystemExit. Once the interpreter's exit has begun nothing is
-    recorded: the code stays, and an exit then (a sys.exit, or a SystemExit
-    a chained signal handler raises), which Python ignores, sets none."""
+    caught that SystemExit. Once the interpreter's exit has begun no exit's
+    code is recorded: the code stays, and a sys.exit then, which Python
+    ignores, sets none."""
     global _exit_code, _exit_code_by_sys_exit
-    # Converted first, and the flag read last: a signal handled during either call may record its own code.
     code = int(code)
     if not _main_thread_runs():
         return
@@ -2563,8 +2559,12 @@ def _handle_signal(signum, frame):
         handler = _shut_down_on_signal
     try:
         _call_chained(handler, signum, frame)
-    except SystemExit as error:
-        _record_exit_code(_system_exit_code(error.code))
+    except BaseException as error:
+        if not _main_thread_runs():
+            # Python ignores whatever the handler raises once the interpreter's exit has begun, an exit among them: the signal ends the run, as kymo's own handling would.
+            _record_signal_code(signum)
+        elif isinstance(error, SystemExit):
+            _record_exit_code(_system_exit_code(error.code))
         raise
 
 
