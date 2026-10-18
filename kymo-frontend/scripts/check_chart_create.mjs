@@ -72,7 +72,8 @@ function element(id = "") {
     classList: { toggle() {}, add() {}, remove() {} },
     addEventListener(type, fn) { (listeners[type] ||= []).push(fn); },
     dispatchEvent(event) { this.dispatched.push(event); return true; },
-    getBoundingClientRect: () => ({ left: 0, top: 0, right: 400, bottom: 220, width: 400, height: 220 }),
+    width: 400,
+    getBoundingClientRect() { return { left: 0, top: 0, right: this.width, bottom: 220, width: this.width, height: 220 }; },
     appendChild() {}, closest() { return null; },
     fire(type, event) { for (const fn of listeners[type] || []) fn(event); },
   };
@@ -98,6 +99,9 @@ function page({ dpr = 1 } = {}) {
       this.axes = opts.axes;
       this.scales = { x: { distr: opts.scales.x.distr }, y: {} };
       this.rebuilds = 0;
+      this.width = opts.width;
+      this.height = opts.height;
+      this.resizes = 0;
       this.fitX();
     }
     fitX() { const x = this.data[0]; this.scales.x.min = x[0]; this.scales.x.max = x[x.length - 1]; }
@@ -111,6 +115,7 @@ function page({ dpr = 1 } = {}) {
     }
     setData(data) { this.data = data; if (this.opts.scales.x.auto(this)) this.fitX(); this.rebuilds++; }
     setCursor() {}
+    setSize({ width, height }) { Object.assign(this, { width, height }); this.resizes++; }
     setSelect(box) { this.box = box; }
     destroy() { this.root.isConnected = false; }
     valToPos(value) { return value; }
@@ -131,7 +136,7 @@ function page({ dpr = 1 } = {}) {
   };
   const context = vm.createContext({
     window, document, uPlot: FakeUPlot, devicePixelRatio: dpr, CustomEvent: class { constructor(type, init) { this.type = type; Object.assign(this, init); } },
-    ResizeObserver: class { observe() {} disconnect() {} }, getComputedStyle: () => ({ height: "220px", getPropertyValue: () => "" }),
+    ResizeObserver: class { constructor(fire) { this.fire = fire; } observe() {} disconnect() {} }, getComputedStyle: () => ({ height: "220px", getPropertyValue: () => "" }),
     queueMicrotask, dioxus: { close() {} },
   });
   vm.runInContext(hoverPoints, context);
@@ -145,6 +150,11 @@ function page({ dpr = 1 } = {}) {
       return window.__kymo_charts[id];
     },
     el(id) { return nodes[id]; },
+    /** Lays a container out `width` px wide, and runs its chart's ResizeObserver if one is mounted. */
+    resize(id, width) {
+      (nodes[id] ||= element(id)).width = width;
+      window.__kymo_ro?.[id]?.fire();
+    },
     tipOf(id) { return created.find(node => node.id === `${id}-tip`); },
     fireWindow(type, event) { for (const fn of [...(windowListeners[type] || [])]) fn(event); },
   };
@@ -513,4 +523,22 @@ test("a rebuild during a selection carries the window it started from", () => {
   assert.deepEqual([rebuilt.scales.x.min, rebuilt.scales.x.max], [25, 75]);
   assert.equal(rebuilt.__kymo_userzoom, true);
   assert.equal(p.window.__kymo_zg, null, "the selection was cancelled");
+});
+
+test("a chart takes its box's width floored, at creation and on resize", () => {
+  // uPlot hides its cursor line once the line's rounded x passes a fractional plot width, which loses it on right-edge hovers.
+  const p = page();
+  p.resize("w", 400.6);
+  const c = p.create("w", [0, 50, 100]);
+  assert.equal(c.width, 400);
+  // The observer's first call, just after the create, finds the box within 1 px of the chart and resizes nothing.
+  p.resize("w", 400.6);
+  assert.equal(c.resizes, 0);
+  p.resize("w", 452.5);
+  assert.equal(c.width, 452);
+  // A box read a hair short, as at browser zoom, keeps the chart; more than 1 px away resizes it.
+  p.resize("w", 451.997);
+  assert.equal(c.width, 452);
+  p.resize("w", 453.9);
+  assert.equal(c.width, 453);
 });

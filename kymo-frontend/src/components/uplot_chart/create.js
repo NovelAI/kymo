@@ -19,8 +19,6 @@ if(!data||!data.length)return'chart data is missing';
 // no gaps and stays typed.
 // An indexed loop, not Array.from(c,fn): the callback form costs ~7x more on typed arrays (set_data_js repeats this).
 data=data.map((c,i)=>{if(i==0)return c;let n=c.length,o=new Array(n);for(let j=0;j<n;j++){let v=c[j];o[j]=v!==v?null:v;}return o;});
-// The chart takes its container's box, as the ResizeObserver below does, so height is not structural config and a height change resizes in place. A hidden container has no box: it falls back to 600 wide at its CSS height.
-let box=el.getBoundingClientRect(),w=box.width||600,h=box.height||parseFloat(getComputedStyle(el).height);
 let prev=window.__kymo_charts['__KYMO_ID__'];
 // isConnected guards a recreated container div: updating a chart
 // whose canvas was detached would paint nothing, forever.
@@ -34,6 +32,12 @@ if(prev&&prev.root&&prev.root.isConnected&&prev.__kymo_cfghash==='__KYMO_CFG_HAS
   prev.setData(data);
   return'';
 }
+// The chart takes its container's box, as the ResizeObserver below does, so height is not structural config and a height change resizes in place. A hidden container has no box: it falls back to 600 wide at its CSS height.
+// This and the ResizeObserver floor the width, because uPlot mishandles a fractional one; a whole width gives a whole plot, since uPlot rounds the y axis's size up and the padding below is whole.
+// uPlot draws the cursor line at a rounded x but hides it once that x passes the plot's unrounded width (elTrans in uPlot's dom.js), so from a fraction of .5 the line vanishes on right-edge hovers, which hover_points.js snaps to the plot's edge.
+// Its canvas bitmap is round(w * dpr) pixels stretched over w * dpr device pixels, which smears 1px lines when that isn't whole.
+// Rounding the container in CSS fails at browser zoom, where layout measures a whole CSS width a hair short (596.989 for 597).
+let box=el.getBoundingClientRect(),w=Math.floor(box.width)||600,h=box.height||parseFloat(getComputedStyle(el).height);
 // The x axis a client-side zoom's window is in: its kind (the sync key) and its scale. Its log shift follows from them: relative time on a log axis always starts at 0, and wall time and custom x never shift.
 let axisKey='__KYMO_SYNC_KEY__|__KYMO_X_DISTR__';
 // A client-side zoom lives only on the instance, so a rebuild for anything but the x axis (a recolor, a rename, a run's first NaN or spread bucket) carries it over rather than resetting what the user zoomed to. Step charts zoom through the step store and never set it.
@@ -410,10 +414,10 @@ window.__kymo_ro['__KYMO_ID__']=new ResizeObserver(()=>{
   if(c){
     let r=el.getBoundingClientRect();
     if(r.width>0){
-      // The box is the chart's size: its height is fixed by CSS (--kymo-chart-height), which the chart can't inflate, so this setSize never re-triggers the observer. Height compares exactly, so a 1 px height change still lands.
+      // The box is the chart's size, its width floored as at creation. Its height is fixed by CSS (--kymo-chart-height), which the chart can't inflate, so this setSize never re-triggers the observer. Width compares within 1 px, the most the floor takes off, so the observer's first call, just after each create, resizes nothing; height compares exactly, so a 1 px height change still lands.
       if(Math.abs(c.width-r.width)<=1&&c.height===r.height)return;
       let owner=window.__kymo_zg;
-      c.setSize({width:r.width,height:r.height});
+      c.setSize({width:Math.floor(r.width),height:r.height});
       // Only a real container resize invalidates the frozen source geometry.
       // Restore/cancel after uPlot releases its commit queue; internal axis
       // size convergence also fires setSize hooks but never reaches here.

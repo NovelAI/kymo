@@ -520,6 +520,51 @@ def real_resize_cancels(page: Page, source: dict[str, Any]) -> None:
     assert_no_selection(page)
 
 
+def fractional_width_edge_line(page: Page, source: dict[str, Any]) -> None:
+    """uPlot draws the cursor line at a rounded x and hides it once that x passes a fractional plot width, so a chart resized into a container laid out at a fraction of .5 must take a whole width. check_chart_create.mjs pins the floor at creation."""
+    container = page.locator(f"#{source['id']}")
+    original_style = container.evaluate("e => e.style.width")
+    try:
+        # Over 1 px narrower, or the observer, which ignores a change within 1 px, keeps the chart's old whole width.
+        width, fraction = container.evaluate(
+            "e => { const w = window.__kymo_charts[e.id].width; e.style.width = `${Math.floor(w) - 2.5}px`; return [w, e.getBoundingClientRect().width % 1]; }"
+        )
+        if fraction != 0.5:
+            raise AssertionError(
+                f"the container did not lay out at a .5 fraction: {fraction}"
+            )
+        page.wait_for_function(
+            "([id, w]) => window.__kymo_charts[id].width < w - 1",
+            arg=[source["id"], width],
+        )
+        chart = chart_snapshot(page, source["id"])
+        page.mouse.move(x_at_fraction(chart, 0.5), y_mid(chart))
+        # Into the right padding, which plotPosition snaps to the plot's edge.
+        page.mouse.move(mouse_pixel(chart["left"] + chart["width"] + 4), y_mid(chart))
+        state = page.evaluate(
+            """id => {
+                const u = window.__kymo_charts[id];
+                return {
+                    left: u.cursor.left,
+                    plot: parseFloat(u.over.style.width),
+                    line: !u.root.querySelector('.u-cursor-x').classList.contains('u-off'),
+                };
+            }""",
+            source["id"],
+        )
+        # The positive control: the hover reached the edge, where a fractional width loses the line.
+        if abs(state["left"] - state["plot"]) > 0.01:
+            raise AssertionError(f"right-edge hover missed the plot's edge: {state}")
+        if not state["line"]:
+            raise AssertionError(
+                f"a fractional container width lost the cursor line at the plot's edge: {state}"
+            )
+    finally:
+        page.mouse.move(1, 1)
+        container.evaluate("(e, width) => { e.style.width = width; }", original_style)
+        fitted_box(container)
+
+
 def idle_sync(page: Page, source: dict[str, Any], peer: dict[str, Any]) -> None:
     if source["sync_key"] != peer["sync_key"]:
         raise AssertionError("fixture charts are not cursor-synced")
@@ -932,6 +977,7 @@ def run_fences(page: Page) -> None:
         gutter_extrapolation(page, source)
         cancellation(page, source)
         real_resize_cancels(page, source)
+        fractional_width_edge_line(page, source)
         idle_sync(page, source, peer)
         axis_internal_reflow_keeps_owner(page, source)
         axis_pull(page, source)
