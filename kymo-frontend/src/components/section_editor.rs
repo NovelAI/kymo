@@ -2,9 +2,9 @@ use dioxus::prelude::*;
 
 use crate::components::options_editor::{ChartOptionsForm, EditorSection, OPTIONS_ID_PREFIX};
 use crate::components::options_panel::OptionsPanel;
-use crate::state::layout_config::{RectOptions, MAX_SECTION_COLUMNS};
+use crate::state::layout_config::{stored_display_name, RectOptions, MAX_SECTION_COLUMNS};
 use crate::state::{DashboardState, SectionConfig};
-use crate::util::use_live_apply;
+use crate::util::{blur_target, reveal_renamed_section, use_live_apply, OPTIONS_PANEL_ID};
 
 /// The section settings this editor owns, as one draft.
 #[derive(Clone, PartialEq)]
@@ -13,16 +13,6 @@ struct SectionDraft {
     max_columns: u32,
     rows_per_page: u32,
     chart_opts: RectOptions,
-}
-
-/// The `display_name` a typed name stores: trimmed, and empty when it matches the id (a rename to the id is no rename at all).
-fn stored_display_name(typed: &str, name: &str) -> String {
-    let display = typed.trim();
-    if display == name {
-        String::new()
-    } else {
-        display.to_string()
-    }
 }
 
 /// Edits section settings and chart defaults live. Renames update `display_name`; `name` stays the identity.
@@ -57,6 +47,19 @@ pub fn SectionEditor(return_focus_id: String, config: SectionConfig) -> Element 
     };
     let mut cleared = use_signal(Vec::new);
     let unchanged = current() == initial && cleared.read().is_empty();
+    // The page follows a rename once it settles, not per keystroke (each one can move the section, remounting the panels it passes): when the Name field hands focus to the panel or to nothing, on Close or Esc, and at once on Revert. A rename left for another control outside the panel waits for Close; one left by switching the panel to another target isn't followed.
+    // `followed` is the name the page last followed the section to; the reveal waits a frame, by when the live apply has moved the section.
+    let mut followed = use_hook(|| CopyValue::new(initial.display_name.clone()));
+    let follow = {
+        let name = name.clone();
+        move || {
+            let label = stored_display_name(&draft_display_name.peek(), &name);
+            if *followed.peek() != label {
+                followed.set(label);
+                reveal_renamed_section(&name);
+            }
+        }
+    };
     use_live_apply(current, {
         let chart_baseline = chart_baseline.clone();
         move |previous: &SectionDraft, draft: SectionDraft| {
@@ -88,15 +91,25 @@ pub fn SectionEditor(return_focus_id: String, config: SectionConfig) -> Element 
             revert_disabled: unchanged,
             on_revert: {
                 let initial = initial.clone();
+                let mut follow = follow.clone();
                 move |_| {
+                    // A rename still being typed settles first, so the page follows the section back too.
+                    follow();
                     draft_display_name.set(initial.display_name.clone());
                     draft_max_columns.set(initial.max_columns);
                     draft_rows_per_page.set(initial.rows_per_page);
                     draft_chart_opts.set(initial.chart_opts.clone());
                     state.restore_overrides(&std::mem::take(&mut *cleared.write()));
+                    follow();
                 }
             },
-            on_close: move |_| state.close_options_panel(),
+            on_close: {
+                let mut follow = follow.clone();
+                move |_| {
+                    follow();
+                    state.close_options_panel();
+                }
+            },
 
             div { class: "editor-options",
                 div { class: "binding-field",
@@ -108,6 +121,17 @@ pub fn SectionEditor(return_focus_id: String, config: SectionConfig) -> Element 
                         placeholder: "{config.name}",
                         oninput: move |e: Event<FormData>| {
                             draft_display_name.set(e.value());
+                        },
+                        onblur: {
+                            let mut follow = follow.clone();
+                            move |e: Event<FocusData>| {
+                                let outside_panel = blur_target(&e).is_some_and(|target| {
+                                    target.closest(&format!("#{OPTIONS_PANEL_ID}")).ok().flatten().is_none()
+                                });
+                                if !outside_panel {
+                                    follow();
+                                }
+                            }
                         },
                     }
                 }

@@ -158,7 +158,7 @@ input[type="range"]:focus::-moz-range-thumb {
 }
 
 /* Text fields: no UA outline, headings border when focused. */
-.rect-title-input, .sidebar-filter, .projects-filter, .navbar-search-input,
+.rect-title-input, .section-name-input, .sidebar-filter, .projects-filter, .navbar-search-input,
 .binding-field select,
 .binding-field input[type="text"],
 .binding-field input[type="number"] {
@@ -952,6 +952,24 @@ input[type="checkbox"]:checked::before {
     color: var(--text-headings);
 }
 .section-name:hover { color: var(--text-main); }
+
+.section-name-input {
+    min-width: 0;
+    width: 20ch;
+    font-family: var(--font-heading);
+    font-size: var(--font-size-15);
+    font-weight: 600;
+    color: var(--text-headings);
+    background: var(--bg1);
+    border: 1px solid var(--text-headings);
+    border-radius: 3px;
+    /* No vertical padding: the header keeps its height while the field is open. */
+    padding: 0 4px;
+}
+
+/* Inside the grid, whose padding makes up the rest. */
+.section-empty { grid-column: 1 / -1; padding: var(--spacing-sm) var(--spacing-sm) var(--spacing-md); }
+.section-empty .btn { display: inline-flex; align-items: center; gap: var(--spacing-xs); }
 
 .section-count { font-size: var(--font-size-11); color: var(--text-disabled); margin-left: var(--spacing-xs); }
 

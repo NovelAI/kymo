@@ -281,6 +281,9 @@ pub fn BindingEditor(
     let baseline = use_hook(|| state.rect_options_baseline(&rect_id));
     // The draft keeps the saved width: only the Width control clamps it to the section's columns, as rendering does.
     let initial = use_hook(|| (rect.bindings.clone(), baseline.opened.clone()));
+    // An unconfigured panel opens on its first metric picker, ready to choose data.
+    let focus_metric =
+        take_focus && !initial.0.is_empty() && initial.0.iter().all(|b| b.metric_name.is_empty());
     // Each source with an id of its own, which keeps row-local state with its source across removals.
     let mut sources = use_signal(|| {
         (0..)
@@ -347,7 +350,8 @@ pub fn BindingEditor(
             target: rect_title(&rect),
             // The opener, then the maximized chart's own Configure (shown again as the panel goes), then its grid copy's (once closing un-maximizes the chart).
             return_focus_ids: vec![return_focus_id, editor_trigger_id("rect-max", &rect.id), editor_trigger_id("rect-grid", &rect.id)],
-            take_focus,
+            // Only the picker takes focus, rather than winning against the panel body by mount order.
+            take_focus: take_focus && !focus_metric,
             revert_disabled: unchanged,
             on_revert: revert,
             on_close: move |_| state.close_options_panel(),
@@ -360,6 +364,7 @@ pub fn BindingEditor(
                     BindingRow {
                         key: "{row_id}",
                         index: i,
+                        focus_metric: focus_metric && row_id == 0,
                         binding,
                         required_kind: required_kind(&sources.read(), &row_catalogs.read(), i),
                         row_id,
@@ -961,6 +966,7 @@ mod tests {
 #[component]
 fn BindingRow(
     index: usize,
+    focus_metric: bool,
     binding: MetricBinding,
     /// Set when the other sources agree on a type: metrics of any other type are disabled, since a chart cannot mix types.
     required_kind: Option<DisplayType>,
@@ -1233,6 +1239,11 @@ fn BindingRow(
                             select {
                                 id: "{id_prefix}-metric",
                                 aria_label: "{metric_label}",
+                                onmounted: move |e| {
+                                    if focus_metric {
+                                        crate::util::focus_on_mount(e);
+                                    }
+                                },
                                 value: "{current}",
                                 onchange: {
                                     let binding = binding.clone();

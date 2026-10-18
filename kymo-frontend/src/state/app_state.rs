@@ -7,8 +7,9 @@ use crate::grpc::proto::{RunInfo, RunRecord};
 use crate::grpc::GrpcClient;
 use crate::route::Route;
 use crate::state::layout_config::{
-    local_bases, DisplayType, LayoutDiff, LoadResult, MetricBinding, OptionOverride,
-    OptionsBaseline, RectConfig, RectOptions, SectionConfig, ViewContext, MAX_SECTION_COLUMNS,
+    local_bases, stored_display_name, DisplayType, LayoutDiff, LoadResult, MetricBinding,
+    OptionOverride, OptionsBaseline, RectConfig, RectOptions, SectionConfig, ViewContext,
+    MAX_SECTION_COLUMNS,
 };
 use crate::state::section_order::SectionGap;
 use crate::state::LayoutConfig;
@@ -292,6 +293,11 @@ pub struct DashboardState {
     pub panel_filter: Signal<String>,
     /// Whether a `MetricGrid` is mounted. A run page that can't show its run renders none while `layout_config` keeps the last layout, so the navbar's collapse toggle checks this.
     pub grid_mounted: Signal<bool>,
+    /// The newly added section whose inline name field should mount and take focus; one at a time, so adding another saves this one's name first.
+    /// Limit: one whose section leaves the layout other than by this tab's Delete (another tab's, say) stays until another press completes it, whose save then only warns in the console that the section is gone.
+    pub naming_section: Signal<Option<String>>,
+    /// What that field holds. Untracked, and the field is uncontrolled, so a keystroke re-renders nothing.
+    pub naming_draft: CopyValue<String>,
     /// CopyValue (untracked, never written) rather than a bare GrpcClient,
     /// so the whole state struct is Copy and handlers can capture it
     /// without a clone per closure.
@@ -383,6 +389,8 @@ impl DashboardState {
             step_zoom: Signal::new(None),
             panel_filter: Signal::new(String::new()),
             grid_mounted: Signal::new(false),
+            naming_section: Signal::new(None),
+            naming_draft: CopyValue::new(String::new()),
             grpc: CopyValue::new(GrpcClient::new()),
         }
     }
@@ -594,11 +602,53 @@ impl DashboardState {
     }
 
     pub fn delete_section(&self, name: &str) {
+        // A name being typed for this section goes with it, rather than being saved to a section that is gone by the next press.
+        let mut naming = self.naming_section;
+        if naming.peek().as_deref() == Some(name) {
+            naming.set(None);
+        }
         self.record_edit(|diff, base| diff.delete_section(base, name));
     }
 
     pub fn add_section(&self, section: SectionConfig) {
         self.record_edit(|diff, base| diff.add_section(base, &section));
+    }
+
+    /// Open the name field of `section`, just added: one write replaces the open one, whose typed name is then saved.
+    pub fn begin_section_name(&self, section: String) {
+        let mut naming = self.naming_section;
+        let previous = naming.write().replace(section);
+        let typed = self.take_naming_draft();
+        if let Some(previous) = previous {
+            self.save_section_name(&previous, &typed);
+        }
+    }
+
+    /// Enter/blur keeps the name; Escape leaves the section's initial label. Returns whether a name was stored, which can move the section.
+    pub fn finish_section_name(&self, save: bool) -> bool {
+        let mut naming = self.naming_section;
+        // A write wakes every section's naming memo even when it finds nothing, and every Configure and add press calls this.
+        let Some(section) = naming.peek().clone() else {
+            return false;
+        };
+        naming.set(None);
+        let typed = self.take_naming_draft();
+        save && self.save_section_name(&section, &typed)
+    }
+
+    fn take_naming_draft(&self) -> String {
+        let mut draft = self.naming_draft;
+        draft.take()
+    }
+
+    /// Store `typed` as `section`'s label, trimmed and with the settings editor's rule for a name equal to the id. Returns whether it stored one: a blank name stores nothing.
+    fn save_section_name(&self, section: &str, typed: &str) -> bool {
+        if typed.trim().is_empty() {
+            return false;
+        }
+        let label = stored_display_name(typed, section);
+        self.edit_section_settings(section, |s| s.display_name = label);
+        true
     }
 
     /// One ordering gesture, validated inside the fresh-storage edit funnel.

@@ -1,4 +1,5 @@
 use dioxus::prelude::*;
+use dioxus::web::WebEventExt;
 
 use crate::components::icons::{
     CaretLeftIcon, CaretRightIcon, GearIcon, GripIcon, PlusIcon, TrashIcon,
@@ -9,7 +10,10 @@ use crate::state::layout_config::{MetricBinding, ProjectRef, RectOptions, RunRef
 use crate::state::{
     DashboardState, DisplayType, PanelTarget, RectConfig, SectionConfig, UserConfigState,
 };
-use crate::util::{confirm, editor_trigger_id, primary};
+use crate::util::{
+    blur_target, confirm, editor_trigger_id, focus_later, focus_on_mount, is_app_escape, primary,
+    refocus_if_dropped, reveal_renamed_section,
+};
 
 /// Greedy row-pack: each rect consumes its `column_span` units of the current
 /// row; overflow wraps to the next row; `rows_per_page` rows = one page.
@@ -57,10 +61,16 @@ pub fn Section(
     let section_id = config.name.clone();
     let trigger_id = editor_trigger_id("section", &section_id);
     let body_id = format!("{trigger_id}-body");
+    let add_trigger_id = editor_trigger_id("section-add", &section_id);
+    let add_panel_id = editor_trigger_id("section-add-panel", &section_id);
     let section_label = config.display_name().to_string();
     let state = use_context::<DashboardState>();
     let mut panel_filter = state.panel_filter;
     let mut current_page = use_signal(|| 0usize);
+    let naming = use_memo({
+        let section_id = section_id.clone();
+        move || state.naming_section.read().as_deref() == Some(section_id.as_str())
+    });
     let drag = use_context::<SectionDrag>();
     let (insert_before, insert_after) = drag.marker_on(&section_id);
     let dragging = drag.is_source(&section_id);
@@ -99,6 +109,55 @@ pub fn Section(
         config.chart_height
     );
 
+    // The header's Add metric and an empty section's Add panel.
+    let add_panel = {
+        let section_id = section_id.clone();
+        let add_trigger_id = add_trigger_id.clone();
+        move |e: Event<MouseData>| {
+            e.stop_propagation();
+            // As Configure does: the new chart's Close returns focus here, so the page follows this section if its completed name moved it.
+            let naming_this = *naming.peek();
+            if state.finish_section_name(true) && naming_this {
+                reveal_renamed_section(&section_id);
+            }
+            // An active filter would hide the new blank rect; clear it first. Guarded — set on an already-empty filter still notifies subscribers.
+            if !panel_filter.peek().is_empty() {
+                panel_filter.set(String::new());
+            }
+            // Expand before adding so the new rect is visible.
+            if collapsed {
+                state.edit_section_settings(&section_id, |s| {
+                    s.set_collapsed(false, sections_visible)
+                });
+            }
+            // Generated id, not a position: the layout base regenerates
+            // as metrics appear/disappear, so a length-based id could
+            // collide with an earlier user-added rect in the saved diff.
+            let id = crate::util::unique_id(&format!("{}-new", section_id));
+            state.add_rect(
+                &section_id,
+                RectConfig {
+                    id: id.clone(),
+                    label: String::new(),
+                    bindings: vec![MetricBinding {
+                        project: ProjectRef::Current,
+                        runs: RunRef::Selected,
+                        metric_name: String::new(),
+                    }],
+                    display_type: DisplayType::Numeric,
+                    options: RectOptions::default(),
+                },
+            );
+            // The new rect appends to the end; overshoot the page
+            // signal and let the render-time clamp resolve it to
+            // whatever the last page becomes.
+            current_page.set(usize::MAX);
+            // Configure's flow: the new chart maximizes beside its editor, which opens on its first metric picker (`BindingEditor`); closing the editor returns to that last page.
+            state.open_options_panel(PanelTarget::Chart, add_trigger_id.clone());
+            crate::route::focus_chart(Some(id));
+        }
+    };
+
     rsx! {
         div {
             class: "section",
@@ -114,6 +173,10 @@ pub fn Section(
                 onmousedown: primary({
                     let section_id = section_id.clone();
                     move |_| {
+                        // While naming, a press on the bar only leaves the field, whose blur saves the name, and one in the field bubbles here: collapsing would hide the new section's Add panel.
+                        if *naming.peek() {
+                            return;
+                        }
                         state.edit_section_settings(&section_id, |s| {
                             s.set_collapsed(!collapsed, sections_visible)
                         });
@@ -141,54 +204,81 @@ pub fn Section(
                     ondragend: move |_| drag.end(state),
                     GripIcon {}
                 }
-                // The toggle's keyboard face, with no handler of its own: a press bubbles to the bar's mousedown, and Enter or Space on it reaches the same handler through KB_ACTIVATE_JS (main.rs).
-                button {
-                    r#type: "button",
-                    class: "section-toggle",
-                    aria_expanded: !collapsed,
-                    // A collapsed section renders no body, so there is nothing to point at then.
-                    aria_controls: (!collapsed).then(|| body_id.clone()),
-                    span { class: "section-name", "{section_label}" }
+                // The name field takes the toggle's place while naming: a button can't hold an input.
+                if naming() {
+                    {
+                        // Enter and Escape hand focus to the section's Add panel.
+                        let add_panel_id = add_panel_id.clone();
+                        let section_id = section_id.clone();
+                        rsx! {
+                            input {
+                                class: "section-name-input",
+                                aria_label: "Section name",
+                                placeholder: "{section_label}",
+                                onmounted: move |e: MountedEvent| {
+                                    // Reveal the whole section by the least distance, so its Add panel shows too, not just the input at the viewport edge.
+                                    if let Some(element) = e.data().try_as_web_event() {
+                                        if let Ok(Some(section)) = element.closest(".section") {
+                                            let options = web_sys::ScrollIntoViewOptions::new();
+                                            options.set_block(web_sys::ScrollLogicalPosition::Nearest);
+                                            section.scroll_into_view_with_scroll_into_view_options(&options);
+                                        }
+                                    }
+                                    focus_on_mount(e);
+                                },
+                                // Uncontrolled: the typed name lives in the field and the untracked draft, so typing re-renders nothing.
+                                oninput: move |e: Event<FormData>| {
+                                    let mut draft = state.naming_draft;
+                                    draft.set(e.value());
+                                },
+                                onkeydown: {
+                                    let section_id = section_id.clone();
+                                    move |e: Event<KeyboardData>| {
+                                        if e.key() == Key::Enter && !e.is_composing() {
+                                            e.prevent_default();
+                                            if state.finish_section_name(true) {
+                                                reveal_renamed_section(&section_id);
+                                            }
+                                            focus_later(&[&add_panel_id]);
+                                        } else if is_app_escape(&e) {
+                                            e.prevent_default();
+                                            state.finish_section_name(false);
+                                            focus_later(&[&add_panel_id]);
+                                        }
+                                    }
+                                },
+                                onblur: move |e: Event<FocusData>| {
+                                    let reached = blur_target(&e);
+                                    let stored = state.finish_section_name(true);
+                                    match reached {
+                                        // Another control took focus and keeps it: the page stays, unless that control moved with the section.
+                                        Some(reached) => refocus_if_dropped(&reached),
+                                        // A press in neutral space, or a blur with no target at all (switching app or tab): the page follows the section.
+                                        None if stored => reveal_renamed_section(&section_id),
+                                        None => {}
+                                    }
+                                },
+                            }
+                        }
+                    }
                     span { class: "section-count", "{display_rects.len()}" }
+                } else {
+                    // The toggle's keyboard face, with no handler of its own: a press bubbles to the bar's mousedown, and Enter or Space on it reaches the same handler through KB_ACTIVATE_JS (main.rs).
+                    button {
+                        r#type: "button",
+                        class: "section-toggle",
+                        aria_expanded: !collapsed,
+                        // A collapsed section renders no body, so there is nothing to point at then.
+                        aria_controls: (!collapsed).then(|| body_id.clone()),
+                        span { class: "section-name", "{section_label}" }
+                        span { class: "section-count", "{display_rects.len()}" }
+                    }
                 }
                 button {
+                    id: "{add_trigger_id}",
                     class: "section-action icon-button",
                     title: "Add metric",
-                    onmousedown: primary({
-                        let section_id_add = section_id.clone();
-                        move |e: Event<MouseData>| {
-                            e.stop_propagation();
-                            // An active filter would hide the new blank rect; clear it first. Guarded — set on an already-empty filter still notifies subscribers.
-                            if !panel_filter.peek().is_empty() {
-                                panel_filter.set(String::new());
-                            }
-                            // Expand before adding so the new rect is visible.
-                            if collapsed {
-                                state.edit_section_settings(&section_id_add, |s| {
-                                    s.set_collapsed(false, sections_visible)
-                                });
-                            }
-                            // Generated id, not a position: the layout base regenerates
-                            // as metrics appear/disappear, so a length-based id could
-                            // collide with an earlier user-added rect in the saved diff.
-                            let id = crate::util::unique_id(&format!("{}-new", section_id_add));
-                            state.add_rect(&section_id_add, RectConfig {
-                                id,
-                                label: String::new(),
-                                bindings: vec![MetricBinding {
-                                    project: ProjectRef::Current,
-                                    runs: RunRef::Selected,
-                                    metric_name: String::new(),
-                                }],
-                                display_type: DisplayType::Numeric,
-                                options: RectOptions::default(),
-                            });
-                            // The new rect appends to the end; overshoot the page
-                            // signal and let the render-time clamp resolve it to
-                            // whatever the last page becomes.
-                            current_page.set(usize::MAX);
-                        }
-                    }),
+                    onmousedown: primary(add_panel.clone()),
                     PlusIcon {}
                 }
                 button {
@@ -200,6 +290,11 @@ pub fn Section(
                         let section_id = section_id.clone();
                         move |e: Event<MouseData>| {
                             e.stop_propagation();
+                            // Seed the settings editor from the completed inline name; the panel takes focus, so the page follows this section if the name moved it.
+                            let naming_this = *naming.peek();
+                            if state.finish_section_name(true) && naming_this {
+                                reveal_renamed_section(&section_id);
+                            }
                             state.open_options_panel(
                                 PanelTarget::Section(section_id.clone()),
                                 trigger_id.clone(),
@@ -283,6 +378,17 @@ pub fn Section(
 
             if !collapsed {
                 div { id: "{body_id}", class: "section-grid", style: "{grid_style}",
+                    if config.rects.is_empty() {
+                        div { class: "section-empty",
+                            button {
+                                id: "{add_panel_id}",
+                                class: "btn btn-ghost",
+                                onmousedown: primary(add_panel.clone()),
+                                PlusIcon {}
+                                "Add panel"
+                            }
+                        }
+                    }
                     for i in visible_indices.iter().copied() {
                         {
                             let rect = display_rects[i].clone();

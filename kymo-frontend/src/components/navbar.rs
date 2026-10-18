@@ -130,7 +130,11 @@ pub fn Navbar() -> Element {
             button {
                 class: "navbar-action",
                 title: "Add a section",
-                onmousedown: primary(move |_| {
+                // Until the grid shows a layout (the metrics sweep can take tens of seconds), or with no grid at all (a run page that can't show its run), a new section and its name field would appear only later, the field then taking focus from wherever it had gone.
+                disabled: !*state.grid_mounted.read() || state.layout_config.read().is_none(),
+                onmousedown: primary(move |e| {
+                    // Keep the press from taking focus back from the inline input and committing its blur.
+                    e.prevent_default();
                     // An active filter would hide the new empty section; clear it first. Guarded like the Esc handler above — set on an already-empty filter still notifies subscribers.
                     if !panel_filter.peek().is_empty() {
                         panel_filter.set(String::new());
@@ -139,10 +143,20 @@ pub fn Navbar() -> Element {
                     // collide with an earlier added section in the saved
                     // diff once the base regenerates.
                     let name = unique_id("section");
-                    let mut section = SectionConfig::auto(name, Vec::new());
+                    let mut section = SectionConfig::auto(name.clone(), Vec::new());
                     section.display_name = "New Section".to_string();
                     section.set_collapsed(false, sections_visible);
                     state.add_section(section);
+                    // The grid must be interactive before its new name field takes focus.
+                    if state.maximized.peek().is_some() {
+                        state.close_options_panel();
+                        let mut maximized = state.maximized;
+                        if maximized.peek().is_some() {
+                            maximized.set(None);
+                            crate::route::focus_chart(None);
+                        }
+                    }
+                    state.begin_section_name(name);
                 }),
                 "+ Section"
             }

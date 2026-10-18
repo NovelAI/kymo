@@ -201,6 +201,7 @@ def alive(pid, *, process_group):
 def offline_browser():
     from playwright.sync_api import sync_playwright
 
+    import creation_fences
     import gesture_fences
     import legacy_storage_fences
     import user_settings_fences
@@ -315,6 +316,13 @@ def offline_browser():
             zoom_fences.run_fences,
             "chart zoom gesture fences passed",
             viewport=zoom_fences.VIEWPORT,
+        )
+        # Its own RPC fixture answers every socket, so it needs only the served frontend.
+        run_fence_page(
+            "/",
+            lambda page: creation_fences.checks(page, endpoints["dashboard_origin"]),
+            "section and panel creation fences passed",
+            viewport=creation_fences.VIEWPORT,
         )
 
         # The last fence page just closed. Wait out the ensure hold and one idle timeout from that close, plus a poll, its two-second timeout and a second: then only the primary page's socket can be holding the stack, and an idle stop that began would have logged its line. A merely attempted upgrade cannot satisfy the frame-proven socket assertion.

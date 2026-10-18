@@ -43,9 +43,9 @@ def pin_trigger(page: Page, trigger: Locator) -> Locator:
 
 
 def configure_maximizes(trigger: Locator) -> bool:
-    """Whether `trigger` is a grid chart's Configure, which maximizes the chart beside its panel."""
+    """Whether `trigger` maximizes a chart beside its panel: a grid chart's Configure, or a section's Add metric, which opens its new chart that way."""
     return trigger.evaluate(
-        "element => !!element.closest('.metric-rect') && !element.closest('.maximize-overlay')"
+        "element => (!!element.closest('.metric-rect') && !element.closest('.maximize-overlay')) || element.matches('.section-header [title=\"Add metric\"]')"
     )
 
 
@@ -1497,6 +1497,17 @@ def media_sections_open(page: Page) -> None:
     neighbours = info.locator(SECTION_OF).locator(".metric-rect")
     info.locator(SECTION_OF).get_by_title("Add metric", exact=True).click()
     expect(neighbours).to_have_count(2)
+    # Adding opens the new panel's metric picker immediately.
+    panel = options_panel(page, "Configure Metric")
+    expect(
+        panel.get_by_role("combobox", name="Source 1 metric", exact=True)
+    ).to_be_focused()
+    dismiss(
+        page,
+        panel,
+        info.locator(SECTION_OF).get_by_title("Add metric", exact=True),
+        "Close",
+    )
     for slot, title, content, away_and_back in (
         (
             "info/run_info",

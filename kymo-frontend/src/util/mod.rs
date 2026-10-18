@@ -145,6 +145,37 @@ pub fn editor_trigger_id(kind: &str, identity: &str) -> String {
     id
 }
 
+/// Follow a settled section rename (the default order sorts by name within a priority, under any saved drag placements) to the section's new place, after the reordered layout has rendered, without moving focus, by the least distance: the whole section when it fits the view, else its header. A section the panel filter hides has no header to reveal and stays hidden: clearing the user's filter to show it would be intrusive.
+pub fn reveal_renamed_section(name: &str) {
+    let id = serde_json::to_string(&editor_trigger_id("section", name))
+        .expect("serializing a string cannot fail");
+    let js = format!(
+        "requestAnimationFrame(()=>{{const h=document.getElementById({id})?.closest('.section-header');if(!h)return;const s=h.closest('.section');(s.offsetHeight>s.closest('main').clientHeight?h:s).scrollIntoView({{block:'nearest'}});}});"
+    );
+    let _ = js_sys::eval(&js);
+}
+
+/// The control a blur hands focus to, or None when it hands it to nothing, as a press in neutral space does.
+/// Limit: this tells where focus went, not what was pressed. A button press focuses nothing in WebKit (as in Safari) or in Firefox on macOS, so it counts as neutral there, for the inline name field and the settings Name alike, and so does the theme toggle everywhere, its icon replaced under the pointer before focus moves.
+pub fn blur_target(e: &Event<dioxus::prelude::FocusData>) -> Option<web_sys::Element> {
+    use dioxus::web::WebEventExt;
+    use wasm_bindgen::JsCast;
+    e.data()
+        .try_as_web_event()?
+        .related_target()?
+        .dyn_into()
+        .ok()
+}
+
+/// On the next animation frame, bring `target` into view, focusing it again if focus fell to the page meanwhile. A blur that saves a section's name hands focus on (Tab reaches the next control); the rename can then move that control away with its section, or take focus off it with the section's keyed move (Firefox).
+pub fn refocus_if_dropped(target: &web_sys::Element) {
+    let refocus = js_sys::Function::new_with_args(
+        "t",
+        "requestAnimationFrame(()=>{const a=document.activeElement;if(a===document.body)t.focus();else if(a===t)t.scrollIntoView({block:'nearest'})})",
+    );
+    let _ = refocus.call1(&wasm_bindgen::JsValue::NULL, target);
+}
+
 /// On the next animation frame, focus the first of these ids that can take it (one in an inert grid can't), without scrolling the page, if focus was lost by then: fell back to the page (a closing panel or a remount took it along) or left on a disabled control (WebKit keeps it on a button that disables itself). Focus moved to another element stays put, so a control picked before the frame keeps the next key. A later call supersedes one still waiting (WebKit can hold a frame while nothing changes).
 pub fn focus_later(ids: &[&str]) {
     let ids = serde_json::to_string(ids).expect("serializing strings cannot fail");

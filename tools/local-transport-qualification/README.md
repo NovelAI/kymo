@@ -50,6 +50,8 @@ python options_panel_fences.py <dashboard-project-url>
 
 Run them after editor, focus, or panel changes; they are excluded from CI to keep its runtime down. Run `user_settings_fences.py <dashboard-origin> --dashboard-path /<project>` as well when changing the shared panel or focus helpers; without `--dashboard-path` it skips its dashboard checks. They pass in Chromium, WebKit and Firefox (Firefox needs `CFFIXED_USER_HOME` set to a writable directory on macOS); in WebKit a label click doesn't focus a checkbox and Tab skips buttons, as in Safari, so those two checks adapt there.
 
+`creation_fences.py <dx-serve-origin>` checks creating and naming sections and panels against an RPC fixture it answers itself, so it needs only a served frontend. CI runs it in Chromium in the local-runtime qualification's browser phase; run it in WebKit and Firefox too after changes to those flows.
+
 ## Target status
 
 | Target | Status | Evidence |
@@ -84,6 +86,6 @@ python tools/local-transport-qualification/legacy_storage_fences.py http://127.0
 python tools/local-transport-qualification/zoom_fences.py http://127.0.0.1:PORT/zoom-e2e/zoom-fixture
 ```
 
-The gesture, user settings, legacy storage, zoom, options panel, first-mount, and text scroll fences accept `--browser chromium|firefox|webkit` (default: `chromium`).
+The gesture, user settings, legacy storage, zoom, options panel, creation, first-mount, and text scroll fences accept `--browser chromium|firefox|webkit` (default: `chromium`).
 
 WebKit exercises native checkbox activation on auxiliary clicks that Chromium does not produce. The gesture fence suppresses native context menus to keep test input flowing; Kevin must check the actual macOS Ctrl-click menu by hand.

@@ -423,6 +423,16 @@ impl SectionConfig {
     }
 }
 
+/// The `display_name` a typed name stores: trimmed, and empty when it matches the id.
+pub fn stored_display_name(typed: &str, name: &str) -> String {
+    let display = typed.trim();
+    if display == name {
+        String::new()
+    } else {
+        display.to_string()
+    }
+}
+
 /// Default priority for an auto-generated section, derived from its name.
 /// The unnamed catch-all (empty name) pins to the top — it holds the
 /// unprefixed metrics, which tend to be the user's primary scalars.
