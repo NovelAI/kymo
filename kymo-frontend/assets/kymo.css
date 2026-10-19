@@ -967,7 +967,6 @@ input[type="checkbox"]:checked::before {
     padding: 0 4px;
 }
 
-/* Inside the grid, whose padding makes up the rest. */
 .section-empty { grid-column: 1 / -1; padding: var(--spacing-sm) var(--spacing-sm) var(--spacing-md); }
 .section-empty .btn { display: inline-flex; align-items: center; gap: var(--spacing-xs); }
 

@@ -11,8 +11,8 @@ use crate::state::{
     DashboardState, DisplayType, PanelTarget, RectConfig, SectionConfig, UserConfigState,
 };
 use crate::util::{
-    blur_target, confirm, editor_trigger_id, focus_later, focus_on_mount, is_app_escape, primary,
-    refocus_if_dropped, reveal_renamed_section,
+    blur_target, confirm, editor_trigger_id, focus_later, focus_on_mount, is_app_escape,
+    page_has_focus, press_target, primary, refocus_if_dropped, reveal_renamed_section,
 };
 
 /// Greedy row-pack: each rect consumes its `column_span` units of the current
@@ -109,13 +109,13 @@ pub fn Section(
         config.chart_height
     );
 
-    // The header's Add metric and an empty section's Add panel.
+    // Add panel: the header's + and an empty section's + Add panel.
     let add_panel = {
         let section_id = section_id.clone();
         let add_trigger_id = add_trigger_id.clone();
         move |e: Event<MouseData>| {
             e.stop_propagation();
-            // As Configure does: the new chart's Close returns focus here, so the page follows this section if its completed name moved it.
+            // As Configure does: if the completed name moved this section, the page follows it at the press, so the button the new chart's Close returns focus to is in view.
             let naming_this = *naming.peek();
             if state.finish_section_name(true) && naming_this {
                 reveal_renamed_section(&section_id);
@@ -173,7 +173,7 @@ pub fn Section(
                 onmousedown: primary({
                     let section_id = section_id.clone();
                     move |_| {
-                        // While naming, a press on the bar only leaves the field, whose blur saves the name, and one in the field bubbles here: collapsing would hide the new section's Add panel.
+                        // While naming, a press on the bar only leaves the field, whose blur saves the name, and one in the field bubbles here: collapsing would hide the new section's + Add panel.
                         if *naming.peek() {
                             return;
                         }
@@ -207,7 +207,7 @@ pub fn Section(
                 // The name field takes the toggle's place while naming: a button can't hold an input.
                 if naming() {
                     {
-                        // Enter and Escape hand focus to the section's Add panel.
+                        // Enter and Escape hand focus to the section's + Add panel.
                         let add_panel_id = add_panel_id.clone();
                         let section_id = section_id.clone();
                         rsx! {
@@ -215,9 +215,11 @@ pub fn Section(
                                 class: "section-name-input",
                                 aria_label: "Section name",
                                 placeholder: "{section_label}",
+                                // A field the grid remounts (Back from a run page to its project, say) shows the draft it held; a new one's is empty.
+                                initial_value: state.naming_draft.peek().to_string(),
                                 onmounted: move |e: MountedEvent| {
-                                    // Reveal the whole section by the least distance, so its Add panel shows too, not just the input at the viewport edge.
                                     if let Some(element) = e.data().try_as_web_event() {
+                                        // Reveal the whole section by the least distance, so its + Add panel shows too, not just the input at the viewport edge.
                                         if let Ok(Some(section)) = element.closest(".section") {
                                             let options = web_sys::ScrollIntoViewOptions::new();
                                             options.set_block(web_sys::ScrollLogicalPosition::Nearest);
@@ -247,14 +249,19 @@ pub fn Section(
                                         }
                                     }
                                 },
+                                // Limits: this section's grip can't drag while naming: its press completes the name first and the page follows, as for its bar. Completing a name that moves this section from above a pressed section shifts that one up under the pointer, so Chromium and WebKit start no drag from it, a chart's x-axis pull doesn't start, and a text selection there goes astray.
                                 onblur: move |e: Event<FocusData>| {
+                                    // Switching app or tab leaves the field open, with its text: focus comes back to it with the window.
+                                    if !page_has_focus() {
+                                        return;
+                                    }
                                     let reached = blur_target(&e);
                                     let stored = state.finish_section_name(true);
                                     match reached {
                                         // Another control took focus and keeps it: the page stays, unless that control moved with the section.
                                         Some(reached) => refocus_if_dropped(&reached),
-                                        // A press in neutral space, or a blur with no target at all (switching app or tab): the page follows the section.
-                                        None if stored => reveal_renamed_section(&section_id),
+                                        // A press that focused nothing, on a control or in another section, leaves the page still too. One in neutral space or in this section: the page follows the section.
+                                        None if stored && press_target().is_none() => reveal_renamed_section(&section_id),
                                         None => {}
                                     }
                                 },
@@ -277,7 +284,7 @@ pub fn Section(
                 button {
                     id: "{add_trigger_id}",
                     class: "section-action icon-button",
-                    title: "Add metric",
+                    title: "Add panel",
                     onmousedown: primary(add_panel.clone()),
                     PlusIcon {}
                 }

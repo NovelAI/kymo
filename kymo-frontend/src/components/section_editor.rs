@@ -2,9 +2,12 @@ use dioxus::prelude::*;
 
 use crate::components::options_editor::{ChartOptionsForm, EditorSection, OPTIONS_ID_PREFIX};
 use crate::components::options_panel::OptionsPanel;
-use crate::state::layout_config::{stored_display_name, RectOptions, MAX_SECTION_COLUMNS};
+use crate::state::layout_config::{RectOptions, MAX_SECTION_COLUMNS};
 use crate::state::{DashboardState, SectionConfig};
-use crate::util::{blur_target, reveal_renamed_section, use_live_apply, OPTIONS_PANEL_ID};
+use crate::util::{
+    blur_target, page_has_focus, press_target, reveal_renamed_section, use_live_apply,
+    OPTIONS_PANEL_ID,
+};
 
 /// The section settings this editor owns, as one draft.
 #[derive(Clone, PartialEq)]
@@ -13,6 +16,16 @@ struct SectionDraft {
     max_columns: u32,
     rows_per_page: u32,
     chart_opts: RectOptions,
+}
+
+/// The `display_name` a typed name stores: trimmed, and empty when it matches the id (a rename to the id is no rename at all).
+fn stored_display_name(typed: &str, name: &str) -> String {
+    let display = typed.trim();
+    if display == name {
+        String::new()
+    } else {
+        display.to_string()
+    }
 }
 
 /// Edits section settings and chart defaults live. Renames update `display_name`; `name` stays the identity.
@@ -47,7 +60,7 @@ pub fn SectionEditor(return_focus_id: String, config: SectionConfig) -> Element 
     };
     let mut cleared = use_signal(Vec::new);
     let unchanged = current() == initial && cleared.read().is_empty();
-    // The page follows a rename once it settles, not per keystroke (each one can move the section, remounting the panels it passes): when the Name field hands focus to the panel or to nothing, on Close or Esc, and at once on Revert. A rename left for another control outside the panel waits for Close; one left by switching the panel to another target isn't followed.
+    // Follow a settled rename on blur into the panel or neutral space, on Close/Esc, and immediately on Revert. A blur to an outside control or grid section waits for Close; switching panel targets abandons the follow.
     // `followed` is the name the page last followed the section to; the reveal waits a frame, by when the live apply has moved the section.
     let mut followed = use_hook(|| CopyValue::new(initial.display_name.clone()));
     let follow = {
@@ -125,7 +138,11 @@ pub fn SectionEditor(return_focus_id: String, config: SectionConfig) -> Element 
                         onblur: {
                             let mut follow = follow.clone();
                             move |e: Event<FocusData>| {
-                                let outside_panel = blur_target(&e).is_some_and(|target| {
+                                // Switching app or tab settles nothing: focus comes back to Name with the window.
+                                if !page_has_focus() {
+                                    return;
+                                }
+                                let outside_panel = blur_target(&e).or_else(press_target).is_some_and(|target| {
                                     target.closest(&format!("#{OPTIONS_PANEL_ID}")).ok().flatten().is_none()
                                 });
                                 if !outside_panel {

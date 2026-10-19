@@ -145,7 +145,7 @@ pub fn editor_trigger_id(kind: &str, identity: &str) -> String {
     id
 }
 
-/// Follow a settled section rename (the default order sorts by name within a priority, under any saved drag placements) to the section's new place, after the reordered layout has rendered, without moving focus, by the least distance: the whole section when it fits the view, else its header. A section the panel filter hides has no header to reveal and stays hidden: clearing the user's filter to show it would be intrusive.
+/// After the reordered layout renders, reveal the renamed section by the least distance without moving focus: the whole section when it fits the view, otherwise its header. A section hidden by the panel filter stays hidden.
 pub fn reveal_renamed_section(name: &str) {
     let id = serde_json::to_string(&editor_trigger_id("section", name))
         .expect("serializing a string cannot fail");
@@ -155,14 +155,30 @@ pub fn reveal_renamed_section(name: &str) {
     let _ = js_sys::eval(&js);
 }
 
-/// The control a blur hands focus to, or None when it hands it to nothing, as a press in neutral space does.
-/// Limit: this tells where focus went, not what was pressed. A button press focuses nothing in WebKit (as in Safari) or in Firefox on macOS, so it counts as neutral there, for the inline name field and the settings Name alike, and so does the theme toggle everywhere, its icon replaced under the pointer before focus moves.
+/// The control a blur hands focus to, or None when it hands it to nothing (`press_target` then tells what the press landed on).
 pub fn blur_target(e: &Event<dioxus::prelude::FocusData>) -> Option<web_sys::Element> {
     use dioxus::web::WebEventExt;
     use wasm_bindgen::JsCast;
     e.data()
         .try_as_web_event()?
         .related_target()?
+        .dyn_into()
+        .ok()
+}
+
+/// False during the blur that switching to another app or tab causes, after which focus comes back to the same element.
+pub fn page_has_focus() -> bool {
+    web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.has_focus().ok())
+        .unwrap_or(true)
+}
+
+/// During a blur that hands focus to nothing, what the press causing it landed on: the control under the pointer, else the section (`press_target.js`). None for a press in neutral space (outside every section, on no control) or in the section being named, and for a blur with no press.
+pub fn press_target() -> Option<web_sys::Element> {
+    use wasm_bindgen::JsCast;
+    js_sys::Reflect::get(&web_sys::window()?.into(), &"__kymo_press".into())
+        .ok()?
         .dyn_into()
         .ok()
 }

@@ -133,7 +133,7 @@ pub fn Navbar() -> Element {
                 // Until the grid shows a layout (the metrics sweep can take tens of seconds), or with no grid at all (a run page that can't show its run), a new section and its name field would appear only later, the field then taking focus from wherever it had gone.
                 disabled: !*state.grid_mounted.read() || state.layout_config.read().is_none(),
                 onmousedown: primary(move |e| {
-                    // Keep the press from taking focus back from the inline input and committing its blur.
+                    // Without this, the press would move focus after this handler, and the open name field's blur would finish the section this press just began naming.
                     e.prevent_default();
                     // An active filter would hide the new empty section; clear it first. Guarded like the Esc handler above — set on an already-empty filter still notifies subscribers.
                     if !panel_filter.peek().is_empty() {
@@ -149,6 +149,8 @@ pub fn Navbar() -> Element {
                     state.add_section(section);
                     // The grid must be interactive before its new name field takes focus.
                     if state.maximized.peek().is_some() {
+                        // This press keeps focus where it was, so a chart title being renamed in the overlay still holds it, and the un-maximize would remove it without the blur that saves it.
+                        let _ = js_sys::eval("document.activeElement?.blur()");
                         state.close_options_panel();
                         let mut maximized = state.maximized;
                         if maximized.peek().is_some() {

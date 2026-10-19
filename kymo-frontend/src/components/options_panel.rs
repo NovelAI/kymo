@@ -18,9 +18,9 @@ pub fn OptionsPanel(
     title: String,
     /// The line under the title: what the panel edits, or where it saves.
     target: Option<String>,
-    /// However the panel goes (closed, deleted, un-maximized, replaced), focus it takes along returns to the first of these that can take it: the control that opened the panel, then any stand-ins for it (a chart panel's opener can be a maximized chart's Configure that a ←/→ follow or the un-maximize took away).
+    /// Focus the panel takes along as it goes returns to the first of these that can take it: the control that opened the panel, then any stand-ins for it (a chart panel's opener can be a maximized chart's Configure that a ←/→ follow or the un-maximize took away), unless a panel that takes focus replaces this one.
     return_focus_ids: Vec<String>,
-    /// Whether the panel takes focus as it mounts (see `OpenPanel::take_focus`).
+    /// Whether the panel body takes focus as it mounts (see `OpenPanel::take_focus`); an unconfigured chart panel focuses its metric picker instead.
     #[props(default = true)]
     take_focus: bool,
     revert_disabled: bool,
@@ -28,7 +28,18 @@ pub fn OptionsPanel(
     on_close: EventHandler<()>,
     children: Element,
 ) -> Element {
+    // None in the user settings panel, which has no dashboard.
+    let dashboard = try_use_context::<DashboardState>();
     use_drop(move || {
+        // A replacing panel that takes focus needs no return. WebKit's press drops focus after that panel takes it, so the return would focus the old opener for a frame, scrolling to it despite preventScroll. A section panel whose target vanished drops before the effect that closes it, so it skips the return too.
+        if dashboard.is_some_and(|s| {
+            s.options_panel
+                .peek()
+                .as_ref()
+                .is_some_and(|p| p.take_focus)
+        }) {
+            return;
+        }
         // A maximized chart makes the grid inert, so an opener there can't take focus; the overlay can.
         let ids: Vec<&str> = return_focus_ids
             .iter()

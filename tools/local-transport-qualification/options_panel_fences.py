@@ -43,9 +43,9 @@ def pin_trigger(page: Page, trigger: Locator) -> Locator:
 
 
 def configure_maximizes(trigger: Locator) -> bool:
-    """Whether `trigger` maximizes a chart beside its panel: a grid chart's Configure, or a section's Add metric, which opens its new chart that way."""
+    """Whether `trigger` maximizes a chart beside its panel: a grid chart's Configure, or a section header's Add panel (+), which opens its new chart that way."""
     return trigger.evaluate(
-        "element => (!!element.closest('.metric-rect') && !element.closest('.maximize-overlay')) || element.matches('.section-header [title=\"Add metric\"]')"
+        "element => (!!element.closest('.metric-rect') && !element.closest('.maximize-overlay')) || element.matches('.section-header [title=\"Add panel\"]')"
     )
 
 
@@ -1495,7 +1495,7 @@ def media_sections_open(page: Page) -> None:
     """Configure on a grid gallery or metadata chart opens on its own section, expanded, while the maximized copy's manifest is still on its way; the metadata chart's still does after the panel follows ←/→ to a chart added beside it and back, since the grid copy's hand-over outlives the maximize it was made for."""
     info = page.locator('.metric-rect[data-slot-id="info/run_info"]')
     neighbours = info.locator(SECTION_OF).locator(".metric-rect")
-    info.locator(SECTION_OF).get_by_title("Add metric", exact=True).click()
+    info.locator(SECTION_OF).get_by_title("Add panel", exact=True).click()
     expect(neighbours).to_have_count(2)
     # Adding opens the new panel's metric picker immediately.
     panel = options_panel(page, "Configure Metric")
@@ -1505,7 +1505,7 @@ def media_sections_open(page: Page) -> None:
     dismiss(
         page,
         panel,
-        info.locator(SECTION_OF).get_by_title("Add metric", exact=True),
+        info.locator(SECTION_OF).get_by_title("Add panel", exact=True),
         "Close",
     )
     for slot, title, content, away_and_back in (

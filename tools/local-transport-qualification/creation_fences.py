@@ -12,12 +12,13 @@ from urllib.parse import urlsplit
 from playwright.sync_api import expect, sync_playwright
 
 from fences_common import encode_response, render_turn, request_frame
-from text_scroll_fences import Fixture, PRIMARY, PROJECT, RUNS, pb
+from text_scroll_fences import METRICS, Fixture, PRIMARY, PROJECT, RUNS, pb
 from user_settings_fences import options_panel, panel_body
 
 
 STORAGE_KEY = f"kymo_layout_diff_{PROJECT}"
 VIEWPORT = {"width": 1440, "height": 900}
+NUMERIC = "train/loss"
 
 
 class CreationFixture(Fixture):
@@ -26,17 +27,58 @@ class CreationFixture(Fixture):
         # While set, the metrics sweep's replies wait for `release_metrics`.
         self.hold_metrics = False
         self.held = []
+        # While set, the sweep also finds NUMERIC, whose charts get data; their requests are kept.
+        self.numeric = False
+        self.chart_requests = []
 
     def request(self, socket, message):
-        identifier, path, _ = request_frame(message, urlsplit(socket.url).path)
+        identifier, path, payload = request_frame(message, urlsplit(socket.url).path)
         method = path.rsplit("/", 1)[-1]
         if self.hold_metrics and method in ("ListMetrics", "ListRunSetMetrics"):
             self.held.append((socket, message))
+        elif self.numeric and method in ("ListMetrics", "ListRunSetMetrics"):
+            metrics = [
+                pb.MetricInfo(metric_name=n, metric_type=pb.MetricInfo.TEXT_STREAM)
+                for n in METRICS
+            ]
+            metrics.append(
+                pb.MetricInfo(metric_name=NUMERIC, metric_type=pb.MetricInfo.NUMERIC)
+            )
+            response = pb.ListMetricsResponse(metrics=metrics)
+            socket.send(encode_response(identifier, response.SerializeToString()))
+        elif self.numeric and path == "/kymo.Kymo/QueryChart":
+            request = pb.ChartRequest.FromString(payload)
+            self.chart_requests.append(request)
+            refs = [ref for ref in request.y_series if ref.metric_name == NUMERIC]
+            response = pb.ChartResponse(
+                x_values=[float(i) for i in range(100)] if refs else [],
+                series=[
+                    pb.ChartSeries(
+                        label=ref.run_id,
+                        run_id=ref.run_id,
+                        seg_starts=[0],
+                        seg_lens=[100],
+                        values=[float(i * 7 % 13) for i in range(100)],
+                    )
+                    for ref in refs
+                ],
+                run_versions={ref.run_id: 1 for ref in request.y_series},
+            )
+            socket.send(encode_response(identifier, response.SerializeToString()))
         # A new panel starts numeric while its chosen metric's type is discovered.
         elif path == "/kymo.Kymo/QueryChart":
             socket.send(
                 encode_response(identifier, pb.ChartResponse().SerializeToString())
             )
+        # A run page asks for its run.
+        elif path == "/kymo.Kymo/GetRun":
+            run = pb.GetRunRequest.FromString(payload).run_id
+            record = pb.RunRecord(
+                run=pb.RunInfo(project_id=PROJECT, run_id=run, run_name=run),
+                state=pb.RUN_LIFECYCLE_STATE_ACTIVE,
+            )
+            response = pb.GetRunResponse(run=record, global_version=1)
+            socket.send(encode_response(identifier, response.SerializeToString()))
         else:
             super().request(socket, message)
 
@@ -67,6 +109,13 @@ def named_section(page, name):
     """The section whose name field `name` is open, by a locator that outlives the field."""
     sid = section_of(name).get_attribute("data-section-id")
     return page.locator(f".section[data-section-id={json.dumps(sid)}]")
+
+
+def empty_add_panel(section):
+    """An empty section's + Add panel; the header's + is titled Add panel too."""
+    return section.locator(".section-empty").get_by_role(
+        "button", name="Add panel", exact=True
+    )
 
 
 def pointer_open(page, trigger, focused):
@@ -149,8 +198,8 @@ def rename_reveal(page):
         expect(section.locator(".section-header")).to_be_in_viewport(ratio=0.99)
         assert main.evaluate(scroll_top) > before + 2000
         if finish == "Enter":
-            # The whole short section comes into view, so the Add panel Enter focused is on screen, by the least distance: its bottom at the view's.
-            empty_add = section.get_by_role("button", name="Add panel", exact=True)
+            # The whole short section comes into view, so the + Add panel Enter focused is on screen, by the least distance: its bottom at the view's.
+            empty_add = empty_add_panel(section)
             expect(empty_add).to_be_focused()
             expect(empty_add).to_be_in_viewport(ratio=1)
             gap = section.evaluate(
@@ -289,12 +338,12 @@ def rename_reveal(page):
     add.click()
     added = named_section(page, name)
     name.fill("Z panel added while named")
-    added.get_by_role("button", name="Add panel", exact=True).click()
+    empty_add_panel(added).click()
     chart_settings = options_panel(page, "Configure Metric")
     picker = chart_settings.get_by_role("combobox", name="Source 1 metric", exact=True)
     expect(picker).to_be_focused()
     picker.select_option(PRIMARY)
-    close_metric(page, chart_settings, added.get_by_title("Add metric", exact=True))
+    close_metric(page, chart_settings, added.get_by_title("Add panel", exact=True))
     expect(added.locator(".section-header")).to_be_in_viewport(ratio=0.99)
 
     print("rename: renaming a tall section in place leaves the page still", flush=True)
@@ -313,6 +362,142 @@ def rename_reveal(page):
     assert main.evaluate(scroll_top) <= 2, main.evaluate(scroll_top)
     settings.get_by_role("button", name="Close", exact=True).click()
 
+    print(
+        "rename: a press inside another section saves the name and leaves the page still: its bar, a drag by its grip, a log text selection",
+        flush=True,
+    )
+    # Two sections above where a new one lands, so completing its name (which moves it past logs) shifts neither.
+    above = []
+    for label in ("A one", "A two"):
+        add.click()
+        above.append(named_section(page, name))
+        name.fill(label)
+        name.press("Enter")
+    one, two = above
+    toggle = two.locator(".section-toggle")
+
+    def press_while_naming(label, press):
+        main.evaluate("e => e.scrollTop = 0")
+        render_turn(page)
+        add.click()
+        named = named_section(page, name)
+        name.fill(label)
+        render_turn(page)
+        press()
+        expect(named.locator(".section-name")).to_have_text(label)
+        render_turn(page)
+        assert main.evaluate(scroll_top) == 0, (label, main.evaluate(scroll_top))
+
+    def drag(source, target_y):
+        box = source.bounding_box()
+        x, y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+        page.mouse.move(x, y)
+        page.mouse.down()
+        page.mouse.move(x + 8, y - 10, steps=3)
+        page.mouse.move(x + 40, target_y, steps=8)
+        page.mouse.up()
+
+    def press_bar():
+        # The bar beside the title, clear of its buttons.
+        bar = two.locator(".section-header").bounding_box()
+        page.mouse.click(bar["x"] + bar["width"] - 160, bar["y"] + bar["height"] / 2)
+
+    press_while_naming("Zz pressed on a bar", press_bar)
+    expect(toggle).to_have_attribute("aria-expanded", "false")
+    two.locator(".section-name").click()
+    expect(toggle).to_have_attribute("aria-expanded", "true")
+    press_while_naming(
+        "Zz pressed on a grip",
+        lambda: drag(two.locator(".section-drag-handle"), one.bounding_box()["y"] + 3),
+    )
+    assert two.bounding_box()["y"] < one.bounding_box()["y"], "the drop landed"
+
+    def select_text():
+        line = logs.locator(".text-stream-line").nth(1).bounding_box()
+        x, y = line["x"] + 5, line["y"] + line["height"] / 2
+        page.mouse.move(x, y)
+        page.mouse.down()
+        page.mouse.move(x + 60, y + 60, steps=6)
+        page.mouse.up()
+
+    press_while_naming("Zz pressed on log text", select_text)
+    page.evaluate("() => getSelection().removeAllRanges()")
+
+    print(
+        "rename: a settings Name left by a press inside a section waits for Close",
+        flush=True,
+    )
+    # Not A one: the drag above anchored A two to it, so A two would move with its rename.
+    main.evaluate("e => e.scrollTop = 0")
+    other.locator('.section-header button[title="Configure"]').click()
+    settings = options_panel(page, "Configure section")
+    editor_name = settings.get_by_role("textbox", name="Name", exact=True)
+    render_turn(page)
+    editor_name.fill("Zz settings pressed on a bar")
+    press_bar()
+    expect(toggle).to_have_attribute("aria-expanded", "false")
+    render_turn(page)
+    assert main.evaluate(scroll_top) == 0, main.evaluate(scroll_top)
+    settings.get_by_role("button", name="Close", exact=True).click()
+    expect(other.locator(".section-header")).to_be_in_viewport(ratio=0.99)
+    assert main.evaluate(scroll_top) > 2000
+
+
+def chart_press_while_naming(page, fixture):
+    print(
+        "rename: a zoom drag on another section's chart saves the name, leaves the page still, and zooms",
+        flush=True,
+    )
+    fixture.numeric = True
+    # A numeric section above where a new section lands, so completing its name, which moves it past logs, leaves the chart in place.
+    page.evaluate(
+        "([key, value]) => localStorage.setItem(key, JSON.stringify(value))",
+        [
+            STORAGE_KEY,
+            {
+                "format_version": 1,
+                "section_overrides": [
+                    {
+                        "key": "logs",
+                        "patch": {"display_name": "O logs", "priority": 0},
+                    },
+                    {
+                        "key": "train",
+                        "patch": {"display_name": "B train", "priority": 0},
+                    },
+                ],
+            },
+        ],
+    )
+    page.reload(wait_until="domcontentloaded")
+    page.wait_for_function(
+        "() => Object.values(window.__kymo_charts || {}).some(c => c.over)"
+    )
+    main = page.locator("main.main-content")
+    name = page.get_by_role("textbox", name="Section name", exact=True)
+    page.get_by_title("Add a section", exact=True).click()
+    named = named_section(page, name)
+    name.fill("Zz zoomed elsewhere")
+    render_turn(page)
+    plot = page.evaluate(
+        "() => { const r = Object.values(window.__kymo_charts)[0].over.getBoundingClientRect(); return [r.x, r.y, r.width, r.height]; }"
+    )
+    x, y = plot[0] + plot[2] * 0.3, plot[1] + plot[3] / 2
+    page.mouse.move(x, y)
+    page.mouse.down()
+    page.mouse.move(x + 80, y, steps=6)
+    page.mouse.up()
+    expect(named.locator(".section-name")).to_have_text("Zz zoomed elsewhere")
+    render_turn(page)
+    assert main.evaluate("e => e.scrollTop") == 0, main.evaluate("e => e.scrollTop")
+    # The zoom refetches the chart over the dragged step range.
+    for _ in range(50):
+        if any(r.HasField("step_min") for r in fixture.chart_requests):
+            break
+        page.wait_for_timeout(100)
+    else:
+        raise AssertionError("the drag zoomed nothing")
+
 
 def checks(page, url):
     fixture = CreationFixture()
@@ -323,6 +508,7 @@ def checks(page, url):
         "**/alerts",
         lambda route: route.fulfill(content_type="application/json", body="[]"),
     )
+    # dx's development shell may inject an external Inter stylesheet. The dashboard itself uses bundled fonts; keep startup independent of Google.
     page.route(
         "https://fonts.googleapis.com/**",
         lambda route: route.fulfill(content_type="text/css", body=""),
@@ -391,7 +577,7 @@ def checks(page, url):
     # The field takes the title's place without growing the header.
     height = header.evaluate("e => e.getBoundingClientRect().height")
     assert abs(height - naming_height) < 0.01, (naming_height, height)
-    empty_add = section.get_by_role("button", name="Add panel", exact=True)
+    empty_add = empty_add_panel(section)
     expect(empty_add).to_be_in_viewport()
     page.mouse.move(0, 0)
     expect(empty_add).to_be_visible()
@@ -405,7 +591,7 @@ def checks(page, url):
     expect(picker.locator(f"option[value={json.dumps(PRIMARY)}]")).to_have_count(1)
     picker.select_option(PRIMARY)
     expect(panel.get_by_role("button", name="Revert", exact=True)).to_be_enabled()
-    close_metric(page, panel, section.get_by_title("Add metric", exact=True))
+    close_metric(page, panel, section.get_by_title("Add panel", exact=True))
     expect(empty_add).to_have_count(0)
     expect(section.locator(".metric-rect")).to_have_count(1)
     page.reload(wait_until="domcontentloaded")
@@ -473,10 +659,10 @@ def checks(page, url):
     add_section.click()
     name.fill("Name before panel")
     new = named_section(page, name)
-    new.get_by_role("button", name="Add panel", exact=True).click()
+    empty_add_panel(new).click()
     expect(picker).to_be_focused()
     picker.select_option(PRIMARY)
-    close_metric(page, panel, new.get_by_title("Add metric", exact=True))
+    close_metric(page, panel, new.get_by_title("Add panel", exact=True))
     expect(new.locator(".section-name")).to_have_text("Name before panel")
 
     print("new section: keyboard, Escape, whitespace, blur, and IME", flush=True)
@@ -499,7 +685,7 @@ def checks(page, url):
             name.press(how)
         expect(name).to_have_count(0)
         expect(new.locator(".section-name")).to_have_text(label)
-        empty_add = new.get_by_role("button", name="Add panel", exact=True)
+        empty_add = empty_add_panel(new)
         expect(empty_add).to_be_visible()
         # Enter and Escape hand focus to the section's next step; a blur leaves it where it went.
         if how != "blur":
@@ -512,19 +698,21 @@ def checks(page, url):
     expect(filter_input).to_have_value("")
     expect(name).to_be_focused()
     expect(name).to_be_in_viewport()
+    filtered = named_section(page, name)
     name.fill("Filtered creation")
     name.press("Enter")
 
     print("header add: collapsed section and active filter", flush=True)
     filter_input.fill(PRIMARY)
-    expect(section.get_by_role("button", name="Add panel", exact=True)).to_have_count(0)
+    # The filter hides a section with no panels, such as the one just created.
+    expect(filtered).to_have_count(0)
     section.locator(".section-name").click()
     expect(section.locator(".section-grid")).to_have_count(0)
-    section.get_by_title("Add metric", exact=True).press("Enter")
+    section.get_by_title("Add panel", exact=True).press("Enter")
     expect(picker).to_be_focused()
     expect(filter_input).to_have_value("")
     picker.select_option(PRIMARY)
-    close_metric(page, panel, section.get_by_title("Add metric", exact=True))
+    close_metric(page, panel, section.get_by_title("Add panel", exact=True))
     expect(section.locator(".metric-rect")).to_have_count(2)
 
     print("header add: returns to the last page of a paginated section", flush=True)
@@ -533,10 +721,10 @@ def checks(page, url):
     settings.get_by_role("spinbutton", name="Columns", exact=True).fill("1")
     settings.get_by_role("spinbutton", name="Rows / page", exact=True).fill("1")
     settings.get_by_role("button", name="Close", exact=True).click()
-    section.get_by_title("Add metric", exact=True).click()
+    section.get_by_title("Add panel", exact=True).click()
     expect(picker).to_be_focused()
     picker.select_option(PRIMARY)
-    close_metric(page, panel, section.get_by_title("Add metric", exact=True))
+    close_metric(page, panel, section.get_by_title("Add panel", exact=True))
     expect(section.get_by_title("Jump to page", exact=True)).to_have_value("3")
     expect(section.locator(".metric-rect")).to_have_count(1)
 
@@ -554,13 +742,23 @@ def checks(page, url):
     name.fill("From maximized chart")
     name.press("Enter")
 
-    print("new section: leaves a chart its Maximize button maximized", flush=True)
+    print(
+        "new section: leaves a chart its Maximize button maximized, saving a title being typed there",
+        flush=True,
+    )
     chart.scroll_into_view_if_needed()
     chart.get_by_title("Maximize", exact=True).click()
-    expect(page.locator(".maximize-overlay")).to_have_count(1)
+    overlay = page.locator(".maximize-overlay")
+    expect(overlay).to_have_count(1)
+    overlay.locator(".rect-title").dblclick()
+    title = overlay.locator(".rect-title-input")
+    expect(title).to_be_focused()
+    title.fill("Renamed while maximized")
     pointer_open(page, add_section, name)
-    expect(page.locator(".maximize-overlay")).to_have_count(0)
+    expect(overlay).to_have_count(0)
     name.press("Escape")
+    chart.scroll_into_view_if_needed()
+    expect(chart.locator(".rect-title")).to_have_text("Renamed while maximized")
 
     print("new section: a visible one doesn't move the page", flush=True)
     # Enough sections after the first for its header to sit 300 px down with room to spare.
@@ -603,9 +801,9 @@ def checks(page, url):
     page.keyboard.press("Tab")
     expect(name).to_have_count(0)
     if tab_reaches_buttons:
-        add_metric = tabbed.get_by_title("Add metric", exact=True)
-        expect(add_metric).to_be_focused()
-        expect(add_metric).to_be_in_viewport()
+        header_add = tabbed.get_by_title("Add panel", exact=True)
+        expect(header_add).to_be_focused()
+        expect(header_add).to_be_in_viewport()
 
     print("new section: one at the viewport's edge comes fully into view", flush=True)
     main.evaluate(
@@ -617,9 +815,7 @@ def checks(page, url):
     add_section.click()
     expect(name).to_be_focused()
     render_turn(page)
-    expect(
-        section_of(name).get_by_role("button", name="Add panel", exact=True)
-    ).to_be_in_viewport(ratio=1)
+    expect(empty_add_panel(section_of(name))).to_be_in_viewport(ratio=1)
     # By the least distance: just the rest of the section.
     moved = main.evaluate("e => e.scrollTop") - before
     assert 0 < moved < 200, moved
@@ -638,11 +834,32 @@ def checks(page, url):
     page.keyboard.press("Tab")
     expect(name).to_have_count(0)
     if tab_reaches_buttons:
-        add_metric = tabbed.get_by_title("Add metric", exact=True)
-        expect(add_metric).to_be_focused()
-        expect(add_metric).to_be_in_viewport()
+        header_add = tabbed.get_by_title("Add panel", exact=True)
+        expect(header_add).to_be_focused()
+        expect(header_add).to_be_in_viewport()
         assert main.evaluate("e => e.scrollTop") > 2000
+
+    print(
+        "naming: a field the grid remounts (a run page and back) keeps its text",
+        flush=True,
+    )
+    page.goto(f"{url.rstrip('/')}/{PROJECT}/{RUNS[0]}", wait_until="domcontentloaded")
+    expect(page.locator(".text-stream-line").first).to_be_visible(timeout=20_000)
+    # The breadcrumb to the project page, and Back: the dashboard stays, its grid remounts.
+    page.locator("a.navbar-current").first.click()
+    expect(add_section).to_be_enabled()
+    add_section.click()
+    remounted = named_section(page, name)
+    name.press_sequentially("Kept across a remount")
+    page.go_back()
+    expect(name).to_have_value("Kept across a remount")
+    expect(name).to_be_focused()
+    name.press("Enter")
+    expect(remounted.locator(".section-name")).to_have_text("Kept across a remount")
+    page.goto(f"{url.rstrip('/')}/{PROJECT}/", wait_until="domcontentloaded")
+    expect(page.locator(".text-stream-line").first).to_be_visible(timeout=20_000)
     rename_reveal(page)
+    chart_press_while_naming(page, fixture)
     assert not fixture.errors, f"unexpected fixture RPCs: {fixture.errors}"
 
 
