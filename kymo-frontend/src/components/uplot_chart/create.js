@@ -79,6 +79,7 @@ let xrBase=nanBase+nanCols;
 let zoomRefetch=__KYMO_ZOOM_REFETCH__;
 let isTimeAxis=__KYMO_IS_TIME__;
 let isWallTime=__KYMO_IS_WALL__;
+let isLogX=__KYMO_X_DISTR__===3;
 // Tooltip
 // Readouts live under <body>, outside the charts' stacking contexts, so they paint over the docked options panel (z-index 70 against its 60) and a section's move never takes them along. The chart's teardown removes its readout.
 let tip=document.getElementById('__KYMO_ID__-tip');
@@ -88,48 +89,55 @@ tip.style.display='none';
 // What the plotted x adds to the real one: a zero-present log x plots x+1 in the wire's units, 1 on a step axis and 1 ms on a time one. Labels and readouts take it off, and so does every window handed between charts, which each receiving chart puts its own back on. xShift is that same 1 on a step axis, whose zoom geometry (AXIS_LOG1P, bucket evidence) works in it; a time axis keeps its geometry unshifted.
 let readoutXShift=__KYMO_READOUT_X_SHIFT__;
 let xShift=zoomRefetch?readoutXShift:0;
-// Value formatter for Y and step X. Zero is just "0": fixed-precision formatting rendered step 0 as "0.00" (AI-1385).
-// Precision comes from the grain, not fixed digit counts. On linear axes the grain is the tick spacing: uPlot hands the whole split list, decFor(step) is however many digits the spacing needs, and adjacent ticks can never render identically (toExponential(1) used to collapse 1.50e6/1.52e6/1.54e6 into three "1.5e6" labels).
-// Log axes (asked directly: scale.distr 3, pv) and degenerate single-tick lists have no meaningful axis-wide spacing, so the grain is the value itself. uPlot labels integral mantissas exactly and filtered-out splits arrive as null, yielding the natural 1k, 10k, 100k, 1M ladder.
+// The decimal digits s needs, up to `cap` (8 by default). The comparison with 1e-6 is inclusive, so an increment of exactly 1e-6 needs six.
+let decFor=function(s,cap){
+  var dec=0;
+  while(dec<(cap||8)&&Math.abs(s*Math.pow(10,dec)-Math.round(s*Math.pow(10,dec)))>=1e-6)dec++;
+  return dec;
+};
+// The formatters are kept, as wallFormats are: toLocaleString with options builds one per call, about 8 us in headless Chromium, and a label can make two.
+let numFormats={};
+let fmtNum=function(v,grouping,fd){
+  var key=grouping+'|'+fd;
+  if(!numFormats[key])numFormats[key]=new Intl.NumberFormat(undefined,grouping?{maximumFractionDigits:fd}:{useGrouping:false,maximumFractionDigits:fd});
+  return numFormats[key].format(v);
+};
+// Value formatter for Y and X. Zero is just "0": fixed-precision formatting rendered step 0 as "0.00" (AI-1385).
+// Precision comes from the grain, not fixed digit counts. On linear axes the grain is the tick spacing (`step`): decFor(step) is however many digits the spacing needs, and adjacent ticks can never render identically (toExponential(1) used to collapse 1.50e6/1.52e6/1.54e6 into three "1.5e6" labels).
+// A step of 0 (a log ladder) has no meaningful axis-wide spacing, so the grain is the value itself; log values are integral mantissas, which print exactly (the natural 1k, 10k, 100k, 1M ladder), and the splits a log y axis's filter drops arrive as null and print blank.
 // Values >=1000 wear k/M/B/T suffixes; of the largest unit fitting the grain and the unit below it, whichever renders narrower wins — the decimal point costs a digit slot, so "1547k" beats "1.547M" but "2.5M" beats "2500k"; ties keep the larger unit.
 // Rounding cannot merge linear neighbors because unit <= step makes consecutive tick mantissas differ in their integer digits. Linear spacings under 1000 (deep y-zoom) keep plain grouped digits; fl floors every sub-1 label at its leading digit, including near-constant metrics whose tiny step decFor's 1e-6 tolerance swallows to 0.
-let yFmt=function(u,vals,ax){
-  var step=Infinity;
-  for(var i=1;i<vals.length;i++){
-    var d=vals[i]-vals[i-1];
-    if(d>0&&d<step)step=d;
-  }
-  var pv=u.scales[u.axes[ax].scale].distr==3||!isFinite(step);
-  var decFor=function(s){
-    var dec=0;
-    while(dec<8&&Math.abs(s*Math.pow(10,dec)-Math.round(s*Math.pow(10,dec)))>1e-6)dec++;
-    return dec;
-  };
+let numFmt=function(vals,step){
+  var pv=!(step>0);
   return vals.map(function(v){
     if(v==null)return'';
     if(v==0)return'0';
     var a=Math.abs(v);
     if(a<0.001)return v.toExponential(decFor((pv?a:step)/Math.pow(10,Math.floor(Math.log10(a)))));
     if(a>=1000&&(pv||step>=1000)){
-      var us=[[1e12,'T'],[1e9,'B'],[1e6,'M'],[1e3,'k'],[1,'']],lim=pv?a:step,j=0;
-      while(us[j][0]>lim)j++;
-      var lab=function(k,fd){return(v/us[k][0]).toLocaleString(undefined,{useGrouping:false,maximumFractionDigits:fd})+us[k][1]};
+      var us=[[12,'T'],[9,'B'],[6,'M'],[3,'k'],[0,'']],lim=pv?a:step,j=0,e=v.toExponential().split('e');
+      while(Math.pow(10,us[j][0])>lim)j++;
+      // The value's own decimal digits, moved to the unit: dividing by it can land an ulp off, and 5.5e26 read 549999999999999.94T.
+      var lab=function(k,fd){return fmtNum(+(e[0]+'e'+(e[1]-us[k][0])),false,fd)+us[k][1]};
       var s1=lab(j,3),s2=lab(j+1,0);
       return s1.length<=s2.length?s1:s2;
     }
     var fl=a<1?-Math.floor(Math.log10(a)):0;
-    return v.toLocaleString(undefined,{maximumFractionDigits:pv?fl+2:Math.max(decFor(step),fl)});
+    return fmtNum(v,true,pv?fl+2:Math.max(decFor(step),fl));
   });
 };
+// The y axis's grain is the increment uPlot chose, as a linear x axis's is; a log y axis labels each tick by its own value.
+let yFmt=function(u,vals,ax,space,incr){return numFmt(vals,__KYMO_Y_DISTR__===3?0:incr)};
 let sameWallDay=function(a,b){
   var da=new Date(a*1000),db=new Date(b*1000);
   return da.getFullYear()===db.getFullYear()&&da.getMonth()===db.getMonth()&&da.getDate()===db.getDate();
 };
-// `fd` fractional digits of seconds (none by default). Naming any time field drops the locale's default fields, so all are named. The formatters are kept: building one per label costs about 25 us.
+// `fd` fractional digits of seconds (none by default); `dateOnly` drops the time, for linear wall ticks a day or more apart, which wallSplits puts on local midnights. Naming any time field drops the locale's default fields, so all are named. The formatters are kept: building one per label costs about 25 us.
 let wallFormats={};
-let fmtWall=function(v,withDate,fd){
+let fmtWall=function(v,withDate,fd,dateOnly){
   // To the millisecond: Date truncates, and a whole-millisecond tick k/1000 s times 1000 can come back just under k (for times such as 2038-01-19 to 2039-09-07, just below 2^41 ms), which would read a millisecond early.
   var d=new Date(Math.round(v*1000));
+  if(dateOnly)return d.toLocaleDateString();
   // Limit: fractional seconds need a time within Date's range (about 275,000 years either way): past it Intl's format would throw inside uPlot's commit. Whole-second labels there read Invalid Date.
   if(!fd)return withDate?d.toLocaleString():d.toLocaleTimeString();
   var key=withDate+'|'+fd;
@@ -144,68 +152,149 @@ let fmtRel=function(v,digits,top){
   if(rest<10*q)sec='0'+sec;
   return sign+(t<3600*q?m:Math.floor(m/60)+':'+(m%60<10?'0':'')+m%60)+':'+sec;
 };
-// Digits of seconds a time tick spacing needs, to the millisecond, or to `cap` digits. Limit: a tick at or below a microsecond, which only a window a few microseconds wide gives, reads 0s.
-let timeDigits=function(s,cap){var d=0;while(d<(cap||3)&&Math.abs(s*Math.pow(10,d)-Math.round(s*Math.pow(10,d)))>1e-6)d++;return d};
-// Time ticks take their precision from their spacing, as yFmt's do, so neighbours never print alike: fractional digits only where the chosen increment needs them (a 2.5 s spacing gets one; xIncrs keeps linear ticks whole milliseconds apart). The spacing is the increment uPlot chose (`incr`, its values callback's fifth argument); differences of epoch seconds carry ulp noise. A log axis has no common spacing: each tick takes its own digits and fields, though wall time stops at the three digits Intl prints, which throws on more (a pull takes a log wall axis below a second, to ticks like 1e-4 s).
-let xFmtRaw=!isTimeAxis?yFmt:function(u,vals,ax,space,incr){
-  var s=u.scales.x,log=s.distr==3,digits=timeDigits(incr),top=0,withDate=isWallTime&&s.min!=null&&s.max!=null&&!sameWallDay(s.min,s.max);
-  if(!isWallTime&&!log)for(var i=0;i<vals.length;i++)if(vals[i]!=null)top=Math.max(top,Math.abs(vals[i]));
-  return vals.map(function(v){if(v==null)return'';var d=log?timeDigits(v,isWallTime?3:9):digits;return isWallTime?fmtWall(v,withDate,d):fmtRel(v,d,log?Math.abs(v):top)});
+// X tick labels at real x, from the ticks' spacing `step`. Time ticks take their precision from it, as numbers do, so neighbours never print alike: fractional digits only where the spacing needs them (a 0.5 s spacing gets one; the increment tables keep time ticks whole milliseconds apart). A log ladder (step 0) has no common spacing: each tick takes its own digits and fields, though wall time stops at the three digits Intl prints, which throws on more.
+let xLabels=!isTimeAxis?function(u,vals,step){return numFmt(vals,step)}:function(u,vals,step){
+  var s=u.scales.x,digits=decFor(step,3),top=0,withDate=isWallTime&&!sameWallDay(s.min,s.max),dateOnly=!isLogX&&step>=86400;
+  if(!isWallTime&&step)for(var i=0;i<vals.length;i++)top=Math.max(top,Math.abs(vals[i]));
+  return vals.map(function(v){var d=step?digits:decFor(v,isWallTime?3:9);return isWallTime?fmtWall(v,withDate,d,dateOnly):fmtRel(v,d,step?top:Math.abs(v))});
 };
-// log(x+1) axes label real x: ticks arrive shifted, subtract before formatting.
-let xFmt=readoutXShift?function(u,vals,ax,space,incr){return xFmtRaw(u,vals.map(function(v){return v==null?null:v-readoutXShift}),ax,space,incr)}:xFmtRaw;
-// Relative-time ticks fall on round durations, so the stopwatch labels read 0:05:00 and 12:00:00 rather than uPlot's numeric 0:08:20 and 13:53:20. A log axis keeps uPlot's log splits, or ticks at real decades when zero-present (xSplits); wall time keeps uPlot's numeric increments from a millisecond up. Both tables are built once per page and reused by every chart create, each of which would build them cold.
-// Both linear time axes space ticks by the width of a label at the finest increment uPlot's 50 px minimum would allow, whose fields and digits are those of the densest ticks it may draw: 1:54:05.370 AM, and 1:00:00.005, are wider than 50 px. A coarser 2.5x10^k wall increment can show one digit more, which the 18 px gap absorbs.
-let spacedBy=function(incrs,label){
-  return{incrs:incrs,space:function(u,axisIdx,mn,mx,dim){
-    let fine=(mx-mn)*50/dim,incr=incrs.find(function(v){return v>=fine});
-    u.ctx.font=u.axes[axisIdx].font[0];
-    return Math.max(50,Math.ceil(u.ctx.measureText(label(mn,mx,timeDigits(incr))).width/devicePixelRatio)+18);
-  }};
+// The increment, ticks and labels pickTicks last chose, the ticks as uPlot was handed them.
+let shown={};
+// uPlot's values callback: the labels pickTicks measured, for the very list it returned (uPlot passes it through the filter unchanged). Any other list is labelled at real x (log(x+1) ticks arrive shifted), by each tick's own value on a log axis and, on a linear one, which only a direct call hands another list, at `incr`.
+let xFmt=function(u,vals,ax,space,incr){
+  if(vals===shown.ticks)return shown.labels;
+  if(readoutXShift)vals=vals.map(function(v){return v-readoutXShift});
+  return xLabels(u,vals,isLogX?0:incr);
 };
-let xIncrs;
-if(isTimeAxis&&!isWallTime&&__KYMO_X_DISTR__===1){
-  if(!window.__kymo_relIncrs){
-    let incrs=[0.001,0.002,0.005,0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10,15,30,60,120,300,600,900,1800,3600,7200,10800,21600,43200,86400,172800,604800,1209600,2592000,7862400,15724800,31536000];
-    // Past a year, 2, 5 and 10 times each power of ten of years, to ten million years. Limit: a window pulled wider than some tens of millions of years (about 30 at 400 px, 100 at 1200 px) has no increment large enough, and uPlot keeps the ticks it drew last, which then cover only part of it.
-    for(let year=31536000;year<1e14;year*=10)incrs.push(2*year,5*year,10*year);
-    window.__kymo_relIncrs=incrs;
-  }
-  // The largest magnitude's label, signed if the window reaches below 0.
-  xIncrs=spacedBy(window.__kymo_relIncrs,function(mn,mx,digits){var top=Math.max(Math.abs(mn),Math.abs(mx));return fmtRel(mn<0?-top:top,digits,top)});
-}else if(isWallTime&&__KYMO_X_DISTR__===1){
-  // Spelled as uPlot spells its own (1, 2, 2.5 and 5 times each power of ten), so they are the very numbers it keeps decimals for; but 2.5 ms, whose ticks would need a fourth digit Intl doesn't print.
-  if(!window.__kymo_wallIncrs){
-    let incrs=[];
-    for(let e=-3;e<32;e++)for(let m of[1,2,2.5,5])if(e>-3||m!==2.5)incrs.push(+(m+'e'+e));
-    window.__kymo_wallIncrs=incrs;
-  }
-  xIncrs=spacedBy(window.__kymo_wallIncrs,function(mn,mx,digits){return fmtWall(mx,!sameWallDay(mn,mx),digits)});
+// Each axis's linear increments, which a log axis also ticks at under a decade. Numbers: uPlot's own (1, 2, 2.5 and 5 times each power of ten, spelled as it spells them); a step axis takes the whole ones, since steps are integers. Time: round durations, so the stopwatch labels read 0:05:00 and 12:00:00 and wall clocks 3:15:00, rather than uPlot's numeric 0:08:20 and 13:53:20 (and 3:16:40). The tables are built once per page and reused by every chart create, each of which would build them cold.
+if(!window.__kymo_incrs){
+  let num=[];
+  for(let e=-32;e<32;e++)for(let m of[1,2,2.5,5])num.push(+(m+'e'+e));
+  let time=[0.001,0.002,0.005,0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10,15,30,60,120,300,600,900,1800,3600,7200,10800,21600,43200,86400,172800,259200,604800,1209600,2592000,5184000,7862400,15724800,31536000];
+  // Past a year, 2, 5 and 10 times each power of ten of years, to ten million years. Limit: a window pulled wider than 50 px of the largest increment (about 70 million years at 400 px, 230 million at 1200 px) gets no ticks on a linear axis, and a log one ticks on its ladder.
+  for(let year=31536000;year<1e14;year*=10)time.push(2*year,5*year,10*year);
+  window.__kymo_incrs={num:num,step:num.filter(function(v){return v%1===0}),time:time};
 }
-// log(x+1) x axis (step and relative-time charts): uPlot's native log splits land on nice SHIFTED values (1,2,5,10 -> steps 0,1,4,9, or 0.009s 0.099s on a time axis — ugly labels). Generate splits at nice REAL values instead, in the wire's units (steps, or ms on a time axis, W being one of them) — 0 plus 1-2-5 ladders per decade, the densest tier that fits the width — mapped +1 for positioning; xFmt subtracts the shift back off. Sub-decade zooms behave linearly and get plain nice increments.
-let xSplits=function(u,axisIdx,smin,smax){
-  let W=readoutXShift,lo=Math.max(smin/W-1,0),hi=smax/W-1;
-  if(!(hi>lo))return[smin,smax];
-  let cap=Math.max(3,Math.floor(u.bbox.width/devicePixelRatio/70));
-  if(hi/Math.max(lo,1)<10){
-    let raw=(hi-lo)/cap,p=Math.pow(10,Math.floor(Math.log10(raw)));
-    let step=raw<=p?p:raw<=2*p?2*p:raw<=5*p?5*p:10*p;
-    let out=[];
-    for(let r=Math.ceil(lo/step)*step;r<=hi+step*1e-9;r+=step)out.push((r+1)*W);
-    return out;
-  }
-  let mk=function(ms){
-    let out=lo<=0?[0]:[];
-    let k0=Math.floor(Math.log10(Math.max(lo,1)));
-    let k1=Math.ceil(Math.log10(hi));
-    for(let k=k0;k<=k1;k++)for(let j=0;j<ms.length;j++){let r=ms[j]*Math.pow(10,k);if(r>=lo&&r<=hi&&r>=1)out.push(r);}
-    return out;
-  };
-  let pick=mk([1,2,5]);
-  if(pick.length>cap)pick=mk([1]);
-  if(pick.length>cap){let s=Math.ceil(pick.length/cap);pick=pick.filter(function(_,i){return i%s===0});}
-  return pick.map(function(r){return (r+1)*W});
+let incrs=window.__kymo_incrs[isTimeAxis?'time':zoomRefetch?'step':'num'];
+// Label widths in CSS px, in axis `axisIdx`'s font.
+let measurer=function(u,axisIdx){
+  u.ctx.font=u.axes[axisIdx].font[0];
+  return function(label){return u.ctx.measureText(label).width/devicePixelRatio};
 };
+// Room a label w px wide needs between tick centres: uPlot's 50 px minimum, and the label plus an 18 px gap.
+let room=function(w){return Math.max(50,Math.ceil(w)+18)};
+// The multiples of st in [lo,hi], as the decimals they spell: st's digits times k, then its exponent (k*st carries float error into labels: 28 times 1e24 is 2.7999999999999996e25, "27999999999999996B"). Null past 2^53, where that product rounds and the counter stops advancing.
+let multiples=function(lo,hi,st){
+  let [digits,exp]=st.toExponential().split('e'),mult=+digits.replace('.',''),shift=exp-(digits.split('.')[1]||'').length,k0=Math.ceil(lo/st-1e-9),k1=Math.floor(hi/st+1e-9),out=[];
+  if(!(Math.max(Math.abs(k0),Math.abs(k1))*mult<2**53))return null;
+  for(let k=k0;k<=k1;k++)out.push(+(k*mult+'e'+shift));
+  return out;
+};
+// Whether neighbouring labels a and b, wa and wb px wide, print apart and fit `gap` px apart.
+let fits=function(a,b,wa,wb,gap){return a!==b&&room(Math.max(wa,wb))<=gap};
+// The first of the axis's increments, from the finest uPlot's 50 px minimum allows, whose ticks (ticksAt, placed by at) all fit, labelled as the axis prints them: a coarser increment can print more digits, labels change width across a window (an exponent, a date), and a spacing finer than decFor resolves prints neighbours alike. A window too narrow for two labels still gets one tick (an increment's only multiple in it, or the crowded increment's tick nearest its middle) rather than none from a coarser increment with no multiple in it. Returns the increment, its ticks and their labels.
+let pickTicks=function(u,axisIdx,lo,hi,dim,ticksAt,at){
+  let width=measurer(u,axisIdx),crowded=null;
+  for(let st of incrs){
+    if(st<(hi-lo)*50/dim)continue;
+    let ticks=ticksAt(lo,hi,st),n=ticks&&ticks.length;
+    if(!ticks)continue;
+    if(!n)break;
+    crowded={step:st,ticks:ticks};
+    // The last pair first: log gaps shrink and linear labels mostly widen there, so most crowded increments go no further than two labels.
+    if(n>1){
+      let pair=xLabels(u,ticks.slice(n-2),st);
+      if(!fits(pair[0],pair[1],width(pair[0]),width(pair[1]),at(ticks[n-1])-at(ticks[n-2])))continue;
+    }
+    let labels=xLabels(u,ticks,st),w=labels.map(width),i=1;
+    while(i<n&&fits(labels[i-1],labels[i],w[i-1],w[i],at(ticks[i])-at(ticks[i-1])))i++;
+    if(i===n)return{step:st,ticks:ticks,labels:labels};
+  }
+  if(!crowded)return{step:Infinity,ticks:[],labels:[]};
+  let mid=crowded.ticks.reduce(function(a,b){return Math.abs(at(b)-dim/2)<Math.abs(at(a)-dim/2)?b:a});
+  return{step:crowded.step,ticks:[mid],labels:xLabels(u,[mid],crowded.step)};
+};
+// Wall ticks fall on round local times: multiples of the increment on the local clock, so ticks stay on the clock's grid across a DST change. Increments of 30 days and up tick at the starts of local months, every n-th from January of year 0. Limits: a window starting in Date's first months or years (about 271,800 BC) gets none, its first start lying before Date's range; Date reports whole-minute offsets, so where a zone's offset had seconds (local mean time, before about 1900) ticks sit those seconds off the round time.
+let wallSplits=function(mn,mx,incr){
+  let out=[];
+  if(incr>=2592000){
+    // Counted in months from year 0, n months a tick: the increment in twelfths of 365 days (1, 2, 3 and 6, then 12 a year).
+    let n=Math.round(incr/2628000),d=new Date(mn*1000),k=Math.floor((d.getFullYear()*12+d.getMonth())/n)*n;
+    for(;;k+=n){
+      // setFullYear, unlike the Date constructor, reads years 0 to 99 as written; it carries months past 11 into the year.
+      d.setFullYear(0,k,1);
+      d.setHours(0,0,0,0);
+      let t=d.getTime()/1000;
+      if(!(t<=mx))return out;
+      if(t>=mn)out.push(t);
+    }
+  }
+  // Up to an hour, ticks step evenly through a DST change, which shifts the clock by a whole number of them (but Lord Howe's 30 minutes against hourly ticks): a repeated hour ticks twice and a skipped one not at all.
+  // A longer increment places each local time at its own offset, the last tick's tried first: a time the change repeats ticks once, at its first instant, and one it skips ticks where Date reads it, as late after the change as it falls in the skipped hour (a midnight change's day tick at 1 AM).
+  // A spring-forward also brings the tick after it an hour closer than the increment (midnight and 3 AM 2 hours apart on 3-hour ticks): under 90% of it, that tick gives way, so labels keep the spacing they were picked for.
+  let offset=function(t){return -new Date(t*1000).getTimezoneOffset()*60||0},o=offset(mn),k=Math.ceil((mn+o)/incr);
+  // Past 2^52 the counter stops advancing (a window millions of years out, where Date has given up anyway).
+  if(!(Math.abs(k)<2**52))return out;
+  for(;;k++){
+    let t=k*incr-o;
+    if(incr>3600){
+      let o2=offset(t);
+      if(o2!==o){let t2=k*incr-o2;if(offset(t2)===o2)t=t2;o=o2;}
+    }
+    if(!(t<=mx))return out;
+    if(t>=mn&&!(t-out[out.length-1]<incr*0.9))out.push(t);
+  }
+};
+// Log x ticks, on every log x axis. uPlot's own log splits fall only on whole multiples of each decade's power of ten (a zoom to 2100..2900 gets none), and the vendored uPlot's log label filter keeps only the powers on a horizontal axis (it compares signed pixel distances; upstream master takes their abs()). So ticks fall on nice real x, in the axis's units (steps, seconds or the custom metric), plotted at x + readoutXShift: a zero-present axis plots its real 0 at 1 step or 1 ms.
+// Neighbours keep room() apart where they land. Under a decade the axis ticks where pickTicks puts its linear increments, placed on log geometry; wider, at the densest tier below that fits. A zero-present axis keeps its 0, dropping the first tick after it if they collide.
+let xSplits=function(u,axisIdx,smin,smax){
+  // Real x has no data in (0, S) on a zero-present axis, nor below a step on a step axis, and time labels print nothing finer than a microsecond, wall clocks a millisecond: the ladder starts there.
+  let S=readoutXShift,lo=Math.max(smin-S,0),hi=smax-S,first=Math.max(lo,S,zoomRefetch?1:isWallTime?0.001:isTimeAxis?1e-6:0);
+  if(!(hi>lo))return[smin,smax];
+  // Pixels per decade, from differences of logs: a pulled window's max over its min can overflow. Limit: in a window narrower than about 1e-13 of its magnitude those differences are a few ulps, and ticks space unevenly.
+  let dim=u.bbox.width/devicePixelRatio,decade=dim/(Math.log10(smax)-Math.log10(smin));
+  // How much farther apart ticks at real a and b must be to fit labels wa and wb wide: 1 or less fits.
+  let crowding=function(a,b,wa,wb){return room(Math.max(wa,wb))/(decade*(Math.log10(b+S)-Math.log10(a+S)))};
+  if(hi<10*first){
+    let base=Math.log10(smin),picked=pickTicks(u,axisIdx,lo,hi,dim,multiples,function(v){return decade*(Math.log10(v+S)-base)});
+    if(picked.ticks.length){
+      shown={step:picked.step,ticks:picked.ticks.map(function(v){return v+S}),labels:picked.labels};
+      return shown.ticks;
+    }
+  }
+  // Tier s: 0 is 1, 2 and 5 times each power, s >= 1 every s-th power. A pulled window can span hundreds of decades, so tiers whose neighbours are closer than 50 px wherever they land are skipped unmeasured, and a crowded tier of powers jumps to the spacing its most crowded pair needs. One tick always fits, and a window between ladder values (only a pull past every increment reaches one) gets none.
+  let K0=Math.floor(Math.log10(first)),K1=Math.ceil(Math.log10(hi)),width=measurer(u,axisIdx),out,widths;
+  for(let s=decade*Math.log10(2)>=50?0:Math.ceil(50/decade);;){
+    out=[];
+    for(let k=s?Math.ceil(K0/s)*s:K0;k<=K1;k+=s||1)for(let mant of s?[1]:[1,2,5]){let v=+(mant+'e'+k);if(v>=first&&v<=hi)out.push(v)}
+    // A stride can pass every power in the window (3 across 1.1e24..1.1e26): the power nearest its middle stands alone.
+    if(!out.length){let v=+('1e'+Math.round((Math.log10(first)+Math.log10(hi))/2));if(v>=first&&v<=hi)out.push(v)}
+    widths=xLabels(u,out,0).map(width);
+    let worst=0;
+    for(let i=1;i<out.length;i++)worst=Math.max(worst,crowding(out[i-1],out[i],widths[i-1],widths[i]));
+    if(!(worst>1))break;
+    s=Math.max(s+1,Math.ceil(s*worst));
+  }
+  if(lo===0){
+    if(out.length&&crowding(0,out[0],width(xLabels(u,[0],0)[0]),widths[0])>1)out.shift();
+    out.unshift(0);
+  }
+  return out.map(function(v){return v+S});
+};
+// A log axis's one increment, Infinity, fits any window, so uPlot always calls xSplits (it skips the call when none fits); its labels bypass uPlot's log filter.
+let xTicks={splits:xSplits,incrs:[Infinity],filter:function(u,s){return s}};
+if(!isLogX){
+  // A linear axis picks its ticks when uPlot asks for its increments: it returns the one picked, which a spacing of 1 always lets through, and splits hands over the ticks picked (or, called directly for another increment, places that one's). Limit: uPlot also refuses an increment under 5 whose decimals and the window's integer digits pass 17, so a custom-x window narrower than about 1e-15 of its magnitude, or than 1e-15 below 1, gets no ticks.
+  let ticksAt=isWallTime?wallSplits:multiples;
+  xTicks={
+    space:1,
+    incrs:function(u,axisIdx,mn,mx,dim){
+      shown=pickTicks(u,axisIdx,mn,mx,dim,ticksAt,function(v){return dim*(v-mn)/(mx-mn)});
+      return[shown.step];
+    },
+    splits:function(u,axisIdx,mn,mx,incr){return incr===shown.step?shown.ticks:ticksAt(mn,mx,incr)||[]},
+  };
+}
 // Single-x formatter for tooltip readouts (xFmt formats axis tick
 // LISTS; wall/relative time need their cursor-grade precision back).
 // Custom numeric X uses the same significant-digit policy as Y tooltip rows;
@@ -218,7 +307,7 @@ let fmtX=function(v){
   if(isWallTime)return fmtWall(v,true);
   if(isTimeAxis)return fmtRel(v,1,Math.abs(v));
   if(!zoomRefetch)return v.toPrecision(4);
-  return v.toLocaleString(undefined,{maximumFractionDigits:2});
+  return fmtNum(v,true,2);
 };
 // Nearest-point marker, drawn by the setCursor hook.
 let hotpt=document.createElement('div');
@@ -246,18 +335,17 @@ let yNice=function(u,mn,mx){
   let i=cap>=5*p?5*p:cap>=2*p?2*p:p;
   return[Math.floor(mn/i)*i,Math.ceil(mx/i)*i];
 };
-// uPlot walks a log axis decade by decade from floor(log10(min)); a min <=0
+// uPlot walks a log y axis decade by decade from floor(log10(min)); a min <=0
 // (log10 -> -Infinity) or a non-finite bound (an x-zoom that caught no points
 // leaves uPlot's auto min/max at +-Infinity) makes that walk never terminate
 // and freezes the tab, as does any min below about 1e-25, where the walk rounds its ticks to 0. logClamp is the one rule both log scales pass through:
 // keep a finite positive bound, else fall back to the data's own positive
-// extent (lo,hi); nothing positive at all -> a neutral decade. (The axis
-// pull keeps its min at or above exp(-50), 1.9e-22, for the same reason.)
+// extent (lo,hi); nothing positive at all -> a neutral decade.
 let logClamp=function(mn,mx,lo,hi){
   if(!(lo<=hi))return[1,10];
   return[(isFinite(mn)&&mn>0)?mn:lo,(isFinite(mx)&&mx>0)?mx:hi];
 };
-// Log-x range: pin to the zoom's own endpoints; data[0] is ascending and >0
+// Log-x range: pin to the zoom's own endpoints, where uPlot's default snaps to powers of 10; data[0] is ascending and >0
 // (the build trims x<=0 for log-x), so its ends are the positive extremes a
 // bound extrapolated past 0 falls back to.
 let logSafeX=function(u,mn,mx){let X=u.data[0];return logClamp(mn,mx,X[0],X[X.length-1]);};
@@ -302,7 +390,7 @@ let u=new uPlot({
   // _focus is our z-order signal (patched drawSeries strokes _focus'd series last); alpha:1 keeps uPlot's native focus from ALSO dimming, so series.alpha stays entirely ours.
   focus:{alpha:1},
   // x auto IS the zoom policy: it gates setData's re-range (uPlot consults it nowhere else that matters in mode 1). Unzoomed, every live flush re-ranges x to the full extent — the chart follows a growing run. While a client-side zoom is active (__kymo_userzoom: set by drag-select/gutter-select/axis-pull, cleared by the configured reset click) setData keeps the current window but still commits, so new points landing inside the window paint on the flush that delivers them. Declaring the policy on the scale keeps every setData caller a plain setData(data) — passing resetScales=false instead skips the commit and freezes the zoomed chart until the next interaction.
-  scales:{x:{time:false,distr:__KYMO_X_DISTR__,...__KYMO_X_RANGE__,auto:u=>!u.__kymo_userzoom},...__KYMO_SYNC_SCALE__,y:{distr:__KYMO_Y_DISTR__,...__KYMO_Y_RANGE__},nan:{range:[0,1]}},
+  scales:{x:{time:false,distr:__KYMO_X_DISTR__,...(isLogX?{range:logSafeX}:{}),auto:u=>!u.__kymo_userzoom},...__KYMO_SYNC_SCALE__,y:{distr:__KYMO_Y_DISTR__,range:__KYMO_Y_DISTR__===3?yNiceLog:yNice},nan:{range:[0,1]}},
   // kymo owns zoom gestures. Leaving uPlot's native drag armed gives every
   // synced chart an independent pixel-space drag state, which lets a peer
   // revive the source selection and makes every peer commit on mouseup.
@@ -362,16 +450,13 @@ let u=new uPlot({
   },
   axes:[
     // The app-root preference scales canvas text too; size is ticks 5 + gap 6 + the rendered font.
-    {stroke:axColor,grid:{show:false},ticks:{stroke:gridColor,width:1,size:5},font:'__KYMO_AXIS_FONT_SIZE__px sans-serif',gap:6,size:__KYMO_X_AXIS_SIZE__,values:xFmt,...__KYMO_X_SPLITS__,...xIncrs},
+    {stroke:axColor,grid:{show:false},ticks:{stroke:gridColor,width:1,size:5},font:'__KYMO_AXIS_FONT_SIZE__px sans-serif',gap:6,size:__KYMO_X_AXIS_SIZE__,values:xFmt,...xTicks},
     // size is a function: the axis grows to fit its widest label (uPlot re-asks on every scale change) until the narrow-cell plot floor below wins. Every label is measured — with proportional glyphs the longest string isn't always the widest. The preference-scaled floor keeps plot left edges aligned across a grid column of short-label charts; the cycleNum guard is the uPlot autosize idiom.
     {stroke:axColor,grid:{stroke:gridColor,width:1},ticks:{stroke:gridColor,width:1,size:5},font:'__KYMO_AXIS_FONT_SIZE__px sans-serif',gap:6,
      size:function(u,values,axisIdx,cycleNum){
        let ax=u.axes[axisIdx];
        if(cycleNum>1)return ax._size;
-       u.ctx.font=ax.font[0];
-       let w=0;
-       for(const v of values||[])w=Math.max(w,u.ctx.measureText(v).width);
-       let measured=Math.max(__KYMO_Y_AXIS_MIN_SIZE__,Math.ceil(ax.ticks.size+ax.gap+w/devicePixelRatio));
+       let measured=Math.max(__KYMO_Y_AXIS_MIN_SIZE__,Math.ceil(ax.ticks.size+ax.gap+Math.max(0,...(values||[]).map(measurer(u,axisIdx)))));
        // A narrow grid cell can be smaller than a long formatted label. Cap
        // this gutter after measurement so the right pad (12px above) and a
        // minimally useful plot keep non-negative geometry; ordinary charts
@@ -396,7 +481,7 @@ if(keepZoom){u.setScale('x',keepZoom);u.__kymo_userzoom=true;}
 // Dynamic metadata read by the once-installed gesture listeners. Keep it on
 // the current uPlot instance so a config rebuild cannot leave those listeners
 // using the first build's x-range column offsets or log transform.
-u.__kymo_zoom={zr:zoomRefetch,xShift:xShift,readoutXShift:readoutXShift,xrBase:hasXr?xrBase:null,axis:u.scales.x.distr===3?(xShift?AXIS_LOG1P:AXIS_LOG):AXIS_LINEAR};
+u.__kymo_zoom={zr:zoomRefetch,xShift:xShift,readoutXShift:readoutXShift,xrBase:hasXr?xrBase:null,axis:isLogX?(xShift?AXIS_LOG1P:AXIS_LOG):AXIS_LINEAR};
 u.__kymo_hl={runs:runIds,names:runNames,rs:rawStride,n:labels.length,nan:nanCols>0};
 // applyHl's retag reaches the tip through the instance; the tip node outlives rebuilds, so a recreated u re-adopts it.
 u.__kymo_tip=tip;
@@ -642,13 +727,13 @@ if(!el.__kymo_axisdrag){
     // data extent went dead the moment a full view had nothing left to
     // reveal. Empty space past the data is what the hand asked for, and a
     // released pull snaps a step axis back to data via the refetch.
-    // In transformed units: on log, exp(-50) keeps min at or above 1.9e-22, where uPlot's log tick walk still ends (below about 1e-25 it never does, and a pull gets there within a few hundred px), and exp(690) keeps max finite; on linear, comfortably sub-overflow. Limit: a log x whose data starts below 1.9e-22 shows its lowest points cut off once pulled at its min edge.
+    // In transformed units: on log, exp(-690) and exp(690) keep both bounds positive and finite; on linear, comfortably sub-overflow.
     let d0=c.data[0];
     if(!d0.length)return; // log-x can trim every point; nothing to pull
     let zm=c.__kymo_zoom,frozen=stepSupports(c,zm);
     if(zm&&zm.zr&&!frozen)return;
     // lo and hi are the scale's own bounds, which the pinned edge and a cancel's restore keep exactly, as a selection's clamped edge does (endpoint).
-    let ad={which:p0<st.w/2?'min':'max',mn:mn,mx:mx,lo:c.scales.x.min,hi:c.scales.x.max,v0:mn+p0/st.w*(mx-mn),p0:p0,left:st.left,w:st.w,moved:false,inv:isLog?Math.exp:function(v){return v},blo:isLog?-50:-1e300,bhi:isLog?690:1e300,coverage:frozen&&frozen.coverage,userzoom:!!c.__kymo_userzoom};
+    let ad={which:p0<st.w/2?'min':'max',mn:mn,mx:mx,lo:c.scales.x.min,hi:c.scales.x.max,v0:mn+p0/st.w*(mx-mn),p0:p0,left:st.left,w:st.w,moved:false,inv:isLog?Math.exp:function(v){return v},blo:isLog?-690:-1e300,bhi:isLog?690:1e300,coverage:frozen&&frozen.coverage,userzoom:!!c.__kymo_userzoom};
     ev.preventDefault();
     // Window listeners live only for the duration of the drag — idle
     // charts add no per-mousemove work and hold no references.
@@ -700,7 +785,7 @@ if(!el.__kymo_axisdrag){
       // clamp sits 25px in: that pins the handoff at an e-fold per 25px
       // (~1 decade per 58px) — a controllable pull — and softens only the
       // last pixels, which the raw asymptote made hyper-sensitive anyway.
-      // The blo/bhi bounds keep the asymptote from overflowing, and on log keep min where uPlot's per-decade tick walk still ends: a pull reaches blo within a few hundred px.
+      // The blo/bhi bounds keep the asymptote from overflowing.
       let m=Math.min(25,ad.w/4);
       let q=Math.min(Math.max(p1,m),ad.w-m);
       if(ad.which==='min'){

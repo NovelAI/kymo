@@ -36,7 +36,7 @@ pub(super) struct ChartJsConfig {
     /// markers — the tooltip appends "×N" on those rows when N > 1.
     pub(super) xnan_counts: Vec<u32>,
     pub(super) axis: ShownAxis,
-    /// Zero-present log x on a step or time axis renders log(x+1) in the wire's units (steps, ms), matching the server's bucket ladder: the data is shifted before uPlot. Its splits and formatters convert back to real values (steps, or ms on a time axis) and a step chart's zoom dispatches to real steps; tooltip and copy readouts undo the shift (+1 step, +0.001 s).
+    /// Zero-present log x on a step or time axis renders log(x+1) in the wire's units (steps, ms), matching the server's bucket ladder: the data is shifted before uPlot. Its ticks fall at real x and its labels read it (steps, or seconds on a time axis), and a step chart's zoom dispatches to real steps; tooltip and copy readouts undo the shift (+1 step, +0.001 s).
     pub(super) log_shift: bool,
     pub(super) log_y: bool,
     /// Canvas font/gutter input included in the structural config.
@@ -242,20 +242,6 @@ pub(super) fn build_create_js(id: &str, cfg: &ChartJsConfig) -> String {
         })
         .collect();
 
-    // Zero-present log x, on a step or a relative-time axis, ticks at nice real values (xSplits).
-    let x_splits = if cfg.log_shift {
-        "{splits:xSplits,filter:function(u,s){return s}}"
-    } else {
-        "{}"
-    };
-    // uPlot's default log range snaps to powers of 10; pin to the zoom's own endpoints, but via logSafeX so an extrapolated <=0/non-finite bound can't freeze the per-decade tick walk.
-    let x_range = if log_x { "{range:logSafeX}" } else { "{}" };
-    // yNice/yNiceLog: nice bounds under a 10% slack cap, measured linearly or in decades to match the scale's geometry.
-    let y_range = if cfg.log_y {
-        "{range:yNiceLog}"
-    } else {
-        "{range:yNice}"
-    };
     // Vendored uPlot's font parser accepts integer `Npx` only. Round each
     // size here rather than emitting a decimal that it would mis-parse.
     let axis_font_size = cfg.font_size.scale_px(12);
@@ -306,17 +292,14 @@ pub(super) fn build_create_js(id: &str, cfg: &ChartJsConfig) -> String {
             }
             .to_string(),
         ),
-        ("__KYMO_X_SPLITS__", x_splits.to_string()),
         (
             "__KYMO_X_DISTR__",
             if log_x { "3" } else { "1" }.to_string(),
         ),
-        ("__KYMO_X_RANGE__", x_range.to_string()),
         (
             "__KYMO_Y_DISTR__",
             if cfg.log_y { "3" } else { "1" }.to_string(),
         ),
-        ("__KYMO_Y_RANGE__", y_range.to_string()),
         ("__KYMO_SERIES_LIST__", series_opts.join(",")),
         ("__KYMO_LABELS__", labels_js.join(",")),
         ("__KYMO_COLORS__", colors_js.join(",")),
@@ -481,7 +464,7 @@ mod tests {
             .find("if(!zoomRefetch)return v.toPrecision(4)")
             .expect("custom X tooltip formatter");
         let step = js
-            .find("return v.toLocaleString(undefined,{maximumFractionDigits:2})")
+            .find("return fmtNum(v,true,2)")
             .expect("step tooltip formatter");
         assert!(custom_x < step, "custom X must bypass step rounding");
     }
@@ -522,8 +505,6 @@ mod tests {
         let js = build_create_js("chart-7", &config);
 
         assert!(js.contains("let readoutXShift=0.001;"));
-        // Ticks at real decades, as a step chart's are.
-        assert!(js.contains("...{splits:xSplits,"));
     }
 
     /// AI-1429: a custom axis syncs only with its own metric, never with one differing only in punctuation nor, when named "step", with the step charts.

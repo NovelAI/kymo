@@ -18,7 +18,7 @@ function test(name, run) {
 }
 
 /** A chart's x axis, as ShownAxis and the series it plots: one run, one values line. */
-function render(id, { axis = "rel", logX = false, shifted = false, labels = ["run"], hash = "cfg" } = {}) {
+function render(id, { axis = "rel", logX = false, shifted = false, logY = false, labels = ["run"], hash = "cfg" } = {}) {
   const step = axis === "step";
   const time = axis === "rel" || axis === "wall";
   const tokens = {
@@ -37,11 +37,8 @@ function render(id, { axis = "rel", logX = false, shifted = false, labels = ["ru
     __KYMO_ZOOM_REFETCH__: String(step),
     // A zero-present log x plots x+1 in the wire's units (ChartJsConfig::log_shift): the step zoom geometry shifts by 1, readouts by 1 step or 1 ms.
     __KYMO_READOUT_X_SHIFT__: !shifted ? "0" : time ? "0.001" : "1",
-    __KYMO_X_SPLITS__: shifted ? "{splits:xSplits,filter:function(u,s){return s}}" : "{}",
     __KYMO_X_DISTR__: logX ? "3" : "1",
-    __KYMO_X_RANGE__: logX ? "{range:logSafeX}" : "{}",
-    __KYMO_Y_DISTR__: "1",
-    __KYMO_Y_RANGE__: "{range:yNice}",
+    __KYMO_Y_DISTR__: logY ? "3" : "1",
     __KYMO_SERIES_LIST__: "{}," + labels.map(label => `{'label':'${label}','stroke':'#123456','width':1.5}`).join(","),
     __KYMO_LABELS__: labels.map(label => `'${label}'`).join(","),
     __KYMO_COLORS__: labels.map(() => "'#123456'").join(","),
@@ -173,6 +170,34 @@ function tickLabels(c, values, incr = values[1] - values[0]) {
   return c.axes[0].values(c, values, 0, 50, incr);
 }
 
+// The ticks a linear axis picks for a window on a `dim` px plot and their labels, asked as uPlot asks: incrs, splits, then values on the very list splits returned.
+function picked(c, mn, mx, dim = 800) {
+  c.setScale("x", { min: mn, max: mx });
+  const ax = c.axes[0];
+  const [step] = ax.incrs(c, 0, mn, mx, dim);
+  const ticks = ax.splits(c, 0, mn, mx, step);
+  return { step, ticks: [...ticks], labels: [...tickLabels(c, ticks, step)] };
+}
+
+// The same for a log axis's window, on the fake's 400 px.
+function logTicks(c, lo, hi) {
+  c.setScale("x", { min: lo, max: hi });
+  const ticks = c.axes[0].splits(c, 0, lo, hi);
+  return { ticks: [...ticks], labels: [...tickLabels(c, ticks, Infinity)] };
+}
+
+// Every neighbouring pair of ticks keeps uPlot's 50 px, and the wider label plus 18 px, on the fake's 7 px a character, placed linearly or on a log axis.
+function fits({ ticks, labels }, mn, mx, dim = 800, log = false) {
+  const at = log ? v => (dim * Math.log10(v / mn)) / Math.log10(mx / mn) : v => (dim * (v - mn)) / (mx - mn);
+  for (let i = 1; i < ticks.length; i++) {
+    const need = Math.max(50, 7 * Math.max(labels[i - 1].length, labels[i].length) + 18);
+    assert.ok(at(ticks[i]) - at(ticks[i - 1]) >= need - 1e-9, `${labels[i - 1]} and ${labels[i]}`);
+  }
+}
+
+// A reproducible pseudo-random 0..1 sequence, so a fuzz failure repeats.
+const random = seed => () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+
 // The source tooltip's x header with the cursor on column `idx` of chart `id`.
 function readout(p, id, idx) {
   const c = p.window.__kymo_charts[id];
@@ -270,12 +295,13 @@ test("a log-x peer with nothing positive in the window, or a window across 0 tha
   untouched(across.late);
 });
 
-test("a log-x pull stops where uPlot's log tick walk still ends", () => {
+test("a log-x pull keeps its window positive and finite", () => {
   const p = page();
   const c = p.create("c", [500, 1000, 4000], { axis: "m-x", logX: true });
-  // Far past the panel: below about 1e-25 uPlot's walk never ends, and the tab hangs.
+  // Far past the panel, the min stops at exp(-690), a normal double, and the axis still ticks there.
   pullAxis(p, "c", 120, 3000);
-  assert.ok(c.scales.x.min >= Math.exp(-50) * (1 - 1e-9), `min ${c.scales.x.min}`);
+  assert.ok(Math.abs(c.scales.x.min / Math.exp(-690) - 1) < 1e-9, `min ${c.scales.x.min}`);
+  assert.ok(c.axes[0].splits(c, 0, c.scales.x.min, c.scales.x.max).length > 1);
   // The max has no such bound to meet: a custom x near 1e23 (training FLOPs, say) pulled at its max edge keeps its data in view.
   const flops = p.create("f", [1e20, 1e22, 1e23], { axis: "m-x", logX: true });
   pullAxis(p, "f", 300, 280);
@@ -304,8 +330,6 @@ test("relative-time ticks keep neighbours apart at every spacing, as a stopwatch
     [[18000, 18100, 18200, 18300], ["5:00:00", "5:01:40", "5:03:20", "5:05:00"]],
     [[0, 2000, 4000, 6000], ["0:00:00", "0:33:20", "1:06:40", "1:40:00"]],
   ]) assert.deepEqual(ticks(values), labels);
-  // Filtered-out splits arrive as null and stay blank.
-  assert.deepEqual(tickLabels(c, [0, null, 20], 10), ["0s", "", "20s"]);
 });
 
 test("log-time ticks take each value's own precision", () => {
@@ -329,9 +353,9 @@ test("a log relative-time chart plotted 1 ms late labels and hands on its real t
   // Its zoom geometry stays unshifted; a shifted step chart's works in its 1 step.
   assert.equal(shifted.__kymo_zoom.xShift, 0);
   assert.equal(p.create("st", [1, 2, 11], { axis: "step", logX: true, shifted: true }).__kymo_zoom.xShift, 1);
-  // It ticks at real decades, not at uPlot's plotted ones (which read 0.009s, 0.099s, 9.999s).
+  // It ticks at real decades, not at uPlot's plotted ones (which read 0.009s, 0.099s, 9.999s); 1 ms, 36 px from its 0 on this 400 px axis, gives way to it.
   const decades = p.create("d", [0.001, 2.001], { logX: true, shifted: true });
-  assert.deepEqual(tickLabels(decades, [...decades.axes[0].splits(decades, 0, 0.001, 2.001)]), ["0s", "0.001s", "0.01s", "0.1s", "1s"]);
+  assert.deepEqual(logTicks(decades, 0.001, 2.001).labels, ["0s", "0.01s", "0.1s", "1s"]);
   const near = (a, b) => assert.ok(Math.abs(a - b) < 1e-12, `${a} vs ${b}`);
   const real = c => [c.scales.x.min - (c === shifted ? 0.001 : 0), c.scales.x.max - (c === shifted ? 0.001 : 0)];
   // A pull on it moves a linear peer to the same real window, and a pull on the peer moves it back by that window plus its 1 ms.
@@ -424,56 +448,227 @@ test("a rebuild for anything but the x axis keeps a client-side zoom", () => {
   }
 });
 
-test("only a linear relative-time axis ticks at round durations", () => {
+test("linear time axes tick at round durations, step axes at whole steps", () => {
   const p = page();
-  const incrs = options => p.create(`c${Object.values(options).join("-")}`, [0, 100], options).axes[0].incrs;
-  const rel = incrs({ axis: "rel" });
-  for (const round of [1, 5, 15, 30, 60, 300, 900, 3600, 21600, 43200, 86400]) assert.ok(rel.includes(round), `${round} s`);
-  assert.ok(!rel.includes(2.5) && !rel.includes(25), "no 2.5 steps, which read as 0:00:25 and 0:00:02.5");
-  const c = p.create("spaced", [0, 100]);
-  c.axes[0].font = ["12px sans-serif"];
-  // Spaced by the largest label at the finest increment uPlot's 50 px allows on an 800 px axis, plus a gap.
-  assert.equal(c.axes[0].space(c, 0, 0, 30, 800), 50, "seconds keep uPlot's spacing");
-  assert.equal(c.axes[0].space(c, 0, 0, 7200, 800), 7 * 7 + 18, "h:mm:ss labels are spaced by their width");
-  assert.equal(c.axes[0].space(c, 0, 0, 36000, 800), 7 * 8 + 18);
-  assert.equal(c.axes[0].space(c, 0, 0, 400 * 3600, 800), 7 * 9 + 18, "three-digit hours widen it");
-  assert.equal(c.axes[0].space(c, 0, 3600, 3600.0667, 800), 7 * 11 + 18, "and so do the millisecond digits 5 ms ticks show");
-  assert.equal(c.axes[0].space(c, 0, -7200, 60, 800), 7 * 8 + 18, "and a sign");
-  const sharp = page({ dpr: 2 }).create("spaced", [0, 100]);
-  sharp.axes[0].font = ["24px sans-serif"];
-  assert.equal(sharp.axes[0].space(sharp, 0, 0, 7200, 800), 7 * 7 + 18, "in CSS pixels at a device pixel ratio of 2 too");
+  p.create("c", [0, 100]);
+  const tables = p.window.__kymo_incrs, { time, step, num } = tables;
+  for (const round of [1, 5, 15, 30, 60, 300, 900, 3600, 21600, 43200, 86400]) assert.ok(time.includes(round), `${round} s`);
+  assert.ok(!time.includes(2.5) && !time.includes(25), "no 2.5 steps, which read as 0:00:25 and 0:00:02.5");
   // Increasing, up to ten million years.
-  assert.ok(rel.every((v, i) => i === 0 || v > rel[i - 1]));
-  assert.equal(rel.length, 55);
-  assert.equal(rel.at(-1), 10 * 31536000 * 1e6);
-  assert.equal(p.create("again", [0, 100]).axes[0].incrs, rel, "built once per page");
-  assert.equal(p.create("rl", [0.001, 100.001], { axis: "rel", logX: true, shifted: true }).axes[0].incrs, undefined);
-  assert.equal(incrs({ axis: "step" }), undefined);
+  assert.ok(time.every((v, i) => i === 0 || v > time[i - 1]));
+  assert.equal(time.length, 57);
+  assert.equal(time.at(-1), 10 * 31536000 * 1e6);
+  p.create("again", [0, 100]);
+  assert.equal(p.window.__kymo_incrs, tables, "built once per page");
+  // Steps are integers; custom x keeps uPlot's own increments, spelled as it spells them.
+  assert.ok(step.every(Number.isInteger) && step[0] === 1 && step.includes(25) && !step.includes(2.5));
+  assert.ok(num.includes(2.5) && num.includes(0.025) && num[0] === 1e-32 && num.at(-1) === 5e31);
+  // Each axis picks from its own: a wall clock round minutes, a step axis whole steps where uPlot ticked 1,500,020.2.
+  const t = 1.76e9;
+  assert.equal(picked(p.create("w", [t, t + 3600], { axis: "wall" }), t, t + 3600).step % 60, 0);
+  assert.deepEqual(picked(p.create("s", [0, 10], { axis: "step" }), 1500020, 1500022).labels, ["1,500,020", "1,500,021", "1,500,022"]);
+  // A log axis ticks through xSplits; its one increment fits any window, so uPlot always asks for them.
+  assert.deepEqual([...p.create("rl", [0.001, 100.001], { axis: "rel", logX: true, shifted: true }).axes[0].incrs], [Infinity]);
+});
+
+test("a linear axis ticks at the finest increment whose labels all fit where they land", () => {
+  const p = page();
+  const check = (c, mn, mx, step, dim = 800) => {
+    const pick = picked(c, mn, mx, dim);
+    assert.equal(pick.step, step, `${mn}..${mx}: ${pick.labels.join(" | ")}`);
+    fits(pick, mn, mx, dim);
+  };
+  // Relative time on 800 px: seconds at uPlot's 50 px, then h:mm:ss labels, three-digit hours, the millisecond digits 5 ms ticks would print, and a sign each push it coarser.
+  const c = p.create("rel", [0, 100]);
+  for (const [mn, mx, step] of [[0, 30, 2], [0, 7200, 900], [0, 36000, 3600], [0, 400 * 3600, 172800], [3600, 3600.0667, 0.01], [-7200, 60, 900]]) check(c, mn, mx, step);
+  // In CSS pixels at a device pixel ratio of 2 too.
+  check(page({ dpr: 2 }).create("rel", [0, 100]), 0, 7200, 900);
+  // Steps past a million print 9 characters, so 2-step ticks overlapped at uPlot's 50 px; short and suffixed steps keep it.
+  const s = p.create("step", [0, 100], { axis: "step" });
+  for (const [mn, mx, step] of [[1500012, 1500042, 5], [0, 300, 20], [0, 2e7, 2e6]]) check(s, mn, mx, step);
+  // Custom x: 0.02 ticks print "1,000,000.12" and 0.025 ones a digit more, so 0.05; signed below 0 too.
+  const x = p.create("custom", [0, 100], { axis: "custom" });
+  for (const [mn, mx] of [[1000000.1, 1000000.3], [-1000000.3, -1000000.1]]) check(x, mn, mx, 0.05);
+  // Exactly 1e-6 apart, ticks print their six digits.
+  assert.deepEqual(picked(x, 0.147441, 0.147446, 600).labels.slice(0, 2), ["0.147441", "0.147442"]);
+  // FLOPs ticks are the decimals they spell (28 times 1e24 read 27999999999999996B), and a window too narrow for two labels shows one.
+  const flops = p.create("flops", [2e25, 3e25], { axis: "custom" });
+  for (const label of picked(flops, 2.2e25, 2.9e25).labels) assert.match(label, /^\d+T$/);
+  assert.deepEqual(picked(flops, 1.0700394e25, 1.077871e25, 200).labels, ["10750000000000T"]);
+  // Fuzz: random windows on each linear kind at 200 to 1000 px; one tick at least wherever one fits.
+  const t = 1.76e9;
+  const rnd = random(11);
+  for (const [chart, lo, hi, least] of [[c, 0, 3 * 86400, 0.001], [s, 0, 2e7, 1], [x, -12.9, 3.7e6, 1e-4], [flops, 1e20, 6e25, 1e18], [p.create("wall", [t, t + 1], { axis: "wall" }), t, t + 400 * 86400, 0.001]]) {
+    for (let k = 0; k < 150; k++) {
+      const span = Math.max(least * 40, (hi - lo) * Math.pow(10, -6 * rnd())), mn = lo + (hi - lo - span) * rnd(), dim = 200 + 800 * rnd();
+      const pick = picked(chart, mn, mn + span, dim);
+      fits(pick, mn, mn + span, dim);
+      assert.ok(pick.ticks.length >= 1 && pick.ticks.every(v => v >= mn - 1e-9 * span && v <= mn + span * (1 + 1e-9)), `${mn}..${mn + span} at ${dim} px: ${pick.labels.join(" | ")}`);
+    }
+  }
 });
 
 test("a linear wall-time axis spaces its ticks a millisecond apart at least, where their labels still differ", () => {
   const p = page();
   const t = 1.76e9;
   const c = p.create("w", [t, t + 1], { axis: "wall" });
-  const incrs = c.axes[0].incrs;
-  assert.equal(incrs[0], 0.001);
-  assert.ok(incrs.every((v, i) => i === 0 || v > incrs[i - 1]));
-  // uPlot's own increments, as it spells them: 1, 2, 2.5 and 5 times each power of ten.
-  assert.ok(incrs.includes(0.025) && incrs.includes(2.5e9) && incrs.at(-1) === 5e31);
-  // Whole milliseconds, which the three digits Intl prints show exactly: no 2.5 ms.
-  assert.ok(incrs.filter(v => v < 1).every(v => Number.isInteger(Math.round(v * 1e6) / 1e3)), "only whole milliseconds");
-  assert.equal(p.create("w2", [t, t + 1], { axis: "wall" }).axes[0].incrs, incrs, "built once per page");
   // A millisecond apart the labels differ; closer, the three digits Intl prints would make them alike.
   const at = spacing => Array.from({ length: 4 }, (_, i) => t + 0.37 + i * spacing);
   assert.equal(new Set(tickLabels(c, at(0.001), 0.001)).size, 4);
   assert.ok(new Set(tickLabels(c, at(0.0002), 0.0002)).size < 4);
-  // Spaced by the width of a label at the finest increment that fits uPlot's 50 px, plus a gap: sub-second labels are twice that wide.
-  c.axes[0].font = ["12px sans-serif"];
-  for (const [span, incr] of [[0.035, 0.001], [60, 5]]) {
-    const label = tickLabels(c, [t + span], incr)[0];
-    assert.equal(c.axes[0].space(c, 0, t, t + span, 800), 7 * label.length + 18, `${span} s: ${label}`);
+  // Sub-second ticks fit their wider labels too.
+  for (const span of [0.035, 60]) fits(picked(c, t, t + span), t, t + span);
+  // Ticks a day or more apart fall on local midnights and read as dates, which fit many more to the window than date-and-time labels.
+  assert.equal(tickLabels(c, [t], 86400)[0], new Date(t * 1000).toLocaleDateString());
+  const month = picked(c, t, t + 30 * 86400);
+  assert.ok(month.step >= 86400 && month.ticks.length >= 4 && month.labels.every(label => !label.includes(":")), month.labels.join(" | "));
+  fits(month, t, t + 30 * 86400);
+  // A window too narrow for two dates shows one, not a coarser increment with no midnight in it.
+  assert.equal(picked(c, t, t + 1.3 * 86400, 90).ticks.length, 1);
+  // Nothing throws in Date's last year, which stops in September.
+  assert.doesNotThrow(() => picked(c, 8639999999999, 8640000000000));
+  // Its ticks a day or more apart are epoch multiples, not local midnights, so they keep their times.
+  const lw = p.create("lw2", [t, t + 30 * 86400], { axis: "wall", logX: true });
+  const days = logTicks(lw, t, t + 30 * 86400);
+  assert.ok(days.ticks[1] - days.ticks[0] >= 86400 && days.labels.every(label => /\d:\d\d/.test(label)), days.labels.join(" | "));
+});
+
+test("wall-time ticks fall on round local times, through a DST change too", () => {
+  const tz = process.env.TZ;
+  try {
+    for (const [zone, from, span, incr] of [
+      // US clocks fall back at 2 AM on 2026-11-01: 6-hour ticks stay at midnight, 6 AM, noon and 6 PM either side.
+      ["America/New_York", Date.UTC(2026, 9, 31, 12) / 1000, 2 * 86400, 21600],
+      ["America/New_York", Date.UTC(2026, 9, 30, 12) / 1000, 4 * 86400, 86400],
+      // Quarter hours tick on through the repeated hour, twice.
+      ["America/New_York", Date.UTC(2026, 10, 1, 5) / 1000, 7200, 900],
+      // US clocks spring forward at 2 AM on 2026-03-08: no 2:00 or 2:30 ticks, and 3:00 follows 1:30.
+      ["America/Los_Angeles", Date.UTC(2026, 2, 8, 8) / 1000, 5 * 3600, 1800],
+      ["America/Los_Angeles", Date.UTC(2026, 2, 8, 9, 59, 30) / 1000, 60, 60],
+      // Its midnight and 3 AM would sit 2 hours apart on 3-hour ticks: 3 AM gives way.
+      ["America/Los_Angeles", Date.UTC(2026, 2, 7, 12) / 1000, 86400, 10800],
+      ["America/Los_Angeles", Date.UTC(2026, 2, 7, 12) / 1000, 2 * 86400, 21600],
+      // Nepal is UTC+5:45: quarter hours of its clock, not of UTC's.
+      ["Asia/Kathmandu", Date.UTC(2026, 0, 1, 3, 7) / 1000, 7200, 900],
+      ["Asia/Kathmandu", Date.UTC(2026, 0, 1, 3, 7, 13.0123) / 1000, 0.05, 0.005],
+    ]) {
+      process.env.TZ = zone;
+      const p = page();
+      const c = p.create("w", [from, from + span], { axis: "wall" });
+      const ticks = c.axes[0].splits(c, 0, from, from + span, incr);
+      assert.ok(ticks.length >= Math.floor(span / incr) - 1, `${zone}: ${ticks.length} ticks`);
+      assert.ok(ticks.every((t, i) => i === 0 || t - ticks[i - 1] >= 0.9 * incr), `${zone}: in order, once each, an increment apart`);
+      for (const tick of ticks) {
+        assert.ok(tick >= from && tick <= from + span);
+        const d = new Date(Math.round(tick * 1000));
+        const clock = ((d.getHours() * 60 + d.getMinutes()) * 60 + d.getSeconds()) * 1000 + d.getMilliseconds();
+        assert.equal(clock % Math.round(incr * 1000), 0, `${zone}: ${d.toString()}`);
+      }
+      // Months tick at their local starts, a quarter from January; years every 2 from year 0.
+      for (const [incr, n, months] of [[7862400, 3, true], [2 * 31536000, 2, false]]) {
+        const ticks = c.axes[0].splits(c, 0, from, from + 9 * 31536000, incr);
+        const at = ticks.map(tick => new Date(tick * 1000)), index = d => d.getFullYear() * 12 + d.getMonth();
+        assert.ok(ticks[0] - from < incr * 1.1 && from + 9 * 31536000 - ticks.at(-1) < incr * 1.1, `${zone}: ${ticks.length} ticks`);
+        for (const [i, d] of at.entries()) {
+          assert.ok(d.getDate() === 1 && d.getHours() === 0 && d.getMinutes() === 0 && (months ? d.getMonth() % n : d.getMonth() + (d.getFullYear() % n)) === 0, `${zone}: ${d.toString()}`);
+          if (i) assert.equal(index(d) - index(at[i - 1]), months ? n : 12 * n);
+        }
+      }
+    }
+    // Santiago skips its midnight on 2026-09-06: that day still ticks, where Date reads the midnight, at 1 AM.
+    process.env.TZ = "America/Santiago";
+    const santiago = page().create("s", [1788600000, 1788800000], { axis: "wall" });
+    const days = [...santiago.axes[0].splits(santiago, 0, Date.UTC(2026, 8, 5, 16) / 1000, Date.UTC(2026, 8, 7, 15) / 1000, 86400)].map(t => new Date(t * 1000));
+    assert.deepEqual(days.map(d => [d.getDate(), d.getHours()]), [[6, 1], [7, 0]]);
+    // A window millions of years out gets no ticks rather than a counter that stops advancing.
+    const p = page();
+    const far = p.create("far", [1.76e9, 1.76e9 + 1], { axis: "wall" });
+    assert.deepEqual([...far.axes[0].splits(far, 0, 1e13, 1e13 + 1, 0.001)], []);
+  } finally {
+    if (tz === undefined) delete process.env.TZ;
+    else process.env.TZ = tz;
   }
-  assert.equal(p.create("lw", [t, t + 1], { axis: "wall", logX: true }).axes[0].incrs, undefined);
+});
+
+test("every log x axis ticks at real values its labels fit between, zoomed or not", () => {
+  // The fake plots on 400 px and measures 7 px a character; xSplits reads both.
+  const ticked = (c, lo, hi) => {
+    const pick = logTicks(c, lo, hi), { ticks, labels } = pick;
+    assert.ok(ticks.every(v => v >= lo && v <= hi * (1 + 1e-12)), `${ticks} in ${lo}..${hi}`);
+    assert.equal(new Set(labels).size, labels.length, labels.join(" | "));
+    fits(pick, c.scales.x.min, c.scales.x.max, 400, true);
+    return labels;
+  };
+  const p = page();
+  // A zoomed step chart refetches a window without its step 0, which plots plain log x: uPlot's own log ticks left steps 2000..3000 and 120k..800k blank.
+  const plain = p.create("plain", [2000, 3000], { axis: "step", logX: true });
+  assert.deepEqual(ticked(plain, 2000, 3000), ["2,000", "2,200", "2,400", "2,600", "2,800", "3,000"]);
+  assert.deepEqual(ticked(plain, 120000, 800000), ["200k", "400k", "600k", "800k"]);
+  assert.deepEqual(ticked(plain, 300, 90000), ["1k", "10k"], "decades where 1, 2, 5 crowd");
+  assert.deepEqual(ticked(plain, 2000.2, 2000.8), [], "and no fractional steps");
+  // Nor below a step, where a pull can take the window.
+  assert.deepEqual(ticked(plain, 0.1, 0.8), []);
+  assert.deepEqual(ticked(plain, 0.1, 10), ["1", "2", "5", "10"]);
+  // A zero-present chart plots steps + 1; its ticks a decade apart or less are labelled by their spacing, not as 1M six times.
+  const shifted = p.create("shifted", [1, 2e6 + 1], { axis: "step", logX: true, shifted: true });
+  assert.deepEqual(ticked(shifted, 1000001, 1000011), ["1,000,000", "1,000,005", "1,000,010"]);
+  assert.deepEqual(ticked(shifted, 2101, 2201), ["2,100", "2,120", "2,140", "2,160", "2,180", "2,200"]);
+  assert.deepEqual(ticked(shifted, 1, 2e6 + 1), ["0", "100", "10k", "1M"]);
+  // Custom x at any magnitude: these FLOPs were all blank, and these learning rates read only 1e-4.
+  const flops = p.create("flops", [3e20, 7e20], { axis: "custom", logX: true });
+  assert.deepEqual(ticked(flops, 3e20, 7e20), ["400000000T", "600000000T"]);
+  assert.deepEqual(ticked(flops, 2e-5, 9e-4), ["2e-5", "5e-5", "1e-4", "2e-4", "5e-4"]);
+  // A log time axis's linear ticks fall on round durations: 2:46:40, 5:33:20 overlapped.
+  const rel = p.create("rel", [0.001, 100000.001], { logX: true, shifted: true });
+  assert.deepEqual(ticked(rel, 10000.001, 90000.001), ["12:00:00", "24:00:00"]);
+  // Pulled past every increment into a window with no 1, 2 or 5 times a power of ten, an axis gets no ticks rather than a search that never ends, or the one tick that fits of its largest increments; across hundreds of decades it measures a few labels, not hundreds.
+  assert.deepEqual(ticked(flops, 2.1e33, 4.9e33), []);
+  assert.deepEqual(ticked(plain, 2.1e33, 4.9e33), []);
+  assert.equal(ticked(rel, 1.1e15, 1.99e15).length, 1);
+  // A crowded tier's stride can pass every power in a window: on a 113 px plot 1e25 and 1e26 crowd, and every third power lies outside 1.1e24..1.1e26, so the power nearest its middle stands alone.
+  flops.bbox.width = 113;
+  assert.deepEqual(ticked(flops, 1.1e24, 1.1e26), ["10000000000000T"]);
+  flops.bbox.width = 400;
+  // A pulled log time axis ticks no finer than its labels print, a microsecond: its ladder below one read 0s five times.
+  const relPlain = p.create("relPlain", [5, 50, 500], { logX: true });
+  assert.deepEqual(ticked(relPlain, 1e-21, 100), ["0.00001s", "1s"]);
+  let measured = 0;
+  const measure = flops.ctx.measureText;
+  flops.ctx.measureText = text => (measured++, measure(text));
+  assert.ok(ticked(flops, 1.9e-22, 1.19e300).length >= 1 && measured < 40, `${measured} labels measured`);
+  flops.ctx.measureText = measure;
+  // FLOPs ticks are the decimals they spell: 20 times 1e24 read 19999999999999996B.
+  for (const label of ticked(flops, 1.9e25, 2.2e25)) assert.match(label, /^(19|2[0-2])0+T$/);
+  // And so do they over their unit: 5.5e26 over 1e12 read 549999999999999.94T.
+  for (const label of ticked(flops, 5.5e26, 6.5e26)) assert.match(label, /^\d+T$/);
+  // Past 2^53 the finest increment's multiples would round, or its counter stop advancing: a coarser one ticks.
+  assert.deepEqual(ticked(flops, 1e15, 1e15 + 0.125), ["1,000,000,000,000,000"]);
+  const narrow = logTicks(flops, 110198468853707550, 110198468853707840).labels;
+  assert.ok(narrow.length && narrow.every(label => label.endsWith("00")), `${narrow}, not ...760`);
+  // Fuzz: random windows on each kind, wall time's dates among them, whose labels change width across a window.
+  const t = 1.76e9;
+  const wall = p.create("wall", [t, t + 400 * 86400], { axis: "wall", logX: true });
+  const rnd = random(7);
+  for (const c of [plain, shifted, flops, rel, wall]) {
+    const x = c.data[0], a = Math.log10(x[0]), b = Math.log10(x[x.length - 1]);
+    for (let k = 0; k < 200; k++) {
+      const w = (b - a) * Math.pow(10, -4 * rnd()), lo = a + (b - a - w) * rnd();
+      ticked(c, Math.pow(10, lo), Math.pow(10, lo + w));
+    }
+  }
+});
+
+test("y labels take the increment uPlot chose and every digit their ticks differ in", () => {
+  const p = page();
+  const y = (c, vals, incr) => [...c.axes[1].values(c, vals, 1, 50, incr)];
+  const c = p.create("y", [0, 1, 2]);
+  // The smallest tick difference, which labelled them before, carries float error: 0.02 five times.
+  assert.deepEqual(y(c, [0.019385, 0.019386, 0.019387, 0.019388, 0.019389], 1e-6), ["0.019385", "0.019386", "0.019387", "0.019388", "0.019389"]);
+  // Suffixed labels move each value's own digits to the unit: rounded to 15 digits these read 1000000000000000T three times.
+  assert.deepEqual(y(c, [1e27, 1.000000000000002e27, 1.000000000000004e27], 2e12), ["1000000000000000T", "1000000000000002T", "1000000000000004T"]);
+  // A log y axis labels each tick by its own value, and the splits its filter drops arrive as null and print blank.
+  const log = p.create("logy", [0, 1, 2], { logY: true });
+  assert.deepEqual(y(log, [1, null, 100, 2000], 0), ["1", "", "100", "2k"]);
 });
 
 test("relative-time labels take their fields from the rounded value, both signs", () => {
