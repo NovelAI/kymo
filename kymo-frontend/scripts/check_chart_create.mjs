@@ -18,7 +18,7 @@ function test(name, run) {
 }
 
 /** A chart's x axis, as ShownAxis and the series it plots: one run, one values line. */
-function render(id, { axis = "rel", logX = false, shifted = false, logY = false, labels = ["run"], hash = "cfg" } = {}) {
+function render(id, { axis = "rel", logX = false, shifted = false, logY = false, labels = ["run"], hash = "cfg", extraSeries = "" } = {}) {
   const step = axis === "step";
   const time = axis === "rel" || axis === "wall";
   const tokens = {
@@ -39,7 +39,7 @@ function render(id, { axis = "rel", logX = false, shifted = false, logY = false,
     __KYMO_READOUT_X_SHIFT__: !shifted ? "0" : time ? "0.001" : "1",
     __KYMO_X_DISTR__: logX ? "3" : "1",
     __KYMO_Y_DISTR__: logY ? "3" : "1",
-    __KYMO_SERIES_LIST__: "{}," + labels.map(label => `{'label':'${label}','stroke':'#123456','width':1.5}`).join(","),
+    __KYMO_SERIES_LIST__: "{}," + labels.map(label => `{'label':'${label}','stroke':'#123456','width':1.5}`).join(",") + extraSeries,
     __KYMO_LABELS__: labels.map(label => `'${label}'`).join(","),
     __KYMO_COLORS__: labels.map(() => "'#123456'").join(","),
     __KYMO_RUN_IDS__: labels.map(label => `'${label}'`).join(","),
@@ -82,6 +82,8 @@ function page({ dpr = 1 } = {}) {
   const nodes = {};
   const created = [];
   class FakeUPlot {
+    // Like uPlot's, the linear builder returns a path for a column with data and null for an all-null one (or a missing one).
+    static paths = { linear: () => (u, si) => ((u.data[si] || []).some(v => v != null) ? { linear: si } : null) };
     constructor(opts, data) {
       this.opts = opts;
       this.data = data;
@@ -94,19 +96,20 @@ function page({ dpr = 1 } = {}) {
       this.cursor = { sync: { key: opts.cursor.sync.key }, idx: null, left: 0, top: 0 };
       this.series = opts.series;
       this.axes = opts.axes;
-      this.scales = { x: { distr: opts.scales.x.distr }, y: {} };
+      // uPlot's default x ranger widens a single value by about its own magnitude (10 -> 0..20); this fake's widen pads it by 1, which the one-value checks pin.
+      const widen = (u, min, max) => min != null && min === max ? [min - 1, max + 1] : [min, max];
+      this.scales = { x: { distr: opts.scales.x.distr, range: opts.scales.x.range || widen }, y: {} };
       this.rebuilds = 0;
       this.width = opts.width;
       this.height = opts.height;
       this.resizes = 0;
       this.fitX();
     }
-    fitX() { const x = this.data[0]; this.scales.x.min = x[0]; this.scales.x.max = x[x.length - 1]; }
+    // uPlot runs the scale's range function on the data's extent when it auto-ranges or is given open bounds, and never on an explicit setScale's bounds.
+    fitX() { const x = this.data[0]; [this.scales.x.min, this.scales.x.max] = this.scales.x.range(this, x[0], x[x.length - 1], "x"); }
     setScale(key, { min, max }) {
-      // uPlot runs the scale's range function on every explicit setScale.
-      const range = this.opts.scales[key].range;
-      if (typeof range === "function") [min, max] = range(this, min, max, key);
-      Object.assign(this.scales[key], { min, max });
+      if (key === "x" && min == null && max == null) this.fitX();
+      else Object.assign(this.scales[key], { min, max });
       this.rebuilds++;
       for (const hook of this.opts.hooks.setScale || []) hook(this, key);
     }
@@ -284,15 +287,40 @@ test("a log-x peer with nothing positive in the window, or a window across 0 tha
   assert.ok(negative.source.scales.x.max <= 0, `source window ${negative.source.scales.x.min}..${negative.source.scales.x.max}`);
   untouched(negative.logPeer);
   assert.equal(negative.linear.__kymo_userzoom, true, "a linear peer takes any window, its data's or not");
-  // Inside the positive half, the peer takes the window, and so does one whose data starts after the window ends: only a window reaching 0 is left to its range function.
+  // Inside the positive half, the peer takes the window, and so does one whose data starts after the window ends: only a window reaching 0 is clamped.
   const positive = select(240, 320);
   assert.deepEqual([positive.logPeer.scales.x.min, positive.logPeer.scales.x.max], [20, 60]);
   const before = select(240, 260);
   assert.deepEqual([before.late.scales.x.min, before.late.scales.x.max], [20, 30]);
-  // Across 0, a peer takes the window from its first x; one whose data starts past the window's end is left alone, not given a window its range function would turn inside out.
+  // Across 0, a peer takes the window from its first x; one whose data starts past the window's end is left alone, not given a window that would turn inside out.
   const across = select(100, 250);
   assert.deepEqual([across.logPeer.scales.x.min, across.logPeer.scales.x.max], [1, 25]);
   untouched(across.late);
+});
+
+test("a chart with one x value ranges around it at creation and after a reset, on log and linear x", () => {
+  const p = page();
+  for (const [id, logX, range] of [["log", true, [1, 100]], ["linear", false, [9, 11]]]) {
+    const c = p.create(id, [10], { axis: "m-x", logX });
+    assert.deepEqual([c.scales.x.min, c.scales.x.max], range, `${id} at creation`);
+    c.setScale("x", { min: 5, max: 50 });
+    c.__kymo_userzoom = true;
+    p.el(id).fire("dblclick", {});
+    assert.deepEqual([c.scales.x.min, c.scales.x.max], range, `${id} after a reset`);
+    assert.equal(c.__kymo_userzoom, false);
+  }
+  // A log-x chart whose every x was trimmed (x <= 0) shows a neutral decade.
+  const none = p.create("none", [], { axis: "m-x", logX: true });
+  assert.deepEqual([none.scales.x.min, none.scales.x.max], [1, 10]);
+});
+
+test("series paths pass a built path through, keep a series' own builder, and stand in for null", () => {
+  const c = page().create("c", [1, 2], { extraSeries: ",{'paths':()=>'own'}" });
+  const [, line, own] = c.series;
+  assert.deepEqual(line.paths(c, 1, 0, 1), { linear: 1 });
+  assert.equal(own.paths(c, 2, 0, 1), "own");
+  const stand = line.paths({ ...c, data: [c.data[0], [null, null]] }, 1, 0, 1);
+  assert.equal(stand?.flags, 0, "an empty stand-in uPlot caches, not null");
 });
 
 test("a log-x pull keeps its window positive and finite", () => {
@@ -614,7 +642,7 @@ test("every log x axis ticks at real values its labels fit between, zoomed or no
   assert.deepEqual(ticked(shifted, 1000001, 1000011), ["1,000,000", "1,000,005", "1,000,010"]);
   assert.deepEqual(ticked(shifted, 2101, 2201), ["2,100", "2,120", "2,140", "2,160", "2,180", "2,200"]);
   assert.deepEqual(ticked(shifted, 1, 2e6 + 1), ["0", "100", "10k", "1M"]);
-  // Custom x at any magnitude: these FLOPs were all blank, and these learning rates read only 1e-4.
+  // kymo's tick functions at any magnitude: these FLOPs were all blank, and these learning rates read only 1e-4. The vendored uPlot itself still asks for no splits from 1e17 up (assets/vendor/README.md).
   const flops = p.create("flops", [3e20, 7e20], { axis: "custom", logX: true });
   assert.deepEqual(ticked(flops, 3e20, 7e20), ["400000000T", "600000000T"]);
   assert.deepEqual(ticked(flops, 2e-5, 9e-4), ["2e-5", "5e-5", "1e-4", "2e-4", "5e-4"]);
@@ -669,6 +697,15 @@ test("y labels take the increment uPlot chose and every digit their ticks differ
   // A log y axis labels each tick by its own value, and the splits its filter drops arrive as null and print blank.
   const log = p.create("logy", [0, 1, 2], { logY: true });
   assert.deepEqual(y(log, [1, null, 100, 2000], 0), ["1", "", "100", "2k"]);
+});
+
+test("the log y range snaps positive bounds and gives null bounds a neutral decade", () => {
+  const c = page().create("logy", [0, 1, 2], { logY: true });
+  const range = c.opts.scales.y.range;
+  // A positive window snaps outward on the 1/2/5 ladder.
+  assert.deepEqual([...range(c, 2, 700)], [2, 1000]);
+  // uPlot passes null when the window holds no positive y.
+  assert.deepEqual([...range(c, null, null)], [1, 10]);
 });
 
 test("relative-time labels take their fields from the rounded value, both signs", () => {

@@ -19,7 +19,7 @@ const THEME_BOOT: Asset = asset!(
     AssetOptions::js().with_static_head(true)
 );
 // Vendored uPlot draws _focus series last; uplot_chart/highlight.js sets that flag.
-// See assets/vendor/README.md for the patch's provenance.
+// See assets/vendor/README.md for its provenance.
 const UPLOT_JS: Asset = asset!("/assets/vendor/uPlot.iife.min.js");
 // Static head, not a runtime link: while a sheet is still loading, WebKit reports new elements to ResizeObserver at 0×0, and a callback that reads layout then raises a "ResizeObserver loop" notice.
 const UPLOT_CSS: Asset = asset!(

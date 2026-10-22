@@ -16,7 +16,7 @@ static CHART_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 // Unsmoothed downsampled runs draw faint min–max envelopes, or one ordinary line if no bucket has spread; bucket means stay data-only.
 // Smoothing adds a full-strength values line over faint raw evidence. Passthrough charts draw values directly, plus raw scatter when smoothed.
-// Column order is draw order (uPlot strokes series by index): all raw/envelope blocks first, all values lines after. A collapsed unsmoothed line remains in its raw block; the vendored _focus patch lifts the highlighted run's group on top.
+// Column order is draw order (uPlot strokes series by index): all raw/envelope blocks first, all values lines after. A collapsed unsmoothed line remains in its raw block; uPlot paints the highlighted run's _focus'd groups on top.
 
 fn next_chart_id() -> String {
     let n = CHART_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -256,7 +256,7 @@ pub fn UPlotChart(
                     c.resize(n_axis, f64::NAN);
                     c
                 };
-                // Envelope columns ship as wire truth, including mins <= 0 on log-y charts: those CLIP at the bottom border instead of gapping (uPlot's log scale clamps non-positive values a decade under the scale min, so the band visibly runs into the border), yNiceLog keeps them from driving the y-range, and the tooltip prints the real number. The wire never carries a non-finite value other than NaN; logged ±inf render as marker circles at the border they exceed.
+                // Envelope columns ship as wire truth, including mins <= 0 on log-y charts: those CLIP at the bottom border instead of gapping (uPlot's log scale ranges over positive values only and clamps the rest a decade under the scale min, so the band visibly runs into the border), and the tooltip prints the real number. The wire never carries a non-finite value other than NaN; logged ±inf render as marker circles at the border they exceed.
                 // Raw/envelope blocks first, values lines after, matching build_create_js's series opts (see the top-of-file comment).
                 let mut all_series = Vec::new();
                 // Slots where the log axis clips a run's lowest drawn evidence get a synthesized kind-5 border circle below.

@@ -125,7 +125,7 @@ fn sync_key(axis: &ShownAxis) -> String {
     }
 }
 
-/// Build the JS that creates a uPlot chart. Rust's `ChartJsConfig` equality gate keeps ordinary data-only refreshes out of this roughly 52-KiB renderer entirely; the embedded config hash is a second, browser-side race guard so overlapping same-config create evaluations coalesce through `setData` instead of destroying and recreating the chart. A genuinely different config still falls through to destroy + recreate.
+/// Build the JS that creates a uPlot chart. Rust's `ChartJsConfig` equality gate keeps ordinary data-only refreshes out of this renderer entirely; the embedded config hash is a second, browser-side race guard so overlapping same-config create evaluations coalesce through `setData` instead of destroying and recreating the chart. A genuinely different config still falls through to destroy + recreate.
 pub(super) fn build_create_js(id: &str, cfg: &ChartJsConfig) -> String {
     let log_x = cfg.axis.log_x;
     let zoom_refetch = cfg.axis.step_axis();
@@ -174,7 +174,7 @@ pub(super) fn build_create_js(id: &str, cfg: &ChartJsConfig) -> String {
                 "{'stroke':'transparent','width':0,'points':{show:false},'paths':()=>null}"
                     .to_string()
             });
-            // Fill max-to-min in the raw block, below value lines. Keep log-clipped bounds as data; uPlot clamps their paths while yNiceLog excludes them from the range.
+            // Fill max-to-min in the raw block, below value lines. Keep log-clipped bounds as data; uPlot clamps their paths and leaves them out of its log range.
             if cfg.banded[i] {
                 let min_idx = 1 + i * raw_stride + (if cfg.has_raw { 1 } else { 0 });
                 let max_idx = min_idx + 1;

@@ -44,7 +44,7 @@ let axisKey='__KYMO_SYNC_KEY__|__KYMO_X_DISTR__';
 // During an axis pull on this chart the window carried is the one the pull started from (its `start`): the pull, cancelled below, has already moved the scale, and uPlot commits its restore later. A selection moves no scale before its release.
 let gesture=window.__kymo_zg&&window.__kymo_zg.srcId==='__KYMO_ID__'?window.__kymo_zg.start:null;
 let was=prev&&(gesture||{min:prev.scales.x.min,max:prev.scales.x.max,userzoom:prev.__kymo_userzoom});
-// Limit: a second create before uPlot's commit microtask, which no path is known to make, would carry the first instance's still-null scale and draw blank until a reset.
+// Limit: a second create before uPlot's commit microtask, which no path is known to make, would carry the first instance's still-null scale: the chart shows its full extent but stays marked zoomed, not following live data, until a reset.
 let keepZoom=was&&was.userzoom&&prev.__kymo_axiskey===axisKey?{min:was.min,max:was.max}:null;
 if(prev){
   // A structural source rebuild invalidates the gesture-start geometry and
@@ -62,6 +62,7 @@ let labels=[__KYMO_LABELS__];
 let colors=[__KYMO_COLORS__];
 let runIds=[__KYMO_RUN_IDS__];
 let runNames=[__KYMO_RUN_NAMES__];
+// xnanC, hasRaw, hasRange and isSmoothed are read only by the embedded hover.js (the tooltip), which shares this closure.
 let xnanC=[__KYMO_XNAN_COUNTS__];
 let hasRaw=__KYMO_HAS_RAW__;
 let hasRange=__KYMO_HAS_RANGE__;
@@ -245,7 +246,7 @@ let wallSplits=function(mn,mx,incr){
     if(t>=mn&&!(t-out[out.length-1]<incr*0.9))out.push(t);
   }
 };
-// Log x ticks, on every log x axis. uPlot's own log splits fall only on whole multiples of each decade's power of ten (a zoom to 2100..2900 gets none), and the vendored uPlot's log label filter keeps only the powers on a horizontal axis (it compares signed pixel distances; upstream master takes their abs()). So ticks fall on nice real x, in the axis's units (steps, seconds or the custom metric), plotted at x + readoutXShift: a zero-present axis plots its real 0 at 1 step or 1 ms.
+// Log x ticks, on every log x axis. uPlot's own log splits fall only on whole multiples of each decade's power of ten (a zoom to 2100..2900 gets none), and its log label filter keeps a label only by its leading digit. So ticks fall on nice real x, in the axis's units (steps, seconds or the custom metric), plotted at x + readoutXShift: a zero-present axis plots its real 0 at 1 step or 1 ms.
 // Neighbours keep room() apart where they land. Under a decade the axis ticks where pickTicks puts its linear increments, placed on log geometry; wider, at the densest tier below that fits. A zero-present axis keeps its 0, dropping the first tick after it if they collide.
 let xSplits=function(u,axisIdx,smin,smax){
   // Real x has no data in (0, S) on a zero-present axis, nor below a step on a step axis, and time labels print nothing finer than a microsecond, wall clocks a millisecond: the ladder starts there.
@@ -281,7 +282,8 @@ let xSplits=function(u,axisIdx,smin,smax){
   }
   return out.map(function(v){return v+S});
 };
-// A log axis's one increment, Infinity, fits any window, so uPlot always calls xSplits (it skips the call when none fits); its labels bypass uPlot's log filter.
+// Limit: from 1e17 in magnitude up, the vendored uPlot accepts no increment, so no axis gets ticks there (an upstream bug; see assets/vendor/README.md).
+// A log axis's one increment, Infinity, fits any window below that, so uPlot calls xSplits (it skips the call when none fits); its labels bypass uPlot's log filter.
 let xTicks={splits:xSplits,incrs:[Infinity],filter:function(u,s){return s}};
 if(!isLogX){
   // A linear axis picks its ticks when uPlot asks for its increments: it returns the one picked, which a spacing of 1 always lets through, and splits hands over the ticks picked (or, called directly for another increment, places that one's). Limit: uPlot also refuses an increment under 5 whose decimals and the window's integer digits pass 17, so a custom-x window narrower than about 1e-15 of its magnitude, or than 1e-15 below 1, gets no ticks.
@@ -328,49 +330,32 @@ let gridColor=function(){return cssv('--chart-grid')};
 let yNice=function(u,mn,mx){
   if(!isFinite(mn)||!isFinite(mx))return[mn,mx];
   let span=mx-mn;
-  // Flat/ulp-noise spans (e.g. smoothed constant metrics) explode uPlot's tick walk into millions of ticks (uPlot #1135). A custom range fn bypasses the default ranger's flat fallback, so mirror its flat test and delegate those spans back to rangeNum.
+  // Flat and ulp-noise spans (e.g. smoothed constant metrics) take uPlot's default padded range (uPlot.rangeNum) rather than a rounding that magnifies the noise.
   if(!(span>1e-24)||Math.max(Math.abs(mn),Math.abs(mx))/span>1e10)return uPlot.rangeNum(mn,mx,0.1,true);
   let cap=0.1*span;
   let p=Math.pow(10,Math.floor(Math.log10(cap)));
   let i=cap>=5*p?5*p:cap>=2*p?2*p:p;
   return[Math.floor(mn/i)*i,Math.ceil(mx/i)*i];
 };
-// uPlot walks a log y axis decade by decade from floor(log10(min)); a min <=0
-// (log10 -> -Infinity) or a non-finite bound (an x-zoom that caught no points
-// leaves uPlot's auto min/max at +-Infinity) makes that walk never terminate
-// and freezes the tab, as does any min below about 1e-25, where the walk rounds its ticks to 0. logClamp is the one rule both log scales pass through:
-// keep a finite positive bound, else fall back to the data's own positive
-// extent (lo,hi); nothing positive at all -> a neutral decade.
-let logClamp=function(mn,mx,lo,hi){
-  if(!(lo<=hi))return[1,10];
-  return[(isFinite(mn)&&mn>0)?mn:lo,(isFinite(mx)&&mx>0)?mx:hi];
-};
-// Log-x range: pin to the zoom's own endpoints, where uPlot's default snaps to powers of 10; data[0] is ascending and >0
-// (the build trims x<=0 for log-x), so its ends are the positive extremes a
-// bound extrapolated past 0 falls back to.
-let logSafeX=function(u,mn,mx){let X=u.data[0];return logClamp(mn,mx,X[0],X[X.length-1]);};
+// Log-x range: the data's own ends, not the powers of 10 uPlot's default would snap to. uPlot calls it only to range data[0], which is ascending and >0 (the build trims x<=0 for log-x); explicit bounds skip it (applyClientRange clamps its own).
+// No data gets a neutral decade, and a single x value a decade either side, since this replaces uPlot's own single-value widening.
+// Limit: from about 1.8e307 up, that decade overflows to Infinity.
+let logXRange=function(u,mn,mx){return mn==null?[1,10]:mn===mx?[mn/10,mn*10]:[mn,mx];};
 // Log-y counterpart of yNice: bounds snap to m*10^k — m from the coarse
 // ladder (1/2/5) when that costs <=10% of the displayed decades in log
 // space, the fine ladder as fallback, the raw data bound last. uPlot's
-// own log ranging always rounds to integer-mantissa steps, which on a
+// own log ranging rounds out to whole powers of 10, which on a
 // sub-decade chart is mostly empty space.
 let yNiceLog=function(u,mn,mx){
-  if(!(isFinite(mn)&&mn>0&&isFinite(mx))){
-    // Degenerate: a <=0 sample or envelope edge in view (it clips at the bottom border via uPlot's log clamp and must not drive the range), or an empty window. Range to the strictly-positive extent of the y evidence in the visible x window. The dense envelope, when present, provably contains the raw column (a duplicate-x band spans every point at its x; min==max==sample elsewhere) and the unsmoothed values line (the bucket mean), so those reads are skipped as redundant (AI-1411); a smoothed line stays scanned — its trailing window reaches samples outside the visible window, so it can extend past the window's envelope. y isn't sorted, so this needs a scan, but only the degenerate case pays for it.
-    let X=u.data[0],x0=u.scales.x.min,x1=u.scales.x.max;
-    let lo=Infinity,hi=0,scan=function(col){for(let j=0;j<col.length;j++){let v=col[j];if(v==null||v<=0)continue;if(isFinite(x0)&&(X[j]<x0||X[j]>x1))continue;if(v<lo)lo=v;if(v>hi)hi=v;}};
-    for(let i=0;i<labels.length;i++){let b=1+i*rawStride;for(let k=(hasRange&&hasRaw)?1:0;k<rawStride;k++)scan(u.data[b+k]);if(isSmoothed||!hasRange)scan(u.data[lineBase+i]);}
-    [mn,mx]=logClamp(mn,mx,lo,hi);
-  }
+  // uPlot's log scan skips values <=0 and passes null when the window has no positive value: a neutral decade.
+  if(mn==null)return[1,10];
   let cap=0.1*(Math.log10(mx)-Math.log10(mn));
   if(!(cap>0))return[mn/1.25,mx*1.25];
   let snap=function(v,up){
     let k=Math.pow(10,Math.floor(Math.log10(v)));
     let m=v/k;
     for(const ms of [[1,2,5,10],[1,1.5,2,3,4,5,6,7,8,9,10]]){
-      let c;
-      if(up)c=k*ms.find(function(x){return x>=m-1e-12});
-      else{let lo=ms.filter(function(x){return x<=m+1e-12});c=k*lo[lo.length-1];}
+      let c=k*(up?ms.find(x=>x>=m-1e-12):ms.filter(x=>x<=m+1e-12).at(-1));
       if(Math.abs(Math.log10(c/v))<=cap)return c;
     }
     return v;
@@ -382,15 +367,18 @@ let yNiceLog=function(u,mn,mx){
 // The draw hook paints them; setCursor measures the cursor to the same spot so
 // a NaN reads as a hoverable sample. One source so the two can't drift apart.
 let markR=3.5,markGap=1.5;
+// uPlot rebuilds a series' paths on every repaint while its builder returns null, rescanning the column each time: a column with no finite value (say a NaN-only run) or a paths:()=>null column. An empty stand-in is kept instead, until the next rebuild.
+let emptyPaths={flags:0},linearPaths=uPlot.paths.linear();
+let cacheEmptyPaths=function(s,i){if(i){let build=s.paths||linearPaths;s.paths=function(u,si,i0,i1){return build(u,si,i0,i1)||emptyPaths;};}return s;};
 let u=new uPlot({
   width:w,height:h,
   // Replaces uPlot's autoPadSide (17 top / 25 right). Top 8 is the whole title-to-plot gap (.rect-header has no margin-bottom) and absorbs y-max stroke caps; the rename hover strip (.rect-title::before) deadens its top half and must stay <= it. Right 12 keeps the last x label's centered half on-canvas and leaves a gutter for edge-hover and gutter-select drags.
   padding:[8,12,0,0],
   legend:{show:false},
-  // _focus is our z-order signal (patched drawSeries strokes _focus'd series last); alpha:1 keeps uPlot's native focus from ALSO dimming, so series.alpha stays entirely ours.
+  // _focus is our z-order signal (uPlot paints a series or band group with a _focus member last); alpha:1 keeps uPlot's native focus from ALSO dimming, so series.alpha stays entirely ours.
   focus:{alpha:1},
   // x auto IS the zoom policy: it gates setData's re-range (uPlot consults it nowhere else that matters in mode 1). Unzoomed, every live flush re-ranges x to the full extent — the chart follows a growing run. While a client-side zoom is active (__kymo_userzoom: set by drag-select/gutter-select/axis-pull, cleared by the configured reset click) setData keeps the current window but still commits, so new points landing inside the window paint on the flush that delivers them. Declaring the policy on the scale keeps every setData caller a plain setData(data) — passing resetScales=false instead skips the commit and freezes the zoomed chart until the next interaction.
-  scales:{x:{time:false,distr:__KYMO_X_DISTR__,...(isLogX?{range:logSafeX}:{}),auto:u=>!u.__kymo_userzoom},...__KYMO_SYNC_SCALE__,y:{distr:__KYMO_Y_DISTR__,range:__KYMO_Y_DISTR__===3?yNiceLog:yNice},nan:{range:[0,1]}},
+  scales:{x:{time:false,distr:__KYMO_X_DISTR__,...(isLogX?{range:logXRange}:{}),auto:u=>!u.__kymo_userzoom},...__KYMO_SYNC_SCALE__,y:{distr:__KYMO_Y_DISTR__,range:__KYMO_Y_DISTR__===3?yNiceLog:yNice},nan:{range:[0,1]}},
   // kymo owns zoom gestures. Leaving uPlot's native drag armed gives every
   // synced chart an independent pixel-space drag state, which lets a peer
   // revive the source selection and makes every peer commit on mouseup.
@@ -451,11 +439,10 @@ let u=new uPlot({
   axes:[
     // The app-root preference scales canvas text too; size is ticks 5 + gap 6 + the rendered font.
     {stroke:axColor,grid:{show:false},ticks:{stroke:gridColor,width:1,size:5},font:'__KYMO_AXIS_FONT_SIZE__px sans-serif',gap:6,size:__KYMO_X_AXIS_SIZE__,values:xFmt,...xTicks},
-    // size is a function: the axis grows to fit its widest label (uPlot re-asks on every scale change) until the narrow-cell plot floor below wins. Every label is measured — with proportional glyphs the longest string isn't always the widest. The preference-scaled floor keeps plot left edges aligned across a grid column of short-label charts; the cycleNum guard is the uPlot autosize idiom.
+    // size is a function: the axis grows to fit its widest label (uPlot re-asks on every scale change) until the narrow-cell plot floor below wins. Every label is measured — with proportional glyphs the longest string isn't always the widest. The preference-scaled floor keeps plot left edges aligned across a grid column of short-label charts.
     {stroke:axColor,grid:{stroke:gridColor,width:1},ticks:{stroke:gridColor,width:1,size:5},font:'__KYMO_AXIS_FONT_SIZE__px sans-serif',gap:6,
-     size:function(u,values,axisIdx,cycleNum){
+     size:function(u,values,axisIdx){
        let ax=u.axes[axisIdx];
-       if(cycleNum>1)return ax._size;
        let measured=Math.max(__KYMO_Y_AXIS_MIN_SIZE__,Math.ceil(ax.ticks.size+ax.gap+Math.max(0,...(values||[]).map(measurer(u,axisIdx)))));
        // A narrow grid cell can be smaller than a long formatted label. Cap
        // this gutter after measurement so the right pad (12px above) and a
@@ -465,7 +452,7 @@ let u=new uPlot({
        return Math.min(measured,maxAxis);
      },values:yFmt}
   ],
-  series:[__KYMO_SERIES_LIST__],
+  series:[__KYMO_SERIES_LIST__].map(cacheEmptyPaths),
   bands:[__KYMO_BANDS_LIST__]
 },data,el);
 u.over.appendChild(hotpt);
@@ -505,7 +492,7 @@ window.__kymo_ro['__KYMO_ID__']=new ResizeObserver(()=>{
       c.setSize({width:Math.floor(r.width),height:r.height});
       // Only a real container resize invalidates the frozen source geometry.
       // Restore/cancel after uPlot releases its commit queue; internal axis
-      // size convergence also fires setSize hooks but never reaches here.
+      // resizing also fires setSize hooks but never reaches here.
       if(owner&&owner.srcId==='__KYMO_ID__'&&owner.cancel)queueMicrotask(function(){if(window.__kymo_zg===owner)owner.cancel();});
     }
   }
@@ -518,12 +505,12 @@ let eachPeer=function(sync,fn){
   let cs=window.__kymo_charts||{};
   for(let id in cs){let peer=cs[id],meta=peer&&peer.__kymo_zoom;if(meta&&peer.cursor.sync.key===sync)fn(peer,meta);}
 };
-// A client-side zoom's one commit, for a selection and an axis pull alike: the real-x window goes to every chart in the sync group but `except` (an axis pull's source, already showing it). A log-x peer takes the part it can show: a lower bound at or below 0 (a pull past a linear chart's data reaches there) is raised to its first plotted x by its range function (logSafeX); a window ending before that x, which logSafeX would turn inside out, leaves the peer alone.
+// A client-side zoom's one commit, for a selection and an axis pull alike: the real-x window goes to every chart in the sync group but `except` (an axis pull's source, already showing it). A log-x peer takes the part it can show: a lower bound at or below 0 (a pull past a linear chart's data reaches there) is raised to its first plotted x, and the peer is left alone when the window ends before that x or it has no x data.
 let applyClientRange=function(sync,range,except){
   eachPeer(sync,function(c,m){
     if(c===except)return;
     let lo=range.lo+m.readoutXShift,hi=range.hi+m.readoutXShift;
-    if(c.scales.x.distr===3&&!(lo>0)&&!(hi>c.data[0][0]))return;
+    if(c.scales.x.distr===3&&!(lo>0)){if(!(hi>c.data[0][0]))return;lo=c.data[0][0];}
     c.setScale('x',{min:lo,max:hi});c.__kymo_userzoom=true;
   });
 };
@@ -541,8 +528,9 @@ let resetZoom=function(){
       el.dispatchEvent(new CustomEvent('kymo-zoom',{detail:{xmin:null,xmax:null},bubbles:true}));
     }else{
       eachPeer(c.cursor.sync.key,function(peer,meta){
-        if(meta.zr||!peer.__kymo_userzoom||!peer.data[0].length)return;
-        peer.setScale('x',{min:peer.data[0][0],max:peer.data[0][peer.data[0].length-1]});
+        if(meta.zr||!peer.__kymo_userzoom)return;
+        // Open bounds range the data as on creation, so a single x value widens rather than collapsing to a zero span.
+        peer.setScale('x',{min:null,max:null});
         peer.__kymo_userzoom=false;
       });
     }

@@ -6,7 +6,7 @@ The chart where a selection begins owns the gesture until commit or cancellation
 
 Step-axis selections resolve against the complete x extents of the rendered buckets. Every bucket intersecting the original selected interval is included once, a selection wholly inside a data gap is a no-op, and extrapolated space outside the current coverage is retained. Client-only time and custom-x charts instead use their exact plotted domain. Axis-bound pulls share the page-level ownership slot but keep their separate pull geometry.
 
-A real container resize invalidates frozen source geometry and cancels the matching owner. uPlot's internal axis-size convergence is not a container resize: it only repaints the active selection after uPlot updates its plot rectangle. Structural source replacement and unmount also cancel; peer replacement only repaints.
+A real container resize invalidates frozen source geometry and cancels the matching owner. uPlot's internal axis resizing is not a container resize: it only repaints the active selection after uPlot updates its plot rectangle. Structural source replacement and unmount also cancel; peer replacement only repaints.
 
 ## Deferred improvements
 

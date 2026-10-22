@@ -51,7 +51,7 @@ def main() -> None:
         if SOURCE_FIRST <= step <= SOURCE_LAST:
             # Monotone sub-cent values make y-axis label precision/width change
             # as an x-axis pull narrows the visible window. This exercises
-            # uPlot's internal axis-size convergence without a container resize.
+            # uPlot's internal axis resizing without a container resize.
             metrics["zoom_a_source"] = 1.0 + step / 100_000
         if PEER_FIRST <= step <= PEER_LAST:
             metrics["zoom_b_peer"] = float(200 + (step * 11) % 67)
