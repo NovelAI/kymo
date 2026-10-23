@@ -53,6 +53,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - name: Refresh build trust
+        run: |
+          cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+          export PATH="$cargo_bin:$PATH"
+          sh "${{ github.workspace }}/security/refresh-trust.sh" --rustup
+          echo "$cargo_bin" >> "$GITHUB_PATH"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -70,15 +76,23 @@ jobs:
   frontend:
     needs: meta
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
+      - name: Refresh build trust
+        run: |
+          cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+          export PATH="$cargo_bin:$PATH"
+          sh "${{ github.workspace }}/security/refresh-trust.sh" --rustup
+          echo "$cargo_bin" >> "$GITHUB_PATH"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
-      - run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: dioxus-cli@0.7.9
+      - run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler patch
+      - name: Build the patched Dioxus CLI
+        run: |
+          sh security/install-dx.sh "$RUNNER_TEMP/kymo-dx"
+          echo "$RUNNER_TEMP/kymo-dx/bin" >> "$GITHUB_PATH"
       # rust-cache finds only a target dir inside the workspace.
       - if: needs.meta.outputs.release == ''
         uses: Swatinem/rust-cache@v2
@@ -96,6 +110,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - name: Refresh build trust
+        run: |
+          cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+          export PATH="$cargo_bin:$PATH"
+          sh "${{ github.workspace }}/security/refresh-trust.sh" --rustup
+          echo "$cargo_bin" >> "$GITHUB_PATH"
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
         with:
@@ -143,6 +163,12 @@ jobs:
       KYMO_FRONTEND_BUNDLE_DIR: ${{ github.workspace }}/local-runtime/.frontend-bundle
     steps:
       - uses: actions/checkout@v6
+      - name: Refresh build trust
+        run: |
+          cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+          export PATH="$cargo_bin:$PATH"
+          sh "${{ github.workspace }}/security/refresh-trust.sh" --rustup
+          echo "$cargo_bin" >> "$GITHUB_PATH"
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/download-artifact@v8
         with:
@@ -168,6 +194,10 @@ jobs:
           manylinux: '2_28'
           maturin-version: v1.14.1
           working-directory: local-runtime
+          # This hook runs after the action bootstraps Rust, Maturin, and uv.
+          # The manylinux image must already have clean OS trust and patched Rustup.
+          before-script-linux: |
+            sh "${{ github.workspace }}/security/refresh-trust.sh" --rustup
           docker-options: -e KYMO_FRONTEND_BUNDLE_DIR
       - uses: actions/upload-artifact@v7
         with:
@@ -196,6 +226,12 @@ jobs:
       # The runner context is not available in a job-level env.
       - run: echo "KYMO_LOCAL_ROOT=$RUNNER_TEMP/kymo-local-runtime" >> "$GITHUB_ENV"
       - uses: actions/checkout@v6
+      - name: Refresh build trust
+        run: |
+          cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+          export PATH="$cargo_bin:$PATH"
+          sh "${{ github.workspace }}/security/refresh-trust.sh" --rustup
+          echo "$cargo_bin" >> "$GITHUB_PATH"
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v6
         with:
@@ -230,6 +266,12 @@ jobs:
         working-directory: tools/local-transport-qualification
     steps:
       - uses: actions/checkout@v6
+      - name: Refresh build trust
+        run: |
+          cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+          export PATH="$cargo_bin:$PATH"
+          sh "${{ github.workspace }}/security/refresh-trust.sh" --rustup
+          echo "$cargo_bin" >> "$GITHUB_PATH"
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v6
         with:

@@ -20,6 +20,8 @@ kymo-local-runtime-core = { path = "../../local-runtime/core" }
 prost = "0.14"
 rcgen = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# Constrain rustls's verifier after the eMudhra intermediate compromise.
+rustls-webpki = { version = "0.103.16", default-features = false }
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }

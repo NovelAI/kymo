@@ -5,6 +5,9 @@
 # "GLIBC_2.38 not found". Keep builder + runtime on the same Debian release.
 FROM rust:1-bookworm AS builder
 
+COPY security/refresh-trust.sh security/verify-ca-bundle.sh /tmp/kymo-security/
+RUN sh /tmp/kymo-security/refresh-trust.sh --rustup && rm -rf /tmp/kymo-security
+
 WORKDIR /build
 COPY . /build
 
@@ -12,7 +15,8 @@ RUN cargo build --locked --release --package kymo-server
 
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY security/refresh-trust.sh security/verify-ca-bundle.sh /tmp/kymo-security/
+RUN sh /tmp/kymo-security/refresh-trust.sh && rm -rf /tmp/kymo-security
 
 COPY --from=builder /build/target/release/kymo-server /usr/local/bin/kymo-server
 

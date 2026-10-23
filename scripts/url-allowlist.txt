@@ -13,6 +13,7 @@ prometheus
 prometheus-server
 # Public sites
 github.com
+sh.rustup.rs
 www.apache.org
 www.postgresql.org
 ftp.postgresql.org

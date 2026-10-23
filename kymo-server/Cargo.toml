@@ -40,6 +40,11 @@ libc = "0.2"
 url = "2"
 object_store = { version = "=0.14.1", features = ["gcp"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+# Keep the shared TLS verifier and embedded roots above the eMudhra security fixes.
+rustls-webpki = { version = "0.103.16", default-features = false }
+webpki-roots = "1.0.10"
+# SQLx uses the compatibility crate; older 0.26 releases embed a separate root set.
+webpki-roots-compat = { package = "webpki-roots", version = "0.26.11" }
 crc32c = "0.6.8"
 base64 = "0.22"
 async-trait = "0.1.92"
@@ -57,3 +62,7 @@ tokio-tungstenite = { version = "0.28", default-features = false, features = ["c
 protoc-bin-vendored = "3"
 sha2 = "0.10"
 tonic-prost-build = "0.14"
+
+# reqwest's platform verifier uses this bundle on wasm32.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+webpki-root-certs = "1.0.10"
