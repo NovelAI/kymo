@@ -194,11 +194,10 @@ jobs:
           manylinux: '2_28'
           maturin-version: v1.14.1
           working-directory: local-runtime
-          # This hook runs after the action bootstraps Rust, Maturin, and uv.
-          # The manylinux image must already have clean OS trust and patched Rustup.
-          before-script-linux: |
-            sh "${{ github.workspace }}/security/refresh-trust.sh" --rustup
-          docker-options: -e KYMO_FRONTEND_BUNDLE_DIR
+          # The entrypoint repairs trust before the action downloads its build tools.
+          docker-options: >-
+            --entrypoint "${{ github.workspace }}/security/manylinux-entrypoint.sh"
+            -e KYMO_FRONTEND_BUNDLE_DIR
       - uses: actions/upload-artifact@v7
         with:
           name: dist-runtime-${{ matrix.platform }}

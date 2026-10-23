@@ -5,6 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 root() {
+    python security/test_trust.py
     cargo fmt --all -- --check
     cargo clippy --locked --workspace --all-targets -- -D warnings
     # One package per invocation: --workspace, or both --package flags in one command, gives kymo-server the frontend's serde_json features, which its builds never have.
