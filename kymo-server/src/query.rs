@@ -4432,7 +4432,7 @@ pub struct QueryService {
     // Push bus: lifecycle version bumps (run added / terminated / project
     // created) go out to connected dashboards from here.
     events: crate::events::EventSender,
-    // Rolls the 1-in-67 sampled audit (see build_chart), which also covers the memo's and held state's answers. Prime, so the round-robin can't phase-lock with a dashboard's periodic panel count and audit the same panels every cycle while never touching others.
+    // Rolls the 1-in-67 sampled audit (see build_chart), which also covers the memo's and held state's answers. Prime, so a periodic poll cycle phase-locks with it, auditing the same panels every cycle and never the others, only when its length is a multiple of 67.
     delta_audit: std::sync::atomic::AtomicU64,
     // Stage 1 of docs/chart-request-latency.md: memoized `unchanged` replies. KYMO_CHART_MEMO=0 turns it off.
     chart_memo: Arc<memo::ChartMemo>,

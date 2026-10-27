@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use super::proto;
 use crate::series_cache::{SeriesSnapshot, ARC_HEADER};
 
-/// Bound on retained memo bytes, as [`Memo::bytes`] accounts them. A 12-ref chart's memo is about 1.6 KB, so this holds about 5,000 of them; prod has about 300 open tab-charts.
+/// Bound on retained memo bytes, as [`Memo::bytes`] accounts them. A 12-ref chart's memo is about 1.6 KB, so this holds about 5,000 of them; prod's peaked at 559 entries in 0.4 MiB (2026-10-17 to 10-20).
 const MEMO_BUDGET_BYTES: usize = 8 << 20;
 
 /// SHA-256 of the canonical request bytes; see [`memo_key`].
