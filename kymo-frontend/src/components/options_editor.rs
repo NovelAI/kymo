@@ -1,4 +1,8 @@
+use std::time::Duration;
+
+use dioxus::core::{needs_update, Task};
 use dioxus::prelude::*;
+use gloo_timers::future::sleep;
 use serde_json::Value;
 
 use crate::components::icons::{CaretDownIcon, CaretRightIcon, CloseIcon};
@@ -13,18 +17,20 @@ use crate::util::{primary, use_live_apply};
 /// Field-id prefix for every options editor; one panel is open at a time.
 pub const OPTIONS_ID_PREFIX: &str = "kymo-options";
 
-/// Reset an overridden field to its inherited value; hidden when `show` is false.
+/// A field's row, marked when `overridden`, with a dot that resets it to its inherited value.
 #[component]
-fn ResetDot(show: bool, onreset: EventHandler<()>) -> Element {
-    if !show {
-        return rsx! {};
-    }
+fn Field(overridden: bool, onreset: EventHandler<()>, children: Element) -> Element {
     rsx! {
-        button {
-            class: "field-reset-dot",
-            title: "Reset to inherited value",
-            onmousedown: primary(move |_| onreset.call(())),
-            "●"
+        div { class: if overridden { "binding-field field-overridden" } else { "binding-field" },
+            if overridden {
+                button {
+                    class: "field-reset-dot",
+                    title: "Reset to inherited value",
+                    onmousedown: primary(move |_| onreset.call(())),
+                    "●"
+                }
+            }
+            {children}
         }
     }
 }
@@ -36,8 +42,131 @@ const EMA_POLYFIT_HINT: &str =
 
 const BIWEIGHT_POLYFIT_HINT: &str =
     "Local polynomial fit in a symmetric window. Only compare runs when they have the same x values in the window. For example, do not use this to compare the last point of an incomplete run to other runs; use an EMA instead.\nTechnical details: This is Savitzky-Golay on a biweight window, which approximates a Gaussian. Higher powers are closer to Gaussian, and we chose the second power.";
-/// UI cap for the biweight-polyfit smoothing window (the server clamps at 4096).
-const BIWEIGHT_WINDOW_MAX: u32 = 500;
+/// UI cap for the biweight-polyfit smoothing window and the EMA time constant (the server clamps windows at 4096).
+const SMOOTHING_MAX: u32 = 2000;
+/// The smallest biweight-polyfit window; the server floors smaller ones to it.
+const BIWEIGHT_WINDOW_MIN: u32 = 3;
+/// The smallest EMA time constant.
+const TIME_CONSTANT_MIN: u32 = 1;
+/// Steps on the exponential smoothing sliders, whose positions run 0..=SLIDER_STEPS: each step moves the value by the same ratio.
+const SLIDER_STEPS: u32 = 100;
+
+/// The value at `position` on an exponential slider from `min` to [`SMOOTHING_MAX`].
+fn slider_value(min: u32, position: u32) -> u32 {
+    let ratio = f64::from(SMOOTHING_MAX) / f64::from(min);
+    let fraction = f64::from(position) / f64::from(SLIDER_STEPS);
+    (f64::from(min) * ratio.powf(fraction)).round() as u32
+}
+
+/// The position nearest `value` on an exponential slider from `min`; values outside the slider's range, or within half a step of one end (window 1937 and up, time constant 1926 and up), sit at that end, where its Home or End key writes nothing.
+fn slider_position(min: u32, value: f64) -> u32 {
+    let ratio = f64::from(SMOOTHING_MAX) / f64::from(min);
+    let position = (value / f64::from(min)).log(ratio) * f64::from(SLIDER_STEPS);
+    position.round().clamp(0.0, f64::from(SLIDER_STEPS)) as u32
+}
+
+/// Where a slider from `min` draws `value`, and the value its number box shows: `thumb` and the value it reads while a drag's rest is `pending` or that value is `value` rounded, else the position nearest `value` and `value` rounded.
+fn display(min: u32, thumb: Option<u32>, pending: bool, value: f64) -> (u32, u32) {
+    let shown = value.round() as u32;
+    match thumb.map(|thumb| (thumb, slider_value(min, thumb))) {
+        Some((thumb, reads)) if pending || reads == shown => (thumb, reads),
+        _ => (slider_position(min, value), shown),
+    }
+}
+
+/// How long a mouse drag rests before its slider writes. Each write re-renders the dashboard and starts full chart builds the server never cancels (measured in `docs/chart-repaint-performance.md`, 2026-10-28), so a drag writes only when it rests or lets go, while arrow keys and typed values write at once. A drag the panel closes under (Escape under a held button) loses its moves since it last rested.
+const SLIDER_REST: Duration = Duration::from_millis(250);
+
+/// An exponential slider's state across renders.
+#[derive(Clone, Copy)]
+struct ExpSlider {
+    min: u32,
+    /// Where the thumb last moved. Every re-render rewrites the volatile `value`, and neighboring low-end positions round to one value: drawn at the value's nearest position, the thumb would jump under the pointer within such a run, and arrow keys could never leave it.
+    thumb: Signal<Option<u32>>,
+    /// The timer writing a drag's position once it rests; the thumb's value shows meanwhile.
+    rest: Signal<Option<Task>>,
+}
+
+fn use_exp_slider(min: u32) -> ExpSlider {
+    ExpSlider {
+        min,
+        thumb: use_signal(|| None),
+        rest: use_signal(|| None),
+    }
+}
+
+impl ExpSlider {
+    /// `input`: move the thumb, and write its value once it rests.
+    fn slide(mut self, event: Event<FormData>, mut write: impl FnMut(u32) + 'static) {
+        let Ok(position) = event.value().parse() else {
+            return;
+        };
+        self.thumb.set(Some(position));
+        if let Some(task) = self.rest.take() {
+            task.cancel();
+        }
+        let value = slider_value(self.min, position);
+        self.rest.set(Some(spawn(async move {
+            sleep(SLIDER_REST).await;
+            self.rest.set(None);
+            write(value);
+        })));
+    }
+
+    /// `change` (a release, or each arrow key after its `input`) and `pointerup` (a release back where the drag started fires no `change`): write a pending rest now, so arrow keys write at once and no rest can undo a Reset or Revert made just after a release.
+    fn flush(mut self, mut write: impl FnMut(u32)) {
+        if let (Some(task), Some(position)) = (self.rest.take(), *self.thumb.peek()) {
+            task.cancel();
+            write(slider_value(self.min, position));
+        }
+    }
+
+    /// The label, slider and number box editing `value`, with ids from `name`. The box writes typed whole values at once, capped at [`SMOOTHING_MAX`], and leaves those below the minimum for its commit to raise, since each write re-renders it: raised on its first digit, a typed 1500 would end as 2000, and a typed 0150 as 1150.
+    fn inputs(
+        self,
+        name: &str,
+        text: &str,
+        value: f64,
+        mut write: impl FnMut(u32) + Copy + 'static,
+    ) -> Element {
+        let pending = self.rest.read().is_some();
+        let (position, shown) = display(self.min, *self.thumb.read(), pending, value);
+        let min = self.min;
+        rsx! {
+            label { id: "{OPTIONS_ID_PREFIX}-{name}-label", r#for: "{OPTIONS_ID_PREFIX}-{name}", "{text}" }
+            div { class: "slider-input-row",
+                input {
+                    aria_labelledby: "{OPTIONS_ID_PREFIX}-{name}-label",
+                    aria_valuetext: "{shown}",
+                    r#type: "range",
+                    min: "0",
+                    max: "{SLIDER_STEPS}",
+                    value: "{position}",
+                    oninput: move |event| self.slide(event, write),
+                    onchange: move |_| self.flush(write),
+                    onpointerup: move |_| self.flush(write),
+                }
+                input {
+                    id: "{OPTIONS_ID_PREFIX}-{name}",
+                    r#type: "number",
+                    class: "slider-input-number",
+                    min: "{min}",
+                    max: "{SMOOTHING_MAX}",
+                    value: "{shown}",
+                    oninput: move |event: Event<FormData>| match event.value().parse::<u32>() {
+                        Ok(value) if value >= min => write(value.min(SMOOTHING_MAX)),
+                        _ => {}
+                    },
+                    // A commit rounds and clamps what typing couldn't take (2.5, -5, 1e4) and redraws a box left empty, so the box never keeps a value the chart doesn't use.
+                    onchange: move |event: Event<FormData>| match event.value().parse::<f64>() {
+                        Ok(value) => write(value.round().clamp(f64::from(min), f64::from(SMOOTHING_MAX)) as u32),
+                        Err(_) => needs_update(),
+                    },
+                }
+            }
+        }
+    }
+}
 
 /// Format override values using the field's UI representation.
 fn pretty_option_value(field: &str, v: &Value) -> String {
@@ -177,14 +306,6 @@ pub fn EditorSection(title: String, children: Element) -> Element {
     }
 }
 
-fn field_class(overridden: bool) -> &'static str {
-    if overridden {
-        "binding-field field-overridden"
-    } else {
-        "binding-field"
-    }
-}
-
 /// Smoothing controls shared by chart and defaults editors; optional chips expose finer-level overrides.
 #[component]
 pub fn SmoothingFields(
@@ -195,67 +316,34 @@ pub fn SmoothingFields(
     let state = use_context::<DashboardState>();
     let chips_for = |field| override_chips(state, field, chips);
     let o = draft.read().clone();
-    let smoothing_value = match &o.smoothing {
-        SmoothingAlgorithm::None => "none",
-        SmoothingAlgorithm::TriangularPolyfit => "triangular",
-        SmoothingAlgorithm::EmaPolyfit => "ema-polyfit",
-        SmoothingAlgorithm::BiweightPolyfit => "savgol",
+    let (smoothing_value, hint) = match o.smoothing {
+        SmoothingAlgorithm::None => ("none", None),
+        SmoothingAlgorithm::TriangularPolyfit => ("triangular", Some(TRIANGULAR_POLYFIT_HINT)),
+        SmoothingAlgorithm::EmaPolyfit => ("ema-polyfit", Some(EMA_POLYFIT_HINT)),
+        SmoothingAlgorithm::BiweightPolyfit => ("savgol", Some(BIWEIGHT_POLYFIT_HINT)),
     };
-    let hint = match o.smoothing {
-        SmoothingAlgorithm::None => None,
-        SmoothingAlgorithm::TriangularPolyfit => Some(TRIANGULAR_POLYFIT_HINT),
-        SmoothingAlgorithm::EmaPolyfit => Some(EMA_POLYFIT_HINT),
-        SmoothingAlgorithm::BiweightPolyfit => Some(BIWEIGHT_POLYFIT_HINT),
-    };
-    let is_ema = matches!(o.smoothing, SmoothingAlgorithm::EmaPolyfit);
-    let is_polyfit = matches!(
-        o.smoothing,
-        SmoothingAlgorithm::TriangularPolyfit
-            | SmoothingAlgorithm::EmaPolyfit
-            | SmoothingAlgorithm::BiweightPolyfit
-    );
-    let needs_window = matches!(o.smoothing, SmoothingAlgorithm::BiweightPolyfit);
-    let window = o.smoothing_window;
-    let poly_order = o.smoothing_poly_order;
+    let window_slider = use_exp_slider(BIWEIGHT_WINDOW_MIN);
+    let tc_slider = use_exp_slider(TIME_CONSTANT_MIN);
+    let write_window = move |value: u32| draft.write().smoothing_window = value;
     // The UI edits the e-folding time constant, while the draft stores alpha.
-    let tc_display = ema_time_constant(o.smoothing_alpha).round() as u32;
-    let inherited_smoothing = anchor.smoothing;
-    let inherited_order = anchor.smoothing_poly_order;
-    let inherited_window = anchor.smoothing_window;
-    let inherited_alpha = anchor.smoothing_alpha;
-    let set_window = move |event: Event<FormData>| {
-        if let Ok(value) = event.value().parse::<u32>() {
-            draft.write().smoothing_window = value.clamp(3, BIWEIGHT_WINDOW_MAX);
-        }
-    };
-    let set_time_constant = move |event: Event<FormData>| {
-        if let Ok(value) = event.value().parse::<f64>() {
-            let value = value.clamp(1.0, 1000.0);
-            draft.write().smoothing_alpha = 1.0 - (-1.0 / value).exp();
-        }
+    let write_time_constant = move |value: u32| {
+        draft.write().smoothing_alpha = 1.0 - (-1.0 / f64::from(value)).exp();
     };
 
     rsx! {
-        div { class: field_class(o.smoothing != anchor.smoothing),
-            ResetDot { show: o.smoothing != anchor.smoothing, onreset: move |_| draft.write().smoothing = inherited_smoothing }
+        Field { overridden: o.smoothing != anchor.smoothing, onreset: move |_| draft.write().smoothing = anchor.smoothing,
             label { r#for: "{OPTIONS_ID_PREFIX}-smoothing", "Smoothing" }
             select {
                 id: "{OPTIONS_ID_PREFIX}-smoothing",
                 class: "smoothing-select",
                 value: "{smoothing_value}",
                 onchange: move |e: Event<FormData>| {
-                    let s = match e.value().as_str() {
+                    draft.write().smoothing = match e.value().as_str() {
                         "triangular" => SmoothingAlgorithm::TriangularPolyfit,
                         "ema-polyfit" => SmoothingAlgorithm::EmaPolyfit,
                         "savgol" => SmoothingAlgorithm::BiweightPolyfit,
                         _ => SmoothingAlgorithm::None,
                     };
-                    let mut d = draft.write();
-                    // Normalize a retained legacy/inherited value when the windowed algorithm becomes active.
-                    if matches!(s, SmoothingAlgorithm::BiweightPolyfit) {
-                        d.smoothing_window = d.smoothing_window.min(BIWEIGHT_WINDOW_MAX);
-                    }
-                    d.smoothing = s;
                 },
                 option { value: "none", "None" }
                 option { value: "triangular", "Triangular polyfit" }
@@ -264,13 +352,12 @@ pub fn SmoothingFields(
             }
         }
         {chips_for("smoothing")}
-        if is_polyfit {
-            div { class: field_class(o.smoothing_poly_order != anchor.smoothing_poly_order),
-                ResetDot { show: o.smoothing_poly_order != anchor.smoothing_poly_order, onreset: move |_| draft.write().smoothing_poly_order = inherited_order }
+        if o.smoothing != SmoothingAlgorithm::None {
+            Field { overridden: o.smoothing_poly_order != anchor.smoothing_poly_order, onreset: move |_| draft.write().smoothing_poly_order = anchor.smoothing_poly_order,
                 label { r#for: "{OPTIONS_ID_PREFIX}-fit-order", "Fit order" }
                 select {
                     id: "{OPTIONS_ID_PREFIX}-fit-order",
-                    value: "{poly_order}",
+                    value: "{o.smoothing_poly_order}",
                     onchange: move |e: Event<FormData>| {
                         if let Ok(v) = e.value().parse::<u32>() {
                             draft.write().smoothing_poly_order = v.min(2);
@@ -283,55 +370,15 @@ pub fn SmoothingFields(
             }
             {chips_for("smoothing_poly_order")}
         }
-        if needs_window {
-            div { class: field_class(o.smoothing_window != anchor.smoothing_window),
-                ResetDot { show: o.smoothing_window != anchor.smoothing_window, onreset: move |_| draft.write().smoothing_window = inherited_window }
-                label { id: "{OPTIONS_ID_PREFIX}-window-label", r#for: "{OPTIONS_ID_PREFIX}-window", "Window" }
-                div { class: "slider-input-row",
-                    input {
-                        aria_labelledby: "{OPTIONS_ID_PREFIX}-window-label",
-                        r#type: "range",
-                        min: "3",
-                        max: "{BIWEIGHT_WINDOW_MAX}",
-                        value: "{window}",
-                        oninput: set_window,
-                    }
-                    input {
-                        id: "{OPTIONS_ID_PREFIX}-window",
-                        r#type: "number",
-                        class: "slider-input-number",
-                        min: "3",
-                        max: "{BIWEIGHT_WINDOW_MAX}",
-                        value: "{window}",
-                        oninput: set_window,
-                    }
-                }
+        if o.smoothing == SmoothingAlgorithm::BiweightPolyfit {
+            Field { overridden: o.smoothing_window != anchor.smoothing_window, onreset: move |_| draft.write().smoothing_window = anchor.smoothing_window,
+                {window_slider.inputs("window", "Window", f64::from(o.smoothing_window), write_window)}
             }
             {chips_for("smoothing_window")}
         }
-        if is_ema {
-            div { class: field_class(o.smoothing_alpha != anchor.smoothing_alpha),
-                ResetDot { show: o.smoothing_alpha != anchor.smoothing_alpha, onreset: move |_| draft.write().smoothing_alpha = inherited_alpha }
-                label { id: "{OPTIONS_ID_PREFIX}-time-constant-label", r#for: "{OPTIONS_ID_PREFIX}-time-constant", "Time constant (steps)" }
-                div { class: "slider-input-row",
-                    input {
-                        aria_labelledby: "{OPTIONS_ID_PREFIX}-time-constant-label",
-                        r#type: "range",
-                        min: "1",
-                        max: "500",
-                        value: "{tc_display}",
-                        oninput: set_time_constant,
-                    }
-                    input {
-                        id: "{OPTIONS_ID_PREFIX}-time-constant",
-                        r#type: "number",
-                        class: "slider-input-number",
-                        min: "1",
-                        max: "1000",
-                        value: "{tc_display}",
-                        oninput: set_time_constant,
-                    }
-                }
+        if o.smoothing == SmoothingAlgorithm::EmaPolyfit {
+            Field { overridden: o.smoothing_alpha != anchor.smoothing_alpha, onreset: move |_| draft.write().smoothing_alpha = anchor.smoothing_alpha,
+                {tc_slider.inputs("time-constant", "Time constant (steps)", ema_time_constant(o.smoothing_alpha), write_time_constant)}
             }
             {chips_for("smoothing_alpha")}
         }
@@ -351,15 +398,10 @@ pub fn AxisFields(
     let state = use_context::<DashboardState>();
     let chips_for = |field| override_chips(state, field, chips);
     let o = draft.read().clone();
-    let inherited_max_runs = anchor.max_runs;
     let log_field = |axis: &str, value: bool, inherited: bool, set: fn(&mut RectOptions, bool)| {
         let input_id = format!("{OPTIONS_ID_PREFIX}-log-{}", axis.to_lowercase());
         rsx! {
-            div { class: field_class(value != inherited),
-                ResetDot {
-                    show: value != inherited,
-                    onreset: move |_| draft.with_mut(|options| set(options, inherited)),
-                }
+            Field { overridden: value != inherited, onreset: move |_| draft.with_mut(|options| set(options, inherited)),
                 label { r#for: "{input_id}", "Log {axis}" }
                 input {
                     id: "{input_id}",
@@ -378,8 +420,7 @@ pub fn AxisFields(
         {chips_for("log_x")}
         {log_field("Y", o.log_y, anchor.log_y, |options, value| options.log_y = value)}
         {chips_for("log_y")}
-        div { class: field_class(o.max_runs != anchor.max_runs),
-            ResetDot { show: o.max_runs != anchor.max_runs, onreset: move |_| draft.write().max_runs = inherited_max_runs }
+        Field { overridden: o.max_runs != anchor.max_runs, onreset: move |_| draft.write().max_runs = anchor.max_runs,
             label { r#for: "{OPTIONS_ID_PREFIX}-max-runs", "Max runs" }
             input {
                 id: "{OPTIONS_ID_PREFIX}-max-runs",
@@ -423,5 +464,54 @@ pub fn ChartOptionsForm(
     rsx! {
         SmoothingFields { draft, anchor: anchor.clone(), chips }
         AxisFields { draft, anchor, chips }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smoothing_sliders_are_exponential_from_their_minimum_to_the_cap() {
+        for min in [TIME_CONSTANT_MIN, BIWEIGHT_WINDOW_MIN] {
+            assert_eq!(slider_value(min, 0), min);
+            assert_eq!(slider_value(min, SLIDER_STEPS), SMOOTHING_MAX);
+            for position in 0..SLIDER_STEPS {
+                assert!(slider_value(min, position) <= slider_value(min, position + 1));
+            }
+        }
+        // Halfway is the geometric mean of the ends.
+        assert_eq!(slider_value(TIME_CONSTANT_MIN, SLIDER_STEPS / 2), 45);
+        assert_eq!(slider_value(BIWEIGHT_WINDOW_MIN, SLIDER_STEPS / 2), 77);
+    }
+
+    #[test]
+    fn a_slider_value_sits_at_a_position_showing_it() {
+        for min in [TIME_CONSTANT_MIN, BIWEIGHT_WINDOW_MIN] {
+            for position in 0..=SLIDER_STEPS {
+                let value = slider_value(min, position);
+                let shown = slider_position(min, f64::from(value));
+                assert_eq!(
+                    slider_value(min, shown),
+                    value,
+                    "min {min}, position {position}"
+                );
+            }
+            assert_eq!(slider_position(min, 0.0), 0);
+            assert_eq!(slider_position(min, 4096.0), SLIDER_STEPS);
+        }
+    }
+
+    #[test]
+    fn the_thumb_stays_where_it_moved_while_it_reads_the_value() {
+        // Positions 0-2 all read window 3, so an arrow press from 1 to 2 must leave the thumb at 2.
+        assert_eq!(display(BIWEIGHT_WINDOW_MIN, Some(2), false, 3.0), (2, 3));
+        // A typed 4 moves it to 4's own position.
+        assert_eq!(display(BIWEIGHT_WINDOW_MIN, Some(2), false, 4.0), (4, 4));
+        // A time constant of 1.4, shown as 1: the thumb a slide left reading 1 stays; untouched, it sits at 1.4's position, so Home still moves it and writes 1.
+        assert_eq!(display(TIME_CONSTANT_MIN, Some(2), false, 1.4), (2, 1));
+        assert_eq!(display(TIME_CONSTANT_MIN, None, false, 1.4), (4, 1));
+        // A drag shows its own position and value until its rest writes them.
+        assert_eq!(display(BIWEIGHT_WINDOW_MIN, Some(50), true, 3.0), (50, 77));
     }
 }

@@ -7,6 +7,7 @@ import argparse
 import json
 import math
 import re
+import time
 from contextlib import contextmanager
 from urllib.parse import unquote, urlencode, urlsplit
 
@@ -267,7 +268,9 @@ def chart_option_fields(
     def stored_options() -> dict:
         return page.evaluate(READ_OPTIONS, storage_args)
 
-    def expect_option(field: str, value: float | bool | str) -> None:
+    def expect_option(
+        field: str, value: float | bool | str, timeout: float | None = None
+    ) -> None:
         page.wait_for_function(
             f"""args => {{
                 const options = ({READ_OPTIONS})(args.slice(0, 3));
@@ -277,6 +280,7 @@ def chart_option_fields(
                     : actual === expected;
             }}""",
             arg=[*storage_args, field, value],
+            timeout=timeout,
         )
 
     def reset_to_inherited(control: Locator) -> str | bool:
@@ -342,18 +346,82 @@ def chart_option_fields(
 
     inherited_window = reset_to_inherited(window)
     if scope == "project":
+        # The slider is exponential over 100 steps; its first three positions read 3, and each press still moves on.
         for key, value in (
             ("Home", "3"),
             ("ArrowLeft", "3"),
-            ("End", "500"),
-            ("ArrowRight", "500"),
+            *[("ArrowRight", "3")] * 2,
+            ("ArrowRight", "4"),
+            ("End", "2000"),
+            ("ArrowLeft", "1874"),
+            ("ArrowRight", "2000"),
+            ("ArrowRight", "2000"),
         ):
             window_slider.press(key)
             expect(window).to_have_value(value)
-        for value, clamped in (("1", "3"), ("999", "500")):
+        for value, committed, position in (
+            ("1", "3", "0"),
+            ("77", "77", "50"),
+            # A box left empty on commit shows the value again.
+            ("", "77", "50"),
+        ):
             window.fill(value)
-            expect(window).to_have_value(clamped)
-            expect(window_slider).to_have_value(clamped)
+            window.blur()
+            expect(window).to_have_value(committed)
+            expect(window_slider).to_have_value(position)
+        # Typed key by key, 2500 is capped as it's typed rather than leaving its 250 written.
+        window.fill("")
+        window.press_sequentially("2500")
+        expect(window).to_have_value("2000")
+        expect(window_slider).to_have_value("100")
+        expect_option("smoothing_window", 2000)
+        # Typed key by key, 1500 keeps its first digit, which is below the minimum.
+        window.fill("")
+        window.press_sequentially("1500")
+        expect(window).to_have_value("1500")
+        expect_option("smoothing_window", 1500)
+        # An arrow key writes at once, inside the 250 ms rest a mouse drag waits for; the typed writes' chart replies land first, so they don't hold up the check.
+        page.wait_for_timeout(500)
+        window_slider.press("ArrowLeft")
+        expect_option("smoothing_window", 1445, timeout=200)
+        # A mouse drag writes only when it rests or lets go; the box follows it meanwhile.
+        track = window_slider.bounding_box()
+        y = track["y"] + track["height"] / 2
+
+        def x(fraction: float) -> float:
+            return track["x"] + track["width"] * fraction
+
+        def release(value: int, moved: float) -> None:
+            # The release writes at once, before the rest after its last move could; a run too slow to tell gets the default wait.
+            page.mouse.up()
+            prompt = time.monotonic() - moved < 0.05
+            expect_option("smoothing_window", value, timeout=120 if prompt else None)
+
+        page.mouse.move(x(0.2), y)
+        # Moves 100 ms apart for half a second, each inside the 250 ms rest after the last, write nothing while the box follows them; the check is skipped when a gap stalls past 200 ms.
+        widest, moved = 0.0, time.monotonic()
+        page.mouse.down()
+        for step in range(1, 6):
+            page.wait_for_timeout(100)
+            page.mouse.move(x(0.2 + 0.08 * step), y)
+            widest, moved = max(widest, time.monotonic() - moved), time.monotonic()
+        written, rested = stored_options()["smoothing_window"], window.input_value()
+        if max(widest, time.monotonic() - moved) < 0.2:
+            assert written == 1445, "a moving drag wrote"
+            assert rested != "1445", "the box didn't follow the drag"
+        expect_option("smoothing_window", int(rested), timeout=1000)
+        page.mouse.move(x(0.9), y)
+        moved = time.monotonic()
+        expect(window).not_to_have_value(rested)
+        released = int(window.input_value())
+        release(released, moved)
+        # A drag back where it started fires no `change` on release, which writes at once all the same.
+        page.mouse.down()
+        page.mouse.move(x(0.5), y)
+        expect(window).not_to_have_value(str(released))
+        expect_option("smoothing_window", int(window.input_value()))
+        page.mouse.move(x(0.9), y)
+        release(released, time.monotonic())
     saved_window = "43" if inherited_window != "43" else "47"
     window.fill(saved_window)
     expect_option("smoothing_window", int(saved_window))
@@ -363,13 +431,38 @@ def chart_option_fields(
     algorithm.select_option("ema-polyfit")
     inherited_tau = reset_to_inherited(tau)
     if scope == "project":
-        for key, value in (("Home", "1"), ("End", "500")):
+        # Its first six positions read 1.
+        for key, value in (
+            ("Home", "1"),
+            *[("ArrowRight", "1")] * 5,
+            ("ArrowRight", "2"),
+            ("End", "2000"),
+            ("ArrowLeft", "1854"),
+        ):
             tau_slider.press(key)
             expect(tau).to_have_value(value)
-        for value, clamped, slider_value in (("0", "1", "1"), ("1001", "1000", "500")):
+        for value, committed, position in (
+            ("0", "1", "0"),
+            ("45", "45", "50"),
+            ("2001", "2000", "100"),
+        ):
             tau.fill(value)
-            expect(tau).to_have_value(clamped)
-            expect(tau_slider).to_have_value(slider_value)
+            tau.blur()
+            expect(tau).to_have_value(committed)
+            expect(tau_slider).to_have_value(position)
+        # Typed key by key, 0150 isn't raised to 1 on its first key and reads 150.
+        tau.fill("")
+        tau.press_sequentially("0150")
+        expect(tau).to_have_value("150")
+        expect_option("smoothing_alpha", 1.0 - math.exp(-1.0 / 150))
+        # Typed key by key, 2.5 keeps its dot (the browser reads `2.` as 2) until its commit rounds it.
+        tau.fill("")
+        tau.press_sequentially("2.5")
+        expect(tau).to_have_value("2.5")
+        tau.blur()
+        expect(tau).to_have_value("3")
+        expect(tau_slider).to_have_value("14")
+        expect_option("smoothing_alpha", 1.0 - math.exp(-1.0 / 3))
     saved_tau = "37" if inherited_tau != "37" else "41"
     tau.fill(saved_tau)
     expect_option("smoothing_alpha", 1.0 - math.exp(-1.0 / int(saved_tau)))

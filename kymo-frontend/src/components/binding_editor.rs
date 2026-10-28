@@ -302,7 +302,7 @@ pub fn BindingEditor(
     };
     let current_config = move || (draft(), draft_opts.read().clone());
     let unchanged = current_config() == initial;
-    // Each change (slider ticks included) applies live as one edit of just what changed: the sources as one, option fields as the defaults editors write theirs (`OptionsBaseline::write_fields`).
+    // Each change applies live as one edit of just what changed: the sources as one, option fields as the defaults editors write theirs (`OptionsBaseline::write_fields`).
     use_live_apply(current_config, {
         let baseline = baseline.clone();
         move |previous: &(Vec<MetricBinding>, RectOptions), (bindings, options)| {
