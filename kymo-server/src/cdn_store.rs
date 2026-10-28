@@ -188,7 +188,7 @@ fn changed_within(meta: &std::fs::Metadata, window: Duration) -> bool {
         .map_or(true, |age| age < window)
 }
 
-/// An object a collector lists (from the bucket, or [`FsStore::walk`]), which a viewer can open by its key. `created` starts its grace: GCS last-modified, or a file's ctime.
+/// An object a collector lists (from the bucket, or [`FsStore::walk`]), which a viewer can open by its key. `created` starts its grace: GCS `timeCreated`, or a file's ctime.
 pub(crate) struct Listed {
     pub(crate) key: String,
     pub(crate) size: u64,

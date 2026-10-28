@@ -855,7 +855,7 @@ impl Collector {
                     std::future::ready(Ok(validate_hosted_key(&key).then(|| Listed {
                         key,
                         size: meta.size,
-                        // Last-modified (GCS `updated`): objects are never rewritten, and a later metadata change only delays collection.
+                        // The XML listing's `LastModified` is GCS `timeCreated`, not `updated` (measured; Google's XML reference calls `LastModified` the last metadata change): metadata changes, Autoclass class moves included, move only `updated`.
                         created: unix_seconds(meta.last_modified.into()),
                     })))
                 })
