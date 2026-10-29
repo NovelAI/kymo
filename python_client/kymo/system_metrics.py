@@ -44,7 +44,9 @@ def _nvml(read) -> float:
 class SystemMetricsPoller:
     """Background thread that publishes the captured console and, with system_metrics, polls and publishes system metrics."""
 
-    def __init__(self, *, publish, poll_interval: float = 2.0, system_metrics: bool = True):
+    def __init__(
+        self, *, publish, poll_interval: float = 2.0, system_metrics: bool = True
+    ):
         self._interval = poll_interval
         self._publish = publish
         self._system_metrics = system_metrics
@@ -82,9 +84,13 @@ class SystemMetricsPoller:
             if available:
                 log.info("system metrics enabled (%s)", ", ".join(available))
             else:
-                log.info("system metrics disabled (neither psutil nor a working NVML); the console is still uploaded")
+                log.info(
+                    "system metrics disabled (neither psutil nor a working NVML); the console is still uploaded"
+                )
 
-        self._thread = threading.Thread(target=self._poll_loop, name="kymo-poller", daemon=True)
+        self._thread = threading.Thread(
+            target=self._poll_loop, name="kymo-poller", daemon=True
+        )
         self._thread.start()
 
     def stop(self, timeout: float | None = None) -> bool:
@@ -103,7 +109,9 @@ class SystemMetricsPoller:
         if publication_quiesced:
             self._publish_lock.release()
         else:
-            log.warning("console/system-metrics publication did not quiesce before shutdown")
+            log.warning(
+                "console/system-metrics publication did not quiesce before shutdown"
+            )
 
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
@@ -111,7 +119,9 @@ class SystemMetricsPoller:
         thread_stopped = thread is None or not thread.is_alive()
         if self._nvml_ok and not thread_stopped:
             # A wedged driver or queue call must not make shutdown unbounded. Leaving NVML initialized is safer than racing its active poll.
-            log.warning("console/system-metrics poll did not stop; skipping NVML shutdown")
+            log.warning(
+                "console/system-metrics poll did not stop; skipping NVML shutdown"
+            )
         elif self._nvml_ok:
             try:
                 pynvml.nvmlShutdown()
@@ -166,12 +176,16 @@ class SystemMetricsPoller:
             try:
                 self._poll_once()
             except _WorkerExited:
-                log.warning("console/system-metrics uploads stopped: the upload worker has exited")
+                log.warning(
+                    "console/system-metrics uploads stopped: the upload worker has exited"
+                )
                 return
             except Exception as error:
                 now = time.monotonic()
                 if now - warned_at >= _FAILURE_WARN_INTERVAL:
-                    log.warning("console/system-metrics poll failed; retrying: %s", error)
+                    log.warning(
+                        "console/system-metrics poll failed; retrying: %s", error
+                    )
                     warned_at = now
 
     def _poll_once(self):

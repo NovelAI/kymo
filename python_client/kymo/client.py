@@ -1103,11 +1103,16 @@ def _drain_capture_points(now_ms: int, final: bool = False) -> list[tuple]:
         points, unsent = [], (["output"] if _capture.has_output() else [])
     if final and unsent:
         # Out of the drain's lock: a handler the program added may write this to the captured stderr, perhaps the stream passed over.
-        _log.warning("captured %s left unsent: a capture lock stayed busy as the run ended", " and ".join(unsent))
+        _log.warning(
+            "captured %s left unsent: a capture lock stayed busy as the run ended",
+            " and ".join(unsent),
+        )
     return points
 
 
-def _drain_capture_locked(now_ms: int, final: bool, timeout: Optional[float]) -> tuple[list[tuple], list[str]]:
+def _drain_capture_locked(
+    now_ms: int, final: bool, timeout: Optional[float]
+) -> tuple[list[tuple], list[str]]:
     """_drain_capture_points' drain, _capture_drain_lock held: its text points, and the streams it passed over (_capture.drain_buffers' timeout)."""
     global _last_capture_step
     stdout_text, stderr_text = _capture.drain_buffers(final, timeout)
@@ -1123,7 +1128,11 @@ def _drain_capture_locked(now_ms: int, final: bool, timeout: Optional[float]) ->
             points.append(("text_ts", "logs/std_out", step, stdout_text, now_ms))
         if stderr_text:
             points.append(("text_ts", "logs/std_err", step, stderr_text, now_ms))
-    return points, [name for name, text in (("stdout", stdout_text), ("stderr", stderr_text)) if text is None]
+    return points, [
+        name
+        for name, text in (("stdout", stdout_text), ("stderr", stderr_text))
+        if text is None
+    ]
 
 
 _BACKLOG_WARN_THRESHOLD = 100_000

@@ -133,7 +133,9 @@ def install_capture():
     _installed = True
 
 
-def _take(buffer: deque, stats: dict, in_place=False, whole_lines=False) -> tuple[list[str], int]:
+def _take(
+    buffer: deque, stats: dict, in_place=False, whole_lines=False
+) -> tuple[list[str], int]:
     """Take a stream's chunks and its drop count, its lock held: (chunks, chars dropped). in_place blanks the chunks instead of removing them, for an operation this drain is nested in that may still hold them. Otherwise whole_lines leaves the text after the last newline, a line still being written, for the next drain, and takes everything when there is no newline. Only drains off the main thread ask for it: no handler runs there between the pops and the tail's return, where on the main thread one that calls finish() would leave the tail buffered past the run's end, and a fork child, which no poller drains, would lose its last log()'s partial line."""
     if in_place:
         chunks = list(buffer)
@@ -155,7 +157,9 @@ def _take(buffer: deque, stats: dict, in_place=False, whole_lines=False) -> tupl
     return chunks, dropped
 
 
-def _drain_one(buffer: deque, stats: dict, lock: threading.RLock, final=False, timeout=None) -> str | None:
+def _drain_one(
+    buffer: deque, stats: dict, lock: threading.RLock, final=False, timeout=None
+) -> str | None:
     if lock._is_owned():
         # Nested in a write or a drain on this thread (a handler that called log()): leave the text for the next drain, but the shutdown's last (final), which none follows, takes it in place.
         if not final:

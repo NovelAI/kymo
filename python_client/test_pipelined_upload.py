@@ -416,13 +416,17 @@ class CaptureWriterTests(unittest.TestCase):
             )
         self.assertEqual(got, [("text_ts", "logs/std_out", 1, "tail", 1)])
 
-    def test_a_drain_off_the_main_thread_before_the_runs_end_waits_for_no_stream_lock(self):
+    def test_a_drain_off_the_main_thread_before_the_runs_end_waits_for_no_stream_lock(
+        self,
+    ):
         # The deadlock this closes: the main thread holds a stream lock inside a print (_keep), a drain on another thread (the poller's) holds _capture_drain_lock and asks for that stream lock, and a handler of a signal kymo does not own drains on the main thread inside the print, waiting for _capture_drain_lock. Both drains now finish, and the busy stream's text goes out at the next drain.
         text = ["held by the print\n"]
         with (
             _captured(text, ["err\n"]),
             mock.patch.object(client_module, "_last_capture_step", None),
-            mock.patch.object(capture_module, "drain_buffers", wraps=capture_module.drain_buffers) as drained,
+            mock.patch.object(
+                capture_module, "drain_buffers", wraps=capture_module.drain_buffers
+            ) as drained,
         ):
             with capture_module._stdout_lock:
                 got, finished = _drain_off_main()
@@ -436,18 +440,36 @@ class CaptureWriterTests(unittest.TestCase):
             points = client_module._drain_capture_points(3)
         self.assertEqual(points, [("text_ts", "logs/std_out", 3, text[0], 3)])
 
-    def test_a_drain_off_the_main_thread_before_the_runs_end_leaves_an_unfinished_line(self):
+    def test_a_drain_off_the_main_thread_before_the_runs_end_leaves_an_unfinished_line(
+        self,
+    ):
         # It can land between the writes of one print on another thread (print("step", 1) writes "step", " ", "1" and "\n"), and a merged stdout and stderr read joins a partial line to whatever chunk follows it, so the line waits for the next drain. A stream with no newline at all (a progress bar, a line written over more than a tick) goes out at once, and the run's last drain takes everything.
-        with _captured(["done\nstep", " 1"], ["\r 45%|"]), mock.patch.object(client_module, "_last_capture_step", None):
+        with (
+            _captured(["done\nstep", " 1"], ["\r 45%|"]),
+            mock.patch.object(client_module, "_last_capture_step", None),
+        ):
             got, finished = _drain_off_main()
             self.assertTrue(finished.wait(5))
-            self.assertEqual(got, [[("text_ts", "logs/std_out", 1, "done\n", 1), ("text_ts", "logs/std_err", 1, "\r 45%|", 1)]])
-            self.assertEqual(([*capture_module._stdout_buf], capture_module._stdout_stats["size"]), (["step 1"], len("step 1")))
+            self.assertEqual(
+                got,
+                [
+                    [
+                        ("text_ts", "logs/std_out", 1, "done\n", 1),
+                        ("text_ts", "logs/std_err", 1, "\r 45%|", 1),
+                    ]
+                ],
+            )
+            self.assertEqual(
+                ([*capture_module._stdout_buf], capture_module._stdout_stats["size"]),
+                (["step 1"], len("step 1")),
+            )
             last, last_done = _drain_off_main(final=True)
             self.assertTrue(last_done.wait(5))
         self.assertEqual(last, [[("text_ts", "logs/std_out", 2, "step 1", 1)]])
 
-    def test_a_drain_off_the_main_thread_waits_for_a_busy_drain_lock_only_at_the_runs_end(self):
+    def test_a_drain_off_the_main_thread_waits_for_a_busy_drain_lock_only_at_the_runs_end(
+        self,
+    ):
         # The main thread may hold _capture_drain_lock in a drain a handler interrupted, or for good where a raising handler left it held on Python 3.14: a tick passes the console over, and the shutdown's last drain waits at most _FINAL_DRAIN_LOCK_WAIT for it, then says what it left unsent.
         for held_past_the_wait in (False, True):
             with self.subTest(held_past_the_wait=held_past_the_wait):
@@ -458,14 +480,25 @@ class CaptureWriterTests(unittest.TestCase):
                     mock.patch.object(client_module, "_capture_drain_lock", lock),
                     mock.patch.object(client_module, "_last_capture_step", None),
                     mock.patch.object(client_module, "_FINAL_DRAIN_LOCK_WAIT", wait),
-                    mock.patch.object(client_module._log, "warning", side_effect=lambda message, *args: messages.append(message % args)),
+                    mock.patch.object(
+                        client_module._log,
+                        "warning",
+                        side_effect=lambda message, *args: messages.append(
+                            message % args
+                        ),
+                    ),
                 ):
                     with lock.real:
                         ticked, tick_done = _drain_off_main()
-                        self.assertTrue(tick_done.wait(5), "a tick waited for the drain lock")
+                        self.assertTrue(
+                            tick_done.wait(5), "a tick waited for the drain lock"
+                        )
                         last, last_done = _drain_off_main(final=True)
                         if held_past_the_wait:
-                            self.assertTrue(last_done.wait(5), "waited for the drain lock past its bound")
+                            self.assertTrue(
+                                last_done.wait(5),
+                                "waited for the drain lock past its bound",
+                            )
                         else:
                             # The last drain is now waiting for the drain lock.
                             self.assertFalse(last_done.wait(0.1))
@@ -475,11 +508,21 @@ class CaptureWriterTests(unittest.TestCase):
                 self.assertEqual(ticked, [[]])
                 if held_past_the_wait:
                     self.assertEqual((last, left), ([[]], ["held\n"]))
-                    self.assertEqual(messages, ["captured output left unsent: a capture lock stayed busy as the run ended"])
+                    self.assertEqual(
+                        messages,
+                        [
+                            "captured output left unsent: a capture lock stayed busy as the run ended"
+                        ],
+                    )
                 else:
-                    self.assertEqual((last, left, messages), ([[("text_ts", "logs/std_out", 1, "held\n", 1)]], [], []))
+                    self.assertEqual(
+                        (last, left, messages),
+                        ([[("text_ts", "logs/std_out", 1, "held\n", 1)]], [], []),
+                    )
 
-    def test_a_drain_nested_in_a_drain_on_the_main_thread_leaves_the_text_for_the_next(self):
+    def test_a_drain_nested_in_a_drain_on_the_main_thread_leaves_the_text_for_the_next(
+        self,
+    ):
         # A handler that prints and calls log() inside a drain on its thread, at each opcode of the drain's step code (a superset of where handlers run): both drains would take one step, of which the server keeps one text point. The text goes out once, in order, each point at a step of its own.
         codes = _codes_of(client_module._drain_capture_locked)
         for k in itertools.count():
@@ -492,7 +535,10 @@ class CaptureWriterTests(unittest.TestCase):
 
             tracer, fired = _opcode_tracer(codes, k, nested)
             # Both at time 1, after a step of 0: each would take step 1.
-            with _captured(["outer\n"]), mock.patch.object(client_module, "_last_capture_step", 0):
+            with (
+                _captured(["outer\n"]),
+                mock.patch.object(client_module, "_last_capture_step", 0),
+            ):
                 with _tracing(tracer):
                     published.extend(client_module._drain_capture_points(1))
                 if not fired:
@@ -500,11 +546,17 @@ class CaptureWriterTests(unittest.TestCase):
                 published.extend(client_module._drain_capture_points(1))
             published.sort(key=lambda point: point[2])
             state = f"nested at opcode {k}"
-            self.assertEqual("".join(point[3] for point in published), "outer\nnested\n", state)
-            self.assertEqual(len({point[2] for point in published}), len(published), state)
+            self.assertEqual(
+                "".join(point[3] for point in published), "outer\nnested\n", state
+            )
+            self.assertEqual(
+                len({point[2] for point in published}), len(published), state
+            )
         self.assertGreater(k, 10)
 
-    def test_the_shutdowns_last_drain_off_the_main_thread_waits_for_a_print_but_not_forever(self):
+    def test_the_shutdowns_last_drain_off_the_main_thread_waits_for_a_print_but_not_forever(
+        self,
+    ):
         # None follows it, so it waits for a print to end, but at most _FINAL_DRAIN_LOCK_WAIT: the print may be one a handler interrupted to call log(), which waits for the drain's lock.
         real = capture_module._stdout_lock
 
@@ -512,7 +564,9 @@ class CaptureWriterTests(unittest.TestCase):
             # As a handler the program added that writes to the captured stream still held: it waits for the print.
             messages.append(message % args)
             warned.set()
-            capture_module.TeeWriter(io.StringIO(), deque(), {"size": 0, "dropped": 0}, real).write("warned\n")
+            capture_module.TeeWriter(
+                io.StringIO(), deque(), {"size": 0, "dropped": 0}, real
+            ).write("warned\n")
 
         for held_past_the_wait in (False, True):
             with self.subTest(held_past_the_wait=held_past_the_wait):
@@ -530,8 +584,13 @@ class CaptureWriterTests(unittest.TestCase):
                         self.assertTrue(lock.reached.wait(5))
                         if held_past_the_wait:
                             # Text left unsent is said so, out of the drain's lock: the handler that interrupted the print can drain.
-                            self.assertTrue(warned.wait(5), "the last drain waited past its bound")
-                            self.assertTrue(client_module._capture_drain_lock.acquire(timeout=1), "warned holding the drain's lock")
+                            self.assertTrue(
+                                warned.wait(5), "the last drain waited past its bound"
+                            )
+                            self.assertTrue(
+                                client_module._capture_drain_lock.acquire(timeout=1),
+                                "warned holding the drain's lock",
+                            )
                             client_module._capture_drain_lock.release()
                         else:
                             # The drain is now waiting for the print to end.
@@ -539,11 +598,21 @@ class CaptureWriterTests(unittest.TestCase):
                     self.assertTrue(finished.wait(5))
                     left = list(capture_module._stdout_buf)
                 self.assertEqual(lock.asked, [wait])
-                self.assertEqual(messages, ["captured stdout left unsent: a capture lock stayed busy as the run ended"] if held_past_the_wait else [])
+                self.assertEqual(
+                    messages,
+                    [
+                        "captured stdout left unsent: a capture lock stayed busy as the run ended"
+                    ]
+                    if held_past_the_wait
+                    else [],
+                )
                 if held_past_the_wait:
                     self.assertEqual((got, left), ([[]], ["tail\n"]))
                 else:
-                    self.assertEqual((got, left), ([[("text_ts", "logs/std_out", 1, "tail\n", 1)]], []))
+                    self.assertEqual(
+                        (got, left),
+                        ([[("text_ts", "logs/std_out", 1, "tail\n", 1)]], []),
+                    )
 
     def test_the_shutdowns_last_drain_takes_the_text_of_a_print_it_interrupts(self):
         # A handler installed after init() that calls finish() as it interrupts a print, inside its buffering (the stream's lock held on this thread): a nested drain leaves the text for the next drain, but none follows the shutdown's last, which takes it in place (that no later drain takes it again: test_nested_capture_at_every_opcode_neither_duplicates_nor_loses_text).
@@ -2058,8 +2127,14 @@ print(k > 50, str(late).replace(" ", ""), 0.9 < armed <= 1)
         # The poller uploads the captured console whatever system_metrics says, which decides only its metrics.
         calls = []
         with (
-            self._init_without_a_server(mock.Mock(), _push_run_metadata=lambda: calls.append("metadata")),
-            mock.patch.object(SystemMetricsPoller, "start", lambda poller: calls.append(("start", poller._system_metrics))),
+            self._init_without_a_server(
+                mock.Mock(), _push_run_metadata=lambda: calls.append("metadata")
+            ),
+            mock.patch.object(
+                SystemMetricsPoller,
+                "start",
+                lambda poller: calls.append(("start", poller._system_metrics)),
+            ),
         ):
             self._init(system_metrics=False)
         self.assertEqual(calls, ["metadata", ("start", False)])
@@ -3402,7 +3477,9 @@ class AccountingTests(unittest.TestCase):
             ):
                 client_module._normalize_step(step)
 
-    def test_a_log_whose_start_came_before_a_poller_tick_drains_at_a_later_text_step(self):
+    def test_a_log_whose_start_came_before_a_poller_tick_drains_at_a_later_text_step(
+        self,
+    ):
         # A poller tick keys its text at the tick's time; a log() whose start came before it then drains at a strictly later step.
         target = _ListQueue()
         with _upload_state(_metric_queue=target):
@@ -3420,7 +3497,9 @@ class AccountingTests(unittest.TestCase):
             for point in client_module._decode_queue_item(item)
             if point[0] == "text_ts"
         ]
-        self.assertEqual([(point[2], point[4]) for point in text], [(2000, 2000), (2001, 1000)])
+        self.assertEqual(
+            [(point[2], point[4]) for point in text], [(2000, 2000), (2001, 1000)]
+        )
 
     def _wait_with_unproven(
         self, backlog, unproven, *, process=None, timeout=None, uncharged=()
@@ -7476,7 +7555,9 @@ class ShutdownProofTests(unittest.TestCase):
             target=target,
             status=status,
             poller=poller,
-            capture=lambda final, timeout=None: events.append(("drain", final)) or ("tail", "error"),
+            capture=lambda final, timeout=None: (
+                events.append(("drain", final)) or ("tail", "error")
+            ),
         )
 
         self.assertTrue(complete)
@@ -10461,37 +10542,59 @@ class PollerPublicationTests(unittest.TestCase):
         # init() starts the thread whatever system_metrics says, which decides only the metric backends: off, none is initialized or mentioned; on with none available (pynvml and psutil are optional), the console still goes out.
         for metrics in (False, True):
             with self.subTest(metrics=metrics):
-                poller = SystemMetricsPoller(publish=mock.Mock(), system_metrics=metrics)
+                poller = SystemMetricsPoller(
+                    publish=mock.Mock(), system_metrics=metrics
+                )
                 with (
-                    mock.patch.multiple(system_metrics_module, _HAS_NVML=False, _HAS_PSUTIL=False),
-                    mock.patch.object(poller, "_init_nvml", wraps=poller._init_nvml) as nvml,
-                    mock.patch.object(poller, "_init_psutil", wraps=poller._init_psutil) as psutil,
-                    mock.patch.object(system_metrics_module.threading, "Thread") as thread,
-                    self.assertLogs("kymo", level="INFO") if metrics else self.assertNoLogs("kymo", level="INFO") as logs,
+                    mock.patch.multiple(
+                        system_metrics_module, _HAS_NVML=False, _HAS_PSUTIL=False
+                    ),
+                    mock.patch.object(
+                        poller, "_init_nvml", wraps=poller._init_nvml
+                    ) as nvml,
+                    mock.patch.object(
+                        poller, "_init_psutil", wraps=poller._init_psutil
+                    ) as psutil,
+                    mock.patch.object(
+                        system_metrics_module.threading, "Thread"
+                    ) as thread,
+                    self.assertLogs("kymo", level="INFO")
+                    if metrics
+                    else self.assertNoLogs("kymo", level="INFO") as logs,
                 ):
                     poller.start()
                 if metrics:
-                    self.assertIn("the console is still uploaded", "\n".join(logs.output))
+                    self.assertIn(
+                        "the console is still uploaded", "\n".join(logs.output)
+                    )
                 self.assertEqual((nvml.called, psutil.called), (metrics, metrics))
-                thread.assert_called_once_with(target=poller._poll_loop, name="kymo-poller", daemon=True)
+                thread.assert_called_once_with(
+                    target=poller._poll_loop, name="kymo-poller", daemon=True
+                )
                 thread.return_value.start.assert_called_once_with()
 
     def test_a_tick_without_metrics_publishes_only_the_captured_text(self):
         # A tick publishes just the text, and with no output it puts, charges and drains nothing.
         target = _ListQueue()
-        poller = SystemMetricsPoller(publish=client_module._publish_queue_items, system_metrics=False)
+        poller = SystemMetricsPoller(
+            publish=client_module._publish_queue_items, system_metrics=False
+        )
         with (
             _upload_state(_metric_queue=target),
             _captured(["printed\n"]),
             mock.patch.object(system_metrics_module.time, "time", return_value=5.0),
         ):
             poller._poll_once()
-        self.assertEqual(target.items, [[("text_ts", "logs/std_out", 5000, "printed\n", 5000)]])
+        self.assertEqual(
+            target.items, [[("text_ts", "logs/std_out", 5000, "printed\n", 5000)]]
+        )
         target, status = _ListQueue(), _QueueStatus()
         with (
             _upload_state(_metric_queue=target, _queue_status=status),
             _captured(),
-            mock.patch.object(capture_module, "drain_buffers", wraps=capture_module.drain_buffers) as drained,
+            mock.patch.object(
+                capture_module, "drain_buffers", wraps=capture_module.drain_buffers
+            ) as drained,
         ):
             poller._poll_once()
         self.assertEqual((target.items, status.value), ([], 0))
@@ -10500,7 +10603,11 @@ class PollerPublicationTests(unittest.TestCase):
     def test_a_started_poller_uploads_the_console_without_metrics(self):
         # The thread itself, not a hand-called tick: started without system metrics, it publishes what was printed.
         target = _ListQueue()
-        poller = SystemMetricsPoller(publish=client_module._publish_queue_items, poll_interval=0.01, system_metrics=False)
+        poller = SystemMetricsPoller(
+            publish=client_module._publish_queue_items,
+            poll_interval=0.01,
+            system_metrics=False,
+        )
         with _upload_state(_metric_queue=target), _captured(["printed\n"]):
             poller.start()
             try:
@@ -10509,7 +10616,9 @@ class PollerPublicationTests(unittest.TestCase):
                     time.sleep(0.01)
             finally:
                 self.assertTrue(poller.stop())
-        self.assertEqual([point[3] for item in target.items for point in item], ["printed\n"])
+        self.assertEqual(
+            [point[3] for item in target.items for point in item], ["printed\n"]
+        )
 
     def test_a_tick_after_stop_leaves_the_text_to_the_final_drain(self):
         # No publication begins once stop() has; the shutdown's last drain then takes all the text the tick left.
@@ -10526,11 +10635,17 @@ class PollerPublicationTests(unittest.TestCase):
             self.assertEqual(list(capture_module._stdout_buf), text)
             client_module._publish_queue_items([], capture_ms=2000, final=True)
 
-        self.assertEqual(target.items, [[("text_ts", "logs/std_out", 2000, "".join(text), 2000)]])
+        self.assertEqual(
+            target.items, [[("text_ts", "logs/std_out", 2000, "".join(text), 2000)]]
+        )
 
     def test_stop_waits_for_a_drain_in_progress(self):
         # The tick drains inside the publication gate, so stop() waits for the drain as for any publication. Its 1 s budget and the drain's wait are raised so a stalled runner cannot end either first.
-        started, release, stopped = threading.Event(), threading.Event(), threading.Event()
+        started, release, stopped = (
+            threading.Event(),
+            threading.Event(),
+            threading.Event(),
+        )
         results = []
 
         def slow_drain(final=False, timeout=None):
@@ -10575,12 +10690,16 @@ class PollerPublicationTests(unittest.TestCase):
             ],
         )
 
-    def test_a_charge_failure_on_the_poller_thread_leaves_the_text_at_the_end_of_uncharged(self):
+    def test_a_charge_failure_on_the_poller_thread_leaves_the_text_at_the_end_of_uncharged(
+        self,
+    ):
         # The tick's text that no charge let out waits behind what _uncharged already holds, the loop carries on, and the main thread's next publication puts it first.
         old = [numeric(1)]
         text = [("text_ts", "logs/std_out", 4000, "printed\n", 4000)]
         target, status = _ListQueue(), _QueueStatus()
-        poller = SystemMetricsPoller(publish=client_module._publish_queue_items, system_metrics=False)
+        poller = SystemMetricsPoller(
+            publish=client_module._publish_queue_items, system_metrics=False
+        )
         with (
             _upload_state(
                 _metric_queue=target,
@@ -10590,7 +10709,9 @@ class PollerPublicationTests(unittest.TestCase):
             mock.patch.object(client_module, "_STATUS_LOCK_TIMEOUT", 0.0),
             _captured(["printed\n"]),
             mock.patch.object(system_metrics_module.time, "time", return_value=4.0),
-            mock.patch.object(poller._stop, "wait", side_effect=[False, False, True]) as ticked,
+            mock.patch.object(
+                poller._stop, "wait", side_effect=[False, False, True]
+            ) as ticked,
             self.assertLogs("kymo", level="WARNING"),
         ):
             with status.lock:
