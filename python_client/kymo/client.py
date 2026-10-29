@@ -259,7 +259,7 @@ def _normalize_step(step) -> int:
         raise TypeError("step must be an integer") from error
     if not -(1 << 63) <= normalized < (1 << 63):
         raise OverflowError("step must fit in a signed 64-bit integer")
-    return int(normalized)
+    return normalized
 
 
 def _resolve_server(
@@ -447,19 +447,20 @@ def _forget_pending() -> None:
 
 
 def _forget_pending_in_child() -> None:
-    """A fork child cannot use the parent's CUDA context, so it never publishes the parent's pending calls. It gets fresh locks, since a parent thread may have held one at the fork.
+    """A fork child cannot use the parent's CUDA context, so it never publishes the parent's pending calls. It resets its locks as _capture does its own (_forget_capture_in_child).
 
-    Nor does it handle the parent's deferred shutdown signals, put its held-back groups, or run its shutdown. Its main thread, which runs its handlers, is the one that forked, whose stack holds no section another thread was in. Nor does it count the parent's upload worker among its own children, which multiprocessing's exit hook would terminate at a raw os.fork() child's exit.
+    Nor does it handle the parent's deferred shutdown signals, put its held-back groups, or run its shutdown. Its main thread, the forking one, runs its handlers and holds no section another thread was in. Nor does it count the parent's upload worker among its own children, which multiprocessing's exit hook would terminate at a raw os.fork() child's exit.
     """
-    global _pending_lock, _gallery_lock
     _forget_pending()
-    _pending_lock = threading.RLock()
-    _gallery_lock = threading.RLock()
+    for lock in (_pending_lock, _gallery_lock, _capture_drain_lock, _unproven_lock):
+        if not lock._is_owned():
+            lock._at_fork_reinit()
     # multiprocessing resets a SemLock's owner count only in its own children; after a raw fork while another thread held one, the child's release would leave the shared semaphore taken for good. Where the forking thread held it, the child's release then fails instead of freeing the semaphore under the parent. A test's stand-in status has a threading lock, hence the isinstance check.
     for shared in (_queue_status, _rich_mutation_seq):
         lock = None if shared is None else shared.get_lock()
         if isinstance(lock, multiprocessing.synchronize.SemLock):
             lock._semlock._after_fork()
+    # Limit: the queue is not reset. Once the parent's feeder has started, a raw os.fork() child's copy still names it and starts none, so the child's log() puts are never sent though charged to the backlog: the parent's wait_for_upload() waits for them until its timeout, or for good without one. A put also hangs if another parent thread held the queue's lock at the fork. Resetting the queue, as multiprocessing does in its own children, would give the child a feeder of its own, and a child that ends mid-write (os._exit(), a kill) would leave the shared write lock taken and a partial message in the pipe, cutting off the parent's uploads for good.
     _deferred_signals.clear()
     _uncharged.clear()
     _held_back.clear()
@@ -469,17 +470,7 @@ def _forget_pending_in_child() -> None:
 
 
 if hasattr(os, "register_at_fork"):
-    os.register_at_fork(
-        before=_capture_drain_lock.acquire,
-        after_in_parent=_capture_drain_lock.release,
-        after_in_child=_capture_drain_lock.release,
-    )
     os.register_at_fork(after_in_child=_forget_pending_in_child)
-    os.register_at_fork(
-        before=_unproven_lock.acquire,
-        after_in_parent=_unproven_lock.release,
-        after_in_child=_unproven_lock.release,
-    )
 
 
 # ---------------------------------------------------------------------------

@@ -4,9 +4,8 @@ _reject_legacy_client_env()
 del _reject_legacy_client_env
 
 from kymo._log import logger as _logger  # bind diagnostics before capture
-from kymo._capture import install_capture as _install_capture
+from kymo import _capture as _capture  # start capturing stdout/stderr immediately
 
-_install_capture()  # start capturing stdout/stderr immediately
 del _logger
 
 from kymo.client import (

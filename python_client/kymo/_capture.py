@@ -16,7 +16,6 @@ _stdout_buf: deque[str] = deque()
 _stderr_buf: deque[str] = deque()
 _stdout_stats = {"size": 0, "dropped": 0}
 _stderr_stats = {"size": 0, "dropped": 0}
-_installed = False
 
 # Continuous cap per stream BETWEEN drains, oldest dropped first (the tail is what you want when reading a stalled run). Nothing drains before init(), between runs or once the run has ended, and a fork child drains only in log(), so a chatty process would grow these buffers without bound (tqdm over a slow phase is enough). One drain also becomes ONE text point, and 1M characters stay under the server's 4MiB gRPC frame cap even at 4 UTF-8 bytes each; the wire cuts a larger point to its tail.
 _max_buffered_chars = 1_000_000
@@ -31,37 +30,23 @@ deferred_signals: list = []
 run_deferred_signals = None
 
 
-def _locks_before_fork():
-    _stdout_lock.acquire()
-    _stderr_lock.acquire()
+def _forget_capture_in_child():
+    """Clear a fork child's copy of the parent's pending output, so none of it reaches a child-owned run, and reset each capture lock another thread held at the fork, as logging does its handler locks: left held, it would hang the child's first print (in the upload worker too, under the fork start method). Both in place, since the inherited TeeWriters hold them; a lock the forking thread holds (a signal handler that forked inside a print) is left for that print to release.
 
-
-def _locks_after_fork():
-    _stdout_lock.release()
-    _stderr_lock.release()
-
-
-def _capture_after_fork_child():
-    # A fork child did not produce the parent's pending output. Clear the
-    # copied state in place so its inherited TeeWriters keep valid references
-    # and cannot upload parent-only text/drop markers into a child-owned run.
-    for buffer, stats in (
-        (_stdout_buf, _stdout_stats),
-        (_stderr_buf, _stderr_stats),
+    No hook holds the locks across the fork instead: Python 3.12 prints the fork's DeprecationWarning before the parent's after-fork hooks run, and under logging.captureWarnings that print waits for a handler lock, which another thread may hold while waiting for the stderr lock. Limit: a print from an after_in_child hook registered before kymo's can still meet a lock another thread held.
+    """
+    for lock, buffer, stats in (
+        (_stdout_lock, _stdout_buf, _stdout_stats),
+        (_stderr_lock, _stderr_buf, _stderr_stats),
     ):
+        if not lock._is_owned():
+            lock._at_fork_reinit()
         buffer.clear()
-        stats["size"] = 0
-        stats["dropped"] = 0
-    _locks_after_fork()
+        stats.update(size=0, dropped=0)
 
 
-# Same discipline as the logging module: a fork (init() spawns the upload worker via fork on Linux) while another thread holds a capture lock would leave the child's copy locked forever, deadlocking its first print.
 if hasattr(os, "register_at_fork"):
-    os.register_at_fork(
-        before=_locks_before_fork,
-        after_in_parent=_locks_after_fork,
-        after_in_child=_capture_after_fork_child,
-    )
+    os.register_at_fork(after_in_child=_forget_capture_in_child)
 
 
 class TeeWriter:
@@ -119,18 +104,6 @@ class TeeWriter:
 
     def __getattr__(self, name):
         return getattr(self._original, name)
-
-
-def install_capture():
-    """Wrap available stdout/stderr streams. Called at import time."""
-    global _installed
-    if _installed:
-        return
-    if sys.stdout is not None:
-        sys.stdout = TeeWriter(sys.stdout, _stdout_buf, _stdout_stats, _stdout_lock)
-    if sys.stderr is not None:
-        sys.stderr = TeeWriter(sys.stderr, _stderr_buf, _stderr_stats, _stderr_lock)
-    _installed = True
 
 
 def _take(
@@ -205,3 +178,9 @@ def drain_buffers(final=False, timeout=None) -> tuple[str | None, str | None]:
         if _stderr_buf or _stderr_stats["dropped"]
         else "",
     )
+
+
+if sys.stdout is not None:
+    sys.stdout = TeeWriter(sys.stdout, _stdout_buf, _stdout_stats, _stdout_lock)
+if sys.stderr is not None:
+    sys.stderr = TeeWriter(sys.stderr, _stderr_buf, _stderr_stats, _stderr_lock)

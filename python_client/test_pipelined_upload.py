@@ -825,46 +825,128 @@ os.write(1, json.dumps("ok").encode())
         self.assertEqual(result.stderr, "")
 
     @unittest.skipUnless(hasattr(os, "fork"), "requires os.fork")
-    def test_fork_child_drops_the_parents_pending_capture(self):
+    def test_a_fork_child_takes_the_locks_another_thread_held(self):
+        # A thread holds kymo's capture and client locks and the accounting lock across the fork: the fork must not wait for them, and the child must find them free and none of the parent's pending capture.
         script = r"""
-import json
+import multiprocessing
 import os
+import signal
+import sys
+import threading
+import warnings
 
-import kymo
+import kymo.client as client
 from kymo import _capture
 
-_capture.drain_buffers()
-with _capture._stdout_lock:
-    _capture._stdout_buf.append("parent-out")
-    _capture._stdout_stats.update(size=10, dropped=3)
-with _capture._stderr_lock:
-    _capture._stderr_buf.append("parent-err")
-    _capture._stderr_stats.update(size=10, dropped=4)
+# Else the parent's fork warning, printed before os.fork() returns, would wait for the stderr lock the thread holds until then.
+warnings.simplefilter("ignore", DeprecationWarning)
+held, forked = threading.Event(), threading.Event()
+print("parent")
+print("parent", file=sys.stderr)
+_capture._stdout_stats["dropped"] = _capture._stderr_stats["dropped"] = 3
+client._queue_status = multiprocessing.Value("q", 0)
 
-read_fd, write_fd = os.pipe()
+
+def hold():
+    with _capture._stdout_lock, _capture._stderr_lock, client._capture_drain_lock, client._unproven_lock, client._pending_lock, client._gallery_lock, client._queue_status.get_lock():
+        held.set()
+        forked.wait()
+
+
+thread = threading.Thread(target=hold)
+thread.start()
+held.wait()
 pid = os.fork()
 if pid == 0:
-    os.close(read_fd)
-    payload = json.dumps(_capture.drain_buffers()).encode()
-    os.write(write_fd, payload)
-    os.close(write_fd)
-    os._exit(0)
-
-os.close(write_fd)
-payload = bytearray()
-while True:
-    chunk = os.read(read_fd, 4096)
-    if not chunk:
-        break
-    payload.extend(chunk)
-os.close(read_fd)
+    signal.alarm(15)
+    print("out")
+    print("err", file=sys.stderr)
+    with client._pending_lock, client._gallery_lock, client._unproven_lock:
+        pass
+    # Shared with the parent: the child waits for the thread's release, and its own must free it.
+    client._charge_backlog(1, None)
+    texts = [point[3] for point in client._drain_capture_points(1)]
+    os._exit(0 if texts == ["out\n", "err\n"] else 1)
+forked.set()
+thread.join()
 _, status = os.waitpid(pid, 0)
 assert os.waitstatus_to_exitcode(status) == 0, status
-assert json.loads(payload) == ["", ""], payload
-assert _capture.drain_buffers() == (
-    "[kymo: 3 chars of captured output dropped]\nparent-out",
-    "[kymo: 4 chars of captured output dropped]\nparent-err",
-)
+client._charge_backlog(1, None)
+assert client._queue_status.get_obj().value == 2
+pending = "[kymo: 3 chars of captured output dropped]\nparent\n"
+assert _capture.drain_buffers() == (pending, pending)
+"""
+        result = _run_script_file(script)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires os.fork")
+    def test_a_fork_child_releases_the_locks_its_forking_thread_held(self):
+        script = r"""
+import os
+
+import kymo.client as client
+from kymo import _capture
+
+# As a signal handler forking inside a print, or inside a section that takes the pending lock by name (wait_for_upload()), would: the child ends the section, which releases its lock.
+client._pending_lock.acquire()
+with _capture._stdout_lock:
+    pid = os.fork()
+client._pending_lock.release()
+if pid == 0:
+    os._exit(0)
+_, status = os.waitpid(pid, 0)
+assert os.waitstatus_to_exitcode(status) == 0, status
+"""
+        result = _run_script_file(script)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires os.fork")
+    def test_the_fork_warning_waits_for_a_thread_logging_through_the_fork(self):
+        # Python 3.12 prints a threaded process's fork warning before the parent's after-fork hooks run, so only 3.12 can fail this: under logging.captureWarnings the print waits for the handler lock, which a thread logging during the fork holds while it writes to stderr.
+        script = r"""
+import logging
+import os
+import sys
+import threading
+import warnings
+
+# Shown whatever the interpreter's -W options.
+warnings.simplefilter("default", DeprecationWarning)
+go, holding, forked = threading.Event(), threading.Event(), threading.Event()
+
+
+def let_it_log():
+    go.set()
+    holding.wait()
+
+
+# Before-fork hooks run last registered first, so this one would run after any kymo added (it adds none): the thread would take the handler lock while those held kymo's locks.
+os.register_at_fork(before=let_it_log)
+import kymo  # noqa: E402
+
+logging.basicConfig()
+logging.captureWarnings(True)
+handler = logging.getLogger().handlers[0]
+
+
+def log_through_the_fork():
+    go.wait()
+    with handler.lock:
+        holding.set()
+        sys.stderr.write("logged during the fork\n")
+    forked.wait()
+
+
+thread = threading.Thread(target=log_through_the_fork)
+thread.start()
+pid = os.fork()
+if pid == 0:
+    os._exit(0)
+forked.set()
+thread.join()
+os.waitpid(pid, 0)
 """
         result = _run_script_file(script)
 
@@ -1541,7 +1623,6 @@ class InitApiTests(unittest.TestCase):
         with (
             mock.patch.object(multiprocessing.process, "_children", children),
             mock.patch.object(client_module, "_upload_process", worker),
-            mock.patch.object(client_module, "_pending_lock", threading.RLock()),
         ):
             client_module._forget_pending_in_child()
         self.assertEqual(children, set())
@@ -4698,40 +4779,6 @@ class AccountingTests(unittest.TestCase):
         self.assertEqual(texts, ["captured"])
 
     @unittest.skipUnless(hasattr(os, "fork"), "requires os.fork")
-    def test_a_raw_fork_child_frees_the_accounting_lock_another_thread_held(self):
-        script = """
-import multiprocessing, os, threading
-import kymo.client as client
-
-client._queue_status = multiprocessing.Value("q", 0)
-lock = client._queue_status.get_lock()
-held, forked = threading.Event(), threading.Event()
-
-
-def hold():
-    with lock:
-        held.set()
-        forked.wait()
-
-
-thread = threading.Thread(target=hold)
-thread.start()
-held.wait()
-pid = os.fork()
-if pid == 0:
-    client._charge_backlog(1, None)
-    os._exit(0)
-forked.set()
-thread.join()
-os.waitpid(pid, 0)
-client._charge_backlog(1, None)
-print(client._queue_status.get_obj().value, lock.acquire(timeout=1))
-"""
-        result = _run_script_file(script)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "2 True", result.stderr)
-
-    @unittest.skipUnless(hasattr(os, "fork"), "requires os.fork")
     def test_a_fork_child_handles_shutdown_signals_at_once(self):
         # Forked from another thread while the main thread publishes: the child's main thread is the forking one, in no section.
         script = r"""
@@ -5891,17 +5938,12 @@ class PendingGpuLogTests(unittest.TestCase):
 
     def test_a_fork_child_forgets_the_parents_pending_calls(self):
         client_module.log({"gpu": _GpuScalar(1.0)}, step=1)
-        parent_lock = client_module._pending_lock
-        # Restore the parent's lock with the rest of the patched state.
-        self.addCleanup(setattr, client_module, "_pending_lock", parent_lock)
-
         client_module._pending_incomplete = True
 
         client_module._forget_pending_in_child()
 
         self.assertEqual(len(client_module._pending), 0)
         self.assertFalse(client_module._pending_incomplete)
-        self.assertIsNot(client_module._pending_lock, parent_lock)
         # Freeing the parent's CUDA objects would abort the child.
         self.assertEqual(gpu_module.unfreeable, set(self.reads))
 
@@ -11027,9 +11069,8 @@ def _run_script_file(script: str, **env) -> subprocess.CompletedProcess:
         path = os.path.join(directory, "script.py")
         with open(path, "w") as file:
             file.write(script)
-        # On Python 3.12, os.fork() in a threaded process warns before the parent's at-fork handlers release kymo's capture locks, and printing that warning deadlocks (AI-1518).
         return subprocess.run(
-            [sys.executable, "-W", "ignore::DeprecationWarning", path],
+            [sys.executable, path],
             env={**os.environ, "PYTHONPATH": os.pathsep.join(path_entries), **env},
             capture_output=True,
             text=True,
