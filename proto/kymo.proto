@@ -203,10 +203,12 @@ message FinalizeImportRunResponse {
 // Liveness state of a run, computed server-side on each ListRuns call.
 //
 // Timestamp-derived (non-terminal):
-//   RUNNING       — main + system metrics both within 10s of now
-//   STUCK         — main metrics > 10s old, system metrics fresh
-//   UNRESPONSIVE  — system metrics > 10s old, < 10min, no exit signal
-//   PRESUMED_DEAD — system metrics > 10min old, no exit signal
+//   RUNNING       — main metrics within 10s of now
+//   STUCK         — main metrics > 10s old, the process alive: its latest
+//                   system metric or captured console text within 10s
+//   UNRESPONSIVE  — the latest of its system metrics, console text and
+//                   main metrics > 10s old, < 10min, no exit signal
+//   PRESUMED_DEAD — all of them > 10min old, no exit signal
 //
 // Explicit (terminal, set by TerminateRun):
 //   CRASHED       — client signaled non-zero exit

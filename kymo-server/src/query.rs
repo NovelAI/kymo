@@ -652,12 +652,14 @@ pub(super) fn selected_groups<'a>(
 /// signal — same inputs always produce the same status, so polling clients
 /// (frontend, slack bot) see consistent state across pulls.
 ///
-/// Fallbacks:
-/// - No metrics ever logged → use `created_at_ms` so a brand-new run reads as
-///   RUNNING for the first 10 seconds.
-/// - System metrics never logged (user disabled the poller) → fall back to the
-///   main metric timestamp so the run doesn't get stuck in PRESUMED_DEAD; STUCK
-///   becomes unreachable in this mode, which is the correct degenerate behavior.
+/// RUNNING while main metrics (training progress) are fresh, STUCK while only
+/// the process is alive, then UNRESPONSIVE and PRESUMED_DEAD. The process is
+/// alive as of its latest system metric (captured console text included,
+/// `RunHeartbeat`) or main metric, whichever is later, so a run whose main
+/// metrics arrive without system ones (another client) reads RUNNING while
+/// they are fresh, then UNRESPONSIVE for the 10 minutes to PRESUMED_DEAD.
+/// Before any main metric, `created_at_ms` stands in for one, so a brand-new
+/// run reads as RUNNING for the first 10 seconds.
 fn compute_status(
     now_ms: i64,
     created_at_ms: i64,
@@ -674,16 +676,18 @@ fn compute_status(
     }
 
     let main_at = last_main_metric_at_ms.unwrap_or(created_at_ms);
-    let sys_at = last_system_metric_at_ms.unwrap_or(main_at);
+    // Never before main_at, so RUNNING needs no check of it.
+    let alive_at = last_system_metric_at_ms.unwrap_or(main_at).max(main_at);
 
-    let main_age = (now_ms - main_at).max(0);
-    let sys_age = (now_ms - sys_at).max(0);
+    // A negative age (clock skew) is below every window.
+    let main_age = now_ms - main_at;
+    let alive_age = now_ms - alive_at;
 
-    if main_age < RUNNING_WINDOW_MS && sys_age < RUNNING_WINDOW_MS {
+    if main_age < RUNNING_WINDOW_MS {
         proto::RunStatus::Running
-    } else if sys_age < RUNNING_WINDOW_MS {
+    } else if alive_age < RUNNING_WINDOW_MS {
         proto::RunStatus::Stuck
-    } else if sys_age < PRESUMED_DEAD_WINDOW_MS {
+    } else if alive_age < PRESUMED_DEAD_WINDOW_MS {
         proto::RunStatus::Unresponsive
     } else {
         proto::RunStatus::PresumedDead
@@ -711,6 +715,37 @@ mod liveness_status_tests {
         assert_eq!(
             compute_status(later_main, old_created, Some(later_main), None, None),
             proto::RunStatus::Running
+        );
+    }
+
+    #[test]
+    fn the_process_is_alive_as_of_its_latest_system_or_main_metric() {
+        let now = 1_000_000;
+        let stale = now - RUNNING_WINDOW_MS;
+        // Printing (system slot) while log() has stalled is STUCK.
+        assert_eq!(
+            compute_status(now, 0, Some(stale), Some(now), None),
+            proto::RunStatus::Stuck
+        );
+        // A run without system metrics that printed once and then only logs.
+        assert_eq!(
+            compute_status(now, 0, Some(now), Some(stale), None),
+            proto::RunStatus::Running
+        );
+        assert_eq!(
+            compute_status(now, 0, Some(stale), Some(stale), None),
+            proto::RunStatus::Unresponsive
+        );
+        // Alive as of the main metric, though the system one is older than PRESUMED_DEAD's window.
+        assert_eq!(
+            compute_status(
+                now,
+                0,
+                Some(stale),
+                Some(now - PRESUMED_DEAD_WINDOW_MS),
+                None
+            ),
+            proto::RunStatus::Unresponsive
         );
     }
 

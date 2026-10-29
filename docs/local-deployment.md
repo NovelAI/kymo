@@ -216,7 +216,7 @@ An installation may record another build of the catalog's PostgreSQL major relea
 
 ClickHouse pin moves (its new binary migrates data on first start) and PostgreSQL major releases (`pg_upgrade` into a new data directory) are still refused; each needs its own qualification first.
 
-Also settled: a native launcher instead of Docker Compose (no Docker Desktop prerequisite on personal machines); unauthenticated browser access instead of per-tab sessions (sessions would defend a shared-workstation boundary the product does not claim); an embedded frontend (no server/frontend skew offline); activity-derived idle instead of client leases (existing signals suffice until measurements say otherwise; `system_metrics=False` may cost a cold restart after a long silent phase).
+Also settled: a native launcher instead of Docker Compose (no Docker Desktop prerequisite on personal machines); unauthenticated browser access instead of per-tab sessions (sessions would defend a shared-workstation boundary the product does not claim); an embedded frontend (no server/frontend skew offline); activity-derived idle instead of client leases (existing signals suffice until measurements say otherwise; `system_metrics=False` may cost a cold restart after a long phase that neither logs nor prints).
 
 ## References
 

@@ -53,10 +53,10 @@ do not continuously rescan an active search. Re-submit to refresh its result set
 
 ## Following a live log
 
-- A live run, whose `RunInfo` status is `Running` or `Stuck` (alive but silent,
-  e.g. compiling or hung), opens at its last line unless it has a remembered
-  position. A remembered end resumes at the new bottom, even after the run
-  stops; a remembered row restores as above.
+- A live run, whose `RunInfo` status is `Running` or `Stuck` (alive but not
+  logging, e.g. compiling or hung), opens at its last line unless it has a
+  remembered position. A remembered end resumes at the new bottom, even after
+  the run stops; a remembered row restores as above.
 - An end anchor's first response only measures the stream. Any response whose
   length moves the anchor into another band is not rendered; that band's request
   replaces it, so the head of the log never flashes.

@@ -776,16 +776,17 @@ impl PgStore {
         // status_watch_candidates' WHERE) — non-terminal rows accumulate
         // forever, so without this the scan walks the whole table.
         sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_runs_active_liveness
-             ON runs ((COALESCE(last_system_metric_at, last_main_metric_at, created_at)))
+            "CREATE INDEX IF NOT EXISTS idx_runs_active_alive
+             ON runs ((GREATEST(last_system_metric_at, COALESCE(last_main_metric_at, created_at))))
              WHERE exit_code IS NULL AND deleted_at IS NULL",
         )
         .execute(&self.pool)
         .await?;
-        // The narrower partial index replaces the pre-Trash definition. Its
-        // old name would otherwise survive `IF NOT EXISTS` migrations and
+        // It replaces idx_runs_liveness (pre-Trash) and idx_runs_active_liveness,
+        // whose expressions took the system heartbeat alone when there was one.
+        // Their names would otherwise survive `IF NOT EXISTS` migrations and
         // impose duplicate write/storage cost forever on upgraded databases.
-        sqlx::query("DROP INDEX IF EXISTS idx_runs_liveness")
+        sqlx::query("DROP INDEX IF EXISTS idx_runs_liveness, idx_runs_active_liveness")
             .execute(&self.pool)
             .await?;
 
@@ -1142,10 +1143,10 @@ impl PgStore {
         if !newly_created && import_created_at_ms.is_none() {
             // Re-init of an existing run (rare retry workflow). Clear the
             // terminal exit signal and seed a fresh startup grace. Clear the
-            // prior execution's system heartbeat so system-metrics-disabled
-            // clients keep using the documented main-heartbeat fallback. Use
-            // wall-clock time here because the transaction may have waited on
-            // the project lock; PostgreSQL's NOW() is fixed at transaction start.
+            // prior execution's system heartbeat, which says nothing of this
+            // one's process (compute_status). Use wall-clock time here because
+            // the transaction may have waited on the project lock; PostgreSQL's
+            // NOW() is fixed at transaction start.
             bumped_run = Some(
                 sqlx::query_scalar(
                     "UPDATE runs
@@ -1499,7 +1500,7 @@ impl PgStore {
             .collect())
     }
 
-    /// Runs whose derived liveness status can still change: no exit signal, and effective heartbeat (compute_status's sys → main → created fallback chain) inside the shared PRESUMED_DEAD window plus the independently named status-watch margin. Past that, status is pinned until new data or an exit signal — both push their own events.
+    /// Runs whose derived liveness status can still change: no exit signal, and compute_status's alive time, max(system, main or else created_at), inside the shared PRESUMED_DEAD window plus the independently named status-watch margin. Past that, status is pinned until new data or an exit signal — both push their own events.
     pub async fn status_watch_candidates(&self) -> Result<TimedRunRows> {
         let rows: Vec<TimedRunInfoRow> = self
             .watch_statement(async |connection| {
@@ -1510,7 +1511,7 @@ impl PgStore {
              FROM runs
              WHERE exit_code IS NULL
                AND deleted_at IS NULL
-               AND COALESCE(last_system_metric_at, last_main_metric_at, created_at)
+               AND GREATEST(last_system_metric_at, COALESCE(last_main_metric_at, created_at))
                    > statement_timestamp() - make_interval(secs => $1::double precision)"
                 ))
                 .bind(STATUS_WATCH_WINDOW.as_secs_f64())
@@ -3196,6 +3197,32 @@ mod live_pg_tests {
         anyhow::ensure!(row.last_system_metric_at_ms.is_none());
         anyhow::ensure!(corrected.bumped_run > finalized.bumped_run);
         store.delete_live_projects(&[project_id]).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires KYMO_LIVE_TEST_DATABASE_URL"]
+    async fn live_status_watch_scans_a_logging_run_whose_system_heartbeat_is_stale() -> Result<()> {
+        // A run whose main heartbeat is fresh and whose system heartbeat is long stale (a main metric that arrives without a system one: another client): compute_status takes it as alive, so the watcher must keep scanning it to push its transitions once it falls silent.
+        let _suite_guard = live_database_suite_gate().lock().await;
+        let pg_url = live_test_url("KYMO_LIVE_TEST_DATABASE_URL")?;
+        let store = PgStore::connect(&pg_url).await?;
+        let suffix = unique_suffix();
+        let (project_id, run_id) = (format!("watch-{suffix}"), format!("run-{suffix}"));
+        store.init_run(&project_id, &run_id, "run", None).await?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        store
+            .bump_run_versions(&[TouchedRun {
+                project_id: project_id.clone(),
+                run_id: run_id.clone(),
+                max_main_metric_at_ms: Some(now_ms),
+                max_system_metric_at_ms: Some(now_ms - 20 * 60 * 1000),
+                last_ingested_at_ms: now_ms,
+            }])
+            .await?;
+        let candidates = store.status_watch_candidates().await?;
+        store.delete_live_projects(&[project_id]).await?;
+        anyhow::ensure!(candidates.rows.iter().any(|row| row.run_id == run_id));
         Ok(())
     }
 

@@ -1,8 +1,9 @@
 """
-Background system metrics poller for kymo.
+Background poller for kymo.
 
-Polls GPU (via pynvml), CPU, memory, disk, and network (via psutil)
-every N seconds and publishes timestamped points through the client publisher.
+Every N seconds publishes, through the client publisher, the captured
+stdout/stderr and, unless disabled, timestamped GPU (via pynvml), CPU,
+memory, disk, and network (via psutil) metrics.
 """
 
 import math
@@ -41,11 +42,12 @@ def _nvml(read) -> float:
 
 
 class SystemMetricsPoller:
-    """Background thread that polls and publishes system metrics."""
+    """Background thread that publishes the captured console and, with system_metrics, polls and publishes system metrics."""
 
-    def __init__(self, poll_interval: float = 2.0, publish=None):
+    def __init__(self, *, publish, poll_interval: float = 2.0, system_metrics: bool = True):
         self._interval = poll_interval
         self._publish = publish
+        self._system_metrics = system_metrics
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         # Linearizes the final stop check with queue publication. stop() may
@@ -68,22 +70,21 @@ class SystemMetricsPoller:
         self._prev_disk_time = None
 
     def start(self):
-        """Initialize backends and start polling thread."""
-        self._init_nvml()
-        self._init_psutil()
+        """With system_metrics, initialize the metric backends; either way start the polling thread, which uploads the captured console."""
+        if self._system_metrics:
+            self._init_nvml()
+            self._init_psutil()
+            available = []
+            if self._nvml_ok:
+                available.append(f"gpu×{self._gpu_count}")
+            if self._psutil_ok:
+                available.append("cpu/mem/disk/net")
+            if available:
+                log.info("system metrics enabled (%s)", ", ".join(available))
+            else:
+                log.info("system metrics disabled (neither psutil nor a working NVML); the console is still uploaded")
 
-        if not self._nvml_ok and not self._psutil_ok:
-            log.info("system metrics disabled (no pynvml or psutil)")
-            return
-
-        available = []
-        if self._nvml_ok:
-            available.append(f"gpu×{self._gpu_count}")
-        if self._psutil_ok:
-            available.append("cpu/mem/disk/net")
-        log.info("system metrics enabled (%s)", ", ".join(available))
-
-        self._thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._thread = threading.Thread(target=self._poll_loop, name="kymo-poller", daemon=True)
         self._thread.start()
 
     def stop(self, timeout: float | None = None) -> bool:
@@ -102,7 +103,7 @@ class SystemMetricsPoller:
         if publication_quiesced:
             self._publish_lock.release()
         else:
-            log.warning("system metrics publication did not quiesce before shutdown")
+            log.warning("console/system-metrics publication did not quiesce before shutdown")
 
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
@@ -110,7 +111,7 @@ class SystemMetricsPoller:
         thread_stopped = thread is None or not thread.is_alive()
         if self._nvml_ok and not thread_stopped:
             # A wedged driver or queue call must not make shutdown unbounded. Leaving NVML initialized is safer than racing its active poll.
-            log.warning("system metrics poll did not stop; skipping NVML shutdown")
+            log.warning("console/system-metrics poll did not stop; skipping NVML shutdown")
         elif self._nvml_ok:
             try:
                 pynvml.nvmlShutdown()
@@ -159,18 +160,18 @@ class SystemMetricsPoller:
     # ------------------------------------------------------------------
 
     def _poll_loop(self):
-        """Poll until stopped. A failed poll or publication is retried, with a warning at most once a minute: without system/ metrics, a run that rarely calls log() (each call sends one) reads as unresponsive. Of failures, only the upload worker's exit ends it: nothing restarts the worker (only init() starts one), so no later point could be delivered."""
+        """Poll until stopped. A failed poll or publication is retried, with a warning at most once a minute: the console text and system metrics a tick publishes are what show a run alive between rare log() calls. Of failures, only the upload worker's exit ends it: nothing restarts the worker (only init() starts one), so no later point could be delivered."""
         warned_at = float("-inf")
         while not self._stop.wait(self._interval):
             try:
                 self._poll_once()
             except _WorkerExited:
-                log.warning("system metrics stopped: the upload worker has exited")
+                log.warning("console/system-metrics uploads stopped: the upload worker has exited")
                 return
             except Exception as error:
                 now = time.monotonic()
                 if now - warned_at >= _FAILURE_WARN_INTERVAL:
-                    log.warning("system metrics poll failed; retrying: %s", error)
+                    log.warning("console/system-metrics poll failed; retrying: %s", error)
                     warned_at = now
 
     def _poll_once(self):
@@ -184,9 +185,6 @@ class SystemMetricsPoller:
             self._poll_disk(metrics)
             self._poll_network(metrics)
 
-        if not metrics or self._publish is None or self._stop.is_set():
-            return
-
         # Use timestamp as both step and timestamp_ms
         ts = int(time.time() * 1000)
         points = []
@@ -197,11 +195,11 @@ class SystemMetricsPoller:
             else:
                 points.append(("numeric_ts", name, ts, float(value), ts))
 
-        if points:
-            with self._publish_lock:
-                if self._stop.is_set():
-                    return
-                self._publish([points])
+        with self._publish_lock:
+            if self._stop.is_set():
+                return
+            # The captured console goes with them at their time, or alone without metrics.
+            self._publish([points] if points else [], capture_ms=ts)
 
     # ------------------------------------------------------------------
     # GPU metrics (tagged — lists of per-GPU values)

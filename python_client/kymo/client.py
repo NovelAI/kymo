@@ -355,7 +355,7 @@ _original_signals: dict = {}
 _atexit_registered: bool = False
 _system_poller = None  # SystemMetricsPoller instance
 _last_log_duration_ms: float = 0.0  # overhead of previous log() call
-# Reentrant, like _capture's stream locks: a handler of a signal kymo does not own may call log() or finish() inside a drain on the thread it interrupts (kymo's own shutdown handler waits for the drain's held section to end).
+# Reentrant, like _capture's stream locks: a handler of a signal kymo does not own may call finish() or fork inside a drain on the thread it interrupts, taking this lock again (a log() there leaves the text for the next drain: _drain_capture_points). kymo's own shutdown handler waits for the drain's held section to end.
 _capture_drain_lock = threading.RLock()
 # The shutdown signals waiting for a held section (_HELD_SECTIONS) to end, in arrival order, each as [signum, the frame it interrupted, or None once deferred].
 _deferred_signals: list[list] = []
@@ -386,7 +386,7 @@ _run_metadata: Optional[dict] = None
 # preserving the existing hosted rich-write path byte-for-byte.
 _rich_writer_epoch: Optional[int] = None
 _rich_mutation_seq = None  # multiprocessing.Value("I") when versioning is negotiated
-# log() calls whose GPU values are still being copied to the host (kymo._gpu), oldest first; log_cdn() and update_config() writes queue behind them. All are published in that order. The system-metrics poller and captured text publish directly: log() never writes their metrics.
+# log() calls whose GPU values are still being copied to the host (kymo._gpu), oldest first; log_cdn() and update_config() writes queue behind them. All are published in that order. System metrics and captured text never wait here: the poller publishes them directly, and log() publishes the captured text at once even when its call waits.
 _pending: collections.deque = collections.deque()
 # Reentrant: the shutdown signal handler runs on the main thread, possibly inside log().
 _pending_lock = threading.RLock()
@@ -523,6 +523,7 @@ def init(
         url_base: Dashboard origin that ``run_url()`` builds on in hosted mode
             (``http://host:port``). If None, falls back to ``$KYMO_URL_BASE``.
         system_metrics: Automatically log GPU/CPU/memory/disk/network metrics.
+            Captured stdout/stderr is uploaded every 2 s either way.
         config: Optional run configuration dict (hyperparams, etc.).
         spool_dir: Where undeliverable points are spooled for later replay
             (``python -m kymo.sync``). Falls back to ``$KYMO_SPOOL_DIR`` or
@@ -779,15 +780,15 @@ def init(
         _run_metadata = _collect_run_metadata(config)
         _push_run_metadata()
 
-    # Last, since its start can take seconds (NVML's init): the system metrics poller (GPU/CPU/memory/disk/network), which queues directly to the upload queue with time-based steps.
-    if system_metrics:
-        from kymo.system_metrics import SystemMetricsPoller
+    # Last, since with system_metrics its start can take seconds (NVML's init): the poller, which every 2 s queues the captured console and, with system_metrics, the GPU/CPU/memory/disk/network metrics, directly to the upload queue with time-based steps. Imported here: kymo.system_metrics imports this module back (_WorkerExited).
+    from kymo.system_metrics import SystemMetricsPoller
 
-        _system_poller = SystemMetricsPoller(
-            poll_interval=2.0,
-            publish=_publish_queue_items,
-        )
-        _system_poller.start()
+    _system_poller = SystemMetricsPoller(
+        poll_interval=2.0,
+        publish=_publish_queue_items,
+        system_metrics=system_metrics,
+    )
+    _system_poller.start()
 
 
 def _start_run(process: multiprocessing.Process) -> None:
@@ -1078,27 +1079,51 @@ def log(metrics: dict, step: int) -> None:
     _last_log_duration_ms = (time.perf_counter() - t0) * 1000.0
 
 
+# How long the shutdown's last drain off the main thread waits for each busy capture lock before it leaves that lock's text unsent (_drain_capture_points).
+_FINAL_DRAIN_LOCK_WAIT = 0.1
+
+
 def _drain_capture_points(now_ms: int, final: bool = False) -> list[tuple]:
     """Drain the captured output into text points for a publication (_publish_held), with final the shutdown's last drain (_capture.drain_buffers)."""
-    global _last_capture_step
-    with _capture_drain_lock:
-        stdout_text, stderr_text = _capture.drain_buffers(final)
-        if not stdout_text and not stderr_text:
+    if _on_main_thread():
+        if not final and _capture_drain_lock._is_owned():
+            # A handler's log() nested in a drain on this thread could take the outer drain's step, and the server keeps one text point per stream and step: leave the text for the next drain, as _capture._drain_one does.
             return []
+        with _capture_drain_lock:
+            points, _ = _drain_capture_locked(now_ms, final, None)
+        return points
+    # Off the main thread (the poller's drain, another thread's log()) a drain waits for no capture lock; the shutdown's last waits at most _FINAL_DRAIN_LOCK_WAIT for each. A handler of a signal kymo does not own can call log() inside a print on the main thread, which holds its stream's lock, so waiting for that lock while holding the drain lock would deadlock with the handler's drain; and on Python 3.14 a raising handler can leave a lock held for good as a `with` takes it. No handler runs off the main thread between the acquire and the try.
+    timeout = _FINAL_DRAIN_LOCK_WAIT if final else 0
+    if _capture_drain_lock.acquire(timeout=timeout):
+        try:
+            points, unsent = _drain_capture_locked(now_ms, final, timeout)
+        finally:
+            _capture_drain_lock.release()
+    else:
+        points, unsent = [], (["output"] if _capture.has_output() else [])
+    if final and unsent:
+        # Out of the drain's lock: a handler the program added may write this to the captured stderr, perhaps the stream passed over.
+        _log.warning("captured %s left unsent: a capture lock stayed busy as the run ended", " and ".join(unsent))
+    return points
 
+
+def _drain_capture_locked(now_ms: int, final: bool, timeout: Optional[float]) -> tuple[list[tuple], list[str]]:
+    """_drain_capture_points' drain, _capture_drain_lock held: its text points, and the streams it passed over (_capture.drain_buffers' timeout)."""
+    global _last_capture_step
+    stdout_text, stderr_text = _capture.drain_buffers(final, timeout)
+    points = []
+    if stdout_text or stderr_text:
         step = (
             now_ms
             if _last_capture_step is None
             else max(now_ms, _last_capture_step + 1)
         )
         _last_capture_step = step
-
-        points = []
         if stdout_text:
             points.append(("text_ts", "logs/std_out", step, stdout_text, now_ms))
         if stderr_text:
             points.append(("text_ts", "logs/std_err", step, stderr_text, now_ms))
-        return points
+    return points, [name for name, text in (("stdout", stdout_text), ("stderr", stderr_text)) if text is None]
 
 
 _BACKLOG_WARN_THRESHOLD = 100_000
@@ -2010,7 +2035,7 @@ def wait_for_upload(timeout: Optional[float] = None) -> bool:
         _pending_lock.release()
     wait_time = 0.05
     accounting_unavailable_since = None
-    # The lowest backlog seen, and since when it has not gone lower: the system-metrics poller's publications raise and lower it every 2 s.
+    # The lowest backlog seen, and since when it has not gone lower: the poller's publications, when it has something to publish, raise and lower it every 2 s.
     lowest, steady_since = None, 0.0
 
     while True:
@@ -2107,7 +2132,7 @@ def finish(flush_timeout: Optional[float] = None) -> bool:
     The recommended end-of-run call: unlike ``wait_for_upload``, every client
     wait shares that deadline. A kernel-level filesystem or Queue operation can
     still outlive a Python timeout; parent salvage therefore runs in a daemon
-    thread and an unquiesced system-metrics publisher makes the result false.
+    thread and an unquiesced console/system-metrics publication makes the result false.
     Spooled points are delivered later from any CPU-only machine with
     ``python -m kymo.sync``.
 

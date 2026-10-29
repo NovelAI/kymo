@@ -17,7 +17,7 @@ fn RunStatusIcon(status: RunStatus) -> Element {
         // Warning triangle with the "!" knocked out (evenodd).
         RunStatus::Unresponsive => (
             "unresponsive",
-            "unresponsive (no system metrics)",
+            "unresponsive (>10s silent)",
             "M5 .6 9.7 9.2H.3zM4.35 3.4h1.3v3.1h-1.3zM4.35 7.1h1.3v1.2h-1.3z",
             false,
         ),

@@ -529,25 +529,19 @@ async fn heartbeat_ingest(fixture: &mut Fixture, run: &str, stale_system: bool) 
             Some(system),
             "{run}: stored system heartbeat"
         );
+        // A fresh main metric keeps the run alive however stale its system
+        // metrics (compute_status): RUNNING if the database I/O above ends
+        // within the 10-second window, UNRESPONSIVE if it takes longer, never
+        // PRESUMED_DEAD. The assertions above prove both heartbeats were
+        // stored.
         let status = fixture.listed(run).await?.status();
-        if stale_system {
-            assert_eq!(
+        assert!(
+            matches!(
                 status,
-                proto::RunStatus::PresumedDead,
-                "{run}: stale system with fresh main"
-            );
-        } else {
-            // Successful database I/O can outlast the 10-second Running
-            // window. The bounded case stays below PresumedDead's window;
-            // the assertions above prove both fresh heartbeats were stored.
-            assert!(
-                matches!(
-                    status,
-                    proto::RunStatus::Running | proto::RunStatus::Unresponsive
-                ),
-                "{run}: fresh heartbeat status was {status:?}"
-            );
-        }
+                proto::RunStatus::Running | proto::RunStatus::Unresponsive
+            ),
+            "{run}: fresh main heartbeat status was {status:?}"
+        );
     }
     Ok(())
 }

@@ -422,7 +422,7 @@ fn batch_metadata(rows: &[MetricRow]) -> BatchMetadata<'_> {
         heartbeats
             .entry((row.project_id.as_str(), row.run_id.as_str()))
             .or_insert_with(RunHeartbeat::default)
-            .record(&row.metric_name, row.timestamp_ms);
+            .record(row);
 
         let metric_type = point_metric_type(row);
         candidates
@@ -446,7 +446,11 @@ fn batch_metadata(rows: &[MetricRow]) -> BatchMetadata<'_> {
 
 /// Per-run heartbeat aggregator: tracks the max main-metric and max
 /// system-metric timestamp observed in the current flush window. Reset after
-/// each flush so we only roll forward what's new.
+/// each flush so we only roll forward what's new. Text counts as a system
+/// metric: the client sends text only for its captured console, every 2 s while
+/// the process prints, whatever the training loop does, so it shows the process
+/// alive, not training progress (older clients send it only with `log()`, whose
+/// main metrics arrive with it).
 #[derive(Default, Clone, Copy)]
 struct RunHeartbeat {
     max_main_ms: Option<i64>,
@@ -454,13 +458,13 @@ struct RunHeartbeat {
 }
 
 impl RunHeartbeat {
-    fn record(&mut self, metric_name: &str, ts_ms: i64) {
-        let slot = if metric_name.starts_with(SYSTEM_METRIC_PREFIX) {
+    fn record(&mut self, row: &MetricRow) {
+        let slot = if row.text_data.is_some() || row.metric_name.starts_with(SYSTEM_METRIC_PREFIX) {
             &mut self.max_system_ms
         } else {
             &mut self.max_main_ms
         };
-        *slot = Some(slot.map_or(ts_ms, |cur| cur.max(ts_ms)));
+        *slot = (*slot).max(Some(row.timestamp_ms));
     }
 
     /// Max-merge another window: coalescing can never move a timestamp
@@ -2452,9 +2456,11 @@ mod registry_tests {
             (heartbeat.max_main_ms, heartbeat.max_system_ms),
             (Some(3), Some(7))
         );
+        // Console text shows the process alive, not training progress.
+        let heartbeat = metadata.heartbeats[&("project", "other-run")];
         assert_eq!(
-            metadata.heartbeats[&("project", "other-run")].max_main_ms,
-            Some(5)
+            (heartbeat.max_main_ms, heartbeat.max_system_ms),
+            (None, Some(5))
         );
         assert_eq!(metadata.candidates[&("project", "run", "m")], "NUMERIC");
         assert_eq!(

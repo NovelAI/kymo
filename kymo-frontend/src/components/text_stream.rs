@@ -281,7 +281,7 @@ pub fn TextStreamViewer(
 
             if let (Some(run), Some(log_key)) = (runs.get(active), active_log) {
                 {
-                    // Stuck runs are alive but silent, so their tail is still live.
+                    // Stuck runs are alive but not logging, so their tail is still live.
                     let live = find_run(&display_runs, &run.run_id).is_some_and(|info| {
                         matches!(info.status(), RunStatus::Running | RunStatus::Stuck)
                     });

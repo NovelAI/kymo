@@ -3,7 +3,8 @@ Import-time stdout/stderr capture for kymo.
 
 Wraps sys.stdout and sys.stderr at import time so that output
 produced before init() is not lost. Buffers are drained on each
-log() call and sent as text stream metrics.
+log() call and every 2 s by the client's poller, and sent as text
+stream metrics.
 """
 
 import os
@@ -17,11 +18,11 @@ _stdout_stats = {"size": 0, "dropped": 0}
 _stderr_stats = {"size": 0, "dropped": 0}
 _installed = False
 
-# Continuous cap per stream BETWEEN drains, oldest dropped first (the tail is what you want when reading a stalled run). Two reasons, both real incidents waiting to happen: a chatty process that stops calling log() grows these buffers without bound, and one drain becomes ONE text point — past the server's 4MiB gRPC frame cap it can never be delivered or replayed (tqdm over a slow epoch is enough).
+# Continuous cap per stream BETWEEN drains, oldest dropped first (the tail is what you want when reading a stalled run). Nothing drains before init(), between runs or once the run has ended, and a fork child drains only in log(), so a chatty process would grow these buffers without bound (tqdm over a slow phase is enough). One drain also becomes ONE text point, and 1M characters stay under the server's 4MiB gRPC frame cap even at 4 UTF-8 bytes each; the wire cuts a larger point to its tail.
 _max_buffered_chars = 1_000_000
 
 # One lock per stream guards its buffer and stats: prints come from any thread (data loaders, tqdm monitors) while log() drains, and unsynchronized, write() indexed a deque a drain had just cleared (IndexError out of print()). The passthrough write stays outside it: no user I/O under the lock.
-# Reentrant: a signal handler runs on the thread it interrupts, perhaps inside a write or a drain, and may print or call log() there. Only the outermost operation removes or trims chunks: a nested write appends and counts its chunk (TeeWriter._keep), and a nested drain takes nothing but for the shutdown's last, which takes the text in place and blanks the chunks, so neither the operation it interrupted nor a later drain publishes it again. A drain takes only the chunks held as it started (_drain_one).
+# Reentrant: a signal handler runs on the thread it interrupts, perhaps inside a write or a drain, and may print or call log() there. Only the outermost operation removes or trims chunks: a nested write appends and counts its chunk (TeeWriter._keep), and a nested drain takes nothing but for the shutdown's last, which takes the text in place and blanks the chunks, so neither the operation it interrupted nor a later drain publishes it again. A drain takes only the chunks held as it started (_take).
 _stdout_lock = threading.RLock()
 _stderr_lock = threading.RLock()
 
@@ -132,26 +133,46 @@ def install_capture():
     _installed = True
 
 
-def _drain_one(buffer: deque, stats: dict, lock: threading.RLock, final=False) -> str:
-    if lock._is_owned():
-        # Nested in a write or a drain on this thread (a handler that called log()): leave the text for the next drain, but the shutdown's last (final), which none follows, takes it in place, blanking the chunks the operation nested in may still hold.
-        if not final:
-            return ""
+def _take(buffer: deque, stats: dict, in_place=False, whole_lines=False) -> tuple[list[str], int]:
+    """Take a stream's chunks and its drop count, its lock held: (chunks, chars dropped). in_place blanks the chunks instead of removing them, for an operation this drain is nested in that may still hold them. Otherwise whole_lines leaves the text after the last newline, a line still being written, for the next drain, and takes everything when there is no newline. Only drains off the main thread ask for it: no handler runs there between the pops and the tail's return, where on the main thread one that calls finish() would leave the tail buffered past the run's end, and a fork child, which no poller drains, would lose its last log()'s partial line."""
+    if in_place:
         chunks = list(buffer)
         for index in range(len(chunks)):
             buffer[index] = ""
-        # Summed first, here and below: a handler that runs as sum() returns (a print, or the run's end) then changes the size before the read, not between it and the store, which would undo that change.
-        taken = sum(map(len, chunks))
-        stats["size"] -= taken
-        dropped = stats["dropped"]
-        stats["dropped"] = 0
     else:
+        chunks = [buffer.popleft() for _ in range(len(buffer))]
+        if whole_lines and chunks and not chunks[-1].endswith("\n"):
+            text = "".join(chunks)
+            cut = text.rfind("\n") + 1
+            if cut:
+                buffer.appendleft(text[cut:])
+                chunks = [text[:cut]]
+    # The sum before the read of the size: a handler that prints or drains as sum() returns then changes the size before the read, rather than between it and the store, which would undo the change.
+    taken = sum(map(len, chunks))
+    stats["size"] -= taken
+    dropped = stats["dropped"]
+    stats["dropped"] = 0
+    return chunks, dropped
+
+
+def _drain_one(buffer: deque, stats: dict, lock: threading.RLock, final=False, timeout=None) -> str | None:
+    if lock._is_owned():
+        # Nested in a write or a drain on this thread (a handler that called log()): leave the text for the next drain, but the shutdown's last (final), which none follows, takes it in place.
+        if not final:
+            return ""
+        chunks, dropped = _take(buffer, stats, in_place=True)
+    elif timeout is None:
         with lock:
-            chunks = [buffer.popleft() for _ in range(len(buffer))]
-            taken = sum(map(len, chunks))
-            stats["size"] -= taken
-            dropped = stats["dropped"]
-            stats["dropped"] = 0
+            chunks, dropped = _take(buffer, stats)
+    elif lock.acquire(timeout=timeout):
+        # Off the main thread, where no handler runs between the acquire and the try. Before the run's end it may land between the writes of one print on another thread, so it leaves an unfinished line for the next drain: merged stdout and stderr reads join a stream's partial line to whatever chunk follows it.
+        try:
+            chunks, dropped = _take(buffer, stats, whole_lines=not final)
+        finally:
+            lock.release()
+    else:
+        # Another thread is still writing: the text goes out at the next drain, if any.
+        return None
     # Unix filenames decoded with surrogateescape can be printed normally, but protobuf's string-to-bytes boundary rejects their lone surrogates. Keep terminal passthrough exact and make only the captured copy safe.
     text = "".join(chunks).encode("utf-8", errors="replace").decode("utf-8")
     if dropped:
@@ -170,13 +191,13 @@ def has_output() -> bool:
     )
 
 
-def drain_buffers(final=False) -> tuple[str, str]:
-    """Drain and return (stdout, stderr) text since last drain; has_output() tells whether there is any. A stream with nothing captured is passed over without its lock, as has_output() reads it, so a call that printed to one stream pays for one drain. final: the shutdown's last drain, which also takes the text of a stream whose write or drain it is nested in (_drain_one)."""
+def drain_buffers(final=False, timeout=None) -> tuple[str | None, str | None]:
+    """Drain and return (stdout, stderr) text since last drain; has_output() tells whether there is any. A stream with nothing captured is passed over without its lock, as has_output() reads it, so a call that printed to one stream pays for one drain. final: the shutdown's last drain, which also takes the text of a stream whose write or drain it is nested in (_drain_one). timeout, for drains off the main thread only: how many seconds to wait for each stream lock another thread holds; a stream still busy then comes back as None, its text left buffered, and unless final each stream's unfinished line stays for the next drain (_take's whole_lines). timeout=None waits as long as it takes and takes every line."""
     return (
-        _drain_one(_stdout_buf, _stdout_stats, _stdout_lock, final)
+        _drain_one(_stdout_buf, _stdout_stats, _stdout_lock, final, timeout)
         if _stdout_buf or _stdout_stats["dropped"]
         else "",
-        _drain_one(_stderr_buf, _stderr_stats, _stderr_lock, final)
+        _drain_one(_stderr_buf, _stderr_stats, _stderr_lock, final, timeout)
         if _stderr_buf or _stderr_stats["dropped"]
         else "",
     )
