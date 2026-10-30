@@ -50,6 +50,7 @@ pub fn OptionsPanel(
     });
     let has_target = target.is_some();
     rsx! {
+        // util/width_drag.js sizes this box with an inline flex-basis mid-drag, so Dioxus must never set a style on it.
         aside {
             id: OPTIONS_PANEL_ID,
             class: "options-panel",
@@ -62,7 +63,7 @@ pub fn OptionsPanel(
                     on_close.call(());
                 }
             },
-            // Dragged by util/width_drag.js.
+            // Dragged by util/width_drag.js, which sizes its parent: it must stay a direct child of this aside.
             div { class: "options-panel-resize" }
             div { class: "options-panel-header",
                 div { class: "options-panel-heading",

@@ -905,19 +905,22 @@ def panel_resize(page: Page, defaults: Locator) -> None:
         panel = open_editor(page, defaults, "Project settings")
         start = panel.bounding_box()
         assert start is not None
-        drag_handle(page, handle, start["x"] - 120)
-        widened = panel.bounding_box()
-        assert (
-            widened is not None and abs(widened["width"] - start["width"] - 120) < 2
-        ), (start, widened)
+
+        def widened_by_120() -> dict:
+            widened = panel.bounding_box()
+            assert (
+                widened is not None and abs(widened["width"] - start["width"] - 120) < 2
+            ), (start, widened)
+            return widened
+
+        # The panel follows the pointer mid-drag; the release keeps that width and leaves no inline basis behind.
+        drag_handle(page, handle, start["x"] - 120, widened_by_120)
+        widened = widened_by_120()
+        assert panel.evaluate("e => e.style.flexBasis") == ""
         assert abs(stored() - widened["width"]) < 1, (stored(), widened)
         # A press without a drag saves nothing.
         before = stored()
-        box = handle.bounding_box()
-        assert box is not None
-        page.mouse.move(box["x"] + 2, box["y"] + 100)
-        page.mouse.down()
-        page.mouse.up()
+        handle.click(position={"x": 2, "y": 100})
         assert stored() == before
         # A wider window widens the panel by the same share.
         page.set_viewport_size({"width": 1600, "height": VIEWPORT["height"]})
@@ -973,7 +976,7 @@ def panel_resize(page: Page, defaults: Locator) -> None:
         assert all(count <= 1 for count in resizes), resizes
         dismiss(page, panel, defaults, "Close")
 
-        # A drag the panel closes under (Esc mid-drag) saves nothing, and leaves the width it had.
+        # Mid-drag leaves <html> and storage unchanged; Esc closing the panel mid-drag saves nothing (util/width_drag.js).
         width = "[localStorage.getItem('kymo_options_w'), document.documentElement.style.getPropertyValue('--kymo-options-w')]"
         before = page.evaluate(width)
         panel = open_editor(page, defaults, "Project settings")
@@ -983,6 +986,7 @@ def panel_resize(page: Page, defaults: Locator) -> None:
         page.mouse.move(grip["x"] + grip["width"] / 2, y)
         page.mouse.down()
         page.mouse.move(grip["x"] - 120, y, steps=3)
+        assert page.evaluate(width) == before, (page.evaluate(width), before)
         page.keyboard.press("Escape")
         expect(panel).to_have_count(0)
         page.mouse.move(grip["x"] - 160, y)

@@ -155,13 +155,27 @@ def run_fences(page: Page, origin: str) -> None:
     handle = page.locator(".sidebar-resize")
     box = handle.bounding_box()
     assert box is not None
-    drag_handle(page, handle, box["x"] + 40)
-    width = float(migrated("kymo_sidebar_w", "mkdb2_sidebar_w")["kymo_sidebar_w"])
-    rendered = page.locator(".sidebar").bounding_box()
-    assert rendered is not None
-    assert rendered["width"] > 333, "the sidebar drag did not widen the sidebar"
-    assert abs(width / 100 * VIEWPORT["width"] - rendered["width"]) < 1, (
-        f"stored {width}% does not match the rendered {rendered['width']}px"
+    # Mid-drag the run list alone takes the width, as an inline basis, and the overlay takes the pointer and holds the cursor; the release moves the width to the var and hides the overlay, which would otherwise eat every click (util/width_drag.js).
+    held = """() => {
+        const sidebar = document.querySelector('.sidebar');
+        const hit = document.elementFromPoint(innerWidth / 2, innerHeight / 2);
+        return [document.documentElement.style.getPropertyValue('--kymo-sidebar-w'), sidebar.style.flexBasis, sidebar.getBoundingClientRect().width, hit.id, getComputedStyle(hit).cursor];
+    }"""
+    var_before = page.evaluate(held)[0]
+
+    def mid_drag() -> None:
+        var, basis, rendered, hit, cursor = page.evaluate(held)
+        assert var == var_before and basis and rendered > 333, (var, basis, rendered)
+        assert [hit, cursor] == ["resize-drag-overlay", "col-resize"], (hit, cursor)
+
+    drag_handle(page, handle, box["x"] + 40, mid_drag)
+    stored = migrated("kymo_sidebar_w", "mkdb2_sidebar_w")["kymo_sidebar_w"]
+    var, basis, rendered, hit, _ = page.evaluate(held)
+    assert [var, basis] == [stored + "vw", ""], (var, basis)
+    assert hit != "resize-drag-overlay", "the overlay outlived the drag"
+    assert rendered > 333, "the sidebar drag did not widen the sidebar"
+    assert abs(float(stored) / 100 * VIEWPORT["width"] - rendered) < 1, (
+        f"stored {stored}% does not match the rendered {rendered}px"
     )
 
     # Settings live on the project list; the first change saved migrates the key.

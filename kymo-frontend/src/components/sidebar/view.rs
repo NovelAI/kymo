@@ -261,6 +261,7 @@ pub fn Sidebar() -> Element {
         (0, String::new())
     };
     rsx! {
+        // util/width_drag.js sizes this box with an inline flex-basis mid-drag, so Dioxus must never set a style on it.
         div {
             class: if in_trash_mode && *trash_busy.read() {
                 "sidebar sidebar-trash-mode sidebar-trash-busy"
@@ -413,7 +414,7 @@ pub fn Sidebar() -> Element {
                 }
             }
 
-            // Dragged by util/width_drag.js.
+            // Dragged by util/width_drag.js, which sizes its parent: it must stay a direct child of `.sidebar`.
             div { class: "sidebar-resize" }
         }
 

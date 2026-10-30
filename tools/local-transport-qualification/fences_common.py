@@ -31,14 +31,16 @@ def encode_response(request_id: int, body: bytes, *, code: int = 0) -> bytes:
     return struct.pack("<IB", request_id, code) + body
 
 
-def drag_handle(page, handle, to_x: float) -> None:
-    """Drag `handle` from its middle to `to_x`, in a few moves."""
+def drag_handle(page, handle, to_x: float, before_release=None) -> None:
+    """Drag `handle` from its middle to `to_x`, in a few moves, calling `before_release` (if any) while the button is still down."""
     box = handle.bounding_box()
     assert box is not None
     y = box["y"] + box["height"] / 2
     page.mouse.move(box["x"] + box["width"] / 2, y)
     page.mouse.down()
     page.mouse.move(to_x, y, steps=6)
+    if before_release:
+        before_release()
     page.mouse.up()
 
 
