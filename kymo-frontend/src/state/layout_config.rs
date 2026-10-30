@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::grpc::proto::metric_info::MetricType;
 use crate::grpc::proto::{MetricInfo, SeriesRef};
-use crate::util::sections::group_by_prefix;
+use crate::util::sections::{group_by_prefix, section_of_metric};
 use crate::util::{local_storage, natural_cmp, warn};
 
 use super::section_order::{OrderContext, SectionGap, SectionKey, SectionOrder};
@@ -316,7 +316,7 @@ pub(crate) mod binding_resolution_tests {
 
 // --- Layout config ---
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct LayoutConfig {
     pub sections: Vec<SectionConfig>,
 }
@@ -478,28 +478,14 @@ pub enum XAxisMode {
     WallTime,
 }
 
-/// Smoothing algorithm selection (mirrors proto SmoothingConfig.Algorithm).
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Default)]
+/// Smoothing algorithm selection (mirrors proto SmoothingConfig.Algorithm). Stored names follow the schema rules on [`RectOptions`].
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Default)]
 pub enum SmoothingAlgorithm {
     None,
     TriangularPolyfit,
     EmaPolyfit,
     #[default]
     BiweightPolyfit,
-}
-
-/// Manual Deserialize so an unknown variant in a stored layout — e.g.
-/// "RunningAverage" (removed 2026-06) — falls back to None instead of
-/// failing the parse of the whole layout.
-impl<'de> Deserialize<'de> for SmoothingAlgorithm {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        Ok(match String::deserialize(d)?.as_str() {
-            "TriangularPolyfit" => Self::TriangularPolyfit,
-            "EmaPolyfit" => Self::EmaPolyfit,
-            "BiweightPolyfit" => Self::BiweightPolyfit,
-            _ => Self::None,
-        })
-    }
 }
 
 #[cfg(test)]
@@ -527,6 +513,18 @@ pub fn ema_time_constant(alpha: f64) -> f64 {
 }
 
 /// Per-rect display options.
+///
+/// Stored layouts outlive builds, so schema changes follow these rules and never reuse a retired value or field name. The rewrites live in [`migrate_level`], which runs on load; the next save keeps the result.
+/// - Rename a value: map the old one to its successor in [`migrate_level`], with any field it implied, including a since-changed default it was used with.
+/// - Retire a value: drop it there, so its level inherits.
+/// - Rename a field: rewrite its key there too. A serde alias doesn't work: every patch merges over a serialized anchor that already holds the new key, so serde sees both and rejects them as a duplicate field.
+/// - Retire a field: remove it from the type; reads ignore the stored key.
+/// - Change a value's meaning or units: give it a new name, or convert on read as [`ema_time_constant`] does for alpha. Not a format-version bump: older builds refuse newer formats.
+/// - Change a default: every level that doesn't store the field follows it, except an added chart's creation base, which keeps the default it was created with.
+///
+/// [`migrate_level`] and its gate, [`has_unreadable_smoothing`], look only at `smoothing` today; a rule for another field widens both. A creation base migrates alone, and a chart's comparison treats its base as storing nothing. That is exact while no base holds a renamed value, or an outdated value of a field a rename implies (a then-default can be either); otherwise the rule must compare the base too.
+///
+/// A value this build can't read (a newer build's) inherits from the level above ([`merge_readable`]) and stays stored for builds that read it. Keep `Deserialize` strict: reading unknown names as a fallback would pin that fallback instead.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct RectOptions {
     #[serde(default)]
@@ -847,10 +845,66 @@ pub struct LayoutDiff {
     pub project_chart_defaults: Value,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct AddedRect {
     pub section: String,
-    pub rect: RectConfig,
+    /// The base as this build reads it. Replace it through [`AddedRect::new`], since saves write `stored`.
+    #[serde(skip)]
+    rect: RectConfig,
+    /// The base as stored (its options migrated), written back on save so values and fields this build can't read survive for the build that wrote them.
+    #[serde(rename = "rect")]
+    stored: Value,
+}
+
+impl AddedRect {
+    fn new(section: &str, rect: RectConfig) -> Self {
+        Self {
+            section: section.to_string(),
+            stored: rect_json(&rect),
+            rect,
+        }
+    }
+}
+
+/// Reads a creation base by migrating its options, then reading it whole (as every base a current build created reads) or, failing that, merging its readable leaves over a blank chart with the same id, so an unreadable display type, bindings list or option falls back alone instead of failing the whole layout.
+impl<'de> Deserialize<'de> for AddedRect {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Stored {
+            section: String,
+            rect: Value,
+        }
+        let Stored {
+            section,
+            rect: mut stored,
+        } = Stored::deserialize(d)?;
+        if has_unreadable_smoothing(&stored["options"]) {
+            migrate_nested(&mut stored, "options", &[], &[]);
+        }
+        // Read directly first: `merge_readable`'s own whole read serializes the blank chart and merges over it, about 14× slower per base on every layout read.
+        let rect = match RectConfig::deserialize(&stored) {
+            Ok(rect) => rect,
+            Err(_) => {
+                let id = stored
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| serde::de::Error::missing_field("id"))?;
+                let blank = RectConfig {
+                    id: id.to_string(),
+                    label: String::new(),
+                    bindings: Vec::new(),
+                    display_type: DisplayType::Numeric,
+                    options: RectOptions::default(),
+                };
+                merge_readable(&blank, &[&stored], id)
+            }
+        };
+        Ok(Self {
+            section,
+            rect,
+            stored,
+        })
+    }
 }
 
 impl Default for LayoutDiff {
@@ -879,6 +933,92 @@ fn parse_layout_diff(json: &str) -> Result<LayoutDiff, String> {
     }
     diff.migrate();
     Ok(diff)
+}
+
+/// Whether a level stores a smoothing this build can't read. Unless some level does, [`migrate_level`] changes nothing.
+fn has_unreadable_smoothing(options: &Value) -> bool {
+    options
+        .get("smoothing")
+        .is_some_and(|smoothing| SmoothingAlgorithm::deserialize(smoothing).is_err())
+}
+
+/// Rewrite the retired option values in one level's stored chart options, per the schema rules on [`RectOptions`], leaving `Null` when that empties the level. `old_above` and `new_above` are the levels it inherits from (nearest first), as stored and as rewritten.
+fn migrate_level(options: &mut Value, old_above: &[&Value], new_above: &[&Value]) {
+    let Value::Object(map) = options else {
+        return;
+    };
+    // The alpha this level resolved to when no level stored one: 0.1 at an old "Ema", today's default elsewhere.
+    let old_default_alpha = match map.get("smoothing").and_then(Value::as_str) {
+        None => return,
+        // Renamed 2026-07-20.
+        Some("SavitzkyGolay") => {
+            map.insert("smoothing".to_string(), "BiweightPolyfit".into());
+            default_smoothing_alpha()
+        }
+        // Renamed 2026-07-20, when the default alpha changed from 0.1; old EMA ignored the fit order, so it was EmaPolyfit at order 0. Limit: a finer level that inherits it but stores its own order keeps that order.
+        Some("Ema") => {
+            map.insert("smoothing".to_string(), "EmaPolyfit".into());
+            map.insert("smoothing_poly_order".to_string(), 0.into());
+            0.1
+        }
+        // Retired 2026-07-20 and 2026-06-10, with no successor: the level inherits.
+        Some("Gaussian" | "RunningAverage") => {
+            map.remove("smoothing");
+            if map.is_empty() {
+                *options = Value::Null;
+            }
+            return;
+        }
+        Some(_) => default_smoothing_alpha(),
+    };
+    // A level choosing its own smoothing keeps the order and alpha it resolved to, pinning each only where the rewritten levels above would resolve it otherwise.
+    for (field, old_default, new_default) in [
+        (
+            "smoothing_poly_order",
+            Value::from(default_smoothing_poly_order()),
+            Value::from(default_smoothing_poly_order()),
+        ),
+        (
+            "smoothing_alpha",
+            Value::from(old_default_alpha),
+            Value::from(default_smoothing_alpha()),
+        ),
+    ] {
+        let old = stored_in(old_above, field).unwrap_or(&old_default);
+        if old != stored_in(new_above, field).unwrap_or(&new_default) {
+            map.entry(field).or_insert_with(|| old.clone());
+        }
+    }
+}
+
+/// `field`'s value at the finest of `levels` (finest first) that stores it, readable or not: no build stores an order or alpha that reads would drop.
+fn stored_in<'a>(levels: &[&'a Value], field: &str) -> Option<&'a Value> {
+    levels.iter().find_map(|level| level.get(field))
+}
+
+/// [`migrate_level`] on the object `patch[key]`, then drop the key if the level emptied, leaving `patch` `Null` if that was its last key.
+fn migrate_nested(patch: &mut Value, key: &str, old_above: &[&Value], new_above: &[&Value]) {
+    let Some(options) = patch.get_mut(key).filter(|options| options.is_object()) else {
+        return;
+    };
+    migrate_level(options, old_above, new_above);
+    if options.is_null() {
+        edit_object(patch, |patch| {
+            patch.remove(key);
+        });
+    }
+}
+
+/// `key`'s entries among `entries`, merged in order as reads apply them (skipping any that isn't an object).
+fn merged_patch(entries: &[ConfigPatch], key: &str) -> Value {
+    let mut patch = Value::Null;
+    for ov in entries
+        .iter()
+        .filter(|ov| ov.key == key && ov.patch.is_object())
+    {
+        merge_apply(&mut patch, &ov.patch);
+    }
+    patch
 }
 
 /// One element's user edits (a rect, or a section's settings), stored as a
@@ -1029,7 +1169,7 @@ thread_local! {
     static WARNED: std::cell::RefCell<std::collections::HashSet<String>> = std::cell::RefCell::default();
 }
 
-/// `base` with the object patches among `patches` merged in, in order. When the result doesn't read back as a `T`, they merge leaf by leaf, leaving out (with a console warning naming `what`) each leaf after which it no longer does: a value a newer build wrote, kept since edits write only the fields they change, or one the schema dropped. Objects a patch and the value share are descended into; anything else is one leaf.
+/// `base` with the object patches among `patches` merged in, in order. When the result doesn't read back as a `T`, they merge leaf by leaf, leaving out (with a console warning naming `what`) each leaf after which it no longer does: a value a newer build wrote, kept since edits write only the fields they change, or one the schema dropped. Objects a patch and the value share are descended into; anything else is one leaf. The leaf-by-leaf path costs a serde round trip per stored leaf: an unreadable project default beside one other field makes `apply` 3.3× slower at 400 charts.
 fn merge_readable<T: Clone + Serialize + DeserializeOwned>(
     base: &T,
     patches: &[&Value],
@@ -1077,7 +1217,7 @@ fn merge_readable<T: Clone + Serialize + DeserializeOwned>(
             });
             let mut candidate = value.clone();
             merge_apply(&mut candidate, &single);
-            match serde_json::from_value::<T>(candidate.clone()) {
+            match T::deserialize(&candidate) {
                 Ok(_) => value = candidate,
                 Err(e) => {
                     // Every layout write reads the stored value again: say so once.
@@ -1381,6 +1521,245 @@ mod cascade_tests {
             "the chart's other options survive"
         );
         assert!(rect.options.log_x);
+    }
+
+    /// A stored layout's old smoothing names, at every level: a renamed one reads as its successor, with the order and alpha it resolved to; a retired one is dropped so its level inherits; a finer level choosing its own smoothing keeps the order and alpha it resolved to; and a newer build's name stays stored and inherits.
+    #[test]
+    fn stored_smoothing_names_migrate_on_load() {
+        use serde_json::json;
+        use SmoothingAlgorithm::*;
+        let base = base_with_one_rect();
+        // The default alpha, whose e-folding time is τ = 100 steps.
+        let tau_100 = default_smoothing_alpha();
+        let cases = [
+            // (project, section, chart) → (smoothing, fit order, alpha)
+            (
+                json!({ "smoothing": "Ema" }),
+                json!({}),
+                json!({}),
+                (EmaPolyfit, 0, 0.1),
+            ),
+            (
+                json!({ "smoothing": "Ema", "smoothing_alpha": 0.3 }),
+                json!({}),
+                json!({}),
+                (EmaPolyfit, 0, 0.3),
+            ),
+            (
+                json!({ "smoothing_alpha": 0.3 }),
+                json!({}),
+                json!({ "smoothing": "Ema" }),
+                (EmaPolyfit, 0, 0.3),
+            ),
+            (
+                json!({ "smoothing": "Ema" }),
+                json!({ "smoothing": "SavitzkyGolay" }),
+                json!({}),
+                (BiweightPolyfit, 1, tau_100),
+            ),
+            (
+                json!({ "smoothing": "Ema", "smoothing_poly_order": 2 }),
+                json!({}),
+                json!({ "smoothing": "BiweightPolyfit" }),
+                (BiweightPolyfit, 2, tau_100),
+            ),
+            (
+                json!({}),
+                json!({ "smoothing": "Ema" }),
+                json!({ "smoothing": "SavitzkyGolay" }),
+                (BiweightPolyfit, 1, tau_100),
+            ),
+            (
+                json!({ "smoothing": "Ema" }),
+                json!({ "smoothing": "TriangularPolyfit" }),
+                json!({ "smoothing": "Ema" }),
+                (EmaPolyfit, 0, 0.1),
+            ),
+            (
+                json!({ "smoothing": "Gaussian" }),
+                json!({}),
+                json!({}),
+                (BiweightPolyfit, 1, tau_100),
+            ),
+            (
+                json!({ "smoothing": "TriangularPolyfit" }),
+                json!({ "smoothing": "Gaussian" }),
+                json!({}),
+                (TriangularPolyfit, 1, tau_100),
+            ),
+            (
+                json!({}),
+                json!({ "smoothing": "EmaPolyfit" }),
+                json!({ "smoothing": "RunningAverage" }),
+                (EmaPolyfit, 1, tau_100),
+            ),
+            (
+                json!({}),
+                json!({ "smoothing": "EmaPolyfit" }),
+                json!({ "smoothing": "FutureAlgorithm" }),
+                (EmaPolyfit, 1, tau_100),
+            ),
+            (
+                json!({ "smoothing": "TriangularPolyfit" }),
+                json!({}),
+                json!({ "smoothing": "None" }),
+                (SmoothingAlgorithm::None, 1, tau_100),
+            ),
+        ];
+        for (project, section, chart, resolved) in cases {
+            let case = format!("{project} / {section} / {chart}");
+            let stored = json!({
+                "format_version": 1,
+                "project_chart_defaults": project,
+                "section_overrides": [{ "key": "train", "patch": { "chart_defaults": section } }],
+                "rect_overrides": [{ "key": "train/loss", "patch": { "options": chart } }]
+            });
+            let diff = parse_layout_diff(&stored.to_string()).unwrap();
+            let o = opts_of(&diff.apply(&base), "train/loss");
+            assert_eq!(
+                (o.smoothing, o.smoothing_poly_order, o.smoothing_alpha),
+                resolved,
+                "{case}"
+            );
+            let kept = serde_json::to_string(&diff).unwrap();
+            for old in [
+                "\"Ema\"",
+                "\"SavitzkyGolay\"",
+                "\"Gaussian\"",
+                "\"RunningAverage\"",
+            ] {
+                assert!(!kept.contains(old), "{case}: {old} is rewritten on load");
+            }
+            assert_eq!(
+                kept.contains("FutureAlgorithm"),
+                case.contains("FutureAlgorithm")
+            );
+            let again = parse_layout_diff(&kept).unwrap();
+            assert_eq!(again, diff, "{case}: a second load rewrites nothing");
+        }
+
+        // A chart pins nothing it already inherits from a level that kept its values, so it follows that level's later edits.
+        let stored = json!({
+            "format_version": 1,
+            "project_chart_defaults": { "smoothing": "Ema" },
+            "section_overrides": [{ "key": "train", "patch": { "chart_defaults": { "smoothing": "SavitzkyGolay" } } }],
+            "rect_overrides": [{ "key": "train/loss", "patch": { "options": { "smoothing": "TriangularPolyfit" } } }]
+        });
+        let diff = parse_layout_diff(&stored.to_string()).unwrap();
+        assert_eq!(
+            diff.rect_overrides[0].patch,
+            json!({ "options": { "smoothing": "TriangularPolyfit" } })
+        );
+
+        // An old "Ema" under another pins no alpha the one above already gives it.
+        let stored = json!({
+            "format_version": 1,
+            "project_chart_defaults": { "smoothing": "Ema" },
+            "rect_overrides": [{ "key": "train/loss", "patch": { "options": { "smoothing": "Ema" } } }]
+        });
+        let diff = parse_layout_diff(&stored.to_string()).unwrap();
+        assert_eq!(
+            diff.rect_overrides[0].patch,
+            json!({ "options": { "smoothing": "EmaPolyfit", "smoothing_poly_order": 0 } })
+        );
+
+        // An added chart sits in its own section, not its id's prefix.
+        let stored = json!({
+            "format_version": 1,
+            "section_overrides": [{ "key": "train", "patch": { "chart_defaults": { "smoothing": "Ema" } } }],
+            "added_rects": [{ "section": "train", "rect": { "id": "train-new-1", "bindings": [], "display_type": "Numeric" } }],
+            "rect_overrides": [{ "key": "train-new-1", "patch": { "options": { "smoothing": "SavitzkyGolay" } } }]
+        });
+        let diff = parse_layout_diff(&stored.to_string()).unwrap();
+        let o = opts_of(&diff.apply(&base), "train-new-1");
+        assert_eq!((o.smoothing, o.smoothing_poly_order), (BiweightPolyfit, 1));
+
+        // A level left empty by a dropped name stores nothing, so the layout reads as untouched.
+        let stored = json!({
+            "format_version": 1,
+            "project_chart_defaults": { "smoothing": "Gaussian" },
+            "section_overrides": [{ "key": "train", "patch": { "chart_defaults": { "smoothing": "Gaussian" } } }],
+            "rect_overrides": [{ "key": "train/loss", "patch": { "options": { "smoothing": "RunningAverage" } } }]
+        });
+        assert!(parse_layout_diff(&stored.to_string()).unwrap().is_empty());
+    }
+
+    /// An added chart's creation base migrates its options (format 0 stored a chart's edits there) and reads leaf by leaf, so a newer build's display type, binding or option takes the blank chart's alone instead of failing the whole layout; a save writes the stored base back, so the build that wrote those values still reads them.
+    #[test]
+    fn added_rect_bases_migrate_and_read_unreadable_values_alone() {
+        use serde_json::json;
+        let base = base_with_one_rect();
+        let added = |format_version: u8, rect: Value| {
+            let mut stored = json!({ "id": "user-1", "bindings": [], "display_type": "Numeric" });
+            merge_apply(&mut stored, &rect);
+            let json = json!({
+                "format_version": format_version,
+                "added_rects": [{ "section": "train", "rect": stored }]
+            });
+            let diff = parse_layout_diff(&json.to_string()).expect("the layout parses");
+            let rect = diff.apply(&base).find_rect("user-1").expect("rect").clone();
+            (
+                rect,
+                serde_json::to_value(&diff).unwrap()["added_rects"][0]["rect"].clone(),
+                stored,
+            )
+        };
+        let (rect, _, _) = added(
+            0,
+            json!({ "options": { "smoothing": "Ema", "smoothing_poly_order": 2, "log_y": true } }),
+        );
+        let o = rect.options;
+        assert_eq!(
+            (o.smoothing, o.smoothing_poly_order, o.log_y),
+            (SmoothingAlgorithm::EmaPolyfit, 0, true)
+        );
+        let json = json!({
+            "format_version": 0,
+            "project_chart_defaults": { "smoothing": "TriangularPolyfit" },
+            "added_rects": [{ "section": "train", "rect": { "id": "user-1", "bindings": [], "display_type": "Numeric", "options": { "smoothing": "Gaussian", "log_y": true } } }]
+        });
+        let diff = parse_layout_diff(&json.to_string()).unwrap();
+        let options = opts_of(&diff.apply(&base), "user-1");
+        assert_eq!(
+            (options.smoothing, options.log_y),
+            (SmoothingAlgorithm::TriangularPolyfit, true),
+            "a format-0 base's retired smoothing inherits too"
+        );
+
+        let newer = json!({
+            "display_type": "FutureType",
+            "bindings": [{ "project": "Current", "runs": "FutureRuns", "metric_name": "train/loss" }],
+            "options": { "x_axis_mode": "FutureMode", "log_x": true },
+            "future_field": 1
+        });
+        let (rect, saved, stored) = added(1, newer);
+        assert_eq!(
+            (rect.display_type, rect.bindings.len()),
+            (DisplayType::Numeric, 0)
+        );
+        assert_eq!(
+            (rect.options.x_axis_mode, rect.options.log_x),
+            (XAxisMode::default(), true)
+        );
+        assert_eq!(saved, stored, "a save writes the stored base back");
+
+        // A base the layout rewrites saves as rewritten: the format-0 conversion's, and one a new chart replaces.
+        let reload = |diff: &LayoutDiff| {
+            let saved = parse_layout_diff(&serde_json::to_string(diff).unwrap()).unwrap();
+            saved.added_rects[0].rect.clone()
+        };
+        let mut json = json!({
+            "format_version": 0,
+            "added_rects": [{ "section": "train", "rect": { "id": "user-1", "bindings": [], "display_type": "Numeric", "options": { "log_y": true } } }]
+        });
+        let diff = parse_layout_diff(&json.to_string()).unwrap();
+        assert_eq!(reload(&diff).options, RectOptions::default());
+        json["format_version"] = json!(1);
+        let mut diff = parse_layout_diff(&json.to_string()).unwrap();
+        let mut replacement = diff.added_rects[0].rect.clone();
+        replacement.label = "new".to_string();
+        diff.add_rect(&base, "train", &replacement);
+        assert_eq!(reload(&diff).label, "new");
     }
 
     #[test]
@@ -1865,7 +2244,7 @@ mod cascade_tests {
         set_project_defaults(&mut diff, &RectOptions::default());
         assert!(opts_of(&diff.apply(&base), "train/loss").log_y);
 
-        // A value this build reads as something else (a smoothing it doesn't know reads as None) or not at all stays for the build that wrote it.
+        // A value or field this build can't read stays for the build that wrote it.
         let stored = serde_json::json!({
             "label": "kept",
             "removed_field": 1,
@@ -1968,10 +2347,7 @@ mod cascade_tests {
         user.options.log_x = true;
         user.options.log_y = true;
         user.options.smoothing_window = 7;
-        legacy.added_rects.push(AddedRect {
-            section: "train".to_string(),
-            rect: user,
-        });
+        legacy.added_rects.push(AddedRect::new("train", user));
         legacy.rect_overrides.push(ConfigPatch {
             key: "user-1".to_string(),
             patch: serde_json::json!({ "label": "renamed" }),
@@ -2465,33 +2841,20 @@ fn legacy_key(project_id: &str) -> String {
     format!("mkdb2_layout_{}", project_id)
 }
 
+/// A pre-diff full-layout blob, recognized by shape (a `sections` array) rather than by parsing a `LayoutConfig`, since a blob may name option values this build no longer reads.
 fn is_legacy_layout(json: &str) -> bool {
-    serde_json::from_str::<LayoutConfig>(json).is_ok()
+    serde_json::from_str::<Value>(json).is_ok_and(|value| value["sections"].is_array())
 }
 
-/// Ownership of the legacy diff key, which overlaps another project's pre-diff full-layout key (`legacy_key("diff_x") == legacy_diff_key("x")`): anything that is not a full-layout blob is ours. Readability is deliberately not required — a corrupt or newer-format legacy diff is still ours, and Reset must be able to clear it or the settings-error page becomes inescapable (load_strict reads the same set).
-fn is_owned_legacy_diff(json: &str) -> bool {
-    !is_legacy_layout(json)
-}
-
+/// Remove this project's legacy keys while keeping another project's full layout: the keys overlap (`legacy_key("diff_x") == legacy_diff_key("x")`), so at `legacy_key` only a full layout is ours, and at `legacy_diff_key` anything else is. A corrupt or newer-format diff is still ours, as `load_strict` takes it: Reset must clear it, or the settings-error page is inescapable.
 fn remove_owned_legacy(project_id: &str) {
-    let key = legacy_key(project_id);
-    if local_storage::get(&key)
-        .as_deref()
-        .is_some_and(is_legacy_layout)
-    {
-        local_storage::remove(&key);
-    }
-}
-
-fn remove_owned_legacy_diff(project_id: &str) {
-    let key = legacy_diff_key(project_id);
-    if local_storage::get(&key)
-        .as_deref()
-        .is_some_and(is_owned_legacy_diff)
-    {
-        local_storage::remove(&key);
-    }
+    let remove_if = |key: String, is_ours: fn(&str) -> bool| {
+        if local_storage::get(&key).is_some_and(|json| is_ours(&json)) {
+            local_storage::remove(&key);
+        }
+    };
+    remove_if(legacy_diff_key(project_id), |json| !is_legacy_layout(json));
+    remove_if(legacy_key(project_id), is_legacy_layout);
 }
 
 impl LayoutDiff {
@@ -2527,6 +2890,7 @@ impl LayoutDiff {
         effective
     }
 
+    /// No user content: any format version and an empty section order (`null` or `[]`) count as empty.
     pub fn is_empty(&self) -> bool {
         self.section_order.is_empty()
             && *self
@@ -2537,7 +2901,7 @@ impl LayoutDiff {
                 }
     }
 
-    /// Upgrade whole-stored user rects to the shared sparse-override model.
+    /// Rewrite old option values ([`Self::migrate_option_values`]), then upgrade whole-stored user rects to the shared sparse-override model.
     /// Values equal to the current cascade start inheriting; differing
     /// values remain pinned. The creation base resets to library defaults,
     /// matching the base assigned to charts created by the current UI.
@@ -2545,28 +2909,76 @@ impl LayoutDiff {
     /// pure and an unedited user retains a rollback-compatible v0 blob; the
     /// next edit saves the already-migrated representation.
     fn migrate(&mut self) {
+        self.migrate_option_values();
         if self.format_version != 0 {
             return;
         }
 
         let empty_base = LayoutConfig::auto_generate(&[]);
         for i in 0..self.added_rects.len() {
-            let add = self.added_rects[i].clone();
+            let add = &self.added_rects[i];
             let mut anchor = add.rect.clone();
             anchor.options =
                 self.inherited_options(&empty_base, &add.section, &RectOptions::default());
+            // The stored base read over the anchor, so a field it doesn't store (a dropped smoothing) inherits.
+            let resolved = rect_json(&merge_readable(&anchor, &[&add.stored], &add.rect.id));
             let anchor = rect_json(&anchor);
             let mut patch = Value::Null;
-            rewrite_patch(&mut patch, &anchor, &anchor, &rect_json(&add.rect));
+            rewrite_patch(&mut patch, &anchor, &anchor, &resolved);
 
-            self.added_rects[i].rect.options = RectOptions::default();
             // A stored entry for the rect (the first, as reads take it) applies over the migrated patch.
             if let Some(existing) = self.rect_overrides.iter().find(|ov| ov.key == add.rect.id) {
                 merge_apply(&mut patch, &existing.patch);
             }
             store_patch(&mut self.rect_overrides, &add.rect.id, patch);
+            let base = RectConfig {
+                options: RectOptions::default(),
+                ..add.rect.clone()
+            };
+            self.added_rects[i] = AddedRect::new(&add.section, base);
         }
         self.format_version = 1;
+    }
+
+    /// [`migrate_level`] at every stored chart-options level, coarse to fine, each against the levels above it (creation bases migrate as they deserialize, [`AddedRect`]). Limits, for states no build writes: duplicate entries under one key migrate one by one, and a chart is taken to sit in its `added_rects` section even when the live base owns the id and shows the chart in the metric's own section.
+    fn migrate_option_values(&mut self) {
+        // Skip the pass when every stored smoothing reads.
+        if !std::iter::once(&self.project_chart_defaults)
+            .chain(
+                self.section_overrides
+                    .iter()
+                    .map(|ov| &ov.patch["chart_defaults"]),
+            )
+            .chain(self.rect_overrides.iter().map(|ov| &ov.patch["options"]))
+            .any(has_unreadable_smoothing)
+        {
+            return;
+        }
+        let old_project = self.project_chart_defaults.clone();
+        let old_sections = self.section_overrides.clone();
+        migrate_level(&mut self.project_chart_defaults, &[], &[]);
+        let new_project = &self.project_chart_defaults;
+        for ov in &mut self.section_overrides {
+            migrate_nested(
+                &mut ov.patch,
+                "chart_defaults",
+                &[&old_project],
+                &[new_project],
+            );
+        }
+        for ov in &mut self.rect_overrides {
+            let section = match self.added_rects.iter().find(|add| add.rect.id == ov.key) {
+                Some(add) => add.section.as_str(),
+                None => section_of_metric(&ov.key),
+            };
+            let old_section = merged_patch(&old_sections, section);
+            let new_section = merged_patch(&self.section_overrides, section);
+            let old_above = [&old_section["chart_defaults"], &old_project];
+            let new_above = [&new_section["chart_defaults"], new_project];
+            migrate_nested(&mut ov.patch, "options", &old_above, &new_above);
+        }
+        self.section_overrides.retain(|ov| !ov.patch.is_null());
+        self.rect_overrides.retain(|ov| !ov.patch.is_null());
     }
 
     /// Rect state before its own sparse edit: a live/synthetic auto-gen
@@ -2641,14 +3053,7 @@ impl LayoutDiff {
         after: &SectionConfig,
     ) {
         // Several entries under one name apply in order when read, so they fold into the one written.
-        let mut patch = Value::Null;
-        for ov in self
-            .section_overrides
-            .iter()
-            .filter(|ov| ov.key == after.name)
-        {
-            merge_apply(&mut patch, &ov.patch);
-        }
+        let mut patch = merged_patch(&self.section_overrides, &after.name);
         rewrite_patch(
             &mut patch,
             &section_settings(&section_anchor(base, &after.name)),
@@ -2826,15 +3231,10 @@ impl LayoutDiff {
         // same-id user rect. Keep this outside the match so insert and
         // replacement cannot drift into different reset semantics.
         self.rect_overrides.retain(|ov| ov.key != rect.id);
+        let added = AddedRect::new(section, rect.clone());
         match self.added_rects.iter_mut().find(|a| a.rect.id == rect.id) {
-            Some(entry) => {
-                entry.section = section.to_string();
-                entry.rect = rect.clone();
-            }
-            None => self.added_rects.push(AddedRect {
-                section: section.to_string(),
-                rect: rect.clone(),
-            }),
+            Some(entry) => *entry = added,
+            None => self.added_rects.push(added),
         }
     }
 
@@ -3024,25 +3424,21 @@ impl LayoutDiff {
 
     /// Persist; an empty diff clears storage so reverting all edits returns
     /// the project to pure auto-generation.
-    pub fn save(&self, project_id: &str) {
+    /// Before writing, normalizes the diff in place (its storage version, and its section order in canonical form when every entry reads), which never changes how it applies, so applying it afterwards shows the diff as stored.
+    pub fn save(&mut self, project_id: &str) {
         let key = diff_key(project_id);
         if self.is_empty() {
             local_storage::remove(&key);
-            remove_owned_legacy_diff(project_id);
             remove_owned_legacy(project_id);
             return;
         }
-        let written = Self {
-            format_version: self.storage_version(),
-            section_order: self.section_order.for_save(&self.deleted_sections),
-            ..self.clone()
-        };
-        if let Ok(json) = serde_json::to_string(&written) {
+        self.format_version = self.storage_version();
+        self.section_order = self.section_order.for_save(&self.deleted_sections);
+        if let Ok(json) = serde_json::to_string(self) {
             if local_storage::set(&key, &json) {
                 // The first successful branded-key write also supersedes the
                 // pre-diff full-layout blob. Reads remain pure so untouched
                 // rollback state survives an ordinary visit.
-                remove_owned_legacy_diff(project_id);
                 remove_owned_legacy(project_id);
             }
         }
@@ -3067,7 +3463,6 @@ impl LayoutDiff {
 
     pub fn clear(project_id: &str) {
         local_storage::remove(&diff_key(project_id));
-        remove_owned_legacy_diff(project_id);
         remove_owned_legacy(project_id);
     }
 }
@@ -3075,8 +3470,7 @@ impl LayoutDiff {
 #[cfg(test)]
 mod storage_key_tests {
     use super::{
-        is_legacy_layout, is_owned_legacy_diff, legacy_diff_key, legacy_key, parse_layout_diff,
-        LayoutConfig, LayoutDiff,
+        is_legacy_layout, legacy_diff_key, legacy_key, parse_layout_diff, LayoutConfig, LayoutDiff,
     };
 
     #[test]
@@ -3092,13 +3486,15 @@ mod storage_key_tests {
         let current = serde_json::to_string(&current).unwrap();
 
         assert!(is_legacy_layout(&legacy));
-        assert!(!is_owned_legacy_diff(&legacy));
+        let retired = r#"{"sections":[{"name":"train","rects":[{"id":"loss","bindings":[],"display_type":"Numeric","options":{"smoothing":"Gaussian"}}]}]}"#;
+        assert!(
+            is_legacy_layout(retired),
+            "a blob's old values need not read"
+        );
         assert!(!is_legacy_layout(&current));
-        assert!(is_owned_legacy_diff(&current));
         // Corrupt or newer-format legacy diffs are still ours: Reset must clear them.
         assert!(!is_legacy_layout("not json"));
-        assert!(is_owned_legacy_diff("not json"));
-        assert!(is_owned_legacy_diff(
+        assert!(!is_legacy_layout(
             r#"{"format_version":3,"future_state":{"must_survive":true}}"#
         ));
     }
