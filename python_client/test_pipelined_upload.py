@@ -62,6 +62,9 @@ except ImportError:
     # CI installs no torch: _StubTensor covers the device branches there, and the real-tensor tests skip.
     torch = None
 
+# init()'s first multiprocessing logger set-up in a process (_start_run) unregisters and registers multiprocessing's exit hook again: done here, before any test patches atexit.register, so a test counting init()'s registrations counts kymo's alone, and the hook is not lost to the mock, whichever test runs first.
+multiprocessing.util.get_logger()
+
 
 def numeric(index: int) -> tuple:
     return ("numeric_ts", "train/loss", index, float(index), 1_700_000_000_000)
@@ -2134,6 +2137,15 @@ print(k > 50, str(late).replace(" ", ""), 0.9 < armed <= 1)
             yield process_factory, make_spool_path
 
     @staticmethod
+    def _terminate_run_codes():
+        """The exit codes of the TerminateRuns init() sent through _init_without_a_server's _run_control_rpc."""
+        return [
+            call.args[1].exit_code
+            for call in client_module._run_control_rpc.call_args_list
+            if call.args[0] == "TerminateRun"
+        ]
+
+    @staticmethod
     def _init(**overrides):
         """init() the hosted run "run" (run-id) of project at 127.0.0.1:50051, without system metrics, spooling to relative-spool, overrides aside."""
         client_module.init(
@@ -2244,12 +2256,7 @@ print(k > 50, str(late).replace(" ", ""), 0.9 < armed <= 1)
                 self.assertEqual(client_module._is_initialized, pid is not None)
                 self.assertEqual(register.call_count, int(pid is not None))
                 handlers.assert_called_once_with()
-                ended = [
-                    call.args[1].exit_code
-                    for call in client_module._run_control_rpc.call_args_list
-                    if call.args[0] == "TerminateRun"
-                ]
-                self.assertEqual(ended, [] if pid else [130])
+                self.assertEqual(self._terminate_run_codes(), [] if pid else [130])
 
     def test_a_ctrl_c_any_thread_takes_as_the_worker_starts_waits_for_the_run(self):
         # The signals are blocked across Process.start() on the main thread alone: a group Ctrl-C the kernel gives another thread, a data loader's say, runs Python's handler on the main thread inside the start. kymo's, installed before the start, defers it until the run is active, and init() then raises its KeyboardInterrupt, which the exception hook hands off.
@@ -2274,7 +2281,7 @@ print(k > 50, str(late).replace(" ", ""), 0.9 < armed <= 1)
             self.assertEqual(client_module._deferred_signals, [])
 
     def test_an_init_whose_worker_never_started_puts_back_the_programs_handlers(self):
-        # kymo's handlers are installed before the worker starts. A start that leaves no worker raises out of init() with the run never active, after a best-effort TerminateRun of the run InitRun registered, with a SystemExit's own code (143, kymo's exit on a SIGTERM), and puts back the handlers it installed, so a program that carries on without kymo keeps its own signal handling.
+        # kymo's handlers are installed before the worker starts. A start that leaves no worker raises out of init() with the run never active, after a best-effort TerminateRun of the run InitRun registered, with a SystemExit's own code (143, kymo's exit on a SIGTERM; True as 1), and puts back the handlers it installed, so a program that carries on without kymo keeps its own signal handling.
         def program(signum, frame):
             pass
 
@@ -2283,37 +2290,34 @@ print(k > 50, str(late).replace(" ", ""), 0.9 < armed <= 1)
             for signum in client_module._TERMINATION_SIGNALS
         }
         try:
-            for error, code in ((OSError("no worker"), 1), (SystemExit(143), 143)):
-
-                def start(process, error=error):
-                    raise error
-
+            for error, code in (
+                (OSError("no worker"), 1),
+                (SystemExit(143), 143),
+                (SystemExit(True), 1),
+            ):
                 signal.signal(signal.SIGTERM, program)
                 with (
-                    self.subTest(error=type(error).__name__),
+                    self.subTest(error=error),
                     self._init_without_a_server(
                         mock.Mock(pid=None),
                         _atexit_registered=False,
                         _original_excepthook=None,
                     ),
-                    mock.patch.object(client_module, "_start_worker", start),
+                    mock.patch.object(
+                        client_module, "_start_worker", side_effect=error
+                    ),
                     mock.patch.dict(client_module._original_signals, clear=True),
                 ):
                     with self.assertRaises(type(error)):
                         self._init()
-                    ended = [
-                        call.args[1].exit_code
-                        for call in client_module._run_control_rpc.call_args_list
-                        if call.args[0] == "TerminateRun"
-                    ]
-                self.assertEqual(ended, [code])
-                self.assertEqual(
-                    {
-                        signum: signal.getsignal(signum)
-                        for signum in client_module._TERMINATION_SIGNALS
-                    },
-                    {**saved, signal.SIGTERM: program},
-                )
+                    self.assertEqual(self._terminate_run_codes(), [code])
+                    self.assertEqual(
+                        {
+                            signum: signal.getsignal(signum)
+                            for signum in client_module._TERMINATION_SIGNALS
+                        },
+                        {**saved, signal.SIGTERM: program},
+                    )
         finally:
             for signum, handler in saved.items():
                 signal.signal(signum, handler)
@@ -2369,13 +2373,8 @@ print(k > 50, str(late).replace(" ", ""), 0.9 < armed <= 1)
             ):
                 with self.assertRaises(raised) as error:
                     self._init()
-                ended = [
-                    call.args[1].exit_code
-                    for call in client_module._run_control_rpc.call_args_list
-                    if call.args[0] == "TerminateRun"
-                ]
-            self.assertIsInstance(error.exception.__context__, EOFError)
-            self.assertEqual(ended, [code])
+                self.assertIsInstance(error.exception.__context__, EOFError)
+                self.assertEqual(self._terminate_run_codes(), [code])
 
     def test_a_signal_deferred_as_the_worker_starts_keeps_its_time(self):
         # A Ctrl-C, or a SIGTERM the program's own handler takes, that lands as the worker starts waits for the run to be active (_start_run), and keeps the time it came, which the run's end reads: a program that exits on that Ctrl-C hands the run off at 130, and the atexit flush after that SIGTERM ends within the signal budget from it.

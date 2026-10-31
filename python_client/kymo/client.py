@@ -43,11 +43,10 @@ from kymo._env import reject_legacy_client_env
 from kymo._env import string as _env_string
 from kymo._env import validate_client_settings
 
-# Generated stubs ship with kymo and must match the installed grpc/protobuf
-# runtime.
+# Generated stubs ship with kymo and refuse a grpc or protobuf older than their generator's: grpc with RuntimeError, protobuf with VersionError, a direct Exception subclass, hence except Exception.
 try:
     from kymo._generated import kymo_pb2, kymo_pb2_grpc
-except (ImportError, RuntimeError) as e:
+except Exception as e:
     raise ImportError(
         "kymo's generated proto stubs are unavailable or incompatible with "
         f"the installed grpc/protobuf runtime (original error: {e})"
@@ -2369,11 +2368,7 @@ def update_config(config: dict) -> None:
     if _run_metadata is None:
         _run_metadata = _collect_run_metadata(config)
     else:
-        existing = _run_metadata.get("config", {})
-        if not isinstance(existing, dict):
-            existing = {}
-        existing.update(config)
-        _run_metadata["config"] = existing
+        _run_metadata.setdefault("config", {}).update(config)
     _push_run_metadata()
 
 
@@ -2461,7 +2456,6 @@ def _record_exit_code(code: int, by_sys_exit: bool = False) -> None:
     code is recorded: the code stays, and a sys.exit then, which Python
     ignores, sets none."""
     global _exit_code, _exit_code_by_sys_exit
-    code = int(code)
     if not _main_thread_runs():
         return
     if _exit_code is None or _exit_code_by_sys_exit:
@@ -2542,8 +2536,8 @@ def _ctrl_c_at() -> Optional[float]:
 
 
 def _system_exit_code(code) -> int:
-    # sys.exit(None) is 0, integers pass through, and other values exit 1.
-    return code if isinstance(code, int) else int(code is not None)
+    # sys.exit(None) is 0, an integer is its own code as a plain int (protobuf 7 refuses a bool exit_code), and other values exit 1. A code outside int32 fails its TerminateRun.
+    return operator.index(code) if isinstance(code, int) else int(code is not None)
 
 
 def _install_exit_capture():

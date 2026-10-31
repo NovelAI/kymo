@@ -24,12 +24,12 @@ resource-bounded. Older records containing datetime, NumPy, or custom objects
 require explicit trusted migration; normal sync quarantines them. Replay only
 files from a trusted spool directory.
 
-Runtime floor: the committed protobuf stubs need protobuf>=6.33.5 and
-grpcio>=1.81.0 (see pyproject.toml). Docker builds enforce this, but this
-replay tool is meant to run from any CPU/login node where the interpreter may
-be installed ad hoc — a stale protobuf there fails at import, not at build. Fix
-by upgrading (`pip install -U 'protobuf>=6.33.5' 'grpcio>=1.81.0'`); the
-protobuf runtime check can be bypassed in a pinch with
+Runtime floor: the committed stubs need pyproject.toml's grpcio and protobuf
+floors. Docker builds enforce them, but this replay tool is meant to run from
+any CPU/login node where the interpreter may be installed ad hoc — a stale
+grpcio or protobuf there fails at import, not at build, with an error naming the
+version it needs. Fix by upgrading (`pip install -U grpcio protobuf`); the
+protobuf check (not grpc's) can be bypassed in a pinch with
 TEMPORARILY_DISABLE_PROTOBUF_VERSION_CHECK=true.
 """
 
@@ -342,7 +342,6 @@ def _replay_cdn_record(
             )
         if kind in ("metadata_json", "metadata_json_mutation"):
             prospective_bytes = metadata_manifest(record[3])
-            expected_resources = []
         else:
             expected_resources = [
                 (entry, content_id(entry["data"], entry["ext"])) for entry in record[3]
@@ -568,9 +567,7 @@ def _validate_spool_record(record, known_kinds: set[str]) -> str:
                 raise TypeError(
                     "encoded resource content_type/filename must be strings"
                 )
-    except _PermanentPointError:
-        raise
-    except MemoryError:
+    except (_PermanentPointError, MemoryError):
         raise
     except Exception as error:
         raise _PermanentPointError(

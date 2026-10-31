@@ -13,7 +13,7 @@ from pathlib import Path
 
 PROTO_DIR = Path(__file__).parent.parent / "proto"
 OUT_DIR = Path(__file__).parent / "kymo" / "_generated"
-GENERATOR_VERSION = "1.81.0"
+GENERATOR_VERSION = "1.84.0"
 GENERATED_FILES = ("kymo_pb2.py", "kymo_pb2_grpc.py")
 
 
@@ -38,12 +38,6 @@ def _check_toolchain() -> bool:
 
 def _generate(out_dir: Path) -> int:
     proto_file = PROTO_DIR / "kymo.proto"
-    if not proto_file.exists():
-        print(f"Proto file not found: {proto_file}", file=sys.stderr)
-        return 1
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-
     cmd = [
         sys.executable,
         "-m",
@@ -79,14 +73,6 @@ def _generate(out_dir: Path) -> int:
         )
         return 1
     grpc_file.write_text(text)
-
-    missing = [name for name in GENERATED_FILES if not (out_dir / name).is_file()]
-    if missing:
-        print(
-            f"Proto generation omitted expected file(s): {', '.join(missing)}",
-            file=sys.stderr,
-        )
-        return 1
     return 0
 
 
