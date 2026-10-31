@@ -8249,19 +8249,23 @@ class ShutdownProofTests(unittest.TestCase):
                 ),
                 _uncharged=deque(),
                 _HANDOFF_FEEDER_GRACE=0.0,
+                # Room for a busy runner, which can take longer than the one step the report waits past the zero grace to finish the salvage; the join returns as soon as its thread ends.
+                _SHUTDOWN_STEP=5.0,
             ),
             self.assertLogs("kymo", level="WARNING") as logs,
         ):
             client_module._spool_for_stopped_worker("had not started")
             spooled = [
-                record
+                record[2]
                 for path in spool_module.run_spool_files(
                     "p", "r", spool_dir, session="session-a"
                 )
                 for record in spool_module.read_spool(path)[1]
             ]
         self.assertEqual(spooled, [])
-        self.assertIn("spooled 0 of its 1 point(s)", "\n".join(logs.output))
+        output = "\n".join(logs.output)
+        self.assertIn("the spool's deadline passed while it wrote a record", output)
+        self.assertIn("spooled 0 of its 1 point(s)", output)
 
     def test_a_handed_off_runs_end_is_never_killed(self):
         # The control process that sends a handed-off run's TerminateRun can take much of a second to start: the parent waits 1 s for it at most, then leaves it to finish by itself, by its RPC's deadline, never killing it, which would leave the run RUNNING.
