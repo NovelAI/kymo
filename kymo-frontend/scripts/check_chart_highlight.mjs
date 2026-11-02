@@ -85,10 +85,10 @@ function fixture(setting, initialSidebar = []) {
       pending = undefined;
       callback?.();
     },
-    chart(name, runs, names, { rawStride = 0, nan = false, colors = [], labels = [] } = {}) {
+    chart(name, runs, names, { rawStride = 0, colors = [], labels = [] } = {}) {
       const rows = runs.map((_, index) => row({ r: `${index}` }));
       const chart = {
-        __kymo_hl: { runs, names, n: runs.length, rs: rawStride, nan },
+        __kymo_hl: { runs, names, rs: rawStride },
         __kymo_hleff: "",
         __kymo_tip: {
           style: { display: "block" },
@@ -97,7 +97,7 @@ function fixture(setting, initialSidebar = []) {
             return rows;
           },
         },
-        series: Array.from({ length: 1 + runs.length * (rawStride + 1 + Number(nan)) }, () => ({ alpha: 1, _focus: false })),
+        series: Array.from({ length: 1 + runs.length * (rawStride + 1) }, () => ({ alpha: 1, _focus: false })),
         redraws: 0,
         redraw(rebuildPaths) {
           assert.equal(rebuildPaths, false, "highlight must reuse chart paths");
@@ -117,7 +117,8 @@ function fixture(setting, initialSidebar = []) {
 }
 
 function assertHighlight(chart, focused, active = true, hot = active ? focused : []) {
-  const { n, rs, nan } = chart.__kymo_hl;
+  const { runs, rs } = chart.__kymo_hl;
+  const n = runs.length;
   const lineBase = 1 + n * rs;
   for (let i = 0; i < n; i++) {
     const alpha = !active || focused.includes(i) ? 1 : 0.25;
@@ -126,7 +127,6 @@ function assertHighlight(chart, focused, active = true, hot = active ? focused :
       assert.equal(chart.series[column].alpha, alpha, `series ${column} alpha`);
       assert.equal(chart.series[column]._focus, focus, `series ${column} focus`);
     }
-    if (nan) assert.equal(chart.series[lineBase + n + i].alpha, alpha, `run ${i} marker alpha`);
     assert.equal(chart.rows[i].classList.contains("kymo-tip-row-hot"), hot.includes(i), `run ${i} tooltip`);
   }
 }
@@ -199,7 +199,7 @@ test("missing, remounted and replaced sidebar roots preserve live names without 
 test("missing and false preferences preserve single-run highlight, including tagged series", () => {
   for (const setting of [undefined, "false"]) {
     const f = fixture(setting);
-    const chart = f.chart("one", ["a", "a", "b"], ["resume", "resume", "resume"], { rawStride: 3, nan: true });
+    const chart = f.chart("one", ["a", "a", "b"], ["resume", "resume", "resume"], { rawStride: 3 });
     const peer = f.chart("peer", ["b"], ["resume"]);
     f.window.__kymo_setHl("a", "resume");
     f.flush();
@@ -212,10 +212,10 @@ test("missing and false preferences preserve single-run highlight, including tag
   }
 });
 
-test("name groups span peers without the hovered run and include every raw, envelope, line, marker and tooltip column", () => {
+test("name groups span peers without the hovered run and include every raw, envelope, line and tooltip column", () => {
   const f = fixture("true");
-  const chart = f.chart("one", ["a", "b", "b", "c"], ["resume", "resume", "resume", "other"], { rawStride: 3, nan: true });
-  const peer = f.chart("peer", ["b", "c"], ["resume", "other"], { nan: true });
+  const chart = f.chart("one", ["a", "b", "b", "c"], ["resume", "resume", "resume", "other"], { rawStride: 3 });
+  const peer = f.chart("peer", ["b", "c"], ["resume", "other"]);
   f.window.__kymo_setHl("a", "resume");
   f.flush();
   assertHighlight(chart, [0, 1, 2]);
@@ -386,7 +386,7 @@ test("a rebuilt chart adopts the current name group", () => {
   const f = fixture("true");
   f.window.__kymo_setHl("a", "resume");
   f.flush();
-  const chart = f.chart("replacement", ["b", "c"], ["resume", "other"], { rawStride: 2, nan: true });
+  const chart = f.chart("replacement", ["b", "c"], ["resume", "other"], { rawStride: 2 });
   assertHighlight(chart, [0]);
 });
 

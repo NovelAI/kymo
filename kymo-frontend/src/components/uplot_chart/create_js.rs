@@ -125,6 +125,12 @@ fn sync_key(axis: &ShownAxis) -> String {
     }
 }
 
+/// A line's builders (create.js): the line over the samples it strokes, and a dot on a lone sample, which no segment would show.
+const LINE: &str = "'paths':linePaths,'points':lonePoints()";
+
+/// A series that draws nothing, holding a column for the tooltip or copy: hidden, so uPlot builds it no path and leaves it out of the y range, which follows what is drawn. The drawn series of its run span its values, except on log-y, where uPlot's range skips a bucket's nonpositive min but would count its positive mean.
+const HIDDEN: &str = "'show':false";
+
 /// Build the JS that creates a uPlot chart. Rust's `ChartJsConfig` equality gate keeps ordinary data-only refreshes out of this renderer entirely; the embedded config hash is a second, browser-side race guard so overlapping same-config create evaluations coalesce through `setData` instead of destroying and recreating the chart. A genuinely different config still falls through to destroy + recreate.
 pub(super) fn build_create_js(id: &str, cfg: &ChartJsConfig) -> String {
     let log_x = cfg.axis.log_x;
@@ -153,7 +159,9 @@ pub(super) fn build_create_js(id: &str, cfg: &ChartJsConfig) -> String {
 
         if cfg.has_raw {
             // Raw scatter behind a smoothed passthrough line.
-            series_opts.push(format!("{{'stroke':'rgba({},{},{},0.35)','width':1,'spanGaps':true,'points':{{show:false}}}}", r, g, b));
+            series_opts.push(format!(
+                "{{'stroke':'rgba({r},{g},{b},0.35)','width':1,'spanGaps':true,{LINE}}}"
+            ));
         }
 
         if cfg.has_range {
@@ -164,15 +172,22 @@ pub(super) fn build_create_js(id: &str, cfg: &ChartJsConfig) -> String {
             } else {
                 (color.to_string(), 1.5)
             };
-            let edge_opt = format!(
-                "{{'stroke':'{edge_stroke}','width':{edge_width},'spanGaps':true,'points':{{show:false}}}}"
+            let edge = format!(
+                "'stroke':'{edge_stroke}','width':{edge_width},'spanGaps':true,'paths':linePaths"
             );
-            series_opts.push(edge_opt.clone());
-            series_opts.push(if faint {
-                edge_opt
+            // A lone bucket's mark rides the min edge: on unsmoothed charts in the run's color at its line's weight, banded or not (one bucket's band has no width); behind a smoothed curve in the faint edge color and width, as evidence.
+            let (mark_fill, mark_bar) = if cfg.smoothed {
+                (edge_stroke.as_str(), edge_width)
             } else {
-                "{'stroke':'transparent','width':0,'points':{show:false},'paths':()=>null}"
-                    .to_string()
+                (color, 1.5)
+            };
+            series_opts.push(format!(
+                "{{{edge},'points':lonePoints('{mark_fill}',{mark_bar})}}"
+            ));
+            series_opts.push(if faint {
+                format!("{{{edge},'points':{{show:false}}}}")
+            } else {
+                format!("{{{HIDDEN}}}")
             });
             // Fill max-to-min in the raw block, below value lines. Keep log-clipped bounds as data; uPlot clamps their paths and leaves them out of its log range.
             if cfg.banded[i] {
@@ -192,30 +207,12 @@ pub(super) fn build_create_js(id: &str, cfg: &ChartJsConfig) -> String {
         // spanGaps: each series only has values at its own x positions on
         // the joined axis — bridge the slots owned by other series. Logged
         // NaNs still surface via the hollow markers.
-        // Unsmoothed bucket means are data-only; skip building their invisible paths.
-        let (line_stroke, line_paths) = if cfg.has_range && !cfg.smoothed {
-            ("transparent", ",'paths':()=>null")
+        // Unsmoothed bucket means are data-only.
+        series_opts.push(if cfg.has_range && !cfg.smoothed {
+            format!("{{'label':'{escaped}',{HIDDEN}}}")
         } else {
-            (color, "")
-        };
-        series_opts.push(format!(
-            "{{'label':'{}','stroke':'{}','width':1.5,'spanGaps':true,'points':{{show:false}}{}}}",
-            escaped, line_stroke, line_paths
-        ));
-    }
-
-    // NaN markers: appended AFTER all real series + bands so the block/band
-    // index math above is untouched. One marker column per real series; the
-    // column holds the marker KIND (1-5, see UPlotChart) at each marked
-    // slot (NaN elsewhere). Nothing renders through the series machinery —
-    // each marker series sits on the dummy 'nan' scale so it can never
-    // stretch the y range, and the draw hook paints its hollow circles
-    // pinned to the plot's border (top for +inf, bottom for the rest).
-    for _ in 0..cfg.nan_markers {
-        series_opts.push(
-            "{'scale':'nan','stroke':'transparent','width':0,'points':{show:false},'paths':()=>null}"
-                .to_string(),
-        );
+            format!("{{'label':'{escaped}','stroke':'{color}','width':1.5,'spanGaps':true,{LINE}}}")
+        });
     }
 
     let colors_js: Vec<String> = colors.iter().map(|color| format!("'{color}'")).collect();
@@ -382,39 +379,98 @@ mod tests {
         }
     }
 
+    /// Every series after x's, by position: envelope edges are faint under a band or a smoothed curve, and otherwise the min edge is the run's line. A lone sample's mark: a dot on each line, in its stroke (the run's color on a values line, the faint evidence color on the raw scatter); on an envelope, a bar on the min edge, in the run's color at 1.5 px on unsmoothed charts, in the faint edge color and width behind a smoothed curve. Max edges carry none, and undrawn series are hidden.
     #[test]
-    fn envelope_borders_stay_faint_and_single_lines_keep_normal_strength() {
+    fn each_series_strokes_and_marks_its_run_or_is_hidden() {
+        // Each series: "<stroke> <width>", then " dot" or " bar <width> <fill>" for its mark; or "hidden". Every shown series spans its gaps through linePaths: one without linePaths would get uPlot's linear builder, which returns null on an empty column and so rebuilds on every repaint, and one that broke its line at gaps would leave samples between gaps unmarked.
+        fn series(js: &str) -> String {
+            let list = js.split_once("series:[{},{").unwrap().1;
+            let list = list.split_once("}],\n  bands:").unwrap().0;
+            list.split("},{")
+                .map(|entry| {
+                    if entry.contains(HIDDEN) {
+                        return "hidden".to_string();
+                    }
+                    let (line, points) = entry
+                        .split_once(",'spanGaps':true,'paths':linePaths,'points':")
+                        .expect(entry);
+                    let line = line.split_once("'stroke':'").unwrap().1;
+                    let line = line.replace("','width':", " ");
+                    match points {
+                        "{show:false}" => line,
+                        "lonePoints()" => format!("{line} dot"),
+                        bar => {
+                            let bar = bar.strip_prefix("lonePoints('").unwrap();
+                            let (fill, width) =
+                                bar.strip_suffix(')').unwrap().split_once("',").unwrap();
+                            format!("{line} bar {width} {fill}")
+                        }
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("|")
+        }
+        assert_eq!(
+            series(&build_create_js("plain", &minimal_config())),
+            "#010203 1.5 dot"
+        );
+
+        let (a, b) = ("#123456", "#abcdef");
+        let (fa, fb) = ("rgba(18,52,86,0.2)", "rgba(171,205,239,0.2)");
+        let (ra, rb) = ("rgba(18,52,86,0.35)", "rgba(171,205,239,0.35)");
+        // Per run: [raw], min edge, max edge; then the values lines. Marker columns have no series entries. Run 0 is banded; run 1's max edge is hidden unless smoothing makes its edges faint.
+        let mut cfg = full_config();
+        for (has_range, has_raw, smoothed, expected) in [
+            (
+                true,
+                false,
+                false,
+                format!("{fa} 1 bar 1.5 {a}|{fa} 1|{b} 1.5 bar 1.5 {b}|hidden|hidden|hidden"),
+            ),
+            (
+                true,
+                false,
+                true,
+                format!("{fa} 1 bar 1 {fa}|{fa} 1|{fb} 1 bar 1 {fb}|{fb} 1|{a} 1.5 dot|{b} 1.5 dot"),
+            ),
+            (
+                true,
+                true,
+                true,
+                format!("{ra} 1 dot|{fa} 1 bar 1 {fa}|{fa} 1|{rb} 1 dot|{fb} 1 bar 1 {fb}|{fb} 1|{a} 1.5 dot|{b} 1.5 dot"),
+            ),
+            (
+                false,
+                true,
+                true,
+                format!("{ra} 1 dot|{rb} 1 dot|{a} 1.5 dot|{b} 1.5 dot"),
+            ),
+        ] {
+            cfg.has_range = has_range;
+            cfg.has_raw = has_raw;
+            cfg.smoothed = smoothed;
+            assert_eq!(
+                series(&build_create_js("ranges", &cfg)),
+                expected,
+                "range={has_range} raw={has_raw} smoothed={smoothed}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_banded_run_fills_and_a_hidden_values_line_keeps_its_label() {
         let mut cfg = full_config();
         cfg.has_raw = false;
-        cfg.nan_markers = 0;
         for smoothed in [false, true] {
             cfg.smoothed = smoothed;
             let js = build_create_js("envelopes", &cfg);
-            assert_eq!(
-                js.matches("'stroke':'rgba(18,52,86,0.2)','width':1,")
-                    .count(),
-                2
-            );
-            assert_eq!(
-                js.matches("'stroke':'rgba(171,205,239,0.2)','width':1,")
-                    .count(),
-                if smoothed { 2 } else { 0 }
-            );
             assert!(js.contains("series:[2,1],fill:'rgba(18,52,86,0.12)'"));
             assert!(!js.contains("series:[4,3]"));
-            assert_eq!(
-                js.matches("'paths':()=>null").count(),
-                if smoothed { 0 } else { 3 }
-            );
-            assert_eq!(
-                js.matches("'stroke':'#123456','width':1.5,").count(),
-                usize::from(smoothed)
-            );
-            assert_eq!(js.matches("'stroke':'#abcdef','width':1.5,").count(), 1);
-            let values_stroke = if smoothed { "#abcdef" } else { "transparent" };
-            assert!(js.contains(&format!(
-                "'label':'second\\nline','stroke':'{values_stroke}','width':1.5,"
-            )));
+            assert!(js.contains(if smoothed {
+                "'label':'second\\nline','stroke':'#abcdef','width':1.5,"
+            } else {
+                "'label':'second\\nline','show':false}"
+            }));
         }
     }
 

@@ -72,7 +72,7 @@ let lineBase=1+labels.length*rawStride;
 // Smoothing on: the values column is a stroked smoothed curve; its raw evidence rides in the raw column (passthrough) or the envelope (downsampled).
 let isSmoothed=__KYMO_SMOOTHED__;
 let nanCols=__KYMO_NAN_MARKERS__;
-// Marker columns (and series) live at nanBase+i — after the values lines.
+// Data-only marker columns live at nanBase+i — after the values lines.
 let nanBase=lineBase+labels.length;
 // X-range columns (no series entries; read by tooltips and whole-bucket zoom) trail the markers.
 let hasXr=__KYMO_HAS_XRANGE__;
@@ -367,9 +367,37 @@ let yNiceLog=function(u,mn,mx){
 // The draw hook paints them; setCursor measures the cursor to the same spot so
 // a NaN reads as a hoverable sample. One source so the two can't drift apart.
 let markR=3.5,markGap=1.5;
-// uPlot rebuilds a series' paths on every repaint while its builder returns null, rescanning the column each time: a column with no finite value (say a NaN-only run) or a paths:()=>null column. An empty stand-in is kept instead, until the next rebuild.
+// Line series span their gaps and draw samples only as segments, so a series whose column holds one sample on the chart (one raw point, or one bucket) would draw nothing: linePaths builds it a mark and keeps it on the line path, which lasts until the data, scales or size change, the mark's inputs.
+// The mark: a dot, or on an envelope's min edge (this series; the max edge is the next) a bar from the bucket's min to its max, points.bar CSS px wide and cut at the plot's top and bottom like its band, unless they're within a dot of each other (canvas y grows downward). A bar cut to nothing at a log axis's floor draws nothing, like its band; the border circle for its nonpositive min marks it.
+let loneMark=function(u,si,i){
+  let s=u.series[si],sx=u.scales.x,sy=u.scales.y,xv=u.data[0][i],mn=u.data[si][i],mx=s.points.bar?u.data[si+1][i]:mn;
+  // A sample outside the scales has none, as uPlot culls its own dots: one past the window's edge, or wholly below a log axis, whose border circle marks it instead.
+  if(!(xv>=sx.min&&xv<=sx.max&&mx>=sy.min&&mn<=sy.max))return null;
+  let pr=u.pxRatio,dot=s.points.size*pr,bar=s.points.bar*pr,b=u.bbox,x=Math.round(u.valToPos(xv,'x',true)),lo=u.valToPos(mn,'y',true),hi=u.valToPos(mx,'y',true),fill=new Path2D();
+  // A dot centered on whole device pixels as uPlot centers its own, and a bar on the columns uPlot strokes a line of its width at that x. The cull keeps a dot within a dot of the plot, where uPlot clips its own, so a mark needs no clip.
+  if(lo-hi<dot)fill.arc(x,Math.round((lo+hi)/2),dot/2,0,2*Math.PI);
+  else{hi=Math.max(hi,b.top);fill.rect(x-Math.floor(bar/2),hi,bar,Math.min(lo,b.top+b.height)-hi);}
+  return{fill};
+};
+// A line's or min edge's points (create_js.rs), given an envelope mark's fill and bar width (a line's dot takes its stroke, as uPlot fills a point of width 0): points.show, which gates uPlot's drawing, and points.paths, which uPlot would otherwise rebuild on every repaint, both return the mark its line path carries.
+let markOf=(u,si)=>u.series[si]._paths.mark;
+let lonePoints=(fill,bar)=>({show:markOf,size:5,width:0,fill,bar,paths:markOf});
+// A column's first sample, scanned in from its start (dir 1), or its last, from its end (dir -1), found once per data array (setData replaces it); the column's length going forward when it has none. Its gaps are null: the NaNs in kymo's data are nulled before uPlot gets it.
+let sampleEnd=function(u,si,dir){
+  let r=u.data.__kymo_ends||(u.data.__kymo_ends=[]),k=2*si+(dir<0);
+  if(r[k]===undefined){let d=u.data[si],n=d.length,j=dir>0?0:n-1;while(j>=0&&j<n&&d[j]==null)j+=dir;r[k]=j;}
+  return r[k];
+};
+// Every drawn series names linePaths (create_js.rs). uPlot's range runs out to the nearest sample outside the window, or to the column's end where there is none, and uPlot's line builder would scan in from such an end to a sample on every rebuild (live data, zoom, resize), across the whole leading gap of a late-starting column, trailing gap of a stopped one, or all of an empty one; linePaths strokes from sample to sample, taking an end that lands on a gap from sampleEnd. It never returns null, which uPlot would rebuild on every repaint: a column with no sample gets an empty stand-in, kept until the next rebuild.
 let emptyPaths={flags:0},linearPaths=uPlot.paths.linear();
-let cacheEmptyPaths=function(s,i){if(i){let build=s.paths||linearPaths;s.paths=function(u,si,i0,i1){return build(u,si,i0,i1)||emptyPaths;};}return s;};
+let linePaths=function(u,si,i0,i1){
+  // An end on a sample stands for the column's first or last: one sample at both is lone, and a sample it hides lies past the window, where loneMark culls a false mark.
+  let d=u.data[si],f=d[i0]!=null?i0:sampleEnd(u,si,1);
+  if(f===d.length)return emptyPaths;
+  let l=d[i1]!=null?i1:sampleEnd(u,si,-1),p=linearPaths(u,si,f,l);
+  p.mark=f===l?loneMark(u,si,f):null;
+  return p;
+};
 let u=new uPlot({
   width:w,height:h,
   // Replaces uPlot's autoPadSide (17 top / 25 right). Top 8 is the whole title-to-plot gap (.rect-header has no margin-bottom) and absorbs y-max stroke caps; the rename hover strip (.rect-title::before) deadens its top half and must stay <= it. Right 12 keeps the last x label's centered half on-canvas and leaves a gutter for edge-hover and gutter-select drags.
@@ -378,7 +406,7 @@ let u=new uPlot({
   // _focus is our z-order signal (uPlot paints a series or band group with a _focus member last); alpha:1 keeps uPlot's native focus from ALSO dimming, so series.alpha stays entirely ours.
   focus:{alpha:1},
   // x auto IS the zoom policy: it gates setData's re-range (uPlot consults it nowhere else that matters in mode 1). Unzoomed, every live flush re-ranges x to the full extent — the chart follows a growing run. While a client-side zoom is active (__kymo_userzoom: set by drag-select/gutter-select/axis-pull, cleared by the configured reset click) setData keeps the current window but still commits, so new points landing inside the window paint on the flush that delivers them. Declaring the policy on the scale keeps every setData caller a plain setData(data) — passing resetScales=false instead skips the commit and freezes the zoomed chart until the next interaction.
-  scales:{x:{time:false,distr:__KYMO_X_DISTR__,...(isLogX?{range:logXRange}:{}),auto:u=>!u.__kymo_userzoom},...__KYMO_SYNC_SCALE__,y:{distr:__KYMO_Y_DISTR__,range:__KYMO_Y_DISTR__===3?yNiceLog:yNice},nan:{range:[0,1]}},
+  scales:{x:{time:false,distr:__KYMO_X_DISTR__,...(isLogX?{range:logXRange}:{}),auto:u=>!u.__kymo_userzoom},...__KYMO_SYNC_SCALE__,y:{distr:__KYMO_Y_DISTR__,range:__KYMO_Y_DISTR__===3?yNiceLog:yNice}},
   // kymo owns zoom gestures. Leaving uPlot's native drag armed gives every
   // synced chart an independent pixel-space drag state, which lets a peer
   // revive the source selection and makes every peer commit on mouseup.
@@ -390,11 +418,7 @@ let u=new uPlot({
   hooks:{
     draw:[function(u){
       if(!nanCols)return;
-      // Hollow NaN-marker circles, seated a fixed pixel offset above the
-      // plot's bottom edge. A marker flags WHERE a NaN happened — it has
-      // no y value; rendering through the series machinery forced a fake
-      // one (0, or the min positive value on log scales) that stretched
-      // the y range on every chart with a logged NaN.
+      // Hollow NaN-marker circles, a fixed pixel offset inside the plot's border. A marker flags WHERE a NaN happened and has no y value for the series machinery to place.
       let ctx=u.ctx,dpr=devicePixelRatio;
       let r=markR*dpr;
       // +∞ (kind 2) seats at the TOP border — the side its data exceeds; every other kind at the bottom.
@@ -409,12 +433,10 @@ let u=new uPlot({
       ctx.clip();
       ctx.lineWidth=1.5*dpr;
       // Each marker column's filled slots, indexed once per immutable u.data array (like hover's point lookup), so a repaint visits the markers, not the whole axis.
-      let marks=u.data.__kymo_marks||(u.data.__kymo_marks=u.data.slice(nanBase,nanBase+nanCols).map(col=>{let js=[];if(col)for(let j=0;j<col.length;j++)if(col[j]!=null)js.push(j);return js;}));
-      for(let i=0;i<nanCols;i++){
+      let marks=u.data.__kymo_marks||(u.data.__kymo_marks=u.data.slice(nanBase,nanBase+nanCols).map(col=>{let js=[];for(let j=0;j<col.length;j++)if(col[j]!=null)js.push(j);return js;}));
+      for(let i=0;i<marks.length;i++){
         let col=u.data[nanBase+i];
-        let s=u.series[nanBase+i];
-        if(!col||!s||s.show===false)continue;
-        ctx.globalAlpha=s.alpha==null?1:s.alpha;
+        ctx.globalAlpha=u.series[lineBase+i].alpha;
         ctx.strokeStyle=colors[i];
         for(let j of marks[i]){
           let cx=u.valToPos(u.data[0][j],'x',true);
@@ -452,7 +474,7 @@ let u=new uPlot({
        return Math.min(measured,maxAxis);
      },values:yFmt}
   ],
-  series:[__KYMO_SERIES_LIST__].map(cacheEmptyPaths),
+  series:[__KYMO_SERIES_LIST__],
   bands:[__KYMO_BANDS_LIST__]
 },data,el);
 u.over.appendChild(hotpt);
@@ -469,7 +491,7 @@ if(keepZoom){u.setScale('x',keepZoom);u.__kymo_userzoom=true;}
 // the current uPlot instance so a config rebuild cannot leave those listeners
 // using the first build's x-range column offsets or log transform.
 u.__kymo_zoom={zr:zoomRefetch,xShift:xShift,readoutXShift:readoutXShift,xrBase:hasXr?xrBase:null,axis:isLogX?(xShift?AXIS_LOG1P:AXIS_LOG):AXIS_LINEAR};
-u.__kymo_hl={runs:runIds,names:runNames,rs:rawStride,n:labels.length,nan:nanCols>0};
+u.__kymo_hl={runs:runIds,names:runNames,rs:rawStride};
 // applyHl's retag reaches the tip through the instance; the tip node outlives rebuilds, so a recreated u re-adopts it.
 u.__kymo_tip=tip;
 // Fresh charts are unhighlighted; seed the cache to avoid a redraw when no selection is active.

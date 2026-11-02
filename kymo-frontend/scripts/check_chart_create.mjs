@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// Runs the production chart-create script (create.js, with hover.js and zoom_math.js embedded as build_create_js embeds them) against a stand-in uPlot and DOM, to check gestures that span charts.
+// Runs the production chart-create script (create.js, with hover.js and zoom_math.js embedded as build_create_js embeds them) against a stand-in uPlot and DOM.
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
@@ -17,8 +17,8 @@ function test(name, run) {
   console.log(`ok ${++passed} - ${name}`);
 }
 
-/** A chart's x axis, as ShownAxis and the series it plots: one run, one values line. */
-function render(id, { axis = "rel", logX = false, shifted = false, logY = false, labels = ["run"], hash = "cfg", extraSeries = "" } = {}) {
+/** A chart's x axis, as ShownAxis, and the series it plots: a values line per label. */
+function render(id, { axis = "rel", logX = false, shifted = false, logY = false, labels, hash = "cfg", extraSeries = "", nanMarkers = 0, rawStride = 0 } = {}) {
   const step = axis === "step";
   const time = axis === "rel" || axis === "wall";
   const tokens = {
@@ -28,18 +28,18 @@ function render(id, { axis = "rel", logX = false, shifted = false, logY = false,
     __KYMO_AXIS_FONT_SIZE__: "12",
     __KYMO_X_AXIS_SIZE__: "23",
     __KYMO_Y_AXIS_MIN_SIZE__: "35",
-    __KYMO_RAW_STRIDE__: "0",
+    __KYMO_RAW_STRIDE__: String(rawStride),
     __KYMO_HAS_RAW__: "false",
     __KYMO_HAS_RANGE__: "false",
     __KYMO_SMOOTHED__: "false",
     __KYMO_HAS_XRANGE__: "false",
-    __KYMO_NAN_MARKERS__: "0",
+    __KYMO_NAN_MARKERS__: String(nanMarkers),
     __KYMO_ZOOM_REFETCH__: String(step),
     // A zero-present log x plots x+1 in the wire's units (ChartJsConfig::log_shift): the step zoom geometry shifts by 1, readouts by 1 step or 1 ms.
     __KYMO_READOUT_X_SHIFT__: !shifted ? "0" : time ? "0.001" : "1",
     __KYMO_X_DISTR__: logX ? "3" : "1",
     __KYMO_Y_DISTR__: logY ? "3" : "1",
-    __KYMO_SERIES_LIST__: "{}," + labels.map(label => `{'label':'${label}','stroke':'#123456','width':1.5}`).join(",") + extraSeries,
+    __KYMO_SERIES_LIST__: "{}," + labels.map(label => `{'label':'${label}','stroke':'#123456','width':1.5,'spanGaps':true,'paths':linePaths,'points':lonePoints()}`).join(",") + extraSeries,
     __KYMO_LABELS__: labels.map(label => `'${label}'`).join(","),
     __KYMO_COLORS__: labels.map(() => "'#123456'").join(","),
     __KYMO_RUN_IDS__: labels.map(label => `'${label}'`).join(","),
@@ -47,7 +47,7 @@ function render(id, { axis = "rel", logX = false, shifted = false, logY = false,
     __KYMO_XNAN_COUNTS__: labels.map(() => "0").join(","),
     __KYMO_BANDS_LIST__: "",
     __KYMO_CFG_HASH__: hash,
-    __KYMO_IS_TIME__: String(axis === "rel" || axis === "wall"),
+    __KYMO_IS_TIME__: String(time),
     __KYMO_IS_WALL__: String(axis === "wall"),
     __KYMO_X_LABEL__: step ? "step" : "time",
     __KYMO_SYNC_KEY__: axis,
@@ -82,14 +82,16 @@ function page({ dpr = 1 } = {}) {
   const nodes = {};
   const created = [];
   class FakeUPlot {
-    // Like uPlot's, the linear builder returns a path for a column with data and null for an all-null one (or a missing one).
-    static paths = { linear: () => (u, si) => ((u.data[si] || []).some(v => v != null) ? { linear: si } : null) };
+    // The builder records what it was handed and reads no samples.
+    static paths = { linear: () => (u, si, i0, i1) => ({ range: [i0, i1] }) };
     constructor(opts, data) {
       this.opts = opts;
       this.data = data;
       this.root = { isConnected: true };
       this.over = { getBoundingClientRect: () => ({ left: 0, top: 0, width: 400, height: 200 }), appendChild() {} };
-      this.bbox = { left: 0, top: 0, width: 400, height: 200 };
+      // In device pixels, as uPlot's is.
+      this.bbox = { left: 0, top: 0, width: 400 * dpr, height: 200 * dpr };
+      this.pxRatio = dpr;
       // 7 px per character.
       // At a device pixel ratio above 1, uPlot scales its fonts, so the canvas measures in device pixels.
       this.ctx = { font: "", measureText: text => ({ width: 7 * text.length * dpr }) };
@@ -98,7 +100,7 @@ function page({ dpr = 1 } = {}) {
       this.axes = opts.axes;
       // uPlot's default x ranger widens a single value by about its own magnitude (10 -> 0..20); this fake's widen pads it by 1, which the one-value checks pin.
       const widen = (u, min, max) => min != null && min === max ? [min - 1, max + 1] : [min, max];
-      this.scales = { x: { distr: opts.scales.x.distr, range: opts.scales.x.range || widen }, y: {} };
+      this.scales = { x: { distr: opts.scales.x.distr, range: opts.scales.x.range || widen }, y: { min: 0, max: 200 } };
       this.rebuilds = 0;
       this.width = opts.width;
       this.height = opts.height;
@@ -118,7 +120,8 @@ function page({ dpr = 1 } = {}) {
     setSize({ width, height }) { Object.assign(this, { width, height }); this.resizes++; }
     setSelect(box) { this.box = box; }
     destroy() { this.root.isConnected = false; }
-    valToPos(value) { return value; }
+    // One CSS pixel per unit, y counting down from the plot's 200 px top as uPlot's does; canvas positions are in device pixels.
+    valToPos(value, scale, canvas) { const css = scale === "x" ? value : 200 - value; return canvas ? css * dpr + (scale === "x" ? this.bbox.left : this.bbox.top) : css; }
   }
   const document = {
     body: element("body"),
@@ -138,14 +141,17 @@ function page({ dpr = 1 } = {}) {
     window, document, uPlot: FakeUPlot, devicePixelRatio: dpr, CustomEvent: class { constructor(type, init) { this.type = type; Object.assign(this, init); } },
     ResizeObserver: class { constructor(fire) { this.fire = fire; } observe() {} disconnect() {} }, getComputedStyle: () => ({ height: "220px", getPropertyValue: () => "" }),
     queueMicrotask, dioxus: { close() {} },
+    Path2D: class { ops = []; rect(...args) { this.ops.push(["rect", ...args]); } arc(...args) { this.ops.push(["arc", ...args]); } },
   });
   vm.runInContext(hoverPoints, context);
   return {
     window,
-    create(id, x, options) {
+    /** A chart over `x`, plotting `options.columns` (NaN for a gap; default x / 10), one series each. */
+    create(id, x, options = {}) {
       nodes[id] ||= element(id);
-      window.__kymo_data[id] = [Float64Array.from(x), Float64Array.from(x, v => v / 10)];
-      const status = vm.runInContext(`(function(){${render(id, options)}})()`, context);
+      const columns = options.columns ?? [x.map(v => v / 10)];
+      window.__kymo_data[id] = [Float64Array.from(x), ...columns.map(column => Float64Array.from(column))];
+      const status = vm.runInContext(`(function(){${render(id, { labels: columns.map((_, i) => `run${i}`), ...options })}})()`, context);
       assert.equal(status, "", `create ${id}`);
       return window.__kymo_charts[id];
     },
@@ -314,13 +320,134 @@ test("a chart with one x value ranges around it at creation and after a reset, o
   assert.deepEqual([none.scales.x.min, none.scales.x.max], [1, 10]);
 });
 
-test("series paths pass a built path through, keep a series' own builder, and stand in for null", () => {
-  const c = page().create("c", [1, 2], { extraSeries: ",{'paths':()=>'own'}" });
-  const [, line, own] = c.series;
-  assert.deepEqual(line.paths(c, 1, 0, 1), { linear: 1 });
-  assert.equal(own.paths(c, 2, 0, 1), "own");
-  const stand = line.paths({ ...c, data: [c.data[0], [null, null]] }, 1, 0, 1);
-  assert.equal(stand?.flags, 0, "an empty stand-in uPlot caches, not null");
+test("a line builder gets the stroked range narrowed to its samples; an empty column gets the stand-in", () => {
+  const c = page().create("c", [0, 10, 20, 30, 40, 50], {
+    columns: [[NaN, NaN, 3, 4, NaN, NaN], [NaN, NaN, NaN, NaN, NaN, NaN]],
+  });
+  const [, line, empty] = c.series;
+  assert.deepEqual(line.paths(c, 1, 0, 5).range, [2, 3], "uPlot's range out to the column's ends");
+  // A null path would have uPlot call the builder again on every repaint.
+  assert.equal(empty.paths(c, 2, 0, 5).flags, 0, "an empty column gets a stand-in uPlot caches, without reaching the builder");
+});
+
+// Counts the element reads of chart c's column si from here on.
+function countReads(c, si = 1) {
+  const reads = { n: 0 };
+  c.data[si] = new Proxy(c.data[si], { get(target, key) { if (/^\d+$/.test(String(key))) reads.n++; return target[key]; } });
+  return reads;
+}
+
+test("a column's gaps are scanned once per data array, and not at all when uPlot's range ends on samples", () => {
+  const p = page();
+  const x = Array.from({ length: 1000 }, (_, i) => i * 10);
+  const c = p.create("c", x, { columns: [x.map((_, i) => (i < 900 ? NaN : i)), x.map(() => NaN)] });
+  const reads = countReads(c), empty = countReads(c, 2);
+  // Each build reads the first end of uPlot's range; that end here is a gap, so the first build scans.
+  assert.deepEqual(c.series[1].paths(c, 1, 0, 999).range, [900, 999]);
+  assert.equal(reads.n, 1 + 901 + 1, "in from the start to the first sample, then the last slot, a sample");
+  c.series[1].paths(c, 1, 0, 999);
+  assert.equal(reads.n, 905, "a rebuild without new data scans nothing");
+  for (let k = 0; k < 2; k++) c.series[2].paths(c, 2, 0, 999);
+  assert.equal(empty.n, 2 + 1000, "an empty column is scanned once too, from its start only");
+  c.setData([...c.data]);
+  c.series[1].paths(c, 1, 0, 999);
+  assert.equal(reads.n, 905 + 903, "new data is scanned again");
+  // A zoomed window: uPlot's range runs out to the samples nearest it, so both ends are samples and nothing is scanned.
+  c.setData([...c.data]);
+  assert.deepEqual(c.series[1].paths(c, 1, 949, 961).range, [949, 961]);
+  assert.equal(reads.n, 1808 + 2, "both ends read, nothing scanned");
+  // A window past a finished run's end: only the end on a gap is scanned, not the gap before the run's start.
+  const run = p.create("r", x, { columns: [x.map((_, i) => (i >= 100 && i < 900 ? i : NaN))] }), runReads = countReads(run);
+  assert.deepEqual(run.series[1].paths(run, 1, 850, 999).range, [850, 899]);
+  assert.equal(runReads.n, 1 + 1 + 101, "the start, a sample; the end, a gap, scanned back to the last sample");
+});
+
+test("a run with one sample gets a mark; two samples, however close, draw their segment", () => {
+  const mark = (x, values) => {
+    const c = page().create("l", x, { columns: [values] });
+    return !!c.series[1].paths(c, 1, 0, x.length - 1).mark;
+  };
+  // Both ends of the fake's 0 to 200 y scale: the geometry check pins the cull.
+  for (const value of [0, 200]) assert.equal(mark([0, 10, 20], [NaN, value, NaN]), true, `a lone ${value}`);
+  assert.equal(mark([40, 40.001, 60], [7, 7, NaN]), false);
+  assert.equal(mark([5], [3]), true, "a one-slot axis: uPlot's range is that slot, a sample at both ends");
+});
+
+test("uPlot gets a line's mark through points.show, which is also what it draws, built once per path", () => {
+  const c = page().create("f", [0, 10.4, 20], { columns: [[NaN, 3, NaN]] });
+  const s = c.series[1];
+  assert.deepEqual([s.points.width, s.points.fill], [0, undefined], "uPlot fills a point of width 0 with the line's stroke");
+  s._paths = s.paths(c, 1, 0, 2);
+  const mark = s.points.show(c, 1);
+  assert.deepEqual(mark.fill.ops, [["arc", 10, 197, 2.5, 0, 2 * Math.PI]], "uPlot's 5 px dot, on whole pixels");
+  assert.equal(s.points.paths(c, 1, 0, 2, null), mark);
+  assert.equal(s.points.show(c, 1), mark, "a repaint reuses it");
+  s._paths = s.paths(c, 1, 0, 2);
+  assert.notEqual(s.points.show(c, 1), mark, "a rebuilt path builds its own");
+});
+
+test("the draw hook paints data-only NaN markers with their run's values-line alpha", () => {
+  // With raw blocks of two, the hook reads run i's alpha at lineBase + i, series 5 and 6 (placeholders here: the harness lists its lines first), so reading a block's series or the other run's fails.
+  const col = [1, 2, 3];
+  const c = page().create("n", [0, 10, 20], { labels: ["a", "b"], columns: [col, col, col, col, col, col, [NaN, 1, NaN], [1, NaN, NaN]], extraSeries: ",{},{},{},{}", nanMarkers: 2, rawStride: 2 });
+  c.series[5].alpha = 0.25;
+  c.series[6].alpha = 0.5;
+  const arcs = [];
+  c.ctx = { save() {}, restore() {}, beginPath() {}, rect() {}, clip() {}, stroke() {}, arc: x => arcs.push([x, c.ctx.globalAlpha]) };
+  c.opts.hooks.draw[0](c);
+  assert.deepEqual(arcs, [[10, 0.25], [0, 0.5]]);
+});
+
+// The fake places x and y one CSS pixel per unit, y counting down from 200 (its y scale is 0 to 200); at device pixel ratio 2 kymo's 5 px dot is 10 device px. This plot box starts 20 device px in and 16 down, off the canvas origin as a real one sits right of the y axis and below kymo's top padding.
+test("an envelope's lone bucket is a bar from its min to its max, or a dot when they're within a dot; none outside the scales", () => {
+  const mark = (min, max, window, x = [0, 10, 20]) => {
+    const c = page({ dpr: 2 }).create("e", x, {
+      labels: ["run"],
+      columns: [[NaN, NaN, NaN], [NaN, min, NaN], [NaN, max, NaN]],
+      extraSeries: ",{'paths':linePaths,'points':lonePoints('#123456',1.5)},{'paths':linePaths,'points':{show:false}}",
+    });
+    c.bbox = { left: 20, top: 16, width: 800, height: 400 };
+    if (window) c.setScale("x", window);
+    const s = c.series[2];
+    assert.deepEqual([s.points.width, s.points.fill, s.points.bar], [0, "#123456", 1.5]);
+    s._paths = s.paths(c, 2, 0, 2);
+    const built = s.points.show(c, 2);
+    return built && built.fill.ops;
+  };
+  // x 10 is device px 40; y 7 is 402, 12 is 392: 10 device px apart, a dot.
+  assert.deepEqual(mark(7, 12), [["rect", 39, 392, 3, 10]], "a dot apart: the bar at the line's 1.5 CSS px");
+  assert.deepEqual(mark(7, 12, null, [0, 10.3, 20]), [["rect", 40, 392, 3, 10]], "at x 40.6, the columns a 3 px stroke covers there");
+  assert.deepEqual(mark(7, 11.5), [["arc", 40, 398, 5, 0, 2 * Math.PI]], "closer: a dot between them");
+  assert.deepEqual(mark(-5, 3), [["rect", 39, 410, 3, 6]], "partly below the axis: the bar, cut at the plot's bottom");
+  assert.deepEqual(mark(195, 205), [["rect", 39, 16, 3, 10]], "partly above the axis: the bar, cut at the plot's top");
+  assert.deepEqual(mark(-5, 0), [["rect", 39, 416, 3, 0]], "its max on the axis: cut to nothing, like its band (on a log axis the border circle marks it)");
+  assert.equal(mark(-5, -3), null, "wholly below the axis (a log axis's border circle marks it)");
+  assert.equal(mark(205, 210), null, "wholly above the axis");
+  for (const window of [{ min: 11, max: 20 }, { min: 0, max: 9 }]) assert.equal(mark(7, 12, window), null, `past the window's edge, ${JSON.stringify(window)}`);
+  for (const window of [{ min: 10, max: 20 }, { min: 0, max: 10 }]) assert.ok(mark(7, 12, window), `on the window's edge, ${JSON.stringify(window)}`);
+});
+
+const vendor = readFileSync(new URL("../assets/vendor/uPlot.iife.min.js", import.meta.url), "utf8");
+
+// The narrowed range reads uPlot's stroked range as the window widened to the nearest sample outside it on each side (or to the column's end).
+test("vendored uPlot builds a series' paths over the window widened to its nearest samples outside", () => {
+  assert.match(vendor, /let (\w+)=\w+\((\w+)-1,0,(\w+)-1\),(\w+)=\w+\((\w+)\+1,0,\3-1\);for\(;null==(\w+)\[\1\]&&\1>0;\)\1--;for\(;null==\6\[\4\]&&\3-1>\4;\)\4\+\+;return\[\1,\4\]\}\(\w+\[(\w+)\]\);\w+\._paths=\w+\.paths\(\w+,\7,(\w+)\[0\],\8\[1\]\)/);
+});
+
+// A series that draws nothing is hidden (create_js.rs).
+test("vendored uPlot builds paths for shown series only, and scans only them for a scale's range", () => {
+  assert.match(vendor, /forEach\(\((\w+),(\w+)\)=>\{if\(\2>0&&\1\.show&&\(\w+\(\2,!1\),\w+\(\2,!0\),null==\1\._paths\)\)/);
+  assert.match(vendor, /let (\w+)=\w+\[\w+\];\1\.show&&\1\.scan&&\1\.scale==\w+&&\w+\(/);
+});
+
+// A line's dot names no fill: its series' stroke fills it.
+test("vendored uPlot fills a point of width 0 with its series' stroke", () => {
+  assert.match(vendor, /(\w+)\.points=\w+\(\{\},\{size:\w+,width:\w+\(1,\.2\*\w+\),stroke:\1\.stroke,/);
+  assert.match(vendor, /_stroke:(\w+)=\w+\._stroke,_fill:(\w+)=\w+\._fill,_width:(\w+)=\w+\.width\}=\w+\._paths;.{0,200}?null==\2&&\(\2=\3>0\?"#fff":\1\)/);
+});
+
+test("vendored uPlot draws a series' points when its points.show returns a mark", () => {
+  assert.match(vendor, /(\w+)=\w+\.points\.show\((\w+),(\w+),(\w+),(\w+),\w+\),(\w+)=\w+\.points\.filter\(\2,\3,\1,\w+\);\(\1\|\|\6\)&&\(\w+\.points\._paths=\w+\.points\.paths\(\2,\3,\4,\5,\6\)/);
 });
 
 test("a log-x pull keeps its window positive and finite", () => {

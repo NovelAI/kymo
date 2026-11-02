@@ -46,14 +46,13 @@ window.__kymo_applyHl=function(c){
   if(c.__kymo_hleff===eff)return;
   c.__kymo_hleff=eff;
   // Native focus selects one series; a run group spans raw, envelope, and line columns across charts.
-  let lb=1+m.n*m.rs;
-  for(let i=0;i<m.n;i++){
+  let n=m.runs.length,lb=1+n*m.rs;
+  for(let i=0;i<n;i++){
     let hl=rid!==null&&matches(m.runs[i],m.names[i]);
     let a=(rid===null||hl)?1:0.25;
     // All columns share alpha; _focus lifts each envelope with its band.
     for(let k=0;k<m.rs;k++){let se=c.series[1+i*m.rs+k];se.alpha=a;se._focus=hl;}
     let sl=c.series[lb+i];sl.alpha=a;sl._focus=hl;
-    if(m.nan)c.series[lb+m.n+i].alpha=a;
   }
   c.redraw(false);
 };

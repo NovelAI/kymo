@@ -299,7 +299,7 @@ pub fn UPlotChart(
                     all_series.push(col(&s.values));
                 }
 
-                // Append one NaN-marker column per real series, marking where the run LOGGED a non-finite value (server-computed nan_indices, indexing the shared axis) or where the log axis clipped its envelope or sample. Only when a marker exists somewhere, so healthy charts pay nothing. The value is the marker KIND (1 NaN, 2 +inf, 3 -inf, 4 unplottable x, 5 log-clipped envelope or sample — frontend-only, never on the wire): markers live on a dummy scale and the draw hook pins their circles to the plot's border (top for +inf, bottom for the rest), so the kind value never plots.
+                // Append one NaN-marker column per real series, marking where the run LOGGED a non-finite value (server-computed nan_indices, indexing the shared axis) or where the log axis clipped its envelope or sample. Only when a marker exists somewhere, so healthy charts pay nothing. The value is the marker KIND (1 NaN, 2 +inf, 3 -inf, 4 unplottable x, 5 log-clipped envelope or sample — frontend-only, never on the wire): marker columns have no series entries and the draw hook pins their circles to the plot's border (top for +inf, bottom for the rest), so the kind value never plots.
                 let needs_markers = chart.series.iter().any(|s| !s.nan_indices.is_empty())
                     || synth_marks.iter().any(|v| !v.is_empty());
                 let nan_markers = if needs_markers {
