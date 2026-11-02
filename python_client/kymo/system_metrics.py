@@ -17,21 +17,6 @@ from kymo.client import _WorkerExited
 _STOP_BARRIER_TIMEOUT = 1.0
 _FAILURE_WARN_INTERVAL = 60.0
 
-# Optional imports — gracefully degrade if not available
-try:
-    import pynvml
-
-    _HAS_NVML = True
-except ImportError:
-    _HAS_NVML = False
-
-try:
-    import psutil
-
-    _HAS_PSUTIL = True
-except ImportError:
-    _HAS_PSUTIL = False
-
 
 def _nvml(read) -> float:
     """One value's NVML reading through its own lambda, read, or a NaN marker (a hole in the chart, never an invented 0) wherever read raises: where NVML cannot give the value (an unsupported field, a lost GPU), and where a percentage's total is zero. Guarding each field alone costs about 1 µs of Python per GPU per poll."""
@@ -135,10 +120,12 @@ class SystemMetricsPoller:
     # ------------------------------------------------------------------
 
     def _init_nvml(self):
-        if not _HAS_NVML:
-            return
+        global pynvml
         initialized = False
         try:
+            # Only a run with system metrics imports its backends, since init() imports this module whatever system_metrics says; the module's binding is what the polls and stop() read.
+            import pynvml
+
             pynvml.nvmlInit()
             initialized = True
             self._gpu_count = pynvml.nvmlDeviceGetCount()
@@ -146,7 +133,11 @@ class SystemMetricsPoller:
                 pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(self._gpu_count)
             ]
             self._nvml_ok = True
+        except ImportError:
+            # A backend not installed, or one that cannot load: unmentioned.
+            pass
         except Exception as e:
+            # Including an import failing otherwise than ImportError (pynvml 13's FutureWarning under -W error).
             if initialized:
                 try:
                     pynvml.nvmlShutdown()
@@ -155,13 +146,17 @@ class SystemMetricsPoller:
             log.warning("pynvml init failed (%s), GPU metrics disabled", e)
 
     def _init_psutil(self):
-        if not _HAS_PSUTIL:
-            return
+        # As _init_nvml: imported only for a run with system metrics, an ImportError unmentioned, any other failure warned of.
+        global psutil
         try:
+            import psutil
+
             self._process = psutil.Process(os.getpid())
             # Prime cpu_percent (first call always returns 0)
             self._process.cpu_percent()
             self._psutil_ok = True
+        except ImportError:
+            pass
         except Exception as e:
             log.warning("psutil init failed (%s), CPU/mem/disk/net metrics disabled", e)
 
@@ -360,7 +355,7 @@ class SystemMetricsPoller:
         try:
             now = time.monotonic()
             counters = psutil.disk_io_counters()
-            if self._prev_disk is not None and self._prev_disk_time is not None:
+            if self._prev_disk is not None:
                 dt = now - self._prev_disk_time
                 if dt > 0:
                     read_delta = counters.read_bytes - self._prev_disk.read_bytes
@@ -382,7 +377,7 @@ class SystemMetricsPoller:
         try:
             now = time.monotonic()
             counters = psutil.net_io_counters()
-            if self._prev_net is not None and self._prev_net_time is not None:
+            if self._prev_net is not None:
                 dt = now - self._prev_net_time
                 if dt > 0:
                     sent_delta = counters.bytes_sent - self._prev_net.bytes_sent

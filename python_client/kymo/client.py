@@ -363,6 +363,8 @@ _held_back: collections.deque = collections.deque()
 # Queue groups a publication took over but could not charge (_publish_held): those of a pending log() call and drained captured output, which earlier calls accepted. The main thread's next publication charges and puts them, after _held_back's; the shutdown salvages them, and a handoff drops them with a warning. Changed like _held_back.
 _uncharged: collections.deque = collections.deque()
 _last_capture_step: Optional[int] = None
+# Set when the shutdown's last drain left captured text unsent (_drain_capture_points) or its publication failed, which leaves delivery unproven (_shut_down).
+_capture_left_unsent = False
 # Captured exit code (None = not yet observed; resolved at TerminateRun time), set by sys.excepthook, the wrapped sys.exit and shutdown signals: the first writer wins (_record_exit_code), except that a Ctrl-C's 130 replaces any code and a SIGTERM's or SIGQUIT's 128 + signum None or 0 (_record_signal_code), and that, while the main thread runs the program (_main_thread_runs), a code only sys.exit recorded gives way to a later sys.exit's, a shutdown signal's and the exception hook's, and is dropped by a finish() the program calls after catching it.
 _exit_code: Optional[int] = None
 # Whether only the wrapped sys.exit recorded _exit_code, so the program may have caught that SystemExit.
@@ -375,8 +377,10 @@ _left_control = None
 _interrupted_at: Optional[float] = None
 # When kymo's handler last saw a SIGTERM or SIGQUIT, by which the atexit flush is bounded (_ensure_metrics_uploaded).
 _terminated_at: Optional[float] = None
-# The last run was handed off to its worker (_Shutdown.hand_off): finish() and wait_for_upload() cannot prove its delivery.
+# The last run was handed off to its worker (_Shutdown.hand_off): its delivery cannot be proven, so its shutdown's result is false, and wait_for_upload()'s zero-backlog return reports it.
 _handed_off = False
+# Whether the last run's shutdown proved delivery complete (_drain_and_shutdown), which finish() and wait_for_upload() return once that run has ended: true before the first run, and never read while one is active, so init() need not clear it.
+_last_run_proven = True
 _original_excepthook = None
 _original_sys_exit = None
 # The metadata blob last uploaded, whose config field update_config() changes before uploading it again.
@@ -1075,6 +1079,7 @@ _FINAL_DRAIN_LOCK_WAIT = 0.1
 
 def _drain_capture_points(now_ms: int, final: bool = False) -> list[tuple]:
     """Drain the captured output into text points for a publication (_publish_held), with final the shutdown's last drain (_capture.drain_buffers)."""
+    global _capture_left_unsent
     if _on_main_thread():
         if not final and _capture_drain_lock._is_owned():
             # A handler's log() nested in a drain on this thread could take the outer drain's step, and the server keeps one text point per stream and step: leave the text for the next drain, as _capture._drain_one does.
@@ -1092,6 +1097,7 @@ def _drain_capture_points(now_ms: int, final: bool = False) -> list[tuple]:
     else:
         points, unsent = [], (["output"] if _capture.has_output() else [])
     if final and unsent:
+        _capture_left_unsent = True
         # Out of the drain's lock: a handler the program added may write this to the captured stderr, perhaps the stream passed over.
         _log.warning(
             "captured %s left unsent: a capture lock stayed busy as the run ended",
@@ -2004,7 +2010,9 @@ def wait_for_upload(timeout: Optional[float] = None) -> bool:
     its values keeps their charge, since the queue may have taken them. Once
     the backlog has gone no lower than that many points for longer than the
     server's 2 s flush interval, it returns False: their delivery cannot be
-    proven. So does a run a Ctrl-C handed off (see finish()).
+    proven. So does a run a Ctrl-C handed off (see finish()). Once the run has
+    ended, it returns that run's shutdown result (false until the shutdown
+    sets it).
 
     Raises:
         RuntimeError: if the upload worker has died with points still queued,
@@ -2012,7 +2020,9 @@ def wait_for_upload(timeout: Optional[float] = None) -> bool:
             successful delivery can no longer be reported.
     """
     if not _is_initialized:
-        return not _handed_off
+        return _last_run_proven
+    # The run this waits for: another thread's finish() and init() can end it and start the next between two reads.
+    session = _session_id
     if timeout is not None:
         timeout = _normalize_timeout_budget(timeout, "upload")
     deadline = None if timeout is None else time.monotonic() + timeout
@@ -2038,12 +2048,17 @@ def wait_for_upload(timeout: Optional[float] = None) -> bool:
     lowest, steady_since = None, 0.0
 
     while True:
+        # Before the read: a worker exiting as it stops for another thread's finish() acknowledges its points first, so only a read after its exit proves it died with points still queued.
+        exited = os.getpid() == _init_pid and not _worker_alive(_upload_process)
         # The worker publishes a spill failure before its matching backlog
         # decrement under this same lock.  Read the pair atomically so zero can
         # never win the race against a not-yet-visible eventual exit code.
         snapshot = _delivery_status_snapshot(
             0.1 if deadline is None else min(0.1, _remaining_seconds(deadline))
         )
+        if not _is_initialized or _session_id != session:
+            # The run ended as this waited (another thread's finish(), perhaps its next init() too), perhaps before this read: its shutdown's result.
+            return _last_run_proven
         now = time.monotonic()
         if snapshot is None:
             if accounting_unavailable_since is None:
@@ -2105,7 +2120,8 @@ def wait_for_upload(timeout: Optional[float] = None) -> bool:
         if remaining == 0:
             return not _handed_off
         # A dead worker can't drain the queue: fail with the count instead of waiting forever.
-        _check_worker()
+        if exited:
+            _check_worker()
         # Unproven points may yet be acknowledged, once fed, within the server's flush interval.
         if lowest <= _unproven_points and now - steady_since > _SERVER_FLUSH_INTERVAL:
             _log.warning(
@@ -2167,13 +2183,16 @@ def finish(flush_timeout: Optional[float] = None) -> bool:
     crash through ``try: ... finally: kymo.finish()`` ends the run as finished:
     the exception hook's code comes after the run has ended.
 
-    Returns True only if delivery was proven complete. Returns False if points
-    were spooled or dropped, or the worker otherwise could not prove delivery.
+    Returns True only if delivery was proven complete: False if points were
+    spooled or dropped, captured console text was left unsent (a finish() off
+    the main thread whose last drain found a capture lock still busy), or the
+    worker otherwise could not prove delivery. Once the run has ended, a later
+    call returns that shutdown's result (false until the shutdown sets it).
     """
     global _exit_code, _exit_code_by_sys_exit
     reject_legacy_client_env()
     if not _is_initialized:
-        return not _handed_off
+        return _last_run_proven
     if _follows_ctrl_c(sys.exc_info()[1]):
         # The program is ending, or handling, a Ctrl-C, or ends soon after one: its run is, too.
         return _drain_and_shutdown(signum=signal.SIGINT)
@@ -3468,6 +3487,7 @@ def _drain_and_shutdown(
     """
     global \
         _is_initialized, \
+        _last_run_proven, \
         _run_metadata, \
         _mode, \
         _local_installation_uuid, \
@@ -3477,7 +3497,8 @@ def _drain_and_shutdown(
         _finishing
 
     if not _is_initialized:
-        return True
+        # Already ended (by a shutdown before this call, or another thread's since the caller found the run active): the last shutdown's result.
+        return _last_run_proven
     # Raw os.fork() children (NOT multiprocessing children — those skip atexit) inherit this module's state and hooks; see _init_pid. Only the initializing process may shut the shared worker down.
     if _init_pid is not None and os.getpid() != _init_pid:
         return True
@@ -3507,7 +3528,7 @@ def _drain_and_shutdown(
         _finishing = True
         if not _is_initialized:
             # Another shutdown ended the run as this one was claimed.
-            shutdown.result = not _handed_off
+            shutdown.result = _last_run_proven
             return shutdown.result
         if signum is not None:
             _record_signal_code(signum)
@@ -3526,6 +3547,8 @@ def _drain_and_shutdown(
         if _handed_off:
             _complete_handoff(shutdown)
             result = False
+        # Unproven until the result below, for a finish() or wait_for_upload() that finds the run ended meanwhile.
+        _last_run_proven = False
         _is_initialized = False
         _run_metadata = None
         _mode = "hosted"
@@ -3542,7 +3565,7 @@ def _drain_and_shutdown(
                 "dropped %d point(s) that never reached the upload queue", dropped
             )
             result = False
-        shutdown.result = result
+        shutdown.result = _last_run_proven = result
     finally:
         _release_shutdown(shutdown, () if at_exit else shutdown.arrived)
     if at_exit:
@@ -3700,7 +3723,7 @@ def _feeder_left(source, deadline: float) -> int:
 
 def _shut_down(shutdown: _Shutdown) -> bool:
     """The phases of a shutdown (_drain_and_shutdown); _HandedOff once a Ctrl-C hands it off."""
-    global _system_poller
+    global _system_poller, _capture_left_unsent
     shutdown.check()
     poller_quiesced = True
     if _system_poller is not None:
@@ -3735,7 +3758,8 @@ def _shut_down(shutdown: _Shutdown) -> bool:
     if backlog > 0:
         _log.info("flushing %d queued points (budget %.0fs)…", backlog, shutdown.budget)
 
-    capture_tail_published = True
+    # Cleared for this last drain (a previous run's shutdown, or a handoff's, may have set it), which off the main thread may pass a busy capture lock over, its text left in the buffer (_drain_capture_points).
+    _capture_left_unsent = False
     try:
         _publish_queue_items(
             [],
@@ -3744,7 +3768,7 @@ def _shut_down(shutdown: _Shutdown) -> bool:
             final=True,
         )
     except (OSError, RuntimeError, ValueError, queue.Full) as error:
-        capture_tail_published = False
+        _capture_left_unsent = True
         shutdown.check()
         _log.warning("failed to publish final captured output: %s", error)
 
@@ -3829,7 +3853,7 @@ def _shut_down(shutdown: _Shutdown) -> bool:
     return (
         worker_clean
         and shutdown_marker_published
-        and capture_tail_published
+        and not _capture_left_unsent
         and values_complete
         and poller_quiesced
         and not had_spool

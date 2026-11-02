@@ -6,6 +6,7 @@ import contextlib
 import ctypes
 import dis
 import gc
+import importlib.abc
 import inspect
 import io
 import itertools
@@ -31,6 +32,7 @@ import time
 import traceback
 import types
 import unittest
+import warnings
 import weakref
 from collections import deque
 from unittest import mock
@@ -482,6 +484,7 @@ class CaptureWriterTests(unittest.TestCase):
                     _captured(["held\n"]),
                     mock.patch.object(client_module, "_capture_drain_lock", lock),
                     mock.patch.object(client_module, "_last_capture_step", None),
+                    mock.patch.object(client_module, "_capture_left_unsent", False),
                     mock.patch.object(client_module, "_FINAL_DRAIN_LOCK_WAIT", wait),
                     mock.patch.object(
                         client_module._log,
@@ -507,6 +510,9 @@ class CaptureWriterTests(unittest.TestCase):
                             self.assertFalse(last_done.wait(0.1))
                     self.assertTrue(last_done.wait(5))
                     left = list(capture_module._stdout_buf)
+                    self.assertEqual(
+                        client_module._capture_left_unsent, held_past_the_wait
+                    )
                 self.assertEqual(lock.asked, [0, wait])
                 self.assertEqual(ticked, [[]])
                 if held_past_the_wait:
@@ -579,6 +585,7 @@ class CaptureWriterTests(unittest.TestCase):
                     _captured(["tail\n"]),
                     mock.patch.object(capture_module, "_stdout_lock", lock),
                     mock.patch.object(client_module, "_last_capture_step", None),
+                    mock.patch.object(client_module, "_capture_left_unsent", False),
                     mock.patch.object(client_module, "_FINAL_DRAIN_LOCK_WAIT", wait),
                     mock.patch.object(client_module._log, "warning", side_effect=warn),
                 ):
@@ -600,6 +607,9 @@ class CaptureWriterTests(unittest.TestCase):
                             self.assertFalse(finished.wait(0.1))
                     self.assertTrue(finished.wait(5))
                     left = list(capture_module._stdout_buf)
+                    self.assertEqual(
+                        client_module._capture_left_unsent, held_past_the_wait
+                    )
                 self.assertEqual(lock.asked, [wait])
                 self.assertEqual(
                     messages,
@@ -2231,6 +2241,47 @@ print(k > 50, str(late).replace(" ", ""), 0.9 < armed <= 1)
         ):
             self._init(system_metrics=False)
         self.assertEqual(calls, ["metadata", ("start", False)])
+
+    def test_backend_imports_never_fail_init(self):
+        # init() imports kymo.system_metrics whatever system_metrics says, so the poller imports the backends only for a run with system metrics, and names an import failing otherwise than ImportError: pynvml 13's import hook warns FutureWarning at a process's first pynvml import, and at every one under -W error, whose raise keeps the hook from noting it warned. An ImportError goes unmentioned, and the poller starts either way. The run metadata's own pynvml import, mocked here, catches Exception.
+        class Hook(importlib.abc.MetaPathFinder):
+            def find_spec(self, name, path, target=None):
+                if name in ("pynvml", "psutil"):
+                    attempted.append(name)
+                    if missing:
+                        raise ModuleNotFoundError(name)
+                    warnings.warn(f"The {name} package is deprecated", FutureWarning)
+
+        for metrics, missing in ((False, False), (True, False), (True, True)):
+            attempted, named = [], metrics and not missing
+            with self.subTest(metrics=metrics, missing=missing):
+                with (
+                    self._init_without_a_server(mock.Mock()),
+                    # Not mock.patch.dict(sys.modules), which would also drop the modules init() imports first here (a second resource tracker).
+                    _modules_restored("kymo.system_metrics", "pynvml", "psutil"),
+                    # The import rebinds the package's attribute too.
+                    mock.patch.object(
+                        sys.modules["kymo"], "system_metrics", system_metrics_module
+                    ),
+                    mock.patch.object(sys, "meta_path", [Hook(), *sys.meta_path]),
+                    # The helper patches only the original poller's start: the fresh one's thread would outlive the test.
+                    mock.patch.object(threading.Thread, "start") as start,
+                    warnings.catch_warnings(),
+                    self.assertLogs("kymo", level="WARNING")
+                    if named
+                    else self.assertNoLogs("kymo", level="WARNING") as logs,
+                ):
+                    warnings.simplefilter("error", FutureWarning)
+                    self._init(system_metrics=metrics)
+                    poller = client_module._system_poller
+                self.assertEqual(attempted, ["pynvml", "psutil"] if metrics else [])
+                self.assertEqual((poller._nvml_ok, poller._psutil_ok), (False, False))
+                start.assert_called_once_with()
+                if named:
+                    self.assertEqual(
+                        [record.getMessage().split(" (")[0] for record in logs.records],
+                        ["pynvml init failed", "psutil init failed"],
+                    )
 
     def test_a_ctrl_c_as_the_worker_starts_ends_the_run(self):
         # An exception out of the worker's start once the worker has started (a raising handler of a signal kymo does not own, say): init() raises with the run active and kymo's exit hooks installed, so the exception hook hands it off, rather than leave the worker to multiprocessing's exit, which waits for it, forever under a SIGTERM the program owns. A worker that never started leaves the run InitRun registered, which gets a best-effort TerminateRun. kymo's handler is installed before the start either way.
@@ -7331,13 +7382,15 @@ class QueueDrainTests(unittest.TestCase):
 
 class ShutdownProofTests(unittest.TestCase):
     def setUp(self):
-        # A shutdown leaves these set for the rest of its run, until the next init(): they must not reach later tests.
+        # A shutdown leaves these set after it, until the next init() or shutdown: they must not reach later tests.
         patch = mock.patch.multiple(
             client_module,
             _finishing=False,
             _exit_code=None,
             _unproven_points=0,
             _last_capture_step=None,
+            _capture_left_unsent=False,
+            _last_run_proven=True,
         )
         patch.start()
         self.addCleanup(patch.stop)
@@ -9458,13 +9511,146 @@ class ShutdownProofTests(unittest.TestCase):
         self.assertEqual(target.items, [None])
         self.assertLess(time.monotonic() - started, 0.25)
 
-    def test_finish_fails_once_a_point_was_spooled(self):
+    def test_calls_after_the_run_ended_return_its_shutdown_result(self):
+        # A second finish() (a framework's teardown, then the program's) or a wait_for_upload() must not report a failed delivery as proven: one that spooled a point, or dropped what was held back as the run ended.
+        take = client_module._take_held_back
+
+        def held_back(*args):
+            # A group left behind the run's end, as a log() on another thread can leave one.
+            if client_module._is_initialized:
+                return take(*args)
+            return [[("numeric_ts", "m", 1, 1.0, 1)]]
+
+        for failure in ("spooled", "dropped", None):
+
+            def run():
+                with (
+                    mock.patch.object(
+                        client_module,
+                        "_upload_spooled",
+                        _QueueStatus(failure == "spooled"),
+                    ),
+                    mock.patch.object(
+                        client_module,
+                        "_take_held_back",
+                        held_back if failure == "dropped" else take,
+                    ),
+                ):
+                    first = client_module._drain_and_shutdown(flush_timeout=0.1)
+                return first, client_module.finish(), client_module.wait_for_upload()
+
+            with self.subTest(failure=failure):
+                self.assertEqual(self._run_shutdown(run=run), (failure is None,) * 3)
+
+    def test_calls_before_any_run_report_delivery_proven(self):
+        # Nothing was logged, so nothing is unproven.
+        result = _run_script_file(
+            "import kymo\nprint(kymo.finish(), kymo.wait_for_upload())\n"
+        )
+        self.assertEqual(result.stdout.strip(), "True True", result.stderr)
+
+    def test_the_run_never_reads_ended_with_the_last_runs_proof(self):
+        # From the first opcode at which the run reads ended, a finish() or wait_for_upload() (on another thread, say) reports it unproven until its shutdown's result, never the last run's proof (setUp's True).
+        seen = []
+        tracer, fired = _opcode_tracer(
+            {client_module._drain_and_shutdown.__code__},
+            0,
+            lambda frame: seen.append(
+                (client_module.finish(), client_module.wait_for_upload())
+            ),
+            paused=lambda: client_module._is_initialized,
+        )
+
         def run():
-            with mock.patch.object(client_module, "_upload_spooled", _QueueStatus(1)):
+            with _tracing(tracer):
                 return client_module._drain_and_shutdown(flush_timeout=0.1)
 
-        self.assertTrue(self._run_shutdown())
-        self.assertFalse(self._run_shutdown(run=run))
+        self.assertTrue(self._run_shutdown(run=run))
+        self.assertEqual(seen, [(False, False)])
+
+    def test_calls_the_runs_end_overtakes_return_its_shutdown_result(self):
+        # A finish() that found the run active, a shutdown claimed only once another had ended the run, and a wait_for_upload() in its loop, even once the next init() has started another run, each overtaken by another thread's shutdown (run here, synchronously): that shutdown's result, proven or not.
+        def end_run():
+            with mock.patch.object(
+                client_module, "_upload_spooled", _QueueStatus(spooled)
+            ):
+                return client_module._drain_and_shutdown(flush_timeout=0.1)
+
+        def finish():
+            follows, ended = client_module._follows_ctrl_c, []
+
+            def overtaken(error):
+                ended.append(end_run())
+                return follows(error)
+
+            with mock.patch.object(client_module, "_follows_ctrl_c", overtaken):
+                finished = client_module.finish()
+            return ended, [finished]
+
+        def claim():
+            shutdown_type, ended = client_module._Shutdown, []
+
+            def overtaken(*args, **kwargs):
+                shutdown = shutdown_type(*args, **kwargs)
+                # Past the run's check, before this shutdown's claim.
+                with mock.patch.object(client_module, "_Shutdown", shutdown_type):
+                    ended.append(end_run())
+                return shutdown
+
+            with mock.patch.object(client_module, "_Shutdown", overtaken):
+                claimed = client_module._drain_and_shutdown(flush_timeout=0.1)
+            return ended, [claimed]
+
+        def wait(next_init=False):
+            snapshot, ended = client_module._delivery_status_snapshot, []
+
+            def read(timeout):
+                ended.append(end_run())
+                if next_init:
+                    # The next init() starts another run, with a session and accounting of its own.
+                    client_module._session_id = "session-b"
+                    client_module._queue_status = _QueueStatus()
+                    client_module._is_initialized = True
+                return snapshot(timeout)
+
+            with mock.patch.object(
+                client_module, "_delivery_status_snapshot", side_effect=read
+            ):
+                waited = client_module.wait_for_upload()
+            return ended, [waited]
+
+        for spooled in (True, False):
+            for name, call in (
+                ("finish", finish),
+                ("claim", claim),
+                ("wait_for_upload", wait),
+                ("wait_for_upload across the next init()", lambda: wait(True)),
+            ):
+                with self.subTest(call=name, spooled=spooled):
+                    proven = not spooled
+                    self.assertEqual(self._run_shutdown(run=call), ([proven], [proven]))
+
+    def test_a_wait_the_worker_acknowledges_and_exits_under_returns_its_result(self):
+        # A wait_for_upload() reads a backlog just before the worker, stopping for another thread's finish() with the run still active, acknowledges it and exits: delivery proven, not "worker died with 0 points still queued".
+        worker, status = _Process(), _QueueStatus(1)
+        snapshot = client_module._delivery_status_snapshot
+
+        def read(timeout):
+            got = snapshot(timeout)
+            status.value, worker.exitcode = 0, 0
+            return got
+
+        with (
+            _upload_state(
+                _queue_status=status,
+                _upload_process=worker,
+                _upload_terminal=_QueueStatus(),
+            ),
+            mock.patch.object(
+                client_module, "_delivery_status_snapshot", side_effect=read
+            ),
+        ):
+            self.assertTrue(client_module.wait_for_upload())
 
     def test_shutdown_budget_keeps_equal_delivery_and_worker_spill_halves(self):
         # When the worker stops delivering and spilling, is killed, and the cleanup tail: delivery and spill take equal halves before the tail, the spill ending half the shorter of its half and the tail before the kill.
@@ -9480,6 +9666,49 @@ class ShutdownProofTests(unittest.TestCase):
 
     def test_finish_fails_on_unquiesced_poller(self):
         self.assertFalse(self._run_shutdown(backlog=0, poller_quiesced=False))
+
+    def test_finish_off_the_main_thread_fails_when_its_last_drain_leaves_text_unsent(
+        self,
+    ):
+        # Off the main thread the last drain passes over a capture lock still busy after _FINAL_DRAIN_LOCK_WAIT (drain_buffers' None), and that text stays buffered, unsent.
+        # A later shutdown without such a drain (the next run's) is proven again.
+        def run():
+            result = []
+            _in_thread(
+                lambda: result.append(
+                    client_module._drain_and_shutdown(flush_timeout=0.1)
+                )
+            ).wait(5)
+            return result
+
+        for capture, proven in (((None, "tail\n"), False), (("tail\n", ""), True)):
+            status = _QueueStatus()
+            with (
+                self.subTest(capture=capture),
+                mock.patch.object(client_module._log, "warning") as warning,
+            ):
+                self.assertEqual(
+                    self._run_shutdown(
+                        target=self._AckingQueue(status),
+                        status=status,
+                        capture=capture,
+                        run=run,
+                    ),
+                    [proven],
+                )
+                self.assertEqual(
+                    any(
+                        "left unsent" in call.args[0] for call in warning.call_args_list
+                    ),
+                    not proven,
+                )
+
+    def test_finish_fails_when_its_last_capture_publication_fails(self):
+        # A drain that raises charges nothing, so only the failed publication leaves delivery unproven, unlike a refused put's charge (test_shutdown_continues_but_fails_if_captured_tail_cannot_publish).
+        def drain(final, timeout):
+            raise OSError("broken pipe")
+
+        self.assertFalse(self._run_shutdown(capture=drain))
 
     def test_finish_fails_when_clean_worker_leaves_positive_status(self):
         self.assertFalse(self._run_shutdown(backlog=1, poller_quiesced=True))
@@ -10332,8 +10561,9 @@ class PollerPublicationTests(unittest.TestCase):
         )
         poller = SystemMetricsPoller(publish=mock.Mock())
         with (
-            mock.patch.object(system_metrics_module, "_HAS_NVML", True),
-            mock.patch.object(system_metrics_module, "pynvml", fake_nvml, create=True),
+            mock.patch.dict(sys.modules, {"pynvml": fake_nvml}),
+            # Restored after: _init_nvml's import binds the module's pynvml.
+            mock.patch.object(system_metrics_module, "pynvml", None, create=True),
             self.assertLogs("kymo", level="WARNING"),
         ):
             poller._init_nvml()
@@ -10583,6 +10813,41 @@ class PollerPublicationTests(unittest.TestCase):
             ],
         )
 
+    def test_a_started_poller_imports_its_backends_where_its_polls_and_stop_read_them(
+        self,
+    ):
+        # _init_nvml and _init_psutil bind the module's pynvml and psutil, which the polls and stop() read: a second poller, a later run's, imports them again.
+        fake_nvml = mock.Mock(
+            **{
+                "nvmlDeviceGetCount.return_value": 1,
+                "nvmlDeviceGetTemperature.return_value": 71,
+            }
+        )
+        fake_psutil = mock.Mock(
+            **{
+                "virtual_memory.return_value": types.SimpleNamespace(
+                    available=2e6, percent=25.0
+                )
+            }
+        )
+        with (
+            mock.patch.dict(sys.modules, {"pynvml": fake_nvml, "psutil": fake_psutil}),
+            mock.patch.object(system_metrics_module, "pynvml", None, create=True),
+            mock.patch.object(system_metrics_module, "psutil", None, create=True),
+        ):
+            for _ in range(2):
+                poller = SystemMetricsPoller(publish=mock.Mock())
+                poller._init_nvml()
+                poller._init_psutil()
+                self.assertEqual((poller._nvml_ok, poller._psutil_ok), (True, True))
+                metrics = {}
+                poller._poll_gpu(metrics)
+                poller._poll_cpu_mem(metrics)
+                self.assertEqual(metrics["system/gpu_temp_c"], [71.0])
+                self.assertEqual(metrics["system/sys_mem_pct"], 25.0)
+                self.assertTrue(poller.stop(timeout=0.1))
+        self.assertEqual(fake_nvml.nvmlShutdown.call_count, 2)
+
     def test_start_starts_the_thread_without_a_metric_backend(self):
         # init() starts the thread whatever system_metrics says, which decides only the metric backends: off, none is initialized or mentioned; on with none available (pynvml and psutil are optional), the console still goes out.
         for metrics in (False, True):
@@ -10591,9 +10856,7 @@ class PollerPublicationTests(unittest.TestCase):
                     publish=mock.Mock(), system_metrics=metrics
                 )
                 with (
-                    mock.patch.multiple(
-                        system_metrics_module, _HAS_NVML=False, _HAS_PSUTIL=False
-                    ),
+                    mock.patch.dict(sys.modules, {"pynvml": None, "psutil": None}),
                     mock.patch.object(
                         poller, "_init_nvml", wraps=poller._init_nvml
                     ) as nvml,
@@ -11020,6 +11283,20 @@ def _upload_state(**patches):
             **patches,
         },
     )
+
+
+@contextlib.contextmanager
+def _modules_restored(*names):
+    """Pop names from sys.modules for the block, then put back the modules they held, dropping any the block imported under them."""
+    saved = {name: sys.modules.pop(name, None) for name in names}
+    try:
+        yield
+    finally:
+        for name, module in saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
 
 
 def _drain_off_main(final=False):
