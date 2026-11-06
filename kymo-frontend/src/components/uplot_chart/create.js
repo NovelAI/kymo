@@ -5,20 +5,13 @@ __KYMO_ZOOM_MATH__
 window.__kymo_zm=KYMO_ZOOM_MATH;
 }
 let {AXIS_LINEAR,AXIS_LOG,AXIS_LOG1P,buildFrozenSupports,buildFrozenSourceMap,mapSourcePageX,expandWholeBuckets}=window.__kymo_zm;
-let {createHoverPointLookup,plotPosition}=window.__kymo_hp;
+let {nullGaps,createHoverPointLookup,plotPosition}=window.__kymo_hp;
 if(!window.__kymo_charts) window.__kymo_charts={};
 let el=document.getElementById('__KYMO_ID__');
 if(!el)return'chart container is missing';
 let data=window.__kymo_data&&window.__kymo_data['__KYMO_ID__'];
 if(!data||!data.length)return'chart data is missing';
-// uPlot only treats null as a gap. NaN survives LINEAR rendering by
-// accident (non-finite canvas coords are ignored) but on LOG scales it
-// clamps to the plot floor — every gap slot became a point at the bottom
-// decade with line segments plunging to it, painting a false "fill"
-// under log-y lines. Convert gap slots in one JS pass; x (data[0]) has
-// no gaps and stays typed.
-// An indexed loop, not Array.from(c,fn): the callback form costs ~7x more on typed arrays (set_data_js repeats this).
-data=data.map((c,i)=>{if(i==0)return c;let n=c.length,o=new Array(n);for(let j=0;j<n;j++){let v=c[j];o[j]=v!==v?null:v;}return o;});
+data=nullGaps(data);
 let prev=window.__kymo_charts['__KYMO_ID__'];
 // isConnected guards a recreated container div: updating a chart
 // whose canvas was detached would paint nothing, forever.

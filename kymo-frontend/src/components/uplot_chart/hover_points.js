@@ -1,10 +1,21 @@
 (() => {
   if (window.__kymo_hp) return;
-  // Values and marker columns use null gaps after create.js maps the wire data.
+  // uPlot reads only null as a gap: a NaN passes on a linear scale only because the canvas ignores non-finite coords, and on a log scale clamps to the floor, with lines plunging to it (a false fill under log-y lines).
+  // create.js and set_data_js pass every column but x (data[0], gapless, kept typed) through nullGaps, so every reader of u.data meets a gap only as null.
+  // An indexed loop, not Array.from(c,fn): the callback form costs ~7x more on typed arrays. One long-lived column function: an arrow made per eval ran up to a third slower whenever it came in cold (a first flush, a rebuild, after a GC).
+  function nullColumn(c, i) {
+    if (i === 0) return c;
+    const n = c.length, o = new Array(n);
+    for (let j = 0; j < n; j++) { const v = c[j]; o[j] = v !== v ? null : v; }
+    return o;
+  }
+  function nullGaps(data) {
+    return data.map(nullColumn);
+  }
+
   // A logged NaN/Infinity is still a point: only its marker column is populated.
   function hasHoverPoint(values, markers, index) {
-    return (values[index] != null && !Number.isNaN(values[index])) ||
-      (markers != null && markers[index] != null);
+    return values[index] != null || (markers != null && markers[index] != null);
   }
 
   // Lazily index each series once per immutable u.data array; cached fallbacks binary-search its samples.
@@ -50,5 +61,5 @@
     return { left: left <= 1 ? 0 : left >= rect.width - 1 ? rect.width : left, top };
   }
 
-  window.__kymo_hp = { createHoverPointLookup, plotPosition };
+  window.__kymo_hp = { nullGaps, createHoverPointLookup, plotPosition };
 })();

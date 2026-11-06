@@ -79,12 +79,7 @@ fn parse_hex_color(hex: &str) -> (u8, u8, u8) {
     (r, g, b)
 }
 
-/// Push columnar data to `window.__kymo_data[id]` as typed arrays — one
-/// bulk copy per column across the wasm boundary. Gap slots stay NaN
-/// here; the chart-create JS converts series columns to plain arrays
-/// with NULL gaps in a single JS-side pass (per-element JsValue pushes
-/// from wasm cost a boundary call each — hundreds of thousands per
-/// render of a wide chart).
+/// Push columnar data to `window.__kymo_data[id]` as typed arrays, one bulk copy per column across the wasm boundary (a per-element JsValue push costs a boundary call each, hundreds of thousands per render of a wide chart); gap slots stay NaN for nullGaps (hover_points.js) to null in JS.
 fn push_data_to_js(id: &str, x: &[f64], series: &[Vec<f64>]) {
     let window = web_sys::window().unwrap();
     let key = JsValue::from_str("__kymo_data");
@@ -145,8 +140,7 @@ try{{
 let u=window.__kymo_charts&&window.__kymo_charts['{id}'];
 let data=window.__kymo_data&&window.__kymo_data['{id}'];
 if(!u||!u.root||!u.root.isConnected||!data||!data.length)return false;
-data=data.map((c,i)=>{{if(i==0)return c;let n=c.length,o=new Array(n);for(let j=0;j<n;j++){{let v=c[j];o[j]=v!==v?null:v;}}return o;}});
-u.setData(data);
+u.setData(window.__kymo_hp.nullGaps(data));
 return true;
 }}catch(_error){{
 return false;
@@ -549,5 +543,13 @@ mod tests {
         assert!(js.contains("finally{"));
         assert!(js.contains("dioxus.close();"));
         assert!(!js.contains("dioxus.send"));
+    }
+
+    #[test]
+    fn a_live_set_data_hands_uplot_null_gaps() {
+        // hover_points.js, hover.js and copy.js read a gap only as null; check_chart_create.mjs covers create.js's two hand-offs.
+        let js = set_data_js("c");
+        assert!(js.contains("u.setData(window.__kymo_hp.nullGaps(data));"));
+        assert_eq!(js.matches("setData(").count(), 1);
     }
 }

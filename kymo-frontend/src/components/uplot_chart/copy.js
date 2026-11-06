@@ -15,8 +15,8 @@ let onMouseout=function(event){if(event.relatedTarget==null)pointerX=pointerY=nu
 let buildText=function(chart,idx){
   let m=chart&&chart.__kymo_copy;
   if(!m||!chart.root||!chart.root.isConnected||!Number.isInteger(idx)||idx<0)return null;
-  let x=chart.data&&chart.data[0];
-  if(!x||idx>=x.length||x[idx]==null)return null;
+  let x=chart.data[0];
+  if(idx>=x.length)return null;
 
   let xValue=x[idx]-m.xShift;
   // Undoing the time axis's +0.001s render offset can expose binary
@@ -25,14 +25,13 @@ let buildText=function(chart,idx){
   if(m.xShift===0.001)xValue=Number(xValue.toPrecision(15));
   let xCell=String(xValue),rows=[];
   for(let i=0;i<m.seriesCount;i++){
-    let series=chart.series[m.lineBase+i];
-    let value=chart.data[m.lineBase+i]&&chart.data[m.lineBase+i][idx];
-    let marker=m.nanCols&&chart.data[m.nanBase+i]?chart.data[m.nanBase+i][idx]:null;
+    let value=chart.data[m.lineBase+i][idx];
+    let marker=m.nanCols?chart.data[m.nanBase+i][idx]:null;
     let cell='';
-    if(value!=null&&!Number.isNaN(value))cell=String(value);
+    if(value!=null)cell=String(value);
     // A kind-4 marker without a value (a run with no plottable x) has no sample at this x to copy.
-    else if(marker!=null&&!Number.isNaN(marker)&&marker!==4)cell=marker===2?'Infinity':marker===3?'-Infinity':'NaN';
-    if(cell!=='')rows.push(textCell(series&&series.label!=null?series.label:'')+'\t'+cell);
+    else if(marker!=null&&marker!==4)cell=marker===2?'Infinity':marker===3?'-Infinity':'NaN';
+    if(cell!=='')rows.push(textCell(chart.series[m.lineBase+i].label)+'\t'+cell);
   }
   return rows.length?textCell(m.xLabel)+': '+xCell+'\n\n'+rows.join('\n'):null;
 };

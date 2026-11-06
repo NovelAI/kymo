@@ -210,6 +210,16 @@ const anchorless = {
 };
 assert.equal(window.__kymo_chartCopy.buildText(anchorless, 0), "'=custom x: 41\n\na\t1.25");
 
+// Without marker columns the x-range columns start at nanBase: an empty slot copies nothing.
+const ranged = {
+  ...chart,
+  data: [[42, 43], [1.25, null], [41.5, 42.5], [42.5, 43.5]],
+  series: [{}, { label: "a" }],
+  __kymo_copy: { ...chart.__kymo_copy, seriesCount: 1, nanBase: 2, nanCols: 0 },
+};
+assert.equal(window.__kymo_chartCopy.buildText(ranged, 0), "'=custom x: 41\n\na\t1.25");
+assert.equal(window.__kymo_chartCopy.buildText(ranged, 1), null);
+
 let event = copyEvent();
 copyListener(event);
 assert.equal(copiedText, expected);

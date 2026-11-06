@@ -12,7 +12,7 @@ function installHoverPoints(context) {
   hoverScript.runInContext(context);
   return context.window.__kymo_hp;
 }
-const { createHoverPointLookup, plotPosition } = installHoverPoints(vm.createContext({ window: {} }));
+const { nullGaps, createHoverPointLookup, plotPosition } = installHoverPoints(vm.createContext({ window: {} }));
 let passed = 0;
 function test(name, run) {
   run();
@@ -23,11 +23,19 @@ test("browser startup exposes only the namespaced helpers and preserves them on 
   const context = vm.createContext({ window: {} });
   const helper = installHoverPoints(context);
   assert.equal(typeof helper.createHoverPointLookup, "function");
-  for (const name of ["hasHoverPoint", "createHoverPointLookup", "plotPosition", "KYMO_HOVER_POINTS"]) {
+  for (const name of ["nullColumn", "nullGaps", "hasHoverPoint", "createHoverPointLookup", "plotPosition", "KYMO_HOVER_POINTS"]) {
     assert.equal(vm.runInContext(`typeof ${name}`, context), "undefined", `${name} stays out of the global scope`);
   }
   assert.equal(installHoverPoints(context), helper);
   assert.equal(installHoverPoints(context).createHoverPointLookup, helper.createHoverPointLookup);
+});
+
+test("nullGaps copies every column but x with its NaN gaps nulled and every other value kept", () => {
+  const x = Float64Array.from([0, 1, 2]), wire = [x, Float64Array.from([NaN, 1.5, Infinity]), Float64Array.from([-Infinity, -0, NaN])];
+  const data = nullGaps(wire);
+  assert.notEqual(data, wire);
+  assert.equal(data[0], x, "x stays the typed column");
+  assert.deepEqual(Array.from(data.slice(1), c => Array.from(c)), [[null, 1.5, Infinity], [-Infinity, -0, null]]);
 });
 
 test("the shared pointer mapping reads the live overlay rect, snaps the outer pixel to exact bounds, and rejects moves outside the plot band", () => {
@@ -390,6 +398,23 @@ test("borrowed NaN and Infinity stay readable and exact-column markers stay sele
   }
 });
 
+test("marker-only rows sort after every valued row", () => {
+  const f = fixture({ nanCols: 2 });
+  f.chart.data = [[0, 10, 20], [null, null, null], [-5, -5, -5], [null, 1, null], [null, null, null]];
+  f.run();
+  assert.deepEqual(tooltipRows(f.tip).map(row => row.series), [1, 0]);
+});
+
+test("a marker beside a finite value (a duplicate-x non-finite sample, a log-y border circle) reads as the value", () => {
+  const f = fixture({ nanCols: 2 });
+  f.chart.data = [[0, 10, 20], [5, 2, 8], [-7, 0, 3], [null, 1, null], [null, 5, null]];
+  for (const src of [f.context.el.id, "peer"]) {
+    f.window.__kymo_hoversrc = src;
+    f.run();
+    assert.deepEqual([tooltipCell(f.tip, 0, "val").text, tooltipCell(f.tip, 1, "val").text], ["2.000", "0.000"]);
+  }
+});
+
 test("kind-4 counts and log-time rendering shifts use the selected index", () => {
   const f = fixture({ nanCols: 2, xnanC: [0, 3], readoutXShift: 0.001 });
   f.enable();
@@ -400,6 +425,12 @@ test("kind-4 counts and log-time rendering shifts use the selected index", () =>
   f.run();
   assert.equal(tooltipCell(f.tip, 1, "val").text, "5.000 ×3");
   assert.equal(tooltipCell(f.tip, 1, "x").text, "@ 0");
+  f.chart.data = [
+    [0.001, 10.001, 20.001], [100, 100, 100], [5, null, 8],
+    [null, null, null], [4, 1, null],
+  ];
+  f.run();
+  assert.equal(tooltipCell(f.tip, 1, "val").text, "NaN", "the count belongs to the run's kind-4 point alone");
 });
 
 test("a kind-4 marker without a value reads as no plottable x", () => {

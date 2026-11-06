@@ -884,6 +884,15 @@ test("a rebuild during a selection carries the window it started from", () => {
   assert.equal(p.window.__kymo_zg, null, "the selection was cancelled");
 });
 
+test("every column but x reaches uPlot with null gaps, on a new chart and on a same-config create", () => {
+  // A values line and its data-only marker column, each with NaN gaps.
+  const p = page(), opts = { labels: ["a"], nanMarkers: 1 };
+  const c = p.create("g", [0, 10, 20], { ...opts, columns: [[NaN, 3, NaN], [2, NaN, NaN]] });
+  assert.deepEqual(Array.from(c.data.slice(1), col => Array.from(col)), [[null, 3, null], [2, null, null]]);
+  assert.equal(p.create("g", [0, 10, 20], { ...opts, columns: [[5, NaN, NaN], [NaN, NaN, 1]] }), c, "a same-config create updates the live chart through setData");
+  assert.deepEqual(Array.from(c.data.slice(1), col => Array.from(col)), [[5, null, null], [null, null, 1]]);
+});
+
 test("a chart takes its box's width floored, at creation and on resize", () => {
   // uPlot hides its cursor line once the line's rounded x passes a fractional plot width, which loses it on right-edge hovers.
   const p = page();
