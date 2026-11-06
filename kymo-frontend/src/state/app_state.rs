@@ -286,8 +286,8 @@ pub struct DashboardState {
     pub reported_chart_facts: Signal<Option<ChartFacts>>,
     /// What the grid copy knew when Configure maximized it, filling in what the maximized copy hasn't learned yet.
     pub handed_over_chart_facts: Signal<Option<ChartFacts>>,
-    /// THE x-axis zoom for step-axis charts, as (step_min, step_max) — the single pathway linking them. Every zoom gesture on any chart (drag, reset click, axis pan, pinch) bubbles to the document-level ZoomBridge (uplot_chart.rs) which writes it here, and every step-axis chart's fetch subscribes to it, so zoom-out follows to the whole group (the uPlot cursor sync does not replay a reset-click zoom-out) and panels mounting later (collapsed sections, other pages, the maximize overlay) come up in the same window. Time/custom-x charts zoom client-side and ignore it.
-    pub step_zoom: Signal<Option<(i64, i64)>>,
+    /// THE x-axis zoom for step-axis charts, the single pathway linking them: None unzoomed, (step_min, Some(step_max)) a fixed window, (step_min, None) a following one that takes in new steps. Every zoom gesture on a step chart (a selection, an axis pull, a reset click) bubbles to the document-level ZoomBridge (uplot_chart.rs), which writes it here, and every step-axis chart's fetch subscribes to it, so a zoom reaches the whole group (the uPlot cursor sync does not replay a reset-click zoom-out) and panels mounting later (collapsed sections, other pages, the maximize overlay) come up in the same window. Time/custom-x charts zoom client-side and ignore it.
+    pub step_zoom: Signal<Option<(i64, Option<i64>)>>,
     /// Navbar "filter panels" text; empty = no filter. Transient view state like `step_zoom`/`maximized` — never persisted to the layout diff, but survives navigation. The grid hides panels whose label/metric names don't match.
     pub panel_filter: Signal<String>,
     /// Whether a `MetricGrid` is mounted. A run page that can't show its run renders none while `layout_config` keeps the last layout, so the navbar's collapse toggle checks this.

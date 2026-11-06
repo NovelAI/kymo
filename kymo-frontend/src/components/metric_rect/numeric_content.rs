@@ -375,7 +375,7 @@ pub(super) fn NumericContent(
                     }),
                     target_resolution: measured_px,
                     step_min: zoom.map(|z| z.0),
-                    step_max: zoom.map(|z| z.1),
+                    step_max: zoom.and_then(|z| z.1),
                     use_timestamp_axis: use_ts,
                     relative_time: is_relative,
                     cache_state: None,
@@ -575,13 +575,17 @@ pub(super) fn NumericContent(
                 run_names.push(run.map(|run| run.run_name.clone()));
             }
 
+            let axis = ShownAxis::of_request(request);
+            // From the answer shown, not the zoom asked for: a refetch in flight keeps showing the previous window.
+            let step_open = axis.step_axis() && request.step_max.is_none();
             rsx! {
                 UPlotChart {
                     chart: ChartModel(chart.clone()),
                     labels: labels,
                     run_names: run_names,
                     colors: colors,
-                    axis: ShownAxis::of_request(request),
+                    axis,
+                    step_open,
                     log_y: options.read().log_y,
                     smoothed: smoothed,
                     reply: *reply,

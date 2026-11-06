@@ -79,8 +79,8 @@ fn parse_hex_color(hex: &str) -> (u8, u8, u8) {
     (r, g, b)
 }
 
-/// Push columnar data to `window.__kymo_data[id]` as typed arrays, one bulk copy per column across the wasm boundary (a per-element JsValue push costs a boundary call each, hundreds of thousands per render of a wide chart); gap slots stay NaN for nullGaps (hover_points.js) to null in JS.
-fn push_data_to_js(id: &str, x: &[f64], series: &[Vec<f64>]) {
+/// Push columnar data to `window.__kymo_data[id]` as typed arrays, one bulk copy per column across the wasm boundary (a per-element JsValue push costs a boundary call each, hundreds of thousands per render of a wide chart); gap slots stay NaN for nullGaps (hover_points.js) to null in JS. `stepOpen` on the x column, which that pass hands through, says the step answer had no right bound (see `UPlotChart`'s `step_open`).
+fn push_data_to_js(id: &str, x: &[f64], series: &[Vec<f64>], step_open: bool) {
     let window = web_sys::window().unwrap();
     let key = JsValue::from_str("__kymo_data");
     let data_store = match Reflect::get(&window, &key) {
@@ -92,7 +92,13 @@ fn push_data_to_js(id: &str, x: &[f64], series: &[Vec<f64>]) {
         }
     };
     let data_array = Array::new();
-    data_array.push(&Float64Array::from(x));
+    let xs = Float64Array::from(x);
+    let _ = Reflect::set(
+        &xs,
+        &JsValue::from_str("stepOpen"),
+        &JsValue::from_bool(step_open),
+    );
+    data_array.push(&xs);
     for s in series {
         data_array.push(&Float64Array::from(&s[..]));
     }
@@ -107,7 +113,7 @@ if(window.__kymo_ro&&window.__kymo_ro['{id}']){{
   window.__kymo_ro['{id}'].disconnect();
   delete window.__kymo_ro['{id}'];
 }}
-if(window.__kymo_zg&&window.__kymo_zg.srcId==='{id}'&&window.__kymo_zg.cancel)window.__kymo_zg.cancel();
+if(window.__kymo_zg&&window.__kymo_zg.srcId==='{id}')window.__kymo_zg.cancel();
 if(window.__kymo_charts&&window.__kymo_charts['{id}']){{
   // An unmounting hover source gets no mouseleave: clear its cursor through the normal path so synced readouts and the highlight go with it.
   if(window.__kymo_hoversrc==='{id}')window.__kymo_charts['{id}'].setCursor({{left:-10,top:-10}},true,true);
@@ -201,6 +207,8 @@ pub fn UPlotChart(
     /// None means the run's metadata is not available for name grouping.
     run_names: Vec<Option<String>>,
     axis: ShownAxis,
+    /// The step answer behind `chart` has no right bound (no step_max: unzoomed, or a following zoom). A selection to its right edge follows its newest step when the window shown also reaches it (create.js `showsNewest`), and a left-half axis pull when that window ends exactly there.
+    step_open: bool,
     log_y: bool,
     /// From the request options: stroke smoothed values over raw evidence. Unsmoothed envelope charts render min/max data instead of bucket means.
     smoothed: bool,
@@ -217,11 +225,20 @@ pub fn UPlotChart(
     // Push every new data model; rebuild the uPlot instance only when its structural config changes. use_reactive reruns the effect when any prop differs and holds the last props, keeping the previous chart alive (see ChartModel).
     use_effect(use_reactive(
         (
-            &chart, &labels, &colors, &run_names, &axis, &log_y, &smoothed,
+            &chart, &labels, &colors, &run_names, &axis, &step_open, &log_y, &smoothed,
         ),
         {
             let id = chart_id.clone();
-            move |(ChartModel(chart), labels, colors, run_names, axis, log_y, smoothed)| {
+            move |(
+                ChartModel(chart),
+                labels,
+                colors,
+                run_names,
+                axis,
+                step_open,
+                log_y,
+                smoothed,
+            )| {
                 // Read for its subscription: the liveness check bumps it to rerun this effect, which pushes the held model again.
                 let _revive = *revive.read();
                 let log_x = axis.log_x;
@@ -335,7 +352,7 @@ pub fn UPlotChart(
                     all_series = all_series.iter().map(|s| s[start..].to_vec()).collect();
                 }
 
-                push_data_to_js(&id, &x_values, &all_series);
+                push_data_to_js(&id, &x_values, &all_series, step_open);
 
                 // Per run: envelope has area somewhere (see ChartJsConfig::banded). Straight off the wire columns: NaN slots and absent envelopes fail the < and count as degenerate.
                 let banded: Vec<bool> = chart
@@ -365,14 +382,8 @@ pub fn UPlotChart(
                     log_y,
                     font_size,
                 };
-                // Structure-unchanged refreshes swap the arrays in place:
-                // live runs tick on every pushed update, and a full destroy/
-                // recreate per tick reset cursor and tooltip mid-hover. setData
-                // re-ranges x per the scale's auto policy: full extent normally
-                // (zoom-refetch charts carry the zoom window in the data
-                // itself), current window while a client-side zoom is active
-                // (__kymo_userzoom) — either way it commits, so new points
-                // paint without wiping the zoom.
+                // Structure-unchanged refreshes swap the arrays in place: live runs tick on every pushed update, and a full destroy/recreate per tick reset cursor and tooltip mid-hover.
+                // setData re-ranges x per the scale's auto policy (create.js): the full extent normally (zoom-refetch charts carry the zoom window in the data itself), the window of a fixed client-side zoom, or a following one's start through the newest point. While an axis pull holds the chart, x takes the pull's window instead. Each commits, so new points paint without wiping the zoom.
                 let structure_unchanged = last_create_config.peek().as_ref() == Some(&cfg);
                 if !structure_unchanged {
                     last_create_config.set(Some(cfg.clone()));
@@ -444,6 +455,13 @@ const td=window.__kymo_bridges.mount(__BRIDGE_NAME__,__BRIDGE_OWNER__,cleanup);
 document.addEventListener('kymo-zoom',h);
 })()"#;
 
+/// The step store's window for a `kymo-zoom` detail, which only a gesture's source chart sends: its real-x range quantized outward to inclusive whole steps, open-ended for a following zoom (no xmax), or None for a reset (no xmin). Stored through set_if_changed, a reselected whole-bucket window refetches nothing.
+fn step_window(detail: &serde_json::Value) -> Option<(i64, Option<i64>)> {
+    let xmin = detail.get("xmin").and_then(|v| v.as_f64())?;
+    let xmax = detail.get("xmax").and_then(|v| v.as_f64());
+    Some((xmin.floor() as i64, xmax.map(|b| b.ceil() as i64)))
+}
+
 #[component]
 pub fn ZoomBridge() -> Element {
     let state = use_context::<crate::state::DashboardState>();
@@ -455,13 +473,7 @@ pub fn ZoomBridge() -> Element {
             loop {
                 match eval.recv::<serde_json::Value>().await {
                     Ok(val) => {
-                        let xmin = val.get("xmin").and_then(|v| v.as_f64());
-                        let xmax = val.get("xmax").and_then(|v| v.as_f64());
-                        // The physical gesture source dispatches one real-x range. Quantize it outward to inclusive whole steps; the peek gate keeps an idempotent whole-bucket selection from refetching.
-                        let z = xmin
-                            .zip(xmax)
-                            .map(|(a, b)| (a.floor() as i64, b.ceil() as i64));
-                        set_if_changed(state.step_zoom, z);
+                        set_if_changed(state.step_zoom, step_window(&val));
                     }
                     Err(_) => {
                         // Structurally near-impossible while the listener is attached (it pins the channel); if it ever fires, zoom is dead until the next dashboard mount — say so.
@@ -486,6 +498,20 @@ mod bridge_template_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_step_zoom_is_whole_steps_outward_open_ended_when_following() {
+        let z = |v: serde_json::Value| step_window(&v);
+        assert_eq!(
+            z(serde_json::json!({"xmin": 10.5, "xmax": 99.2})),
+            Some((10, Some(100)))
+        );
+        assert_eq!(
+            z(serde_json::json!({"xmin": 10.5, "xmax": null})),
+            Some((10, None))
+        );
+        assert_eq!(z(serde_json::json!({"xmin": null, "xmax": null})), None);
+    }
 
     #[test]
     fn chart_destroy_clears_every_template_owned_per_chart_global() {

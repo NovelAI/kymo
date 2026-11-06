@@ -4,7 +4,7 @@ if(!window.__kymo_zm){
 __KYMO_ZOOM_MATH__
 window.__kymo_zm=KYMO_ZOOM_MATH;
 }
-let {AXIS_LINEAR,AXIS_LOG,AXIS_LOG1P,buildFrozenSupports,buildFrozenSourceMap,mapSourcePageX,expandWholeBuckets}=window.__kymo_zm;
+let {AXIS_LINEAR,AXIS_LOG,AXIS_LOG1P,buildFrozenSupports,buildSourceMap,mapSourcePlotX,expandWholeBuckets}=window.__kymo_zm;
 let {nullGaps,createHoverPointLookup,plotPosition}=window.__kymo_hp;
 if(!window.__kymo_charts) window.__kymo_charts={};
 let el=document.getElementById('__KYMO_ID__');
@@ -33,17 +33,17 @@ if(prev&&prev.root&&prev.root.isConnected&&prev.__kymo_cfghash==='__KYMO_CFG_HAS
 let box=el.getBoundingClientRect(),w=Math.floor(box.width)||600,h=box.height||parseFloat(getComputedStyle(el).height);
 // The x axis a client-side zoom's window is in: its kind (the sync key) and its scale. Its log shift follows from them: relative time on a log axis always starts at 0, and wall time and custom x never shift.
 let axisKey='__KYMO_SYNC_KEY__|__KYMO_X_DISTR__';
+// This chart's axis pull, while one holds it: the gesture owner with the pull's `range` (a selection's owner, with the same srcId, has none).
+let pulling=function(){let zg=window.__kymo_zg;return zg&&zg.srcId==='__KYMO_ID__'&&zg.range?zg:null;};
 // A client-side zoom lives only on the instance, so a rebuild for anything but the x axis (a recolor, a rename, a run's first NaN or spread bucket) carries it over rather than resetting what the user zoomed to. Step charts zoom through the step store and never set it.
-// During an axis pull on this chart the window carried is the one the pull started from (its `start`): the pull, cancelled below, has already moved the scale, and uPlot commits its restore later. A selection moves no scale before its release.
-let gesture=window.__kymo_zg&&window.__kymo_zg.srcId==='__KYMO_ID__'?window.__kymo_zg.start:null;
-let was=prev&&(gesture||{min:prev.scales.x.min,max:prev.scales.x.max,userzoom:prev.__kymo_userzoom});
-// Limit: a second create before uPlot's commit microtask, which no path is known to make, would carry the first instance's still-null scale: the chart shows its full extent but stays marked zoomed, not following live data, until a reset.
-let keepZoom=was&&was.userzoom&&prev.__kymo_axiskey===axisKey?{min:was.min,max:was.max}:null;
+// During an axis pull on this chart the window carried is the one the pull started from (its own lo, hi and userzoom), not the scale it has moved: its cancel below only queues the restore, which destroy drops. A selection moves no scale before its release.
+let was=prev&&(pulling()||{lo:prev.scales.x.min,hi:prev.scales.x.max,userzoom:prev.__kymo_userzoom});
+// Limit: a second create before uPlot's commit microtask, which no path is known to make, would carry the first instance's still-null scale: a fixed zoom shows its full extent but stays marked zoomed until a reset, and a following one is left without an x minimum.
+let keepZoom=was&&was.userzoom&&prev.__kymo_axiskey===axisKey?was:null;
 if(prev){
-  // A structural source rebuild invalidates the gesture-start geometry and
-  // slot snapshot. Peer rebuilds are harmless and repaint after registration.
+  // A structural source rebuild replaces the instance the active gesture reads, and with it a pull's gesture-start geometry and slot snapshot. Peer rebuilds are harmless and repaint after registration.
   let zg=window.__kymo_zg;
-  if(zg&&zg.srcId==='__KYMO_ID__'&&zg.cancel)zg.cancel();
+  if(zg&&zg.srcId==='__KYMO_ID__')zg.cancel();
   // A rebuilt hover source clears through the normal path first, so synced readouts don't outlive the old instance.
   if(window.__kymo_hoversrc==='__KYMO_ID__')prev.setCursor({left:-10,top:-10},true,true);
   prev.destroy();
@@ -80,9 +80,8 @@ let tip=document.getElementById('__KYMO_ID__-tip');
 if(!tip){tip=document.createElement('div');tip.id='__KYMO_ID__-tip';tip.className='kymo-tip';document.body.appendChild(tip);}
 // Hidden until this instance's hover hook shows it on the next move or synced update, so a failed rebuild leaves no stale tooltip.
 tip.style.display='none';
-// What the plotted x adds to the real one: a zero-present log x plots x+1 in the wire's units, 1 on a step axis and 1 ms on a time one. Labels and readouts take it off, and so does every window handed between charts, which each receiving chart puts its own back on. xShift is that same 1 on a step axis, whose zoom geometry (AXIS_LOG1P, bucket evidence) works in it; a time axis keeps its geometry unshifted.
+// What the plotted x adds to the real one: a zero-present log x plots x+1 in the wire's units, 1 on a step axis and 1 ms on a time one. Labels and readouts take it off, and so does every window handed between charts, which each receiving chart puts its own back on.
 let readoutXShift=__KYMO_READOUT_X_SHIFT__;
-let xShift=zoomRefetch?readoutXShift:0;
 // The decimal digits s needs, up to `cap` (8 by default). The comparison with 1e-6 is inclusive, so an increment of exactly 1e-6 needs six.
 let decFor=function(s,cap){
   var dec=0;
@@ -330,7 +329,7 @@ let yNice=function(u,mn,mx){
   let i=cap>=5*p?5*p:cap>=2*p?2*p:p;
   return[Math.floor(mn/i)*i,Math.ceil(mx/i)*i];
 };
-// Log-x range: the data's own ends, not the powers of 10 uPlot's default would snap to. uPlot calls it only to range data[0], which is ascending and >0 (the build trims x<=0 for log-x); explicit bounds skip it (applyClientRange clamps its own).
+// Log-x range: the data's own ends, not the powers of 10 uPlot's default would snap to. uPlot calls it only to range data[0], which is ascending and >0 (the build trims x<=0 for log-x); explicit bounds skip it (commitZoom clamps its own).
 // No data gets a neutral decade, and a single x value a decade either side, since this replaces uPlot's own single-value widening.
 // Limit: from about 1.8e307 up, that decade overflows to Infinity.
 let logXRange=function(u,mn,mx){return mn==null?[1,10]:mn===mx?[mn/10,mn*10]:[mn,mx];};
@@ -398,8 +397,9 @@ let u=new uPlot({
   legend:{show:false},
   // _focus is our z-order signal (uPlot paints a series or band group with a _focus member last); alpha:1 keeps uPlot's native focus from ALSO dimming, so series.alpha stays entirely ours.
   focus:{alpha:1},
-  // x auto IS the zoom policy: it gates setData's re-range (uPlot consults it nowhere else that matters in mode 1). Unzoomed, every live flush re-ranges x to the full extent — the chart follows a growing run. While a client-side zoom is active (__kymo_userzoom: set by drag-select/gutter-select/axis-pull, cleared by the configured reset click) setData keeps the current window but still commits, so new points landing inside the window paint on the flush that delivers them. Declaring the policy on the scale keeps every setData caller a plain setData(data) — passing resetScales=false instead skips the commit and freezes the zoomed chart until the next interaction.
-  scales:{x:{time:false,distr:__KYMO_X_DISTR__,...(isLogX?{range:logXRange}:{}),auto:u=>!u.__kymo_userzoom},...__KYMO_SYNC_SCALE__,y:{distr:__KYMO_Y_DISTR__,range:__KYMO_Y_DISTR__===3?yNiceLog:yNice}},
+  // x auto IS the zoom policy: it gates setData's re-range (uPlot consults it nowhere else that matters in mode 1). Declaring it on the scale keeps every setData caller a plain setData(data) — passing resetScales=false instead skips the commit and freezes the zoomed chart until the next interaction.
+  // Unzoomed, every live flush re-ranges x to the full extent — the chart follows a growing run. A fixed client-side zoom (__kymo_userzoom true: set by a selection or an axis pull, cleared by the configured reset click) keeps its window but still commits, so new points landing inside it paint on the flush that delivers them. A following zoom (__kymo_userzoom 'follow': a selection to the right edge of a chart that showed its newest point, or a left-half axis pull on a window ending exactly at it) re-ranges like an unzoomed chart, its start pinned by the x range wrapped below. While an axis pull holds the chart, the pull decides, on step charts too: a following one re-ranges, any other keeps its window.
+  scales:{x:{time:false,distr:__KYMO_X_DISTR__,...(isLogX?{range:logXRange}:{}),auto:u=>{let pull=pulling();return pull?pull.follow:u.__kymo_userzoom!==true;}},...__KYMO_SYNC_SCALE__,y:{distr:__KYMO_Y_DISTR__,range:__KYMO_Y_DISTR__===3?yNiceLog:yNice}},
   // kymo owns zoom gestures. Leaving uPlot's native drag armed gives every
   // synced chart an independent pixel-space drag state, which lets a peer
   // revive the source selection and makes every peer commit on mouseup.
@@ -457,8 +457,9 @@ let u=new uPlot({
     // size is a function: the axis grows to fit its widest label (uPlot re-asks on every scale change) until the narrow-cell plot floor below wins. Every label is measured — with proportional glyphs the longest string isn't always the widest. The preference-scaled floor keeps plot left edges aligned across a grid column of short-label charts.
     {stroke:axColor,grid:{stroke:gridColor,width:1},ticks:{stroke:gridColor,width:1,size:5},font:'__KYMO_AXIS_FONT_SIZE__px sans-serif',gap:6,
      size:function(u,values,axisIdx){
-       let ax=u.axes[axisIdx];
-       let measured=Math.max(__KYMO_Y_AXIS_MIN_SIZE__,Math.ceil(ax.ticks.size+ax.gap+Math.max(0,...(values||[]).map(measurer(u,axisIdx)))));
+       let ax=u.axes[axisIdx],pull=pulling();
+       // An axis pull holds the width it pressed on, so the plot's left edge stays where the pull's frame (the plot's page x at the press) has it while the labels change: wider ones are cut at the canvas edge until the pull ends.
+       let measured=pull?pull.hold:Math.max(__KYMO_Y_AXIS_MIN_SIZE__,Math.ceil(ax.ticks.size+ax.gap+Math.max(0,...(values||[]).map(measurer(u,axisIdx)))));
        // A narrow grid cell can be smaller than a long formatted label. Cap
        // this gutter after measurement so the right pad (12px above) and a
        // minimally useful plot keep non-negative geometry; ordinary charts
@@ -479,11 +480,20 @@ u.__kymo_copy={xLabel:'__KYMO_X_LABEL__',lineBase:lineBase,seriesCount:labels.le
 window.__kymo_charts['__KYMO_ID__']=u;
 u.__kymo_cfghash='__KYMO_CFG_HASH__';
 u.__kymo_axiskey=axisKey;
-if(keepZoom){u.setScale('x',keepZoom);u.__kymo_userzoom=true;}
+// The end of a following window from lo to hi on chart c: its newest x when that lies past lo, else hi (a chart whose data ends before lo, or has none, keeps its window).
+let followEnd=function(c,lo,hi){let xs=c.data[0],e=xs[xs.length-1];return e>lo?e:hi;};
+// Whether chart c shows its newest data, which a selection to its right edge or a left-half axis pull may follow: its window ends at or past its newest x and, on a step chart, the answer had no right bound (`stepOpen` on its x column, push_data_to_js); a step chart's window falls short of its data only after a pull narrowed it, until that pull's refetch answers.
+let showsNewest=function(c){let xs=c.data[0];return c.scales.x.max>=xs[xs.length-1]&&(!c.__kymo_zoom.zr||xs.stepOpen);};
+// Puts the client-side window from lo to hi on chart c with zoom state `zoom` (its __kymo_userzoom: falsy none, true fixed, 'follow' ending at followEnd). Unzoomed, lo and hi go unused: open bounds range the data as on creation, so a single x value widens rather than collapsing to a zero span.
+let zoomX=function(c,lo,hi,zoom){c.__kymo_userzoom=zoom;c.setScale('x',zoom?{min:lo,max:zoom==='follow'?followEnd(c,lo,hi):hi}:{min:null,max:null});};
+// A reply's re-range (x auto is on) keeps a following window's start and ends it at followEnd, or, while a following axis pull holds the chart, solves the pull against the reply's newest x.
+let fitX=u.scales.x.range;
+u.scales.x.range=function(u,mn,mx,k){let pull=pulling();return pull?pull.range():u.__kymo_userzoom==='follow'?[u.scales.x.min,followEnd(u,u.scales.x.min,u.scales.x.max)]:fitX(u,mn,mx,k);};
+if(keepZoom)zoomX(u,keepZoom.lo,keepZoom.hi,keepZoom.userzoom);
 // Dynamic metadata read by the once-installed gesture listeners. Keep it on
 // the current uPlot instance so a config rebuild cannot leave those listeners
 // using the first build's x-range column offsets or log transform.
-u.__kymo_zoom={zr:zoomRefetch,xShift:xShift,readoutXShift:readoutXShift,xrBase:hasXr?xrBase:null,axis:isLogX?(xShift?AXIS_LOG1P:AXIS_LOG):AXIS_LINEAR};
+u.__kymo_zoom={zr:zoomRefetch,readoutXShift:readoutXShift,xrBase:hasXr?xrBase:null,axis:isLogX?(zoomRefetch&&readoutXShift?AXIS_LOG1P:AXIS_LOG):AXIS_LINEAR};
 u.__kymo_hl={runs:runIds,names:runNames,rs:rawStride};
 // applyHl's retag reaches the tip through the instance; the tip node outlives rebuilds, so a recreated u re-adopts it.
 u.__kymo_tip=tip;
@@ -508,7 +518,7 @@ window.__kymo_ro['__KYMO_ID__']=new ResizeObserver(()=>{
       // Only a real container resize invalidates the frozen source geometry.
       // Restore/cancel after uPlot releases its commit queue; internal axis
       // resizing also fires setSize hooks but never reaches here.
-      if(owner&&owner.srcId==='__KYMO_ID__'&&owner.cancel)queueMicrotask(function(){if(window.__kymo_zg===owner)owner.cancel();});
+      if(owner&&owner.srcId==='__KYMO_ID__')queueMicrotask(function(){if(window.__kymo_zg===owner)owner.cancel();});
     }
   }
 });
@@ -520,35 +530,43 @@ let eachPeer=function(sync,fn){
   let cs=window.__kymo_charts||{};
   for(let id in cs){let peer=cs[id],meta=peer&&peer.__kymo_zoom;if(meta&&peer.cursor.sync.key===sync)fn(peer,meta);}
 };
-// A client-side zoom's one commit, for a selection and an axis pull alike: the real-x window goes to every chart in the sync group but `except` (an axis pull's source, already showing it). A log-x peer takes the part it can show: a lower bound at or below 0 (a pull past a linear chart's data reaches there) is raised to its first plotted x, and the peer is left alone when the window ends before that x or it has no x data.
-let applyClientRange=function(sync,range,except){
-  eachPeer(sync,function(c,m){
-    if(c===except)return;
+// A zoom's one commit, for a selection and an axis pull alike: the real-x window (`range`) made on chart src, following the newest data when `follow`. A step chart asks the step store for it, a following window with no xmax, for the store and the server to leave open. A client chart's goes to every chart in its sync group, a following one ending at each chart's own newest point, now and on every reply; the source of an axis pull, already showing it (`shown`), takes only the zoom state.
+let commitZoom=function(src,range,follow,shown){
+  if(src.__kymo_zoom.zr){el.dispatchEvent(new CustomEvent('kymo-zoom',{detail:{xmin:range.lo,xmax:follow?null:range.hi},bubbles:true}));return;}
+  let zoom=follow?'follow':true;
+  eachPeer(src.cursor.sync.key,function(c,m){
+    if(shown&&c===src){c.__kymo_userzoom=zoom;return;}
     let lo=range.lo+m.readoutXShift,hi=range.hi+m.readoutXShift;
+    // A log-x peer takes the part it can show: a lower bound at or below 0 (a pull past a linear chart's data reaches there) is raised to its first plotted x, and the peer is left alone when the window ends before that x or it has no x data.
     if(c.scales.x.distr===3&&!(lo>0)){if(!(hi>c.data[0][0]))return;lo=c.data[0][0];}
-    c.setScale('x',{min:lo,max:hi});c.__kymo_userzoom=true;
+    zoomX(c,lo,hi,zoom);
   });
 };
 let singleClickUnzoom=function(){return document.documentElement.getAttribute('data-kymo-single-click-unzoom')==='true';};
-// Click suppression follows pointer travel in both axes; selecting a zoom
-// range still uses horizontal displacement only. Latch during movement so
-// returning to the starting point cannot turn a drag into a reset click.
-let suppressDragClick=function(start,end){
-  if(Math.hypot(end.pageX-start.pageX,end.pageY-start.pageY)>=3)el.__kymo_skipUnzoomClick=true;
+// Gives the page's one gesture slot to owner for the drag pressed by ev, until a release (a mouseup, or a move with the button up when the mouseup landed outside the window and never came) calls end(true), or a cancel (Escape, lost focus, owner.cancel) calls end(false). A drag ends where its last move left it, release latch included: a browser delivers any pending move before the mouseup, and the dashboard's document never scrolls under a held button (its shell scrolls .main-content, which moves no pointer page x). Each move, once the hand is 3 px from the press in any direction, latches the click the release will make, so coming back can't turn a drag into a reset click, then goes to move; a cancel latches that click too, so it can't reset what the cancel kept (the next press clears a latch no click took). Window listeners live only for the drag: idle charts add no per-mousemove work and hold no references.
+let drag=function(ev,owner,move,end){
+  let stop=function(commit){
+    for(let type in on)window.removeEventListener(type,on[type]);
+    if(window.__kymo_zg===owner)window.__kymo_zg=null;
+    end(commit);
+  };
+  let cancel=function(){el.__kymo_skipUnzoomClick=true;stop(false);};
+  let on={
+    mousemove:function(e){if((e.buttons&1)===0)stop(true);else{if(Math.hypot(e.pageX-ev.pageX,e.pageY-ev.pageY)>=3)el.__kymo_skipUnzoomClick=true;move(e);}},
+    mouseup:function(e){if(e.button===0)stop(true);},
+    blur:cancel,
+    keydown:function(e){if(e.key==='Escape')cancel();},
+  };
+  owner.cancel=cancel;
+  window.__kymo_zg=owner;
+  ev.preventDefault();
+  for(let type in on)window.addEventListener(type,on[type]);
 };
 let resetZoom=function(){
     let c=window.__kymo_charts['__KYMO_ID__'];
     if(!c)return;
-    if(c.__kymo_zoom.zr){
-      el.dispatchEvent(new CustomEvent('kymo-zoom',{detail:{xmin:null,xmax:null},bubbles:true}));
-    }else{
-      eachPeer(c.cursor.sync.key,function(peer,meta){
-        if(meta.zr||!peer.__kymo_userzoom)return;
-        // Open bounds range the data as on creation, so a single x value widens rather than collapsing to a zero span.
-        peer.setScale('x',{min:null,max:null});
-        peer.__kymo_userzoom=false;
-      });
-    }
+    if(c.__kymo_zoom.zr)el.dispatchEvent(new CustomEvent('kymo-zoom',{detail:{xmin:null,xmax:null},bubbles:true}));
+    else eachPeer(c.cursor.sync.key,function(peer){if(peer.__kymo_userzoom)zoomX(peer,null,null,false);});
 };
 if(!el.__kymo_unzoomclick){
   el.__kymo_unzoomclick=true;
@@ -561,11 +579,11 @@ if(!el.__kymo_unzoomclick){
     if(!singleClickUnzoom())resetZoom();
   });
 }
-// The axis-pull strip, measured from the plot overlay like plotPosition, so it starts exactly where the hover band ends.
+// The axis-pull strip, measured from the plot overlay like plotPosition, so it starts exactly where the hover band ends. pageLeft is the plot's left edge in the page, the frame a pull holds for its moves as a selection holds wrapLeft: no layout read per move, and a chart that moves without resizing mid-pull (a new metric's chart landing before it) leaves the window where the hand had it rather than jumping.
 let strip=function(c,ev){
   let r=el.getBoundingClientRect(),o=c.over.getBoundingClientRect();
   let left=o.left-r.left,w=o.width,px=ev.clientX-r.left;
-  return {left:left,w:w,px:px,inside:w>0&&ev.clientY-o.top>o.height&&ev.clientY<=r.bottom&&px>=left-10&&px<=left+w+10};
+  return {left:left,w:w,px:px,pageLeft:o.left+window.scrollX,inside:w>0&&ev.clientY-o.top>o.height&&ev.clientY<=r.bottom&&px>=left-10&&px<=left+w+10};
 };
 // kymo owns hover: this one container listener maps every move through plotPosition, so the plot and its side gutters share one rule. The y-axis gutter and right padding stay live on the first/last column (AI-1279); above/below the plot band (title, axis strip) clears.
 // The source (window.__kymo_hoversrc) is the chart the mouse moves over: only it builds the full tooltip and drives the highlight; synced charts show compact readouts.
@@ -590,15 +608,15 @@ if(!el.__kymo_hover){
   });
 }
 let stepSupports=function(c,m){
-  if(!m||!m.zr)return null;
+  if(!m.zr)return null;
   let xl=m.xrBase!=null?c.data[m.xrBase]:null,xh=m.xrBase!=null?c.data[m.xrBase+1]:null;
-  let frozen=buildFrozenSupports({plotXs:c.data[0],xrMin:xl,xrMax:xh,xShift:m.xShift});
+  let frozen=buildFrozenSupports({plotXs:c.data[0],xrMin:xl,xrMax:xh,xShift:m.readoutXShift});
   return frozen.coverage?frozen:null;
 };
-// One kymo-owned x-selection gesture for plot and side-gutter starts.
+// One kymo-owned x-selection gesture for plot and side-gutter starts; its mousedown listener also starts the axis pull (pullPress) for a press on the strip below.
 // uPlot's native mousedown is disabled above, so synced peers remain hover
-// sources only: every pageX is interpreted through the physical source's
-// frozen geometry and bucket evidence, even while the pointer is over a peer.
+// sources only: every pageX is interpreted through the source chart,
+// even while the pointer is over a peer.
 if(!el.__kymo_zoomselect){
   el.__kymo_zoomselect=true;
   let hide={left:0,width:0,top:0,height:0};
@@ -614,38 +632,6 @@ if(!el.__kymo_zoomselect){
       c.setSelect({left:p0,width:p1-p0,top:0,height:c.bbox.height/devicePixelRatio},false);
     });
   };
-  let snapshot=function(c){
-    let m=c.__kymo_zoom;
-    if(!m||!c.data||!c.data[0]||!c.data[0].length)return null;
-    // Refetched step charts resolve real, unshifted bucket evidence. Client
-    // time/custom charts never recover raw evidence, so retain their exact
-    // already-plotted domain (including relative log-time's folded +1ms).
-    let supports=stepSupports(c,m);
-    if(m.zr&&!supports)return null;
-    let o=c.over.getBoundingClientRect();
-    let visualLo=c.scales.x.min-m.xShift,visualHi=c.scales.x.max-m.xShift;
-    let coverageLo=m.zr?supports.coverage.lo:visualLo,coverageHi=m.zr?supports.coverage.hi:visualHi;
-    let map=buildFrozenSourceMap({axis:m.axis,plotLeft:o.left+window.scrollX,width:o.width,visualLo:visualLo,visualHi:visualHi,coverageLo:coverageLo,coverageHi:coverageHi});
-    // The map reads the zoom geometry's x; toReal takes the rest of the plotted shift off, for the real x the gesture's windows are in.
-    return map?{source:c,srcId:'__KYMO_ID__',sync:c.cursor.sync.key,zr:m.zr,supports:supports,map:map,lo:visualLo,hi:visualHi,toReal:m.readoutXShift-m.xShift}:null;
-  };
-  let endpoint=function(s,x){
-    // Client-only charts retain their exact, plot-clamped selection. Step
-    // charts extrapolate without bound in the frozen source transform.
-    // A clamped edge is the scale's own bound: through log and back, a shifted chart's 0.001 (real 0) returns as 0.0010000000000000002, a real 2e-19, which would start a shifted peer's window just past its first point and drop its 0s tick.
-    if(!s.zr){if(x<=s.map.plotLeft)return s.lo;if(x>=s.map.plotLeft+s.map.width)return s.hi;}
-    return mapSourcePageX(s.map,x);
-  };
-  let nominal=function(s){
-    let a=endpoint(s,s.downX),b=endpoint(s,s.lastX);
-    if(!(Number.isFinite(a)&&Number.isFinite(b)))return null;
-    return {lo:Math.min(a,b)-s.toReal,hi:Math.max(a,b)-s.toReal};
-  };
-  let resolved=function(s){
-    let r=nominal(s);
-    if(!r)return null;
-    return s.zr?expandWholeBuckets(s.supports,r.lo,r.hi):r;
-  };
   el.addEventListener('mousedown',function(ev){
     if(ev.button!==0)return;
     // Clear a stale latch from a drag released outside this element (no click
@@ -654,163 +640,104 @@ if(!el.__kymo_zoomselect){
     if(window.__kymo_zg)return;
     let c=window.__kymo_charts['__KYMO_ID__'];
     if(!c)return;
-    // Presses where hover is live (plot height, gutters included) select; the axis strip below belongs to axis-pull.
-    if(!plotPosition(c,ev.clientX,ev.clientY))return;
-    let s=snapshot(c);
-    if(!s)return;
-    s.downX=s.lastX=ev.pageX;
-    let cleanup=function(){
-      window.removeEventListener('mousemove',onmove);
-      window.removeEventListener('mouseup',onup);
-      window.removeEventListener('blur',cleanup);
-      window.removeEventListener('keydown',onkey);
-      clearBoxes(s.sync);
-      if(window.__kymo_zg===s)window.__kymo_zg=null;
+    // Presses where hover is live (plot height, gutters included) select; one on the axis strip below pulls the axis.
+    if(!plotPosition(c,ev.clientX,ev.clientY)){pullPress(ev,c);return;}
+    let m=c.__kymo_zoom,sync=c.cursor.sync.key,lastX=ev.pageX,supportsData,supports;
+    if(!c.data[0].length)return;
+    // The plot as it is now: uPlot writes the overlay's inline width and its left within uPlot's wrap, so these read no layout. The wrap's page x (wrapLeft) is the press's; a container resize cancels the gesture.
+    let wrapLeft=c.over.getBoundingClientRect().left+window.scrollX-parseFloat(c.over.style.left),width=function(){return parseFloat(c.over.style.width);};
+    // The plot x of a page x, snapped as the hover snaps it (plotPosition): within 1 px of a side is that side, where the readout shows the first or the newest point.
+    let plotX=function(x){let px=x-wrapLeft-parseFloat(c.over.style.left),w=width();return px>0&&px<=1?0:px<w&&px>=w-1?w:px;};
+    // The real x of a selection end at plot x px, read from the plot as it is now: the x under the pointer, or past an edge, a step chart's extrapolation from its bucket coverage, and a client chart's own bound for that edge, less its plotted shift. A step chart maps through its plot, visual range and bucket evidence (`supports`, which resolved expands the window to, rebuilt only when a reply replaces the data).
+    let endpoint=function(px){
+      // The bound is exact where posToVal, through log10 and back, is not: at the right edge of a log chart from 0.001 to 3600.001 it returns 3600.0009999999957, which would end the window just short of its last point.
+      if(!m.zr)return (px<=0?c.scales.x.min:px>=width()?c.scales.x.max:c.posToVal(px,'x'))-m.readoutXShift;
+      if(supportsData!==c.data){supportsData=c.data;supports=stepSupports(c,m);}
+      return mapSourcePlotX(supports&&buildSourceMap({axis:m.axis,width:width(),visualLo:c.scales.x.min-m.readoutXShift,visualHi:c.scales.x.max-m.readoutXShift,coverageLo:supports.coverage.lo,coverageHi:supports.coverage.hi}),px);
     };
-    let moved=function(){return Math.abs(s.lastX-s.downX)>=3;};
-    let paint=function(){
-      if(window.__kymo_zg!==s)return;
-      let r=moved()?resolved(s):null;
-      if(r&&r.hi>r.lo)paintRange(s.sync,r);else clearBoxes(s.sync);
+    let px=plotX(ev.pageX),w=width(),x0=endpoint(px);
+    // A press whose x can't be read, as on a step chart without bucket evidence, makes no selection.
+    if(!Number.isFinite(x0))return;
+    // The press keeps the x it had or, made at or past an edge, its place past that edge, resolved against the plot as it is now.
+    let down=px<=0?{edge:0,past:px}:px>=w?{edge:1,past:px-w}:x0;
+    // The real-x window the selection makes, or null when it makes none; the moving end is read anew from the pointer. `reachesRightEdge`: an end is at or past the right edge, so the window may follow the newest data there.
+    let resolved=function(){
+      if(Math.abs(lastX-ev.pageX)<3)return null;
+      let w=width(),px=plotX(lastX),a=typeof down==='number'?down:endpoint(down.edge*w+down.past),b=endpoint(px);
+      if(!(Number.isFinite(a)&&Number.isFinite(b)))return null;
+      let r=m.zr?expandWholeBuckets(supports,a,b):{lo:Math.min(a,b),hi:Math.max(a,b)};
+      if(!r||!(r.hi>r.lo))return null;
+      r.reachesRightEdge=px>=w||down.edge===1;
+      return r;
     };
-    let finish=function(finalX){
-      if(window.__kymo_zg!==s)return;
-      if(Number.isFinite(finalX))s.lastX=finalX;
-      let live=window.__kymo_charts[s.srcId];
-      let range=moved()&&live===s.source?resolved(s):null;
-      cleanup();
-      if(!range||!(range.hi>range.lo))return;
-      if(s.zr){
-        el.dispatchEvent(new CustomEvent('kymo-zoom',{detail:{xmin:range.lo,xmax:range.hi},bubbles:true}));
-      }else applyClientRange(s.sync,range,null);
-    };
-    let onmove=function(e2){
-      if(window.__kymo_zg!==s)return;
-      if((e2.buttons&1)===0){finish(null);return;} // missed mouseup: commit last held position
-      let x=e2.pageX;
-      s.lastX=x;
-      suppressDragClick(ev,e2);
-      paint();
-    };
-    let onup=function(e2){if(e2.button===0){suppressDragClick(ev,e2);finish(e2.pageX);}};
-    let onkey=function(e2){if(e2.key==='Escape')cleanup();};
-    s.cancel=cleanup;s.paint=paint;s.cursor='crosshair';
-    window.__kymo_zg=s;
-    ev.preventDefault();
-    window.addEventListener('mousemove',onmove);
-    window.addEventListener('mouseup',onup);
-    window.addEventListener('blur',cleanup);
-    window.addEventListener('keydown',onkey);
+    let s={srcId:'__KYMO_ID__',cursor:'crosshair',paint:function(){
+      let r=resolved();
+      if(r)paintRange(sync,r);else clearBoxes(sync);
+    }};
+    drag(ev,s,function(e2){lastX=e2.pageX;s.paint();},function(commit){
+      let range=commit&&resolved();
+      clearBoxes(sync);
+      // A window that reached the right edge of a chart showing its newest data follows it.
+      if(range)commitZoom(c,range,range.reachesRightEdge&&showsNewest(c));
+    });
   });
 }
-// X-axis bound drag (AI-1284): grab the axis strip below the plot and
-// PULL the axis — the value under the cursor stays under the cursor
-// while the far edge stays pinned (left half pins x-max, right half
-// pins x-min). Starting mid-strip causes no jump (the map is identity
-// until you move), and dragging right with a left-half grab stretches
-// the axis to reveal more history on the left. Geometry is computed in
-// the frame locked at mousedown; the rescale applies live, and release
-// routes the final range through the normal zoom path (full-resolution
-// refetch on step axes). Listeners are registered once per element and look the live chart up by id, surviving chart recreations.
-if(!el.__kymo_axisdrag){
-  el.__kymo_axisdrag=true;
-  el.addEventListener('mousedown',function(ev){
-    let c=window.__kymo_charts['__KYMO_ID__'];
-    if(!c||ev.button!==0||window.__kymo_zg)return;
-    let st=strip(c,ev);
-    if(!st.inside)return;
-    // On a log x scale pixels are linear in log(value): run the same
-    // pull math in log space and exponentiate on the way out.
-    let isLog=c.scales.x.distr===3;
-    let T=isLog?Math.log:function(v){return v};
-    let mn=T(c.scales.x.min),mx=T(c.scales.x.max);
-    let p0=st.px-st.left;
-    // The drag is direct manipulation
-    // and must respond for as long as the hand moves — bounding at the
-    // data extent went dead the moment a full view had nothing left to
-    // reveal. Empty space past the data is what the hand asked for, and a
-    // released pull snaps a step axis back to data via the refetch.
-    // In transformed units: on log, exp(-690) and exp(690) keep both bounds positive and finite; on linear, comfortably sub-overflow.
-    let d0=c.data[0];
-    if(!d0.length)return; // log-x can trim every point; nothing to pull
-    let zm=c.__kymo_zoom,frozen=stepSupports(c,zm);
-    if(zm&&zm.zr&&!frozen)return;
-    // lo and hi are the scale's own bounds, which the pinned edge and a cancel's restore keep exactly, as a selection's clamped edge does (endpoint).
-    let ad={which:p0<st.w/2?'min':'max',mn:mn,mx:mx,lo:c.scales.x.min,hi:c.scales.x.max,v0:mn+p0/st.w*(mx-mn),p0:p0,left:st.left,w:st.w,moved:false,inv:isLog?Math.exp:function(v){return v},blo:isLog?-690:-1e300,bhi:isLog?690:1e300,coverage:frozen&&frozen.coverage,userzoom:!!c.__kymo_userzoom};
-    ev.preventDefault();
-    // Window listeners live only for the duration of the drag — idle
-    // charts add no per-mousemove work and hold no references.
-    let owner=null;
-    let finish=function(commit){
-      window.removeEventListener('mousemove',onmove);
-      window.removeEventListener('mouseup',onup);
-      window.removeEventListener('blur',oncancel);
-      window.removeEventListener('keydown',onkey);
-      let c2=window.__kymo_charts['__KYMO_ID__'];
-      let state=ad,moved=state&&state.moved;
-      ad=null;
-      if(window.__kymo_zg===owner)window.__kymo_zg=null;
-      if(!commit&&c2&&state){c2.setScale('x',{min:state.lo,max:state.hi});c2.__kymo_userzoom=state.userzoom;}
-      if(!commit||!c2||!moved)return;
-      let meta=c2.__kymo_zoom;
-      if(meta.zr){
-        if(!state.coverage)return;
-        let xmin=c2.scales.x.min-meta.xShift,xmax=c2.scales.x.max-meta.xShift;
-        // The hand-owned bound may extrapolate, but the far pinned edge is
-        // represented by a bucket midpoint on downsampled charts. Preserve
-        // that edge's complete source coverage instead of truncating it.
-        if(state.which==='min')xmax=state.coverage.hi;else xmin=state.coverage.lo;
-        el.dispatchEvent(new CustomEvent('kymo-zoom',{detail:{xmin:xmin,xmax:xmax},bubbles:true}));
-      }else{
-        // The pulled window is the group's, as a selection's is; peers take it once, at release, not on every move.
-        applyClientRange(c2.cursor.sync.key,{lo:c2.scales.x.min-meta.readoutXShift,hi:c2.scales.x.max-meta.readoutXShift},c2);
-      }
-    };
-    let onup=function(e2){if(!e2||e2.button===0){if(e2)suppressDragClick(ev,e2);finish(true);}};
-    let oncancel=function(){finish(false);};
-    let onkey=function(e2){if(e2.key==='Escape')finish(false);};
-    let onmove=function(ev2){
-      let c2=window.__kymo_charts['__KYMO_ID__'];
-      if(!ad||!c2)return;
-      // mouseup outside the window never arrives — finish when the button
-      // state says the drag is over.
-      if((ev2.buttons&1)===0){onup();return;}
-      let r2=el.getBoundingClientRect();
-      let p1=ev2.clientX-r2.left-ad.left;
-      ad.moved=Math.abs(p1-ad.p0)>=1;
-      if(ad.moved)el.__kymo_skipUnzoomClick=true;
-      suppressDragClick(ev,ev2);
-      // Exact pin inside the plot box: v0 stays under the cursor, the far
-      // edge stays pinned. Past the pixel clamps — including the cursor
-      // leaving the panel — the pull continues exponentially at the rate
-      // the 1/p asymptote has at the clamp (C1 handoff), so dragging
-      // off-panel keeps revealing instead of saturating at the edge. The
-      // clamp sits 25px in: that pins the handoff at an e-fold per 25px
-      // (~1 decade per 58px) — a controllable pull — and softens only the
-      // last pixels, which the raw asymptote made hyper-sensitive anyway.
-      // The blo/bhi bounds keep the asymptote from overflowing.
-      let m=Math.min(25,ad.w/4);
-      let q=Math.min(Math.max(p1,m),ad.w-m);
-      if(ad.which==='min'){
-        // Fitting [v0, max] into [q, w] gives span (mx-v0)*w/(w-q).
-        let lnS=Math.log(ad.mx-ad.v0)+Math.log(ad.w/(ad.w-q))+(p1-q)/(ad.w-q);
-        c2.setScale('x',{min:ad.inv(Math.max(ad.mx-Math.exp(lnS),ad.blo)),max:ad.hi});
-      }else{
-        // Mirror: min pinned at the left edge, span (v0-mn)*w/q.
-        let lnS=Math.log(ad.v0-ad.mn)+Math.log(ad.w/q)-(p1-q)/q;
-        c2.setScale('x',{min:ad.lo,max:ad.inv(Math.min(ad.mn+Math.exp(lnS),ad.bhi))});
-      }
-      // Client-side charts have no release refetch: the pulled window is the new view and must survive live refreshes. A hand within a pixel of its press marks no zoom, though its window may have moved by less than a pixel.
-      if(!c2.__kymo_zoom.zr)c2.__kymo_userzoom=ad.moved||ad.userzoom;
-    };
-    owner={srcId:'__KYMO_ID__',cancel:oncancel,cursor:'ew-resize',start:{min:c.scales.x.min,max:c.scales.x.max,userzoom:ad.userzoom}};
-    window.__kymo_zg=owner;
-    window.addEventListener('mousemove',onmove);
-    window.addEventListener('mouseup',onup);
-    window.addEventListener('blur',oncancel);
-    window.addEventListener('keydown',onkey);
+// X-axis pull (AI-1284): grab the axis strip below the plot and pull. In the frame locked at mousedown the grabbed value stays under the hand while the far edge stays pinned (left half pins x-max, right half x-min); a press makes no jump (the map is identity until the hand moves, inside the pixel clamps), and a pull responds for as long as the hand moves, into empty space past the data (bounding it at the data's extent went dead the moment a full view had nothing left to reveal). Moves rescale the source live; the release commits the group's window, or refetches a step chart, which snaps it back to its data.
+// A left-half pull on a window ending exactly at its newest x, showing its newest data (showsNewest), follows it while held and after: its pinned edge is the newest x, which a reply mid-pull moves with the grabbed value kept under the hand between the pixel clamps. Any other pull keeps its window through replies, a left-half one on a window reaching past its data included (a lone x value, which uPlot widens, or a zoom out past the data), whose far edge would otherwise jump to the newest x at the first move.
+// The press itself comes through the selection's mousedown listener (a press outside the plot), which has looked the live chart up by id and cleared any stale click latch.
+let pullPress=function(ev,c){
+  let st=strip(c,ev);
+  if(!st.inside)return;
+  // On a log x scale pixels are linear in log(value): run the same pull math in log space and exponentiate on the way out. bound, in transformed units, keeps the asymptote from overflowing: on log, exp(±690) keeps the window's ends positive and finite; on linear, ±1e300 is comfortably sub-overflow.
+  let isLog=c.scales.x.distr===3;
+  let T=isLog?Math.log:function(v){return v},inv=isLog?Math.exp:T,bound=isLog?690:1e300;
+  let mn=T(c.scales.x.min),mx=T(c.scales.x.max);
+  // m is the pixel clamp's inset, 25px in or a quarter of a narrow plot.
+  let p0=st.px-st.left,p1=p0,w=st.w,m=Math.min(25,w/4),v0=mn+p0/w*(mx-mn),grab=inv(v0);
+  let pressData=c.data,d0=pressData[0],x0=d0[0],xN=d0[d0.length-1];
+  if(!d0.length)return; // log-x can trim every point; nothing to pull
+  let zm=c.__kymo_zoom,cov=stepSupports(c,zm)?.coverage;
+  let which=p0<w/2?'min':'max';
+  // The pull's gesture owner: it holds the y gutter at its laid-out width (the y size function) and, following, ranges x for a reply mid-pull (x auto is off for any other pull). lo and hi are the scale's own bounds, kept exactly by a fixed pull's pinned edge and a restore, as a selection's end past an edge does (endpoint); they and userzoom are what a rebuild mid-pull carries.
+  let pull={srcId:'__KYMO_ID__',cursor:'ew-resize',hold:c.axes[1]._size,lo:c.scales.x.min,hi:c.scales.x.max,userzoom:c.__kymo_userzoom};
+  pull.follow=which==='min'&&pull.hi===xN&&showsNewest(c);
+  // A step window other than its data's extent is an earlier pull's, its refetch pending: a restore keeps it as it was. A lone x value has no extent to compare (uPlot widens it), so its window restores as an unzoomed one, on the data held then.
+  let keepStepWindow=zm.zr&&x0!==xN&&(pull.lo!==x0||pull.hi!==xN);
+  // The window for the hand at its last place (p1), as [min, max]. Exact pin between the pixel clamps: v0 stays under the cursor, the far edge stays pinned (a following pull's at the chart's newest x). Past them — including the cursor leaving the panel — the pull continues exponentially at the rate the 1/p asymptote has at the clamp (C1 handoff), so dragging off-panel keeps revealing instead of saturating at the edge. The clamp sits 25px in: that pins the handoff at an e-fold per 25px (~1 decade per 58px) — a controllable pull — and softens only the last pixels, which the raw asymptote made hyper-sensitive anyway.
+  pull.range=function(){
+    let q=Math.min(Math.max(p1,m),w-m);
+    if(which==='min'){
+      let hi=pull.follow?followEnd(c,grab,pull.hi):pull.hi,mx=T(hi);
+      // Fitting [v0, max] into [q, w] gives span (mx-v0)*w/(w-q).
+      let lnS=Math.log(mx-v0)+Math.log(w/(w-q))+(p1-q)/(w-q);
+      return [inv(Math.max(mx-Math.exp(lnS),-bound)),hi];
+    }
+    // Mirror: min pinned at the left edge, span (v0-mn)*w/q.
+    let lnS=Math.log(v0-mn)+Math.log(w/q)-(p1-q)/q;
+    return [pull.lo,inv(Math.min(mn+Math.exp(lnS),bound))];
+  };
+  // A rebuild or unmount cancels the pull before it replaces the chart, so the pull keeps the chart it pressed on (c) to the end.
+  drag(ev,pull,function(ev2){
+    p1=ev2.pageX-st.pageLeft;
+    if(Math.abs(p1-p0)>=1)el.__kymo_skipUnzoomClick=true;
+    let win=pull.range();
+    c.setScale('x',{min:win[0],max:win[1]});
+  },function(commit){
+    let moved=Math.abs(p1-p0)>=1;
+    // A cancel, or a release back within a pixel of its press that left something changed (a reply mid-hold, or a window its moves shifted), restores what the press found: a kept step window as it was, else the press's zoom on the data held now (none on a step chart, so it ranges all its data, replies mid-hold included). A plain click commits nothing.
+    if(!commit||!moved&&(c.data!==pressData||c.scales.x.min!==pull.lo||c.scales.x.max!==pull.hi)){
+      if(keepStepWindow)c.setScale('x',{min:pull.lo,max:pull.hi});else zoomX(c,pull.lo,pull.hi,pull.userzoom);
+    }
+    // With the hold gone the gutter re-fits its labels. uPlot lays out only for a changed scale, so a cancel always asks (its restore may change none, after labels changed under a still hand), joining the restore's queued commit; a release asks only when the width changed, which the size function, measuring again, predicts exactly (y labels don't depend on the gutter). A queued redraw, not a batch: the destroy that follows a rebuild's or an unmount's cancel drops it.
+    let a=c.axes[1];
+    if(!commit||Math.ceil(a.size(c,a._values,1))!==a._size)c.redraw(false,true);
+    if(!commit||!moved)return;
+    // Peers take the pulled window, fixed or following, once, at release. On a downsampled step chart the hand-owned bound may extrapolate, but the pinned edge is a bucket midpoint: at or past the press data's first or last x it widens to the press buckets' coverage there, never narrowing (a lone x value's widened window keeps its edge); inside the data (a window an earlier pull left, its refetch pending) it goes as shown.
+    let S=zm.readoutXShift,lo=c.scales.x.min-S,hi=c.scales.x.max-S;
+    if(cov){if(which==='min'){if(pull.hi>=xN)hi=Math.max(hi,cov.hi);}else if(pull.lo<=x0)lo=Math.min(lo,cov.lo);}
+    commitZoom(c,{lo:lo,hi:hi},pull.follow,true);
   });
-}
+};
 return'';
 }catch(error){
   return error&&error.stack?String(error.stack):String(error);

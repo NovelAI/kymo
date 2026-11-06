@@ -9,8 +9,8 @@ const {
   AXIS_LOG,
   AXIS_LOG1P,
   buildFrozenSupports,
-  buildFrozenSourceMap,
-  mapSourcePageX,
+  buildSourceMap,
+  mapSourcePlotX,
   expandWholeBuckets,
 } = require("../src/components/uplot_chart/zoom_math.js");
 
@@ -33,9 +33,8 @@ function assertRange(frozen, a, b, lo, hi) {
 }
 
 function sourceMap(overrides = {}) {
-  const map = buildFrozenSourceMap({
+  const map = buildSourceMap({
     axis: AXIS_LINEAR,
-    plotLeft: 100,
     width: 300,
     visualLo: 300,
     visualHi: 600,
@@ -58,14 +57,14 @@ test("the final envelope retains step 89999", () => {
 
 test("source coordinates extrapolate 400 to 700", () => {
   const source = sourceMap();
-  close(mapSourcePageX(source, 200), 400);
-  close(mapSourcePageX(source, 500), 700);
+  close(mapSourcePlotX(source, 100), 400);
+  close(mapSourcePlotX(source, 400), 700);
 });
 
 test("outside extrapolation anchors to coverage rather than visual midpoints", () => {
   const map = sourceMap({ visualLo: 320, visualHi: 580 });
-  close(mapSourcePageX(map, 400), 600);
-  close(mapSourcePageX(map, 500), 700);
+  close(mapSourcePlotX(map, 300), 600);
+  close(mapSourcePlotX(map, 400), 700);
 });
 
 test("whole-bucket expansion does not cascade", () => {
@@ -119,50 +118,46 @@ test("log(x+1) maps shifted plots from real coverage", () => {
   assert.deepEqual(frozen.coverage, { lo: 0, hi: 999 });
   const map = sourceMap({
     axis: AXIS_LOG1P,
-    plotLeft: 0,
     width: 100,
     visualLo: 0,
     visualHi: 999,
     coverageLo: 0,
     coverageHi: 999,
   });
-  close(mapSourcePageX(map, 50), Math.sqrt(1_000) - 1);
-  close(mapSourcePageX(map, 150), 1_000 ** 1.5 - 1);
+  close(mapSourcePlotX(map, 50), Math.sqrt(1_000) - 1);
+  close(mapSourcePlotX(map, 150), 1_000 ** 1.5 - 1);
 });
 
 test("plain log extrapolation advances by source decades", () => {
   const map = sourceMap({
     axis: AXIS_LOG,
-    plotLeft: 0,
     width: 100,
     visualLo: 100,
     visualHi: 1_000,
     coverageLo: 100,
     coverageHi: 1_000,
   });
-  close(mapSourcePageX(map, 50), Math.sqrt(100 * 1_000));
-  close(mapSourcePageX(map, 200), 10_000);
+  close(mapSourcePlotX(map, 50), Math.sqrt(100 * 1_000));
+  close(mapSourcePlotX(map, 200), 10_000);
 });
 
 test("log(x+1) extrapolation fails closed at the inverse-domain boundary", () => {
   const map = sourceMap({
     axis: AXIS_LOG1P,
-    plotLeft: 0,
     width: 100,
     visualLo: 0,
     visualHi: 1,
     coverageLo: 0,
     coverageHi: 1,
   });
-  assert.equal(mapSourcePageX(map, -200_000), null);
+  assert.equal(mapSourcePlotX(map, -200_000), null);
 });
 
 test("invalid source geometry fails closed", () => {
   assert.equal(
-    buildFrozenSourceMap({
+    buildSourceMap({
       axis: AXIS_LINEAR,
-      plotLeft: 0,
-      width: 0,
+        width: 0,
       visualLo: 0,
       visualHi: 1,
       coverageLo: 0,

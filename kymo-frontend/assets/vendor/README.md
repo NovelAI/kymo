@@ -11,3 +11,4 @@ Keep the adjacent upstream license files when updating any asset.
 
 To update uPlot, copy `dist/uPlot.iife.min.js` and `dist/uPlot.min.css` from an upstream commit, then update the recorded commit.
 kymo's highlight relies on uPlot drawing a series or band group with a `_focus` member last.
+An axis pull's exit, re-fitting the y gutter, relies on three more, which `scripts/check_chart_create.mjs` pins: an axis's laid-out `_size` is its size function's answer over its last labels (`_values`), `redraw(false, true)` keeps a layout request a later redraw doesn't ask for, and `destroy()` drops a queued commit.

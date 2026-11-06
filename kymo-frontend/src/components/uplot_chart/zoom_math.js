@@ -1,7 +1,7 @@
 // Pure zoom-selection math shared by the browser integration and its Node
 // regression tests. This file intentionally has no DOM or uPlot dependency;
-// the gesture owner snapshots its source chart, then passes ordinary numbers
-// and array-like columns here.
+// the gesture owner reads its source chart and passes ordinary numbers and
+// array-like columns here.
 
 const AXIS_LINEAR = "linear";
 const AXIS_LOG = "log";
@@ -25,7 +25,7 @@ function slotBounds(snapshot, index) {
     : [center, center];
 }
 
-/** Retain the immutable gesture-start columns and derive their real-x coverage. */
+/** Retain a chart's immutable x columns and derive their real-x coverage. */
 function buildFrozenSupports({ plotXs, xrMin, xrMax, xShift = 0 }) {
   const snapshot = { plotXs, xrMin, xrMax, xShift, coverage: null };
   if (!plotXs || !finite(xShift)) return snapshot;
@@ -64,23 +64,22 @@ function inverse(axis, value) {
 }
 
 /**
- * Freeze source-chart geometry and axis transforms for one gesture.
+ * Map plot x, in px from the plot's left edge, through the source-chart
+ * geometry and axis transform it is given.
  *
- * Inside the plot, pixels map through the visual scale the user pressed on.
+ * Inside the plot, pixels map through the visual scale.
  * Outside, extrapolation begins at the true rendered coverage and advances by
- * one transformed coverage span per plot width. `plotLeft` is in page
- * coordinates so callers can feed MouseEvent.pageX even after scrolling.
+ * one transformed coverage span per plot width.
  */
-function buildFrozenSourceMap({
+function buildSourceMap({
   axis,
-  plotLeft,
   width,
   visualLo,
   visualHi,
   coverageLo,
   coverageHi,
 }) {
-  if (!finite(plotLeft) || !finite(width) || !(width > 0)) return null;
+  if (!finite(width) || !(width > 0)) return null;
 
   const visualTLo = transform(axis, visualLo);
   const visualTHi = transform(axis, visualHi);
@@ -99,7 +98,6 @@ function buildFrozenSourceMap({
 
   return {
     axis,
-    plotLeft,
     width,
     visualTLo,
     visualSpan: visualTHi - visualTLo,
@@ -109,10 +107,9 @@ function buildFrozenSourceMap({
   };
 }
 
-/** Map a page-x coordinate using only the frozen source chart. */
-function mapSourcePageX(sourceMap, pageX) {
-  if (!sourceMap || !finite(pageX)) return null;
-  const pixel = pageX - sourceMap.plotLeft;
+/** Map a plot x through a source map. */
+function mapSourcePlotX(sourceMap, pixel) {
+  if (!sourceMap || !finite(pixel)) return null;
   const fraction = pixel / sourceMap.width;
   let transformed;
 
@@ -170,8 +167,8 @@ const KYMO_ZOOM_MATH = {
   AXIS_LOG,
   AXIS_LOG1P,
   buildFrozenSupports,
-  buildFrozenSourceMap,
-  mapSourcePageX,
+  buildSourceMap,
+  mapSourcePlotX,
   expandWholeBuckets,
 };
 

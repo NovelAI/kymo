@@ -1,11 +1,12 @@
 """Seed the compact deterministic dataset used by ``zoom_fences.py``.
 
-The three unprefixed metrics land in the dashboard's initially-open catch-all
+The four unprefixed metrics land in the dashboard's initially-open catch-all
 section, in lexical order and on one grid row:
 
 * ``zoom_a_source`` is a contiguous, downsampled step chart.
 * ``zoom_b_peer`` has a narrower, asymmetric domain but the same step sync key.
 * ``zoom_c_sparse`` has two dense clusters separated by a large empty gap.
+* ``zoom_d_gutter`` spans the source's steps with values whose y labels need, at the default font and chart height (280 px), 44 px (``0 … 1,600``), then the 37 px floor (``0 … 10``) once the window holds no step below 500, then 58 px (``0 … 0.002``) once it holds none below 700: a left-half axis pull grabbed at 45% and dragged to 30 px inside the plot's left edge crosses both on plots wider than about 112 px, which the fence's are (AI-1510's gutter hold).
 
 ``system/zoom_client_a`` and ``system/zoom_client_b`` land in the system
 section. System metrics default to a relative-time X axis, providing a
@@ -49,10 +50,14 @@ def main() -> None:
     for step in range(last_step + 1):
         metrics: dict[str, float] = {}
         if SOURCE_FIRST <= step <= SOURCE_LAST:
-            # Monotone sub-cent values make y-axis label precision/width change
-            # as an x-axis pull narrows the visible window. This exercises
-            # uPlot's internal axis resizing without a container resize.
             metrics["zoom_a_source"] = 1.0 + step / 100_000
+            # All exact in f32.
+            if step < 500:
+                metrics["zoom_d_gutter"] = float(1500 + step % 11)
+            elif step < 700:
+                metrics["zoom_d_gutter"] = float(step % 11)
+            else:
+                metrics["zoom_d_gutter"] = (step % 64) / 32768
         if PEER_FIRST <= step <= PEER_LAST:
             metrics["zoom_b_peer"] = float(200 + (step * 11) % 67)
         if in_sparse_cluster(step):
