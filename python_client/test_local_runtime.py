@@ -293,6 +293,17 @@ class LocalEndpointTests(unittest.TestCase):
     def test_an_ensure_in_its_own_session_keeps_the_default_mask(self):
         # The ensure before a run's TerminateRun runs as a session leader, which a group Ctrl-C or SIGTERM never reaches, with no signal blocked though its caller blocks some, since a local stack it starts keeps its mask; past its timeout it is killed and reaped, as subprocess.run would. Where posix_spawn has no setsid (CPython built against glibc older than 2.26), it leads a process group of its own instead.
         real_spawn = os.posix_spawn
+        try:
+            os.waitpid(
+                real_spawn(
+                    sys.executable, [sys.executable, "-c", ""], os.environ, setsid=True
+                ),
+                0,
+            )
+            has_setsid = True
+        except NotImplementedError:
+            # python-build-standalone (uv's managed Pythons) and conda: the real spawn takes the fallback too.
+            has_setsid = False
 
         def without_setsid(*args, setsid=False, **kwargs):
             if setsid:
@@ -320,7 +331,10 @@ class LocalEndpointTests(unittest.TestCase):
                 with mock.patch.object(
                     local_runtime, "_launcher_path", return_value=launcher
                 ):
-                    for spawn, leader in ((real_spawn, True), (without_setsid, False)):
+                    for spawn, leader in (
+                        (real_spawn, has_setsid),
+                        (without_setsid, False),
+                    ):
                         with (
                             mock.patch.dict(
                                 os.environ, {"KYMO_TEST_LAUNCHER_SLEEP": "0"}
