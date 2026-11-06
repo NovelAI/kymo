@@ -378,7 +378,7 @@ _handed_off = False
 _last_run_proven = True
 _original_excepthook = None
 _original_sys_exit = None
-# The metadata blob last uploaded, whose config field update_config() changes before uploading it again.
+# This run's metadata dict, whose config field update_config() changes before queueing a fresh snapshot; None when init() published none, as a resume that keeps the run's stored one doesn't.
 _run_metadata: Optional[dict] = None
 # Presence is negotiated by InitRunResponse. An older server leaves this None,
 # preserving the existing hosted rich-write path byte-for-byte.
@@ -503,7 +503,8 @@ def init(
         run_id: Globally unique run identifier. Auto-generated via
             ``uuid.uuid4().hex`` if not provided. Pass explicitly to resume an
             existing run, but do not reuse that ID in another project. The
-            server is idempotent and keeps the *first* run_name set.
+            server keeps the *first* run_name set.
+            A resume without a ``config`` keeps the run's stored config and metadata (``info/run_info``), if any, and publishes none of its own; pass ``config``, ``{}`` included, to replace them. The first resume of a run created before writer epochs replaces them either way.
         mode: ``"hosted"`` (default) or ``"local"``. If omitted, uses
             ``$KYMO_MODE``. Local mode invokes ``kymo ensure --json`` and
             uses its authenticated private Unix sockets.
@@ -643,7 +644,7 @@ def init(
     )
     run_info = resp.run
     _rich_writer_epoch = resp.writer_epoch if resp.HasField("writer_epoch") else None
-    if _rich_writer_epoch is not None and not 1 <= _rich_writer_epoch < (1 << 32):
+    if _rich_writer_epoch == 0:
         raise RuntimeError("kymo returned an invalid rich writer epoch")
     _rich_mutation_seq = (
         multiprocessing.Value("I", 0) if _rich_writer_epoch is not None else None
@@ -670,6 +671,8 @@ def init(
     _galleries_published = 0
     _previous_galleries = 0
     _finishing = False
+    # Also cleared here: a forked child inherits the parent's, and the shutdown above leaves it there (another process's run).
+    _run_metadata = None
     _spool_dir = spool_dir
     _session_id = uuid.uuid4().hex
     spool_path = make_spool_path(
@@ -764,8 +767,9 @@ def init(
         _cdn_address,
     )
 
-    # Collected once: update_config() changes only its config field, so the time, system and git fields never drift between uploads.
-    if _is_initialized:
+    # Collected once: update_config() changes only its config field, so the time, system and git fields never drift between uploads. A resume without a config (a writer epoch past 1) publishes no run_info, so the run keeps its stored one, config included.
+    resumed = _rich_writer_epoch is not None and _rich_writer_epoch > 1
+    if _is_initialized and not (resumed and config is None):
         _run_metadata = _collect_run_metadata(config)
         _push_run_metadata()
 
@@ -2330,7 +2334,7 @@ def _collect_run_metadata(config: Optional[dict]) -> dict:
 
 def _push_run_metadata():
     """Queue one immutable metadata snapshot on the ordered rich lane."""
-    if not _is_initialized or _run_metadata is None:
+    if not _is_initialized:
         return
     _publish_in_log_order(
         _PendingLog(
@@ -2356,15 +2360,17 @@ def update_config(config: dict) -> None:
     Keys present in ``config`` overwrite existing keys with the same JSON text (shallow merge): ``1`` and ``"1"`` are one key, ``1`` and ``1.0`` two. Other fields (time, system, git, slurm) carry over bit-identical from the initial upload — only the ``config`` field is mutated.
 
     Values and keys are stored by the rules on ``kymo.Metadata``. A config that cannot be stored exactly raises ValueError and changes nothing.
+
+    After a resume that kept the run's stored config (``kymo.init``'s ``run_id``), ``update_config`` raises RuntimeError: this process has no copy of it to merge into. Pass the config to ``kymo.init`` instead.
     """
-    global _run_metadata
     if not _is_initialized:
         raise RuntimeError("kymo not initialised — call kymo.init() first")
-    config = _snapshot_config(config)
     if _run_metadata is None:
-        _run_metadata = _collect_run_metadata(config)
-    else:
-        _run_metadata.setdefault("config", {}).update(config)
+        raise RuntimeError(
+            "kymo.update_config: kymo.init published no run_info to merge into (a resume without a config keeps the run's stored one); pass the config to kymo.init instead"
+        )
+    config = _snapshot_config(config)
+    _run_metadata.setdefault("config", {}).update(config)
     _push_run_metadata()
 
 

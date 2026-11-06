@@ -37,7 +37,7 @@ Leave out `mode="local"` and pass the server's gRPC address as `server_address="
 
 ## Configs and metadata
 
-`kymo.init(config=...)`, `kymo.update_config(...)` and `kymo.log({name: kymo.Metadata(...)})` store a dict as JSON, frozen when the call is made. `kymo.Api.run_info` and Python's `json` read it back. Each raise below is a ValueError: `init` raises before it stops a previous run, `update_config` leaves the config as it was, and `log` logs nothing from that call.
+`kymo.init(config=...)`, `kymo.update_config(...)` and `kymo.log({name: kymo.Metadata(...)})` store a dict as JSON, frozen when the call is made. `kymo.Api.run_info` and Python's `json` read it back. A value that cannot be stored raises ValueError: `init` raises before it stops a previous run, `update_config` leaves the config as it was, and `log` logs nothing from that call.
 
 - JSON values are stored as they are, `NaN`, `Infinity` and `-Infinity` included, in Python json's dialect.
 - A numpy bool, integer or floating scalar is stored as its exact bool, int or float. A longdouble that a float can't hold exactly raises.
@@ -58,6 +58,8 @@ Limits:
 - A manifest holding NaN or Infinity is not strict JSON. Read manifests with Python's `json`: jq turns those tokens into `null` and `±1.797e308`, and a lone low surrogate into U+FFFD, without a warning.
 - An array or tensor costs about 10–35 bytes per element in the manifest (a float about 28), and every `update_config` uploads the whole config again. A manifest past 256 MiB (about 9M floats) is never delivered, and it holds every later gallery and metadata of the run on disk.
 - The dashboard shows a string JSON-quoted when its text reads as JSON (`"5"`, `"true"`, `"NaN"`), is empty, or has leading or trailing whitespace, a double space or a control character; copying gives the raw text. It shows, copies and diffs a lone surrogate as the literal text `\udXXX`, so sibling keys that differ only there merge, the later winning. A Metadata dict nested 127 levels deep or more, or a config nested 126, shows as unreadable.
+
+Resuming a run (`kymo.init` with an existing `run_id`) without `config` keeps the run's stored config and metadata, if any, and publishes none of its own, and `update_config` then raises RuntimeError, since this process has no copy of them to merge into. Pass `config`, `{}` included, to replace them. The first resume of a run created before writer epochs replaces them either way.
 
 ## Reading runs back
 

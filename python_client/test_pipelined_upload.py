@@ -2090,11 +2090,12 @@ print(k > 50, str(late).replace(" ", ""), 0.9 < armed <= 1)
         connect.assert_not_called()
 
     @contextlib.contextmanager
-    def _init_without_a_server(self, process, **patches):
-        """Patch kymo.client so init() runs without a server: a module state no run has touched, patches on top, an InitRun that names the run "canonical run", and mocks for its queue, values, run metadata upload and upload worker, process. Yields the mocks of Process and make_spool_path."""
+    def _init_without_a_server(self, process, writer_epoch=None, **patches):
+        """Patch kymo.client so init() runs without a server: a module state no run has touched, patches on top, an InitRun that names the run "canonical run" and allocates writer_epoch (or none), and mocks for its queue, values, run metadata upload and upload worker, process. Yields the mocks of Process and make_spool_path."""
         response = types.SimpleNamespace(
             run=types.SimpleNamespace(run_name="canonical run", ordinal=1),
-            HasField=lambda _name: False,
+            writer_epoch=writer_epoch,
+            HasField=lambda name: name == "writer_epoch" and writer_epoch is not None,
         )
         with (
             mock.patch.multiple(
@@ -2134,6 +2135,8 @@ print(k > 50, str(late).replace(" ", ""), 0.9 < armed <= 1)
                     "_atexit_registered": True,
                     "_run_control_rpc": mock.Mock(return_value=response),
                     "_run_metadata": None,
+                    "_rich_writer_epoch": None,
+                    "_rich_mutation_seq": None,
                     "_collect_run_metadata": mock.Mock(return_value={}),
                     "_push_run_metadata": mock.Mock(),
                     **patches,
@@ -2219,6 +2222,44 @@ print(k > 50, str(late).replace(" ", ""), 0.9 < armed <= 1)
                 self.assertEqual(
                     client_module._run_metadata.get("config", "absent"), expected
                 )
+
+    def test_a_resume_without_a_config_keeps_the_stored_run_info(self):
+        # Epoch 2 is a resume: an earlier InitRun of the run took epoch 1. A resume without a config publishes nothing and collects no meta of this process, so update_config raises; {} or a config, a first init, and a missing epoch publish, and update_config merges into that (basedformer calls it after a first init without a config, which publishes no config field). Each case starts from the metadata a forked child would still hold (its shutdown leaves it: another process's run).
+        for writer_epoch, config, publishes in (
+            (2, None, False),
+            (3, None, False),
+            (2, {}, True),
+            (2, {"lr": 1}, True),
+            (1, None, True),
+            (None, None, True),
+        ):
+            with (
+                self.subTest(writer_epoch=writer_epoch, config=config),
+                self._init_without_a_server(
+                    mock.Mock(),
+                    writer_epoch=writer_epoch,
+                    _run_metadata={"meta": {"system": "parent"}, "config": {"lr": 0.1}},
+                    _collect_run_metadata=mock.Mock(
+                        wraps=client_module._collect_run_metadata
+                    ),
+                ),
+            ):
+                self._init(config=config)
+                self.assertEqual(client_module._collect_run_metadata.called, publishes)
+                if publishes:
+                    client_module.update_config({"b": 2})
+                    self.assertEqual(
+                        client_module._run_metadata["config"],
+                        {**(config or {}), "b": 2},
+                    )
+                    self.assertEqual(client_module._push_run_metadata.call_count, 2)
+                else:
+                    with self.assertRaisesRegex(
+                        RuntimeError, "pass the config to kymo.init instead$"
+                    ):
+                        client_module.update_config({"b": 2})
+                    client_module._push_run_metadata.assert_not_called()
+                    self.assertIsNone(client_module._run_metadata)
 
     def test_a_ctrl_c_as_the_poller_starts_ends_the_run(self):
         # The poller's start, NVML's init with system metrics, can take seconds once the worker has started: a Ctrl-C there raises out of init() with the run active and kymo's exit hooks installed, so the exception hook hands it off, rather than leave the worker, which carries on through a Ctrl-C, to multiprocessing's exit, which waits for it. The poller starts last, after the run's metadata.
