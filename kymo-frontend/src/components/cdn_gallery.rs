@@ -213,16 +213,18 @@ enum GalleryPresentation {
     Content,
 }
 
-/// The status line for sources whose key at the step is still a placeholder: a live run's images may still arrive; an ended run's placeholder is an upload that did not finish. It also names the sources whose manifest failed to load, each asked again RETRY_WAIT after its failure, and those still loading past the grace.
+/// The status line for sources whose key at the step is still a placeholder: a live run's images may still arrive; an ended run's placeholder is an upload that did not finish. It also names the sources whose manifest is unreadable, those whose manifest failed to load, each asked again RETRY_WAIT after its failure, and those still loading past the grace.
 fn pending_status(
     live: &[&str],
     ended: &[&str],
+    unreadable: &[&str],
     failed: &[&str],
     loading: &[&str],
 ) -> Option<String> {
     let clauses: Vec<String> = [
         ("Not uploaded yet", live),
         ("Upload did not finish", ended),
+        ("Unreadable", unreadable),
         ("Failed to load, retrying", failed),
         ("Still loading", loading),
     ]
@@ -344,10 +346,11 @@ struct ManifestSource {
     key: String,
 }
 
-/// A source's last answer: settled (None for nothing usable at its key, or a placeholder key), failed, which is asked again, or still out when its fetches' MANIFEST_GRACE passed.
+/// A source's last answer: settled (None for nothing at its key, or a placeholder key), unreadable content (`parse_manifest`), which is never asked again, failed, which is asked again, or still out when its fetches' MANIFEST_GRACE passed.
 #[derive(Clone, Debug, PartialEq)]
 enum Fetched {
     Settled(Option<Manifest>),
+    Unreadable,
     Failed,
     Waiting,
 }
@@ -424,14 +427,16 @@ fn publish_changes(
             .any(|(source, answer)| fetched.get(source) != Some(answer))
 }
 
-/// The sources a step's fetches ask: every one not yet settled.
-fn unsettled_sources(
-    sources: &[ManifestSource],
-    fetched: &FetchedManifests,
-) -> Vec<ManifestSource> {
+/// The sources a step's fetches ask: those with no settled or unreadable answer yet.
+fn sources_to_fetch(sources: &[ManifestSource], fetched: &FetchedManifests) -> Vec<ManifestSource> {
     sources
         .iter()
-        .filter(|source| !matches!(fetched.get(*source), Some(Fetched::Settled(_))))
+        .filter(|source| {
+            !matches!(
+                fetched.get(*source),
+                Some(Fetched::Settled(_) | Fetched::Unreadable)
+            )
+        })
         .cloned()
         .collect()
 }
@@ -461,7 +466,7 @@ fn latch_settled(
                     latched.insert(identity(source), (source.clone(), manifest.clone()));
                 }
             }
-            Some(Fetched::Settled(_)) => {
+            Some(Fetched::Settled(_) | Fetched::Unreadable) => {
                 latched.remove(&identity(source));
             }
             Some(Fetched::Failed | Fetched::Waiting) | None => {}
@@ -487,12 +492,15 @@ fn open_source_state(
         })
         .map(|source| fetched.get(source));
     (
-        !matches!(answer, None | Some(Some(Fetched::Settled(_)))),
+        matches!(
+            answer,
+            Some(None | Some(Fetched::Failed | Fetched::Waiting))
+        ),
         answer == Some(Some(&Fetched::Failed)),
     )
 }
 
-/// `shown` (the step's sources as drawn, aligned with `sources`) with their manifests, once every source has answered or their grace passed; a failed or waiting source draws as having none. A source joining the step (a pending: key resolving, a run shown) holds the rest back with it, so sources already settled are hidden for up to MANIFEST_GRACE.
+/// `shown` (the step's sources as drawn, aligned with `sources`) with their manifests, once every source has answered or their grace passed; an unreadable, failed or waiting source draws as having none. A source joining the step (a pending: key resolving, a run shown) holds the rest back with it, so sources already settled are hidden for up to MANIFEST_GRACE.
 fn current_manifests(
     shown: &[RunManifest],
     sources: &[ManifestSource],
@@ -504,7 +512,7 @@ fn current_manifests(
         .map(|(run_manifest, source)| {
             let manifest = match fetched.get(source)? {
                 Fetched::Settled(manifest) => manifest.clone(),
-                Fetched::Failed | Fetched::Waiting => None,
+                Fetched::Unreadable | Fetched::Failed | Fetched::Waiting => None,
             };
             Some(RunManifest {
                 manifest,
@@ -572,17 +580,9 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// Ok(None) is settled knowledge — a 404 (nothing at that key), a 400 (the
-/// hosted route's answer to a malformed key, which ingest stores unvalidated)
-/// or unparseable content, none of which heals on retry. Err (a network
-/// failure or any other status) must be retried: a finished run's keys never
-/// change, so a failure taken as settled would never be
-/// refetched.
-/// The Err also says whether `deadline_ms` ran out.
-async fn fetch_manifest(
-    cdn_key: &str,
-    deadline_ms: u32,
-) -> Result<Option<Manifest>, (String, bool)> {
+/// Ok is settled knowledge — a 404 (nothing at that key), a 400 (the hosted route's answer to a malformed key, which ingest stores unvalidated), a manifest, or unreadable content (logged to the console), none of which heals on retry.
+/// Err (a network failure or any other status) must be retried: a finished run's keys never change, so a failure taken as settled would never be refetched. The Err also says whether `deadline_ms` ran out.
+async fn fetch_manifest(cdn_key: &str, deadline_ms: u32) -> Result<Fetched, (String, bool)> {
     let url = crate::runtime::cdn_url(cdn_key);
     let abort =
         AbortOnDrop(web_sys::AbortController::new().map_err(|e| (format!("{e:?}"), false))?);
@@ -598,13 +598,171 @@ async fn fetch_manifest(
         .await
         .map_err(|e| failed(e.to_string()))?;
     if matches!(resp.status(), 400 | 404) {
-        return Ok(None);
+        return Ok(Fetched::Settled(None));
     }
     if !resp.ok() {
         return Err(failed(format!("{} for {url}", resp.status())));
     }
     let text = resp.text().await.map_err(|e| failed(e.to_string()))?;
-    Ok(serde_json::from_str(&text).ok())
+    Ok(settle_body(&text, &url))
+}
+
+/// What a fetched body settles as; an unreadable one's error goes to the console.
+fn settle_body(text: &str, url: &str) -> Fetched {
+    match parse_manifest(text) {
+        Ok(manifest) => Fetched::Settled(Some(manifest)),
+        Err(error) => {
+            crate::util::warn(&format!("[manifest] unreadable: {error} in {url}"));
+            Fetched::Unreadable
+        }
+    }
+}
+
+/// Python's json writes a non-finite float as one of these tokens, which serde_json refuses. The fallback parse reads each through its placeholder, a number in serde_json's stored spelling whose exponent no float reaches (arbitrary_precision keeps it as text), then restores the token.
+const TOKEN_PLACEHOLDERS: [(&str, &str); 3] = [
+    ("-Infinity", "-1e+77777777777777777777"),
+    ("Infinity", "1e+77777777777777777777"),
+    ("NaN", "2e+77777777777777777777"),
+];
+
+/// A manifest read strictly, as serde_json reads it, or else as Python's json writes it beyond strict JSON (`rewrite_python_json`), with each token restored as a Number holding it, so the viewer prints, compares and diffs it as the token. Only a metadata manifest with no items may take the fallback: the CDN collector parses strictly, so it can miss the links in a manifest only the fallback reads. Err says why the text is unreadable, for the console.
+pub(crate) fn parse_manifest(text: &str) -> Result<Manifest, String> {
+    let strict = match serde_json::from_str(text) {
+        Ok(manifest) => return Ok(manifest),
+        Err(error) => error,
+    };
+    let (rewritten, held_placeholder) = rewrite_python_json(text);
+    if held_placeholder {
+        return Err(format!(
+            "{strict}, and it already holds a placeholder number"
+        ));
+    }
+    let mut manifest: Manifest = serde_json::from_slice(&rewritten)
+        .map_err(|error| format!("{strict}; read as Python's json: {error}"))?;
+    if manifest.class != "metadata" || !manifest.items.is_empty() {
+        return Err(format!(
+            "{strict}, in a {:?} manifest with {} items",
+            manifest.class,
+            manifest.items.len()
+        ));
+    }
+    if let Some(data) = &mut manifest.data {
+        restore_tokens(data);
+    }
+    Ok(manifest)
+}
+
+/// `text` rewritten so serde_json reads what Python's json writes beyond strict JSON: outside strings, each whole `-Infinity`, `Infinity` or `NaN` becomes its placeholder (`-NaN` or `Infinity0` stays, and fails the parse); inside strings, an escape of a surrogate that pairs with neither neighbour becomes that escape's own text, escaped, while a valid pair passes through whole. Also says whether `text` already holds a placeholder's spelling outside strings, which the restore would misread. It scans bytes and copies them whole, so it never splits a character.
+fn rewrite_python_json(text: &str) -> (Vec<u8>, bool) {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() + 64);
+    let mut held_placeholder = false;
+    let delimiter = |byte: u8| {
+        matches!(
+            byte,
+            b' ' | b'\t' | b'\n' | b'\r' | b',' | b':' | b'[' | b']' | b'{' | b'}' | b'"'
+        )
+    };
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'"' => {
+                out.push(b'"');
+                at += 1;
+                while at < bytes.len() {
+                    match bytes[at] {
+                        b'"' => {
+                            out.push(b'"');
+                            at += 1;
+                            break;
+                        }
+                        b'\\' => {
+                            let unit = escaped_unit(bytes, at);
+                            let paired = matches!(unit, Some(0xD800..=0xDBFF))
+                                && matches!(escaped_unit(bytes, at + 6), Some(0xDC00..=0xDFFF));
+                            let take = if paired {
+                                12
+                            } else if matches!(unit, Some(0xD800..=0xDFFF)) {
+                                out.push(b'\\');
+                                6
+                            } else {
+                                // Any other escape: its first two bytes, so an escaped quote or backslash never ends the string; a \u escape's hex digits follow as plain bytes.
+                                2
+                            };
+                            let end = (at + take).min(bytes.len());
+                            out.extend_from_slice(&bytes[at..end]);
+                            at = end;
+                        }
+                        byte => {
+                            out.push(byte);
+                            at += 1;
+                        }
+                    }
+                }
+            }
+            byte if delimiter(byte) => {
+                out.push(byte);
+                at += 1;
+            }
+            _ => {
+                // A word: a number, literal or token, up to the next delimiter.
+                let end = bytes[at..]
+                    .iter()
+                    .position(|&byte| delimiter(byte))
+                    .map_or(bytes.len(), |length| at + length);
+                let word = &bytes[at..end];
+                match TOKEN_PLACEHOLDERS
+                    .iter()
+                    .find(|(token, _)| token.as_bytes() == word)
+                {
+                    Some((_, placeholder)) => out.extend_from_slice(placeholder.as_bytes()),
+                    None => {
+                        // A number already spelled as a placeholder, in any spelling serde_json stores as one (1E77777777777777777777 included), would be restored as a token.
+                        held_placeholder |= serde_json::from_slice::<serde_json::Number>(word)
+                            .is_ok_and(|number| token_of_placeholder(number.as_str()).is_some());
+                        out.extend_from_slice(word);
+                    }
+                }
+                at = end;
+            }
+        }
+    }
+    (out, held_placeholder)
+}
+
+/// The UTF-16 code unit a `\uXXXX` escape starting at `at` names.
+fn escaped_unit(bytes: &[u8], at: usize) -> Option<u16> {
+    let hex = bytes.get(at..at + 6)?.strip_prefix(b"\\u")?;
+    hex.iter().try_fold(0, |unit, &digit| {
+        Some(unit << 4 | char::from(digit).to_digit(16)? as u16)
+    })
+}
+
+/// The token a number spelled as a placeholder restores to, if `text` is one.
+fn token_of_placeholder(text: &str) -> Option<&'static str> {
+    TOKEN_PLACEHOLDERS
+        .iter()
+        .find(|(_, placeholder)| *placeholder == text)
+        .map(|(token, _)| *token)
+}
+
+/// Replaces each placeholder in `value` with a Number holding its token, which prints as the token and equals only the same token; kymo-frontend/Cargo.toml says what such a Value can't do.
+fn restore_tokens(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Number(number) => {
+            if let Some(token) = token_of_placeholder(number.as_str()) {
+                *number = serde_json::Number::from_string_unchecked(token.to_string());
+            }
+        }
+        serde_json::Value::Array(values) => values.iter_mut().for_each(restore_tokens),
+        serde_json::Value::Object(map) => map.values_mut().for_each(restore_tokens),
+        _ => {}
+    }
+}
+
+/// Whether Python's json reads `text` as a JSON value, its tokens included: the rewrite leaves strict JSON as it was.
+pub(crate) fn parses_as_python_json(text: &str) -> bool {
+    serde_json::from_slice::<serde::de::IgnoredAny>(&rewrite_python_json(text).0).is_ok()
 }
 
 #[component]
@@ -696,18 +854,18 @@ pub fn CdnGallery(
         });
     }
 
-    // Fetch this step's unsettled manifests (fetch_sources), so a source that fails shows as failed beside the ones that loaded. The resource is keyed on the sources and only peeks the answers it writes, so publishing restarts nothing; a step change drops the fetches, aborting their requests, and so does data that leaves no step, whose empty sources run before the panel says so.
+    // Fetch this step's unanswered manifests (fetch_sources), so a source that fails shows as failed beside the ones that loaded. The resource is keyed on the sources and only peeks the answers it writes, so publishing restarts nothing; a step change drops the fetches, aborting their requests, and so does data that leaves no step, whose empty sources run before the panel says so.
     let mut fetched = use_signal(FetchedManifests::new);
     let _fetch = use_resource(use_reactive((&sources,), move |(sources,)| async move {
         let current: HashSet<ManifestSource> = sources.iter().cloned().collect();
-        let asking = unsettled_sources(&sources, &fetched.peek());
+        let asking = sources_to_fetch(&sources, &fetched.peek());
         crate::grpc::wait_until_page_visible().await;
         let fetch = async |source: &ManifestSource, deadline_ms: u32| {
             if source.key.starts_with("pending:") {
                 return (Fetched::Settled(None), false);
             }
             match fetch_manifest(&source.key, deadline_ms).await {
-                Ok(manifest) => (Fetched::Settled(manifest), false),
+                Ok(answer) => (answer, false),
                 Err((error, at_deadline)) => {
                     crate::util::warn(&format!("[manifest] failed: {error}; retrying"));
                     (Fetched::Failed, at_deadline)
@@ -763,6 +921,7 @@ pub fn CdnGallery(
         let status = pending_status(
             &pending_live,
             &pending_ended,
+            &labels(Fetched::Unreadable),
             &labels(Fetched::Failed),
             &labels(Fetched::Waiting),
         );
@@ -1353,9 +1512,9 @@ mod tests {
     use super::{
         classify_manifests, current_manifests, fetch_sources, file_groups, gallery_file_link_label,
         gallery_presentation, gallery_thumbnail_label, latch_settled, metadata_columns,
-        open_source_state, pending_status, publish_changes, selected_step_index, unsettled_sources,
-        CdnManifestClass, Fetched, FetchedManifests, GalleryPresentation, LightboxImage, Manifest,
-        ManifestItem, ManifestSource, RunManifest,
+        open_source_state, parse_manifest, pending_status, publish_changes, selected_step_index,
+        settle_body, sources_to_fetch, CdnManifestClass, Fetched, FetchedManifests,
+        GalleryPresentation, LightboxImage, Manifest, ManifestItem, ManifestSource, RunManifest,
     };
     use dioxus::html::Modifiers;
 
@@ -1558,26 +1717,34 @@ mod tests {
 
     #[test]
     fn pending_status_names_sources_by_run_liveness() {
-        assert_eq!(pending_status(&[], &[], &[], &[]), None);
+        assert_eq!(pending_status(&[], &[], &[], &[], &[]), None);
         assert_eq!(
-            pending_status(&["a", "b"], &[], &[], &[]).as_deref(),
+            pending_status(&["a", "b"], &[], &[], &[], &[]).as_deref(),
             Some("Not uploaded yet: a, b")
         );
         assert_eq!(
-            pending_status(&[], &["a"], &[], &[]).as_deref(),
+            pending_status(&[], &["a"], &[], &[], &[]).as_deref(),
             Some("Upload did not finish: a")
         );
         assert_eq!(
-            pending_status(&["live"], &["old"], &[], &[]).as_deref(),
+            pending_status(&["live"], &["old"], &[], &[], &[]).as_deref(),
             Some("Not uploaded yet: live · Upload did not finish: old")
         );
         assert_eq!(
-            pending_status(&[], &[], &["broken"], &[]).as_deref(),
+            pending_status(&[], &[], &["garbled"], &[], &[]).as_deref(),
+            Some("Unreadable: garbled")
+        );
+        assert_eq!(
+            pending_status(&[], &[], &[], &["broken"], &[]).as_deref(),
             Some("Failed to load, retrying: broken")
         );
         assert_eq!(
-            pending_status(&[], &[], &[], &["slow"]).as_deref(),
+            pending_status(&[], &[], &[], &[], &["slow"]).as_deref(),
             Some("Still loading: slow")
+        );
+        assert_eq!(
+            pending_status(&[], &[], &["garbled"], &["broken"], &[]).as_deref(),
+            Some("Unreadable: garbled · Failed to load, retrying: broken")
         );
     }
 
@@ -1689,7 +1856,7 @@ mod tests {
         let shown = [drawn("healthy", "Healthy"), drawn("broken", "Broken")];
         let sources = [source("healthy", "a.json"), source("broken", "b.json")];
         let mut fetched = FetchedManifests::new();
-        assert_eq!(unsettled_sources(&sources, &fetched), sources);
+        assert_eq!(sources_to_fetch(&sources, &fetched), sources);
 
         fetched.insert(sources[0].clone(), Fetched::Settled(Some(image_manifest())));
         assert!(
@@ -1709,7 +1876,7 @@ mod tests {
             GalleryPresentation::Content
         );
         assert_eq!(
-            unsettled_sources(&sources, &fetched),
+            sources_to_fetch(&sources, &fetched),
             [sources[1].clone()],
             "only the failed source is asked again"
         );
@@ -1891,7 +2058,7 @@ mod tests {
         let current = current_manifests(&shown, &sources, &fetched).expect("drawn past the grace");
         assert_eq!(current[1].manifest, None);
         assert_eq!(
-            unsettled_sources(&sources, &fetched),
+            sources_to_fetch(&sources, &fetched),
             [sources[1].clone()],
             "a waiting source is asked again if the fetches restart"
         );
@@ -1945,7 +2112,28 @@ mod tests {
         assert!(fetches.done.get());
     }
 
-    /// An open preview keeps the previous step's image while the next step's manifest for its run is out, waiting or failing, and says there is none only once that manifest settles without one, or at once for a run with no key at the step.
+    /// Unreadable content settles: the panel draws the source as having nothing, and it is never asked again.
+    #[test]
+    fn an_unreadable_manifest_settles_and_is_never_asked_again() {
+        let mut fetches = Fetches::start(&[source("garbled", "g.json")]);
+        fetches.answer("garbled", Fetched::Unreadable);
+        assert_eq!(
+            fetches.published(),
+            [vec![("garbled".to_string(), Fetched::Unreadable)]]
+        );
+        fetches.pass_retries();
+        assert_eq!(fetches.asks("garbled"), 1);
+        assert!(fetches.done.get());
+
+        let sources = [source("garbled", "g.json")];
+        let fetched = FetchedManifests::from([(sources[0].clone(), Fetched::Unreadable)]);
+        assert!(sources_to_fetch(&sources, &fetched).is_empty());
+        let current = current_manifests(&[drawn("garbled", "Garbled")], &sources, &fetched)
+            .expect("an unreadable source has answered");
+        assert_eq!(current[0].manifest, None);
+    }
+
+    /// An open preview keeps the previous step's image while the next step's manifest for its run is out, waiting or failing, and says there is none only once that manifest settles without one or as unreadable, or at once for a run with no key at the step.
     #[test]
     fn the_preview_keeps_its_image_until_the_next_step_settles() {
         let image = |resource: &str| Manifest {
@@ -1997,6 +2185,12 @@ mod tests {
             FetchedManifests::from([(step6[0].clone(), Fetched::Settled(Some(image("six"))))]);
         latch_settled(&mut latched, &step6, &fetched);
         assert_eq!(shows(&latched), ["six"]);
+        // Stepped to 7, whose manifest is unreadable: an absence too.
+        let step7 = [source("run", "k7.json")];
+        fetched = FetchedManifests::from([(step7[0].clone(), Fetched::Unreadable)]);
+        latch_settled(&mut latched, &step7, &fetched);
+        assert!(shows(&latched).is_empty());
+        assert_eq!(open_source_state(&open, &step7, &fetched), (false, false));
 
         // Runs log at different steps: A at 1, B at 1 and 2. At step 2 A has no image, whatever step 1's answers `fetched` still holds; B's stays up until its own answer settles.
         let (step1, step2) = (
@@ -2188,5 +2382,202 @@ mod tests {
         }))
         .unwrap();
         assert!(!metadata.is_image_gallery());
+    }
+
+    fn metadata_data(text: &str) -> serde_json::Value {
+        let manifest = parse_manifest(text).expect("readable");
+        assert_eq!(
+            (manifest.class.as_str(), manifest.items.len()),
+            ("metadata", 0)
+        );
+        manifest.data.expect("data")
+    }
+
+    /// Written by kymo's metadata_manifest (json.dumps, indent=2): the strings "NaN" and "-Infinity" beside the tokens.
+    const PYTHON_TOKENS: &str = r#"{
+  "v": 1,
+  "class": "metadata",
+  "data": {
+    "a": "NaN",
+    "b": NaN,
+    "c": "-Infinity",
+    "d": -Infinity,
+    "e": Infinity,
+    "f": [
+      NaN,
+      1.5,
+      {
+        "g": Infinity
+      }
+    ]
+  }
+}"#;
+
+    #[test]
+    fn python_tokens_read_back_as_tokens() {
+        let data = metadata_data(PYTHON_TOKENS);
+        assert_eq!(data["a"], serde_json::json!("NaN"));
+        assert_eq!(data["c"], serde_json::json!("-Infinity"));
+        for (key, printed) in [("b", "NaN"), ("d", "-Infinity"), ("e", "Infinity")] {
+            assert!(data[key].is_number(), "{key}");
+            assert_eq!(data[key].to_string(), printed);
+        }
+        assert_eq!(data["f"].to_string(), r#"[NaN,1.5,{"g":Infinity}]"#);
+        // What kymo-frontend/Cargo.toml says such a Value can't do (json! is to_value, unwrapped).
+        assert_eq!(data["b"].as_f64(), None);
+        assert!(serde_json::to_value(&data["b"]).is_err());
+        assert!(serde_json::from_value::<serde_json::Value>(data["e"].clone()).is_err());
+    }
+
+    #[test]
+    fn a_body_settles_as_its_manifest_or_unreadable() {
+        assert!(matches!(
+            settle_body(PYTHON_TOKENS, "url"),
+            Fetched::Settled(Some(_))
+        ));
+        assert_eq!(settle_body("<html>busy</html>", "url"), Fetched::Unreadable);
+    }
+
+    /// Other writers' layouts, where a token directly follows `[`, `,` or `:`: json.dumps with its default separators, and with compact ones.
+    #[test]
+    fn python_tokens_read_back_in_every_layout() {
+        for text in [
+            r#"{"v": 1, "class": "metadata", "data": {"a": [NaN, -Infinity], "b": {"c": Infinity}}}"#,
+            r#"{"v":1,"class":"metadata","data":{"a":[NaN,-Infinity],"b":{"c":Infinity}}}"#,
+        ] {
+            let data = metadata_data(text);
+            assert_eq!(data["a"].to_string(), "[NaN,-Infinity]", "{text}");
+            assert_eq!(data["b"]["c"].to_string(), "Infinity", "{text}");
+        }
+    }
+
+    #[test]
+    fn nesting_past_serde_jsons_limit_is_unreadable() {
+        let nested = |depth: usize| {
+            format!(
+                r#"{{"class": "metadata", "data": {{"a": NaN, "b": {}{}}}}}"#,
+                "[".repeat(depth),
+                "]".repeat(depth)
+            )
+        };
+        assert!(parse_manifest(&nested(125)).is_ok());
+        assert!(parse_manifest(&nested(126)).is_err());
+    }
+
+    #[test]
+    fn lone_surrogate_escapes_read_as_their_text_beside_valid_pairs() {
+        // json.dumps({"pair_then_lone": "\U0001F600\udc80", "lone_then_pair": "\ud800\U0001F600", "high_then_bmp": "\ud800\u00e9", "lone_low": "\udfff", "two_highs": "\ud800\ud800", "two_lows": "\udce9\udce8", "\udc80key": 1}) in the manifest; two lows are what os.fsdecode makes of a path's non-UTF-8 bytes.
+        let data = metadata_data(
+            r#"{"v": 1, "class": "metadata", "data": {"pair_then_lone": "\ud83d\ude00\udc80", "lone_then_pair": "\ud800\ud83d\ude00", "high_then_bmp": "\ud800\u00e9", "lone_low": "\udfff", "two_highs": "\ud800\ud800", "two_lows": "\udce9\udce8", "\udc80key": 1}}"#,
+        );
+        assert_eq!(
+            data,
+            serde_json::json!({
+                "pair_then_lone": "\u{1F600}\\udc80",
+                "lone_then_pair": "\\ud800\u{1F600}",
+                "high_then_bmp": "\\ud800\u{e9}",
+                "lone_low": "\\udfff",
+                "two_highs": "\\ud800\\ud800",
+                "two_lows": "\\udce9\\udce8",
+                "\\udc80key": 1,
+            })
+        );
+        // json.dumps({"\udc80": 1, "\\udc80": 2}): the two keys read as one text, and the later wins.
+        let data =
+            metadata_data(r#"{"v": 1, "class": "metadata", "data": {"\udc80": 1, "\\udc80": 2}}"#);
+        assert_eq!(data, serde_json::json!({"\\udc80": 2}));
+    }
+
+    #[test]
+    fn the_scan_honours_escapes_at_string_ends() {
+        // json.dumps({"a\\": float("nan"), "b": "\\"}): each key and string ends in an escaped backslash, so the quote after it closes the string and the NaN beyond is a token.
+        let data =
+            metadata_data(r#"{"v": 1, "class": "metadata", "data": {"a\\": NaN, "b": "\\"}}"#);
+        assert_eq!(data["a\\"].to_string(), "NaN");
+        assert_eq!(data["b"], serde_json::json!("\\"));
+        // json.dumps({'x"NaN': 1, 'Infinity"': float("inf")}): a token inside a string, after an escaped quote, stays text.
+        let data = metadata_data(
+            r#"{"v": 1, "class": "metadata", "data": {"x\"NaN": 1, "Infinity\"": Infinity}}"#,
+        );
+        assert_eq!(data["x\"NaN"], serde_json::json!(1));
+        assert_eq!(data["Infinity\""].to_string(), "Infinity");
+    }
+
+    #[test]
+    fn strict_json_reads_as_before() {
+        // No fallback, so the number keeps its spelling, placeholder or not.
+        let data = metadata_data(
+            r#"{"v": 1, "class": "metadata", "data": {"n": 1e+77777777777777777777, "s": "NaN"}}"#,
+        );
+        assert_eq!(data["n"].to_string(), "1e+77777777777777777777");
+        assert_eq!(data["s"], serde_json::json!("NaN"));
+        let gallery = parse_manifest(
+            r#"{"v": 1, "class": "image_gallery", "items": [{"resource": "resource"}]}"#,
+        );
+        assert_eq!(gallery, Ok(image_manifest()));
+    }
+
+    #[test]
+    fn tokens_python_never_writes_are_unreadable() {
+        for value in [
+            "-NaN",
+            "Infinity0",
+            "NaNx",
+            "nan",
+            "inf",
+            "+Infinity",
+            "- Infinity",
+            "-infinity",
+        ] {
+            let text = format!(r#"{{"class": "metadata", "data": {{"a": NaN, "b": {value}}}}}"#);
+            assert!(parse_manifest(&text).is_err(), "{value}");
+        }
+        for text in [
+            "",
+            "not json",
+            r#"{"class": "metadata", "data": {"a": NaN"#,
+            "<html></html>",
+        ] {
+            assert!(parse_manifest(text).is_err(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_placeholder_spelling_outside_strings_is_unreadable() {
+        for placeholder in [
+            "1e+77777777777777777777",
+            "1E77777777777777777777",
+            "2e77777777777777777777",
+            "-1E+77777777777777777777",
+        ] {
+            let text =
+                format!(r#"{{"class": "metadata", "data": {{"a": NaN, "b": {placeholder}}}}}"#);
+            assert!(parse_manifest(&text).is_err(), "{placeholder}");
+        }
+        // Spellings serde_json stores otherwise are plain numbers, and a placeholder inside a string is text.
+        let data = metadata_data(
+            r#"{"class": "metadata", "data": {"a": NaN, "b": -2e+77777777777777777777, "c": 1.0e+77777777777777777777, "d": "1e+77777777777777777777"}}"#,
+        );
+        assert_eq!(data["b"].to_string(), "-2e+77777777777777777777");
+        assert_eq!(data["c"].to_string(), "1.0e+77777777777777777777");
+        assert_eq!(data["d"], serde_json::json!("1e+77777777777777777777"));
+    }
+
+    #[test]
+    fn only_a_metadata_manifest_with_no_items_takes_the_fallback() {
+        for text in [
+            r#"{"class": "image_gallery", "items": [{"resource": "a\ud800.png"}]}"#,
+            r#"{"class": "image_gallery", "items": [{"resource": "a.png", "caption": "\udc80"}]}"#,
+            r#"{"class": "metadata", "items": [{"resource": "a.png"}], "data": {"a": NaN}}"#,
+            r#"{"class": "file_list", "data": {"a": NaN}}"#,
+            r#"{"v": NaN, "class": "metadata", "data": {}}"#,
+        ] {
+            assert!(parse_manifest(text).is_err(), "{text}");
+        }
+        assert_eq!(
+            metadata_data(r#"{"class": "metadata", "items": [], "data": {"a": NaN}}"#)["a"]
+                .to_string(),
+            "NaN"
+        );
     }
 }

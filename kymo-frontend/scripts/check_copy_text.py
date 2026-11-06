@@ -173,13 +173,12 @@ class Fixture:
         elif path == "/cdn/probe/pixel.png":
             route.fulfill(body=PNG, content_type="image/png", headers=headers)
         elif path.startswith("/cdn/probe/") and path.endswith(".json"):
-            run_id = path.split("/")[3]
             if "/info/run_info/" in path:
                 data = {
                     "original": TEXT,
                     "empty": "",
                     "boolean": True,
-                    "collision": "true" if run_id == "run-0" else True,
+                    "true_string": "true",
                     "array": [1, "two"],
                 }
                 manifest = {"class": "metadata", "data": data}
@@ -265,7 +264,7 @@ def char_point(target, offset):
     )
 
 
-def selection_checks(page, target):
+def selection_checks(page, target, value):
     page.bring_to_front()
     page.locator(".metadata-key-cell").filter(has_text="original").click()
     # Chromium autoscrolls a selection drag within 20px of a scroller's edge, where scroll_into_view_if_needed can leave the target.
@@ -307,7 +306,7 @@ def selection_checks(page, target):
     assert page.evaluate("getSelection().isCollapsed"), (
         "click did not dismiss selection"
     )
-    assert copies(page)[len(previous) :] == [target.text_content()], (
+    assert copies(page)[len(previous) :] == [value], (
         "selection-dismiss click did not copy the whole value"
     )
     select_range(target, 3, 8)
@@ -316,7 +315,7 @@ def selection_checks(page, target):
     assert page.evaluate("getSelection().isCollapsed"), (
         "click elsewhere did not dismiss selection"
     )
-    assert copies(page)[len(previous) :] == [target.text_content()], (
+    assert copies(page)[len(previous) :] == [value], (
         "click elsewhere in the value did not copy the whole value"
     )
     # Adjusting a selection is not dismissing it.
@@ -517,17 +516,21 @@ def run_checks(browser: Browser, args):
             original = metadata(page, "original")
             expect(original).to_have_attribute("tabindex", "0")
             expect(original).to_have_attribute("role", "button")
+            # Its whitespace shows JSON-quoted, and copies raw.
+            assert original.text_content() == json.dumps(TEXT)
             pointer_copy(page, original, TEXT)
-            pointer_copy(page, metadata(page, "empty"), "")
-            collision = metadata(page, "collision")
-            expect(collision).to_have_text('"true"')
-            pointer_copy(page, collision, "true")
-            selection_checks(page, original)
+            empty = metadata(page, "empty")
+            expect(empty).to_have_text('""')
+            pointer_copy(page, empty, "")
+            true_string = metadata(page, "true_string")
+            expect(true_string).to_have_text('"true"')
+            pointer_copy(page, true_string, "true")
+            selection_checks(page, original, TEXT)
             caption = page.locator(".cdn-caption").first
             caption.scroll_into_view_if_needed()
             expect(caption).to_have_attribute("tabindex", "0")
             pointer_copy(page, caption, CAPTION)
-            selection_checks(page, caption)
+            selection_checks(page, caption, CAPTION)
             keyboard_checks(page, caption, CAPTION)
             caption.focus()
             page.keyboard.press("Shift+Tab")

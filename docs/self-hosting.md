@@ -98,7 +98,7 @@ docker run -d --name kymo-dashboard -p 80:80 kymo-dashboard
 
 Serve the dashboard at the root of its host. Another web server works if, like the image's nginx, it answers unknown paths with `index.html` and makes `index.html` revalidate; only the content-hashed `/assets/*-dxh<hex>.*` files may be cached for good. A dashboard served over HTTPS needs an `https://` server origin, for example through a TLS proxy in front of port 8080. A proxy that routes by path must pass `/grpc-ws` and should pass `/grpc-ws2`: without it the dashboard runs uncompressed, and once `/grpc-ws2` is refused, the browser's tabs of that dashboard try it again when they reconnect at least 125 seconds later or after the server shuts down cleanly. The server pings dashboard WebSockets every 20 seconds, so a proxy idle timeout longer than that (nginx's default is 60 seconds) keeps them open.
 
-Upgrade the server and the dashboard together. A tab left open on a dashboard the server no longer supports keeps what it shows but stops updating; reload it.
+Upgrade the server and the dashboard together. A tab left open on a dashboard the server no longer supports keeps what it shows but stops updating; reload it. Upgrade the dashboard no later than the training clients: an older dashboard, or a tab left open on one, shows nothing, without an error, for metadata it can't read, such as a config holding NaN or infinity.
 
 ## Clients
 
@@ -115,4 +115,4 @@ kymo.init(
 )
 ```
 
-`KYMO_SERVER` and `KYMO_URL_BASE` supply the same values from the environment. Media uploads go to port 8080 on the server's host; pass `cdn_address="http://host:port"` if the HTTP listener lives elsewhere. Points a job could not deliver are spooled locally; replay them with `python -m kymo.sync`, which reads the server from each spool.
+`KYMO_SERVER` and `KYMO_URL_BASE` supply the same values from the environment. Media uploads go to port 8080 on the server's host; pass `cdn_address="http://host:port"` if the HTTP listener lives elsewhere. Points a job could not deliver are spooled locally; replay them with `python -m kymo.sync`, which reads the server from each spool. Replay with a `kymo.sync` at least as new as the client that wrote the spool: an older one quarantines a spool whose config or metadata holds NaN or infinity (it renames the file `.rejected`); rename it back and replay it with a current one.

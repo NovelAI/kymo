@@ -2432,10 +2432,11 @@ button.editor-section-toggle:focus-visible,
     min-width: 120px;
 }
 
+/* pre: a key, never quoted, shows its whitespace as logged. */
 .metadata-key-cell, .metadata-val-cell {
     padding: 2px 8px;
     font-size: var(--font-size-11);
-    white-space: nowrap;
+    white-space: pre;
 }
 
 /* Sticky key column: opaque in its row's color so values scrolled under it stay hidden, and above masked values like the header. */
@@ -2458,6 +2459,8 @@ button.editor-section-toggle:focus-visible,
 
 .metadata-val-cell:has(.metadata-copy-value) { padding: 0; }
 .metadata-copy-value { padding: 2px 8px; }
+/* Overrides .fade-overflow's nowrap, so a string literal in a value's display (a quoted string, or one inside an array or object) keeps its runs of spaces; an unquoted string has only single inner spaces (metadata_viewer.rs shows_quoted). */
+.metadata-copy-value .fade-overflow { white-space: pre; }
 
 .metadata-branch-cell {
     color: var(--text-headings);

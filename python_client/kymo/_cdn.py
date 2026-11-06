@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import sys
 
 
 _IMAGE_CONTENT_TYPES = {
@@ -18,9 +19,75 @@ def _manifest_text(value: str) -> str:
     return value.encode("utf-8", errors="replace").decode("utf-8")
 
 
-def readable_metadata(data):
-    """Return JSON-shaped metadata with _manifest_text applied to every string, keys included. Takes decoded JSON (json.loads output), whose surrogate pairs are already joined: a pair split into two lone halves would become "??". Keys that differ only where they become "?" merge, the later winning."""
-    return json.loads(_manifest_text(json.dumps(data, ensure_ascii=False)))
+def _numpy_number(o):
+    """Return the exact bool, int or float of a numpy scalar of dtype kind b, i, u or f, or o itself when it is none of those. Never imports numpy: such a scalar can only exist once it is loaded."""
+    generic = getattr(sys.modules.get("numpy"), "generic", None)
+    if not (isinstance(generic, type) and isinstance(o, generic)):
+        return o
+    kind = o.dtype.kind
+    if kind in "biu":
+        return o.item()
+    if kind != "f":
+        return o
+    value = float(o)
+    # float16 and float32 always fit a float; a longdouble often does not (most fractional ones on x86), nor one past the float range, which float() would make inf. A NaN takes the token path.
+    if o == o and value != o:
+        raise ValueError(f"numpy {o.dtype} {o} has no exact float64 value")
+    return value
+
+
+def _metadata_default(o):
+    """json's default for configs and metadata, called only for values json cannot encode itself: numpy scalars as their exact Python number, arrays and tensors as .tolist() gives them, sets as lists in a fixed order, and anything else as its str(). Never imports numpy or torch."""
+    number = _numpy_number(o)
+    if number is not o:
+        return number
+    ndarray = getattr(sys.modules.get("numpy"), "ndarray", None)
+    if isinstance(ndarray, type) and isinstance(o, ndarray):
+        # As its scalars are: .tolist() turns units finer than a microsecond into plain ints, and the array's printed text drops elements past 1,000.
+        return (o.astype(str) if o.dtype.kind in "mM" else o).tolist()
+    # A stub or half-imported torch has no Tensor type.
+    tensor = getattr(sys.modules.get("torch"), "Tensor", None)
+    if isinstance(tensor, type) and isinstance(o, tensor):
+        return o.tolist()
+    if isinstance(o, (set, frozenset)):
+        # Iteration order follows the hash seed; this text does not.
+        return sorted(o, key=lambda e: json.dumps(e, default=_metadata_default))
+    return str(o)
+
+
+def _numpy_keys_converted(data):
+    """Return data with every numpy scalar key converted by _numpy_number, in each container json walks: each dict, subclasses included, rebuilt as a plain dict in its order, and each list and tuple."""
+    if isinstance(data, dict):
+        return {_numpy_number(k): _numpy_keys_converted(v) for k, v in data.items()}
+    if isinstance(data, (list, tuple)):
+        return [_numpy_keys_converted(v) for v in data]
+    return data
+
+
+def _unique_keys(pairs: list) -> dict:
+    """json.loads' object_pairs_hook: raise where keys of one dict were stored as the same text (1 and "1", inf and "Infinity", two NaN), rather than keep only the last."""
+    data = dict(pairs)
+    if len(data) < len(pairs):
+        seen = set()
+        for key, _ in pairs:
+            if key in seen:
+                raise ValueError(f"more than one key of a dict is stored as {key!r}")
+            seen.add(key)
+    return data
+
+
+def _freeze_json(data, label: str):
+    """Return data as the JSON tree its manifest stores, owning every value, or raise ValueError naming label for data that cannot be stored exactly."""
+    encode = json.JSONEncoder(separators=(",", ":"), default=_metadata_default).encode
+    try:
+        try:
+            text = encode(data)
+        except TypeError:
+            # A numpy scalar key, which json never passes to default. Input that encodes as it is pays nothing.
+            text = encode(_numpy_keys_converted(data))
+        return json.loads(text, object_pairs_hook=_unique_keys)
+    except Exception as error:
+        raise ValueError(f"{label} cannot be stored as JSON: {error}") from error
 
 
 def content_id(data: bytes, extension: str) -> str:
@@ -37,12 +104,11 @@ def gallery_manifest(items: list[dict]) -> bytes:
 
 
 def metadata_manifest(data: dict) -> bytes:
-    """Serialize a metadata manifest; raises on non-finite or non-JSON values."""
+    """Serialize a metadata manifest, in Python json's dialect: NaN, Infinity and -Infinity are written as those tokens."""
     return json.dumps(
         {"v": 1, "class": "metadata", "data": data},
         indent=2,
-        default=str,
-        allow_nan=False,
+        default=_metadata_default,
     ).encode("utf-8")
 
 

@@ -41,10 +41,22 @@ class Image:
 
 
 class Metadata:
-    """Arbitrary dict data stored as JSON via CDN.
+    """A dict stored as JSON via CDN, frozen when ``kymo.log`` is called. ``kymo.init`` and ``kymo.update_config`` store configs by the same rules.
+
+    What is stored:
+
+    - JSON values as they are, NaN, Infinity and -Infinity included: Python json's dialect, which ``json.loads`` reads back as floats.
+    - A numpy bool, integer or floating scalar as its exact bool, int or float. A longdouble that a float cannot hold exactly raises.
+    - A numpy array or a torch tensor as ``.tolist()`` gives it, each element by these rules; a datetime64 or timedelta64 array as the text of each element.
+    - A set or frozenset as a list, sorted by each element's JSON text.
+    - Anything else as ``str(value)``: a Path, datetime, Enum, Decimal, bytes, dataclass, numpy datetime64, timedelta64 or complex scalar, or a mapping that is not a dict. Pass ``dataclasses.asdict(x)`` or ``OmegaConf.to_container(cfg, resolve=True)`` to store their fields.
+
+    Keys are JSON text. An int, float, bool or None key becomes the text json writes for it (``1`` as ``"1"``, inf as ``"Infinity"``), and a numpy bool, integer or float key is converted first. Other key types raise ValueError, and so do keys of one dict that become the same text, such as ``1`` and ``"1"`` or two NaN keys, rather than keep only the last.
+
+    Tuples read back as lists, and IntEnum and StrEnum as plain values. NaN keeps neither its sign nor its payload. A lone surrogate (from ``os.fsdecode``) is stored as its exact ``\\udXXX`` escape. The client README lists the other limits.
 
     Args:
-        data: Any JSON-serializable dict.
+        data: The dict to store.
     """
 
     def __init__(self, data: dict):

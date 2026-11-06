@@ -38,7 +38,7 @@ Keep the `if __name__ == "__main__":` guard. kymo uploads from a helper process,
 
 In local mode, the backend autostarts when logged to and stops after an hour idle; logging or viewing will reset the clock. `kymo open` starts it for viewing, since your browser can't autostart it.
 
-The [client README](python_client/README.md) covers the `kymo` commands, remote machines, undelivered data, backups, and logging to a server.
+The [client README](python_client/README.md) covers the `kymo` commands, remote machines, undelivered data, backups, logging to a server, and how configs and metadata are stored.
 
 This repository is a mirror of our internal repository. See [CONTRIBUTING](.github/CONTRIBUTING.md).
 

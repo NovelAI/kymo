@@ -3,7 +3,6 @@
 import contextlib
 import errno
 import fcntl
-import hashlib
 import io
 import json
 import os
@@ -186,9 +185,27 @@ class FrameValidationTests(unittest.TestCase):
             content_id(metadata, "json"),
             "a8c998a6bafafe65d6b0d81f2e434bf09be03992abbc52a51fdbe30bbe27ad2a.json",
         )
-        # log() replaces lone surrogates before spooling (readable_metadata); the serializer keeps them, so a spool written by an older client replays the bytes it published.
+        # A lone surrogate is written as its exact escape. A spool written by an older client, which replaced them with "?" before spooling, still replays the bytes it published.
         self.assertIn(
             b"file-\\udcff.png", metadata_manifest({"path": "file-\udcff.png"})
+        )
+        # Non-finite values are written as Python json's tokens; keys spelled like them stay strings.
+        tokens = metadata_manifest(
+            {
+                "loss": float("nan"),
+                "bounds": [float("-inf"), float("inf")],
+                "Infinity": {"NaN": 0.5},
+            }
+        )
+        self.assertEqual(
+            tokens,
+            b'{\n  "v": 1,\n  "class": "metadata",\n  "data": {\n    "loss": NaN,\n'
+            b'    "bounds": [\n      -Infinity,\n      Infinity\n    ],\n'
+            b'    "Infinity": {\n      "NaN": 0.5\n    }\n  }\n}',
+        )
+        self.assertEqual(
+            content_id(tokens, "json"),
+            "e387f1c096f176e75bcea8c91bd165b184fe2c7d280b900228876f9b9bccc1c1.json",
         )
 
     def test_gallery_manifest_text_replaces_lone_surrogates(self):
@@ -3173,7 +3190,6 @@ class ReplayTests(unittest.TestCase):
                     ],
                 ),
                 ("metadata_json", "bad\0name", 3, {"value": 1}),
-                ("metadata_json", "metadata", 3, {"value": float("nan")}),
                 (
                     "cdn_batch_encoded",
                     "gallery",
@@ -3217,6 +3233,38 @@ class ReplayTests(unittest.TestCase):
 
                     connect.assert_not_called()
                     self.assertTrue(os.path.exists(path + ".rejected"))
+
+    def test_nonfinite_and_lone_surrogate_metadata_replays(self):
+        data = {"value": float("nan"), "inf": [float("inf")], "path": "file-\udcff"}
+        uploaded = []
+
+        def upload(_client, _cdn, body, _ext, *, expected_id=None):
+            uploaded.append(body)
+            return expected_id
+
+        stub = mock.Mock()
+        stub.IngestMetrics.return_value = sync_module.kymo_pb2.IngestResponse(
+            points_received=1
+        )
+        with tempfile.TemporaryDirectory() as spool_dir:
+            path = os.path.join(spool_dir, "nonfinite.mkspool")
+            self._write(path, [("metadata_json", "metadata", 3, data)])
+            with (
+                mock.patch.object(
+                    sync_module, "_connect", return_value=(_Channel(), stub)
+                ),
+                mock.patch("httpx.Client", return_value=mock.Mock()),
+                mock.patch.object(sync_module, "_current_cdn_key", return_value=""),
+                mock.patch.object(sync_module, "_upload_to_cdn", side_effect=upload),
+            ):
+                self.assertTrue(sync_module.replay_file(path, cdn="http://unused"))
+
+            self.assertTrue(os.path.exists(path + ".sent"))
+        # NaN, Infinity and the lone surrogate come back from the spool exactly, so the replay uploads the bytes the live client published.
+        self.assertEqual(uploaded, [metadata_manifest(data)])
+        (batch,) = stub.IngestMetrics.call_args.args[0]
+        (point,) = batch.points
+        self.assertEqual((point.metric_name, point.step), ("metadata", 3))
 
     def test_data_only_reader_rejects_executable_pickle_globals(self):
         with tempfile.TemporaryDirectory() as spool_dir:
@@ -3358,22 +3406,8 @@ class ReplayTests(unittest.TestCase):
             self.assertIsNotNone(expected_id)
             return expected_id
 
-        old_manifest = {"v": 1, "class": "metadata", "data": old[3]}
-        new_manifest = {"v": 1, "class": "metadata", "data": new[3]}
-        new_id = (
-            hashlib.sha256(
-                json.dumps(new_manifest, indent=2, default=str).encode("utf-8")
-            ).hexdigest()
-            + ".json"
-        )
-        state = {
-            "current": (
-                hashlib.sha256(
-                    json.dumps(old_manifest, indent=2, default=str).encode("utf-8")
-                ).hexdigest()
-                + ".json"
-            )
-        }
+        new_id = content_id(metadata_manifest(new[3]), "json")
+        state = {"current": content_id(metadata_manifest(old[3]), "json")}
         writes = []
 
         class Stub:

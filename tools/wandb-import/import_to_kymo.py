@@ -78,6 +78,9 @@ Known limitations:
   run's log source changed (the streamed console log, later output.log) or
   --max-log-bytes changed, the earlier log chunks stay beside the new ones.
   The first import's run name and created_at are kept.
+- Runs imported by an earlier importer hold non-finite config, summary and
+  artifact values in run_info as the strings "nan", "inf" and "-inf" until
+  re-imported, so a diff against a later run shows them as changed.
 - Media a history cell names but the archive lacks are counted
   (media_missing), not damage, so a repair needs a deliberate re-import.
   Files over the server's upload limit (256 MiB) are counted
@@ -132,7 +135,6 @@ from kymo._cdn import (
     gallery_item,
     gallery_manifest,
     metadata_manifest,
-    readable_metadata,
 )
 from kymo._generated import kymo_pb2, kymo_pb2_grpc
 from kymo._local_runtime import ensure_local_endpoint, grpc_channel, http_client
@@ -258,19 +260,6 @@ def write_json(path, obj):
     with open(tmp, "w") as f:
         json.dump(obj, f, indent=1, default=str)
     os.replace(tmp, path)
-
-
-def sanitize_json(value):
-    """Make a tree safe for allow_nan=False manifest encoding."""
-    if isinstance(value, dict):
-        return {str(k): sanitize_json(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [sanitize_json(v) for v in value]
-    if isinstance(value, float) and not math.isfinite(value):
-        return str(value)
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    return str(value)
 
 
 def parse_iso_ms(s):
@@ -1145,8 +1134,6 @@ def import_events(sender, ctx, run_dir):
     execute count/send by reading them (they are tiny next to history)."""
     c = sender.c
     files = sorted(run_dir.glob("events/*.parquet"))
-    if not files:
-        return
     for batch, idx in iter_parquet_rows_meta(files):
         if "_timestamp" not in idx:
             c["events_no_timestamp"] += 1
@@ -1341,9 +1328,9 @@ def build_run_info(run_meta, wb_meta, summary, artifacts, created_ms):
         "artifacts": artifacts,
     }
     doc = {"meta": meta}
-    if run_meta.get("config"):
+    if run_meta.get("config") is not None:
         doc["config"] = run_meta["config"]
-    return sanitize_json(doc)
+    return doc
 
 
 def import_run_info(sender, ctx, run_dir, run_meta, created_ms):
@@ -1353,7 +1340,7 @@ def import_run_info(sender, ctx, run_dir, run_meta, created_ms):
     wb_meta = read_json(run_dir / "files" / "wandb-metadata.json")
     artifacts = read_json(run_dir / "artifacts.json")
     doc = build_run_info(run_meta, wb_meta, summary, artifacts, created_ms)
-    manifest_id = sender.upload(metadata_manifest(readable_metadata(doc)), "json")
+    manifest_id = sender.upload(metadata_manifest(doc), "json")
     sender.queue(
         ctx.project_id,
         ctx.run_id,

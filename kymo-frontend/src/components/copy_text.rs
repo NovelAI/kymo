@@ -38,7 +38,7 @@ pub(crate) fn CopyText(text: String, class: &'static str, display: Option<String
             tabindex: 0,
             class: "copy-text {class}",
             title: "{display}",
-            aria_label: display.trim().is_empty().then_some("Copy empty text"),
+            aria_label: text.trim().is_empty().then_some("Copy empty text"),
             onmousedown: move |event: Event<MouseData>| {
                 // Shift-clicks and multi-clicks adjust the selection rather than dismiss it.
                 let plain = !event.modifiers().contains(Modifiers::SHIFT)

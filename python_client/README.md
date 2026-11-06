@@ -35,6 +35,30 @@ For a backup, keep the stack stopped with `kymo stop --hold` while you copy the 
 
 Leave out `mode="local"` and pass the server's gRPC address as `server_address="host:port"`, or set `KYMO_SERVER`. Pass the dashboard's origin as `url_base` (or set `KYMO_URL_BASE`) for `kymo.run_url()`. To run the server yourself, see [self-hosting](https://github.com/NovelAI/kymo/blob/main/docs/self-hosting.md).
 
+## Configs and metadata
+
+`kymo.init(config=...)`, `kymo.update_config(...)` and `kymo.log({name: kymo.Metadata(...)})` store a dict as JSON, frozen when the call is made. `kymo.Api.run_info` and Python's `json` read it back. Each raise below is a ValueError: `init` raises before it stops a previous run, `update_config` leaves the config as it was, and `log` logs nothing from that call.
+
+- JSON values are stored as they are, `NaN`, `Infinity` and `-Infinity` included, in Python json's dialect.
+- A numpy bool, integer or floating scalar is stored as its exact bool, int or float. A longdouble that a float can't hold exactly raises.
+- A numpy array or a torch tensor is stored as `.tolist()` gives it, nested lists or a 0-d array's scalar, each element by these rules; a datetime64 or timedelta64 array as the text of each element, as its scalars are stored.
+- A set is stored as a list, sorted by each element's JSON text.
+- Anything else is stored as `str(value)`: a Path, datetime, Enum, Decimal, bytes, dataclass, numpy datetime64, timedelta64 or complex scalar, or a mapping that isn't a dict. Pass `dataclasses.asdict(x)` or `OmegaConf.to_container(cfg, resolve=True)` to store their fields.
+- Keys are JSON text. An int, float, bool or None key is stored as the text json writes for it: `1` as `"1"`, inf as `"Infinity"`, NaN as `"NaN"`. A numpy bool, integer or float key is converted first. Other key types raise.
+- When keys of one dict become the same text, such as `1` and `"1"`, inf and `"Infinity"`, or two NaN keys, the call raises naming that text rather than keep only one.
+- `{}` stores an empty config, and `update_config` merges top-level keys by their JSON text: `1` replaces `"1"`, but `1` and `1.0` are two keys.
+
+Limits:
+
+- Tuples read back as lists, and IntEnum and StrEnum as plain values. NaN keeps neither its sign nor its payload.
+- Python's dict merges `0.0` and `-0.0`, and `1` and `True`, before kymo sees them: the first key's text survives with the last value.
+- A repr that holds an object's address (`<object at 0x…>`) differs per process. A dataclass's repr leaves out its `repr=False` fields.
+- A masked array's masked entries are stored as null, and a structured array without its field names (its datetime64 and timedelta64 fields as `.tolist()` gives them). A tensor that `.tolist()` can't read (meta, sparse, quantized, nested, DTensor) raises. A numpy key in a dict held inside an object array raises.
+- A lone surrogate, as `os.fsdecode` makes for a path that isn't UTF-8, is stored as its exact `\udXXX` escape. A high surrogate directly followed by a low one reads back as the one character they encode.
+- A manifest holding NaN or Infinity is not strict JSON. Read manifests with Python's `json`: jq turns those tokens into `null` and `±1.797e308`, and a lone low surrogate into U+FFFD, without a warning.
+- An array or tensor costs about 10–35 bytes per element in the manifest (a float about 28), and every `update_config` uploads the whole config again. A manifest past 256 MiB (about 9M floats) is never delivered, and it holds every later gallery and metadata of the run on disk.
+- The dashboard shows a string JSON-quoted when its text reads as JSON (`"5"`, `"true"`, `"NaN"`), is empty, or has leading or trailing whitespace, a double space or a control character; copying gives the raw text. It shows, copies and diffs a lone surrogate as the literal text `\udXXX`, so sibling keys that differ only there merge, the later winning. A Metadata dict nested 127 levels deep or more, or a config nested 126, shows as unreadable.
+
 ## Reading runs back
 
 `kymo.Api` reads what runs logged. It takes the same `server_address`, `mode` and `cdn_address` as `kymo.init` and falls back to the same environment variables (`cdn_address` has none).

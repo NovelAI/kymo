@@ -4,7 +4,11 @@ import base64
 import collections
 import contextlib
 import ctypes
+import dataclasses
+import datetime
+import decimal
 import dis
+import enum
 import gc
 import importlib.abc
 import inspect
@@ -17,6 +21,7 @@ import multiprocessing
 import multiprocessing.queues
 import multiprocessing.util
 import os
+import pathlib
 import pickle
 import queue
 import random
@@ -48,7 +53,7 @@ from kymo import sync as sync_module
 from kymo import system_metrics as system_metrics_module
 from kymo import _wire as wire_module
 from kymo import _worker as worker_module
-from kymo._cdn import content_id
+from kymo._cdn import content_id, metadata_manifest
 from kymo._local_runtime import (
     LocalInstallationMismatch,
     endpoint_from_worker_config,
@@ -292,6 +297,10 @@ class _StubTensor:
         if self.device.type != "cpu":
             raise TypeError("can't convert a device tensor to numpy")
         return np.array(self.values)
+
+    def tolist(self):
+        # As torch's, which copies a device tensor to the host itself.
+        return self.cpu().values
 
     def untyped_storage(self):
         return types.SimpleNamespace(nbytes=lambda: np.array(self.values).nbytes)
@@ -2006,14 +2015,17 @@ print(k > 50, str(late).replace(" ", ""), 0.9 < armed <= 1)
             mock.patch.object(client_module, "_is_initialized", True),
             mock.patch.object(client_module, "_drain_and_shutdown") as shutdown,
             mock.patch.object(client_module.grpc, "insecure_channel") as connect,
-            self.assertRaisesRegex(ValueError, "finite JSON-serializable"),
+            self.assertRaisesRegex(
+                ValueError,
+                "kymo config cannot be stored as JSON: more than one key of a dict is stored as '1'",
+            ),
         ):
             client_module.init(
                 "localhost:50051",
                 project_id="project",
                 run_name="run",
                 run_id="run",
-                config={"loss": float("nan")},
+                config={1: "a", "1": "b"},
             )
 
         shutdown.assert_not_called()
@@ -2194,6 +2206,19 @@ print(k > 50, str(late).replace(" ", ""), 0.9 < armed <= 1)
             make_spool_path.call_args.kwargs["spool_dir"],
             os.path.abspath("relative-spool"),
         )
+
+    def test_an_empty_config_is_stored_and_none_is_left_out(self):
+        collect = client_module._collect_run_metadata
+        for config, expected in (({}, {}), (None, "absent")):
+            with (
+                self.subTest(config=config),
+                self._init_without_a_server(mock.Mock(), _collect_run_metadata=collect),
+            ):
+                self._init(config=config)
+                client_module._push_run_metadata.assert_called_once_with()
+                self.assertEqual(
+                    client_module._run_metadata.get("config", "absent"), expected
+                )
 
     def test_a_ctrl_c_as_the_poller_starts_ends_the_run(self):
         # The poller's start, NVML's init with system metrics, can take seconds once the worker has started: a Ctrl-C there raises out of init() with the run active and kymo's exit hooks installed, so the exception hook hands it off, rather than leave the worker, which carries on through a Ctrl-C, to multiprocessing's exit, which waits for it. The poller starts last, after the run's metadata.
@@ -2539,19 +2564,15 @@ class ConfigSnapshotTests(unittest.TestCase):
             },
         )
 
-    def test_snapshot_rejects_non_dict_nonfinite_and_cyclic_values(self):
+    def test_snapshot_rejects_non_dict_and_cyclic_values(self):
         with self.assertRaisesRegex(TypeError, "must be dict"):
             client_module._snapshot_config([("loss", 1.0)])
-        for value in (float("nan"), float("inf"), float("-inf")):
-            with (
-                self.subTest(value=value),
-                self.assertRaisesRegex(ValueError, "finite JSON-serializable"),
-            ):
-                client_module._snapshot_config({"value": value})
 
         cyclic = {}
         cyclic["self"] = cyclic
-        with self.assertRaisesRegex(ValueError, "finite JSON-serializable"):
+        with self.assertRaisesRegex(
+            ValueError, "^kymo config cannot be stored as JSON: Circular reference"
+        ):
             client_module._snapshot_config(cyclic)
 
     def test_update_config_owns_patch_without_mutating_public_inputs(self):
@@ -2583,6 +2604,352 @@ class ConfigSnapshotTests(unittest.TestCase):
         )
         self.assertNotIn("schedule", initial)
         push.assert_called_once_with()
+
+    def test_update_config_that_cannot_be_stored_changes_nothing(self):
+        metadata = {"meta": {}, "config": {"1": "stored"}}
+        with (
+            mock.patch.object(client_module, "_is_initialized", True),
+            mock.patch.object(client_module, "_run_metadata", metadata),
+            mock.patch.object(client_module, "_push_run_metadata") as push,
+            self.assertRaisesRegex(
+                ValueError,
+                "^kymo config cannot be stored as JSON: more than one key of a dict is stored as 'NaN'$",
+            ),
+        ):
+            client_module.update_config({"lr": 0.1, math.nan: 1, -math.nan: 2})
+
+        self.assertEqual(metadata, {"meta": {}, "config": {"1": "stored"}})
+        push.assert_not_called()
+
+    def test_update_config_merges_by_json_key_text(self):
+        metadata = {"meta": {}, "config": {"1": "old", "Infinity": "old"}}
+        with (
+            mock.patch.object(client_module, "_is_initialized", True),
+            mock.patch.object(client_module, "_run_metadata", metadata),
+            mock.patch.object(client_module, "_push_run_metadata"),
+        ):
+            client_module.update_config({1: "new", math.inf: "new"})
+            client_module.update_config({1.0: "float"})
+
+        self.assertEqual(
+            metadata["config"], {"1": "new", "Infinity": "new", "1.0": "float"}
+        )
+
+
+class MetadataEncodingTests(unittest.TestCase):
+    """The JSON tree both freeze points store (kymo._cdn._freeze_json): the values table, the keys and the collision guard the README's "Configs and metadata" lists."""
+
+    class Color(enum.Enum):
+        RED = 1
+
+    class Level(enum.IntEnum):
+        HIGH = 3
+
+    class Mode(str, enum.Enum):
+        TRAIN = "train"
+
+    @staticmethod
+    def _freeze(data):
+        return client_module._snapshot_config(data)
+
+    def test_numpy_scalars_are_stored_as_their_exact_python_numbers(self):
+        cases = [(np.bool_(True), True), (np.bool_(False), False)]
+        for dtype in (
+            np.int8,
+            np.int16,
+            np.int32,
+            np.int64,
+            np.uint8,
+            np.uint16,
+            np.uint32,
+            np.uint64,
+        ):
+            info = np.iinfo(dtype)
+            cases += [(dtype(info.min), info.min), (dtype(info.max), info.max)]
+        cases += [
+            (np.float16(1 / 3), 0.333251953125),
+            (np.float32(0.1), 0.10000000149011612),
+            (np.longdouble(0.5), 0.5),
+            (np.float64(0.1), 0.1),
+        ]
+        for value, expected in cases:
+            with self.subTest(dtype=value.dtype.name, value=value):
+                stored = self._freeze({"v": value})["v"]
+                self.assertIs(type(stored), type(expected))
+                self.assertEqual(stored, expected)
+
+    def test_nonfinite_floats_are_stored_as_tokens(self):
+        for dtype in (float, np.float16, np.float32, np.float64, np.longdouble):
+            with self.subTest(dtype=dtype.__name__):
+                stored = self._freeze(
+                    {"nan": dtype("nan"), "inf": dtype("inf"), "-inf": dtype("-inf")}
+                )
+                self.assertTrue(math.isnan(stored["nan"]))
+                self.assertEqual((stored["inf"], stored["-inf"]), (math.inf, -math.inf))
+
+    @unittest.skipIf(
+        np.finfo(np.longdouble).nmant <= np.finfo(np.float64).nmant,
+        "longdouble is float64 on this platform",
+    )
+    def test_a_longdouble_that_a_float_cannot_hold_raises(self):
+        for value in (
+            np.longdouble(1) / 3,
+            np.longdouble(np.finfo(np.float64).max) * 2,
+        ):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "^kymo config cannot be stored as JSON: numpy float[0-9]+ .* has no exact float64 value$",
+                ),
+            ):
+                self._freeze({"v": [value]})
+
+    def test_arrays_are_stored_as_lists_of_their_elements(self):
+        cases = [
+            (np.array([True, False]), [True, False]),
+            (np.array([[1, -2], [3, 4]], dtype=np.int8), [[1, -2], [3, 4]]),
+            (np.array([2**64 - 1], dtype=np.uint64), [2**64 - 1]),
+            (
+                np.array([0.1, 1 / 3], dtype=np.float32),
+                [0.10000000149011612, 0.3333333432674408],
+            ),
+            (np.array([0.5, -np.inf], dtype=np.float16), [0.5, -math.inf]),
+            (np.array([0.5, 0.25], dtype=np.longdouble), [0.5, 0.25]),
+            (np.array(7), 7),
+            (np.array(["a", "b"]), ["a", "b"]),
+            (np.array([1 + 2j]), ["(1+2j)"]),
+            (np.array([{"k": np.int64(1)}, None], dtype=object), [{"k": 1}, None]),
+            (np.ma.masked_array([1, 2], mask=[False, True]), [1, None]),
+            (np.zeros(1, dtype=[("x", "i4"), ("y", "f4")]), [[0, 0.0]]),
+        ]
+        for array, expected in cases:
+            with self.subTest(dtype=array.dtype.name, array=array):
+                self.assertEqual(self._freeze({"v": array})["v"], expected)
+        (nan,) = self._freeze({"v": np.array([np.nan], dtype=np.float32)})["v"]
+        self.assertTrue(math.isnan(nan))
+
+    def test_datetime_arrays_are_stored_as_the_text_of_each_element(self):
+        dates = np.arange(1001).astype("datetime64[D]")
+        self.assertEqual(self._freeze({"v": dates})["v"], [str(d) for d in dates])
+        self.assertEqual(
+            self._freeze(
+                {
+                    "ns": np.array(
+                        ["2026-11-05T12:00:00.123456789", "NaT"], dtype="datetime64[ns]"
+                    ),
+                    "td": np.array([[5], [7]], dtype="timedelta64[ms]"),
+                    "masked": np.ma.array(dates[:2], mask=[False, True]),
+                }
+            ),
+            {
+                "ns": ["2026-11-05T12:00:00.123456789", "NaT"],
+                "td": [["5 milliseconds"], ["7 milliseconds"]],
+                "masked": ["1970-01-01", None],
+            },
+        )
+
+    def test_tensors_are_stored_as_lists_of_their_host_copy(self):
+        # CI has no torch: a stand-in module whose Tensor is the stub.
+        with mock.patch.dict(
+            sys.modules, {"torch": types.SimpleNamespace(Tensor=_StubTensor)}
+        ):
+            self.assertEqual(
+                self._freeze({"t": _StubTensor("cuda", [[1.5, 2.0]])}),
+                {"t": [[1.5, 2.0]]},
+            )
+            # A tensor that .tolist() cannot read raises at the freeze.
+            with self.assertRaisesRegex(
+                ValueError,
+                "^kymo config cannot be stored as JSON: Cannot copy out of meta tensor",
+            ):
+                self._freeze({"t": _StubTensor("meta", [1])})
+        # Without torch loaded, the stub is just an object.
+        with mock.patch.dict(sys.modules, {"torch": None}):
+            self.assertIsInstance(
+                self._freeze({"t": _StubTensor("cuda", [1])})["t"], str
+            )
+        # A stub or half-imported module has neither type, and other values still fall back to str().
+        for name in ("numpy", "torch"):
+            with mock.patch.dict(sys.modules, {name: types.ModuleType(name)}):
+                self.assertEqual(
+                    self._freeze({"p": pathlib.PurePosixPath("/x")}), {"p": "/x"}
+                )
+
+    @unittest.skipUnless(torch is not None, "requires torch")
+    def test_real_tensors_are_stored_as_lists(self):
+        bf16 = torch.tensor([1 / 3], dtype=torch.bfloat16)
+        stored = self._freeze(
+            {
+                "f32": torch.tensor([0.1, math.nan], requires_grad=True),
+                "bf16": bf16,
+                "int": torch.arange(3),
+                "bool": torch.tensor(True),
+            }
+        )
+        self.assertEqual(stored["f32"][0], 0.10000000149011612)
+        self.assertTrue(math.isnan(stored["f32"][1]))
+        self.assertEqual(stored["bf16"], [bf16.item()])
+        self.assertEqual(stored["int"], [0, 1, 2])
+        self.assertIs(stored["bool"], True)
+        with self.assertRaisesRegex(
+            ValueError, "^kymo config cannot be stored as JSON: "
+        ):
+            self._freeze({"meta": torch.empty(2, device="meta")})
+
+    def test_sets_are_stored_as_lists_sorted_by_their_json_text(self):
+        self.assertEqual(
+            self._freeze(
+                {
+                    "set": {3, "a", 1.5, None, (1, 2), np.int64(-1)},
+                    "frozen": frozenset({"b", "a"}),
+                    "empty": set(),
+                }
+            ),
+            {"set": ["a", -1, 1.5, 3, [1, 2], None], "frozen": ["a", "b"], "empty": []},
+        )
+
+    def test_anything_else_is_stored_as_its_str(self):
+        @dataclasses.dataclass
+        class Point:
+            x: int = 1
+
+        for value in (
+            pathlib.PurePosixPath("/data/run"),
+            datetime.datetime(2026, 11, 5, 12, 30),
+            self.Color.RED,
+            decimal.Decimal("0.1"),
+            b"\x00raw",
+            Point(),
+            np.datetime64("2026-11-05"),
+            # .item() would store these as bare integers (5, and nanoseconds since the epoch).
+            np.timedelta64(5, "ns"),
+            np.datetime64("2026-11-05T12:00:00.123456789"),
+            np.complex64(1 + 2j),
+            types.MappingProxyType({"a": 1}),
+            1 + 2j,
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(self._freeze({"v": value})["v"], str(value))
+
+    def test_json_shapes_read_back_as_plain_values(self):
+        self.assertEqual(
+            self._freeze(
+                {
+                    "tuple": (1, (2, 3)),
+                    "int_enum": self.Level.HIGH,
+                    "str_enum": self.Mode.TRAIN,
+                    "ordered": collections.OrderedDict(b=1, a=2),
+                }
+            ),
+            {
+                "tuple": [1, [2, 3]],
+                "int_enum": 3,
+                "str_enum": "train",
+                "ordered": {"b": 1, "a": 2},
+            },
+        )
+
+    def test_plain_keys_become_their_json_text(self):
+        stored = self._freeze(
+            {
+                1: "int",
+                1.5: "float",
+                False: "bool",
+                None: "none",
+                math.inf: "inf",
+                -math.inf: "-inf",
+                math.nan: "nan",
+                "s": "str",
+            }
+        )
+        self.assertEqual(
+            list(stored.items()),
+            [
+                ("1", "int"),
+                ("1.5", "float"),
+                ("false", "bool"),
+                ("null", "none"),
+                ("Infinity", "inf"),
+                ("-Infinity", "-inf"),
+                ("NaN", "nan"),
+                ("s", "str"),
+            ],
+        )
+        # A manifest whose only non-finite floats are keys is strict JSON.
+        json.loads(
+            metadata_manifest(stored),
+            parse_constant=lambda token: self.fail(f"token {token} in the manifest"),
+        )
+
+    def test_other_key_types_raise(self):
+        for key in (
+            (1, 2),
+            pathlib.PurePosixPath("p"),
+            self.Color.RED,
+            np.complex64(1),
+        ):
+            with (
+                self.subTest(key=key),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "^kymo config cannot be stored as JSON: keys must be str, int, float, bool or None",
+                ),
+            ):
+                self._freeze({"nested": [{key: 1}]})
+
+    def test_numpy_keys_are_converted_in_every_container_json_walks(self):
+        counter = collections.Counter({np.int64(2): 5, np.int64(1): 7})
+        data = {
+            np.int64(3): "int",
+            "counter": counter,
+            "tuple": (
+                {np.bool_(True): 1, np.uint64(2**64 - 1): 2},
+                [{np.float16("inf"): 3}],
+            ),
+            "default": collections.defaultdict(list, {np.int8(-1): [np.int32(4)]}),
+        }
+        stored = self._freeze(data)
+        self.assertEqual(
+            stored,
+            {
+                "3": "int",
+                "counter": {"2": 5, "1": 7},
+                "tuple": [
+                    {"true": 1, "18446744073709551615": 2},
+                    [{"Infinity": 3}],
+                ],
+                "default": {"-1": [4]},
+            },
+        )
+        self.assertEqual(list(stored["counter"]), ["2", "1"])
+        # The caller's containers are left as they were.
+        self.assertIsInstance(data["counter"], collections.Counter)
+        self.assertIsInstance(next(iter(counter)), np.int64)
+
+    def test_input_that_encodes_as_it_is_is_never_rebuilt(self):
+        with mock.patch("kymo._cdn._numpy_keys_converted", side_effect=AssertionError):
+            self._freeze({"a": [np.int64(1), {"b": np.float32(2)}], 1: (2,)})
+
+    def test_keys_stored_as_the_same_text_raise(self):
+        for data, key in (
+            ({1: "a", "1": "b"}, "1"),
+            ({math.nan: "a", -math.nan: "b"}, "NaN"),
+            ({math.inf: "a", "Infinity": "b"}, "Infinity"),
+            ({True: "a", "true": "b"}, "true"),
+            ({np.int64(1): "a", "1": "b"}, "1"),
+            ({"outer": [{"inner": ({None: 1, "null": 2},)}]}, "null"),
+        ):
+            with (
+                self.subTest(data=data),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "^kymo config cannot be stored as JSON: more than one key of a dict is stored as "
+                    + re.escape(repr(key))
+                    + "$",
+                ),
+            ):
+                self._freeze(data)
 
 
 class RunMetadataTests(unittest.TestCase):
@@ -3249,8 +3616,13 @@ class AccountingTests(unittest.TestCase):
         )
 
     def test_metadata_snapshot_is_frozen_to_its_rendered_json(self):
-        data = {"stats": _StubTensor("cuda", [1]), "shape": (2, 3), 5: None}
-        manifest = client_module.metadata_manifest(data)
+        data = {
+            "stats": _StubTensor("cuda", [1]),
+            "shape": (2, 3),
+            5: None,
+            "converted": [np.int64(5), np.arange(2, dtype=np.uint8), {2, 1}],
+        }
+        manifest = metadata_manifest(data)
         for batch in (
             ("metadata_batch", "demo/meta", 1, Metadata(data)),
             ("metadata_batch_mutation", "demo/meta", 1, Metadata(data), 7, 9),
@@ -3263,23 +3635,22 @@ class AccountingTests(unittest.TestCase):
                     (client_module._SERIALIZED_RICH_QUEUE_ITEM, payload)
                 )
                 self.assertEqual(decoded[:3] + decoded[4:], batch[:3] + batch[4:])
-                self.assertEqual(
-                    client_module.metadata_manifest(decoded[3].data), manifest
-                )
+                self.assertEqual(metadata_manifest(decoded[3].data), manifest)
 
-    def test_metadata_snapshot_replaces_lone_surrogates(self):
-        # os.fsdecode(b"file-\xff.png"): a POSIX filename, cwd or argument that is not UTF-8. The escaped non-BMP text in "fine" also matches the guard and must come back unchanged.
+    def test_metadata_snapshot_keeps_lone_surrogates_exactly(self):
+        # os.fsdecode(b"file-\xff.png"): a POSIX filename, cwd or argument that is not UTF-8. It is kept exactly, and keys that differ only there stay apart.
         name, readable = "file-\udcff.png", "file-?.png"
-        fine = {"fine": "\u00fcn\u00efcode \U0001f600"}
-        # A key that becomes an existing one after the replacement merges with it, the later value winning.
-        data = {readable: "old", "path": name, name: [name, {"inner": name}], **fine}
+        data = {readable: "old", "path": name, name: [name, {"inner": name}]}
         (item,) = client_module._snapshot_rich_queue_items(
             [("metadata_batch", "demo/meta", 1, Metadata(data))]
         )
         (decoded,) = client_module._decode_queue_item(item)
+        self.assertEqual(decoded[3].data, data)
+        self.assertEqual(list(decoded[3].data), list(data))
+        # A high surrogate directly followed by a low one is written as the escape pair of the character it encodes.
         self.assertEqual(
-            decoded[3].data,
-            {"path": readable, readable: [readable, {"inner": readable}], **fine},
+            client_module._snapshot_config({"pair": "\ud83d\ude00"}),
+            {"pair": "\U0001f600"},
         )
 
     def test_unpicklable_rich_payload_fails_before_capture_or_publication(self):
@@ -3298,40 +3669,69 @@ class AccountingTests(unittest.TestCase):
         self.assertEqual(target.items, [])
         self.assertEqual(status.value, 0)
 
-    def test_nonfinite_metadata_fails_before_capture_or_publication(self):
-        # Both queue shapes must reject synchronously: legacy servers (no
-        # writer epoch -> metadata_batch) and current servers (negotiated
-        # epoch -> metadata_batch_mutation).
-        epoch_states = (
-            ("legacy", None, None),
-            ("versioned", 1, multiprocessing.Value("I", 0)),
+    @staticmethod
+    def _epoch_states():
+        """Both queue shapes: legacy servers (no writer epoch -> metadata_batch) and current servers (negotiated epoch -> metadata_batch_mutation)."""
+        return (
+            (None, None, "metadata_batch"),
+            (1, multiprocessing.Value("I", 0), "metadata_batch_mutation"),
         )
-        for value in (float("nan"), float("inf"), float("-inf")):
-            for label, epoch, seq in epoch_states:
-                with self.subTest(value=value, epoch=label):
-                    target = mock.Mock()
-                    status = _QueueStatus()
-                    capture = mock.Mock(return_value=("captured", ""))
-                    with (
-                        _upload_state(_metric_queue=target, _queue_status=status),
-                        mock.patch.object(client_module, "_rich_writer_epoch", epoch),
-                        mock.patch.object(client_module, "_rich_mutation_seq", seq),
-                        mock.patch("kymo._capture.has_output", return_value=True),
-                        mock.patch("kymo._capture.drain_buffers", capture),
-                        self.assertRaisesRegex(
-                            ValueError,
-                            "metadata metric 'demo/meta' must contain finite "
-                            "JSON-serializable values",
-                        ),
-                    ):
-                        client_module.log(
-                            {"demo/meta": Metadata({"nested": {"value": value}})},
-                            step=1,
-                        )
 
-                    capture.assert_not_called()
-                    target.put.assert_not_called()
-                    self.assertEqual(status.value, 0)
+    def test_nonfinite_metadata_is_queued_as_logged(self):
+        for epoch, seq, kind in self._epoch_states():
+            with self.subTest(kind=kind):
+                target = _ListQueue()
+                with (
+                    _upload_state(_metric_queue=target),
+                    mock.patch.object(client_module, "_rich_writer_epoch", epoch),
+                    mock.patch.object(client_module, "_rich_mutation_seq", seq),
+                    mock.patch("kymo._capture.drain_buffers", return_value=("", "")),
+                ):
+                    client_module.log(
+                        {
+                            "demo/meta": Metadata(
+                                {"bounds": [-math.inf, math.inf], math.nan: math.nan}
+                            )
+                        },
+                        step=1,
+                    )
+
+                (item,) = target.items
+                (batch,) = client_module._decode_queue_item(item)
+                self.assertEqual(batch[0], kind)
+                stored = batch[3].data
+                self.assertEqual(list(stored), ["bounds", "NaN"])
+                self.assertEqual(stored["bounds"], [-math.inf, math.inf])
+                self.assertTrue(math.isnan(stored["NaN"]))
+
+    def test_colliding_metadata_keys_fail_before_capture_or_publication(self):
+        for epoch, seq, kind in self._epoch_states():
+            with self.subTest(kind=kind):
+                target = mock.Mock()
+                status = _QueueStatus()
+                capture = mock.Mock(return_value=("captured", ""))
+                with (
+                    _upload_state(_metric_queue=target, _queue_status=status),
+                    mock.patch.object(client_module, "_rich_writer_epoch", epoch),
+                    mock.patch.object(client_module, "_rich_mutation_seq", seq),
+                    mock.patch("kymo._capture.has_output", return_value=True),
+                    mock.patch("kymo._capture.drain_buffers", capture),
+                    self.assertRaisesRegex(
+                        ValueError,
+                        "^metadata metric 'demo/meta' cannot be stored as JSON: more than one key of a dict is stored as '1'$",
+                    ),
+                ):
+                    client_module.log(
+                        {
+                            "train/loss": 1.0,
+                            "demo/meta": Metadata({"nested": {1: "a", "1": "b"}}),
+                        },
+                        step=1,
+                    )
+
+                capture.assert_not_called()
+                target.put.assert_not_called()
+                self.assertEqual(status.value, 0)
 
     def test_mixed_invalid_rich_list_fails_before_capture_or_publication(self):
         target = mock.Mock()

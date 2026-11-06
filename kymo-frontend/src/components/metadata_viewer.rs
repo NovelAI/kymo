@@ -1,4 +1,4 @@
-use std::borrow::{Borrow, Cow};
+use std::borrow::Borrow;
 use std::collections::{BTreeSet, HashMap};
 use std::hash::Hash;
 
@@ -236,14 +236,7 @@ fn render_rows(
             {match key_node {
                 KeyNode::Leaf(key) => {
                     let path = child_pointer(parent_path, key);
-
-                    let values: Vec<Option<&Value>> = columns
-                        .iter()
-                        .map(|column| resolve_path(&column.data, &path))
-                        .collect();
-
                     let tints = difference_tints(&comparable_row(columns, &path));
-                    let displays = format_row_values(&values);
 
                     rsx! {
                         tr { class: "metadata-row",
@@ -253,25 +246,25 @@ fn render_rows(
                                 style: "padding-left: {indent + 16.0}px;",
                                 "{key}"
                             }
-                            for (i, (val, display)) in values.iter().zip(displays.iter()).enumerate() {
+                            for (column, tint) in columns.iter().zip(tints) {
                                 {
-                                    let color = &columns[i].color;
-                                    let bg = if tints[i] {
-                                        format!("background: {}22;", color)
+                                    let bg = if tint {
+                                        format!("background: {}22;", column.color)
                                     } else {
                                         String::new()
                                     };
-                                    let text = val.map(|value| copy_payload(value, display).to_owned());
+                                    let cell = resolve_path(&column.data, &path).map(|value| {
+                                        let display = format_value(value);
+                                        (copy_payload(value, &display).to_owned(), display)
+                                    });
                                     rsx! {
                                         td { class: "metadata-val-cell", style: "{bg}",
-                                            if let Some(text) = text {
+                                            if let Some((text, display)) = cell {
                                                 CopyText {
                                                     text,
-                                                    display: display.clone(),
+                                                    display,
                                                     class: "metadata-copy-value",
                                                 }
-                                            } else {
-                                                "{display}"
                                             }
                                         }
                                     }
@@ -365,19 +358,12 @@ fn difference_tints<T: Eq + Hash>(values: &[T]) -> Vec<bool> {
 fn comparable_row(columns: &[MetadataColumn], path: &str) -> Vec<Option<String>> {
     columns
         .iter()
-        .map(|column| {
-            diff_comparable_value(&column.data, path, column.ignore_server_timing_in_diff)
-                .map(|value| value.to_string())
-        })
+        .map(|column| diff_comparable_text(&column.data, path, column.ignore_server_timing_in_diff))
         .collect()
 }
 
-/// A value for diff comparison, ignoring server timing even when `/meta` renders as one leaf.
-fn diff_comparable_value<'a>(
-    root: &'a Value,
-    path: &str,
-    ignore_server_timing: bool,
-) -> Option<Cow<'a, Value>> {
+/// JSON text for diff comparison, ignoring server timing even when `/meta` renders as one leaf.
+fn diff_comparable_text(root: &Value, path: &str, ignore_server_timing: bool) -> Option<String> {
     if ignore_server_timing
         && (path == "/meta/server_time" || path.starts_with("/meta/server_time/"))
     {
@@ -385,13 +371,13 @@ fn diff_comparable_value<'a>(
     }
     let value = resolve_path(root, path)?;
     if !ignore_server_timing || path != "/meta" {
-        return Some(Cow::Borrowed(value));
+        return Some(value.to_string());
     }
     let mut comparable = value.clone();
     if let Some(meta) = comparable.as_object_mut() {
         meta.remove("server_time");
     }
-    Some(Cow::Owned(comparable))
+    Some(comparable.to_string())
 }
 
 /// Only strings receive display-only quoting.
@@ -399,35 +385,23 @@ fn copy_payload<'a>(value: &'a Value, display: &'a str) -> &'a str {
     value.as_str().unwrap_or(display)
 }
 
-/// Keep strings unquoted and serialize other JSON values.
+/// Serialize non-string JSON values, and show a string as its text unless `shows_quoted`.
 fn format_value(v: &Value) -> String {
     match v {
-        Value::String(s) => s.clone(),
+        Value::String(s) if !shows_quoted(s) => s.clone(),
         _ => v.to_string(),
     }
 }
 
-/// Missing values render blank; strings are quoted only when another value in the row would render identically.
-fn format_row_values(values: &[Option<&Value>]) -> Vec<String> {
-    let mut displays: Vec<String> = values
-        .iter()
-        .map(|value| value.map_or_else(String::new, format_value))
-        .collect();
-
-    let has_collision = (0..values.len()).any(|index| {
-        ((index + 1)..values.len()).any(|other_index| {
-            values[index] != values[other_index] && displays[index] == displays[other_index]
-        })
-    });
-    if has_collision {
-        for (display, value) in displays.iter_mut().zip(values) {
-            if let Some(Value::String(text)) = value {
-                *display = serde_json::to_string(text).expect("serializing a string cannot fail");
-            }
-        }
-    }
-
-    displays
+/// A string shows JSON-quoted when its text parses as JSON as Python's json reads it (NaN and ±Infinity allowed), is empty, or has leading or trailing whitespace, a double space or a control character. A non-string's display parses so and an unquoted string's never does, and a quoted display is always a string literal, so distinct values never share a display.
+fn shows_quoted(text: &str) -> bool {
+    text.is_empty()
+        || text.trim() != text
+        || text.contains("  ")
+        || text.contains(char::is_control)
+        // A JSON value's first character, so a string that can't be JSON skips the parse.
+        || (text.starts_with(|c| "{[\"-0123456789tfnNI".contains(c))
+            && crate::components::cdn_gallery::parses_as_python_json(text))
 }
 
 #[cfg(test)]
@@ -879,9 +853,9 @@ mod tests {
     fn numbers_render_and_copy_as_logged() {
         for logged in numbers_beyond_f64() {
             let data: Value = serde_json::from_str(&format!(r#"{{"n": {logged}}}"#)).unwrap();
-            let displays = format_row_values(&[Some(&data["n"])]);
-            assert_eq!(displays, vec![logged.clone()]);
-            assert_eq!(copy_payload(&data["n"], &displays[0]), logged);
+            let display = format_value(&data["n"]);
+            assert_eq!(display, logged);
+            assert_eq!(copy_payload(&data["n"], &display), logged);
         }
     }
 
@@ -897,7 +871,7 @@ mod tests {
             "198136.40638684994",
         ] {
             let data: Value = serde_json::from_str(&format!(r#"{{"n": {written}}}"#)).unwrap();
-            assert_eq!(format_row_values(&[Some(&data["n"])]), [written]);
+            assert_eq!(format_value(&data["n"]), written);
         }
     }
 
@@ -932,60 +906,152 @@ mod tests {
         }
     }
 
+    /// `data` as cdn_gallery reads it from a manifest Python's json wrote, NaN and ±Infinity included.
+    fn python_json(data: &str) -> Value {
+        crate::components::cdn_gallery::parse_manifest(&format!(
+            r#"{{"class": "metadata", "data": {data}}}"#
+        ))
+        .expect("readable")
+        .data
+        .unwrap_or_default()
+    }
+
+    /// Every non-string display, tokens and compact containers included, makes a string with the same text show quoted.
     #[test]
-    fn row_formatting_disambiguates_colliding_json_types() {
-        let boolean = json!(true);
-        let boolean_string = json!("true");
-        let displays = format_row_values(&[Some(&boolean), Some(&boolean_string)]);
-        assert_eq!(displays, vec!["true", "\"true\""]);
-        assert_eq!(copy_payload(&boolean_string, &displays[1]), "true");
-        assert_eq!(copy_payload(&boolean, &displays[0]), displays[0]);
-
-        let number = json!(1);
-        let number_string = json!("1");
-        assert_eq!(
-            format_row_values(&[Some(&number), Some(&number_string)]),
-            vec!["1", "\"1\""]
-        );
-
-        let object = json!({"a": 1});
-        let object_string = json!("{\"a\":1}");
-        assert_eq!(
-            format_row_values(&[Some(&object), Some(&object_string)]),
-            vec!["{\"a\":1}", "\"{\\\"a\\\":1}\""]
-        );
-
-        let ordinary = json!("ordinary");
-        let other = json!(false);
-        assert_eq!(
-            format_row_values(&[Some(&ordinary), Some(&ordinary), Some(&other)]),
-            vec!["ordinary", "ordinary", "false"]
-        );
-
-        let quoted_boolean_string = json!("\"true\"");
-        assert_eq!(
-            format_row_values(&[
-                Some(&quoted_boolean_string),
-                Some(&boolean_string),
-                Some(&boolean),
-            ]),
-            vec!["\"\\\"true\\\"\"", "\"true\"", "true"]
-        );
+    fn no_string_displays_like_a_non_string() {
+        for data in [
+            "[NaN]",
+            "[NaN, 1]",
+            r#"{"a": NaN}"#,
+            r#"{"a": [Infinity, -Infinity]}"#,
+            "NaN",
+            "0",
+            "1",
+            "2",
+            "3",
+            "4",
+            "5",
+            "6",
+            "7",
+            "8",
+            "9",
+            "-1",
+            "2.5",
+            "null",
+            "false",
+            "[]",
+            "{}",
+        ] {
+            let display = format_value(&python_json(data));
+            assert_ne!(format_value(&json!(display)), display, "{display}");
+        }
     }
 
     #[test]
-    fn missing_values_render_blank_and_quote_colliding_empty_strings() {
-        assert_eq!(format_row_values(&[None]), vec![""]);
+    fn strings_that_read_as_json_or_hide_whitespace_show_quoted() {
+        let boolean = json!(true);
+        let boolean_string = json!("true");
+        let displays = [&boolean, &boolean_string].map(format_value);
+        assert_eq!(displays, ["true", "\"true\""]);
+        assert_eq!(copy_payload(&boolean_string, &displays[1]), "true");
+        assert_eq!(copy_payload(&boolean, &displays[0]), displays[0]);
+        assert_eq!(format_value(&json!(false)), "false");
 
-        let empty = json!("");
-        assert_eq!(format_row_values(&[None, Some(&empty)]), vec!["", "\"\""]);
+        for text in [
+            "1",
+            "1e-4",
+            "-3",
+            "0.1",
+            "null",
+            "false",
+            "[1, 2]",
+            "{}",
+            r#"{"a":1}"#,
+            "NaN",
+            "Infinity",
+            "-Infinity",
+            "[1, NaN]",
+            "\"\\ud800\"",
+            "\"true\"",
+            // A number spelled as a placeholder, which a strict manifest can hold.
+            "1e+77777777777777777777",
+            // Empty, or whitespace or control characters the bare text would hide.
+            "",
+            " lead",
+            "trail ",
+            "   ",
+            "double  space",
+            "tab\there",
+            "line\nbreak",
+            "\r",
+            "nul\u{0}",
+            "del\u{7f}",
+            "\u{a0}nbsp",
+        ] {
+            let string = json!(text);
+            assert_eq!(
+                format_value(&string),
+                serde_json::to_string(text).unwrap(),
+                "{text:?}"
+            );
+            assert_eq!(copy_payload(&string, &format_value(&string)), text);
+        }
+        for text in [
+            "adam",
+            "nan",
+            "inf",
+            "-NaN",
+            "Infinity0",
+            "1e",
+            "1 2",
+            "a b",
+            "/path/to file",
+            "true story",
+            "\\ud800",
+            "one space",
+            "zero\u{200b}width",
+            "caf\u{e9}",
+            "?",
+        ] {
+            assert_eq!(format_value(&json!(text)), text, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn the_number_nan_and_the_string_nan_show_and_diff_apart() {
+        let runs = columns(vec![
+            (
+                "one".to_string(),
+                python_json(r#"{"loss": NaN, "best": -Infinity}"#),
+            ),
+            (
+                "two".to_string(),
+                json!({"loss": "NaN", "best": "-Infinity"}),
+            ),
+            (
+                "three".to_string(),
+                python_json(r#"{"loss": NaN, "best": Infinity}"#),
+            ),
+        ]);
+        let displays = |path| {
+            runs.iter()
+                .map(|column| format_value(resolve_path(&column.data, path).unwrap()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(displays("/loss"), vec!["NaN", "\"NaN\"", "NaN"]);
         assert_eq!(
-            format_row_values(&[Some(&empty), Some(&empty)]),
-            vec!["", ""]
+            displays("/best"),
+            vec!["-Infinity", "\"-Infinity\"", "Infinity"]
         );
-
-        let question = json!("?");
-        assert_eq!(format_row_values(&[None, Some(&question)]), vec!["", "?"]);
+        // NaN equals NaN in the diff, and never the string.
+        assert_eq!(
+            difference_tints(&comparable_row(&runs, "/loss")),
+            vec![false, true, false]
+        );
+        assert_eq!(
+            difference_tints(&comparable_row(&runs, "/best")),
+            vec![true, true, true]
+        );
     }
 
     #[test]

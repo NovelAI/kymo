@@ -52,12 +52,7 @@ except Exception as e:
         f"the installed grpc/protobuf runtime (original error: {e})"
     ) from e
 from kymo import _capture, _gpu
-from kymo._cdn import (
-    encoded_gallery_item,
-    gallery_manifest,
-    metadata_manifest,
-    readable_metadata,
-)
+from kymo._cdn import _freeze_json, encoded_gallery_item, gallery_manifest
 from kymo._control_rpc import BOOTSTRAP as _CONTROL_BOOTSTRAP, _ended
 from kymo._log import logger as _log
 from kymo.api import _check_fork_safe
@@ -518,7 +513,7 @@ def init(
             (``http://host:port``). If None, falls back to ``$KYMO_URL_BASE``.
         system_metrics: Automatically log GPU/CPU/memory/disk/network metrics.
             Captured stdout/stderr is uploaded every 2 s either way.
-        config: Optional run configuration dict (hyperparams, etc.).
+        config: Optional run configuration dict (hyperparams, etc.), frozen now and stored as JSON by the rules on ``kymo.Metadata``. ``{}`` stores an empty config. A config that cannot be stored exactly raises ValueError before a previous run is stopped.
         spool_dir: Where undeliverable points are spooled for later replay
             (``python -m kymo.sync``). Falls back to ``$KYMO_SPOOL_DIR`` or
             ``~/.cache/kymo/spool``. Point it somewhere shared (e.g.
@@ -1197,26 +1192,14 @@ def _snapshot_rich_queue_items(cdn_batches: list[tuple]) -> list[tuple]:
     unpaced = in_child or bool(_lanes_on_disk is not None and _lanes_on_disk.value)
     marker = _ChildGalleryItems if in_child else _UnpacedGalleryItems
     for batch in cdn_batches:
-        if unpaced and batch[0] in ("cdn_batch", "cdn_batch_mutation"):
+        if unpaced and batch[0] in _GALLERY_KINDS:
             batch = (*batch[:3], marker(batch[3]), *batch[4:])
-        if batch[0] in ("metadata_batch", "metadata_batch_mutation"):
-            try:
-                manifest = metadata_manifest(batch[3].data)
-            except (TypeError, ValueError) as error:
-                raise ValueError(
-                    f"metadata metric {batch[1]!r} must contain finite "
-                    "JSON-serializable values"
-                ) from error
-            # Freeze metadata to its rendered JSON, as _snapshot_config does, so the payload never carries tensors or other objects the worker might fail to unpickle.
-            data = json.loads(manifest)["data"]
-            # A lone surrogate (an os.fsdecode()d filename, cwd or argument) renders as a \ud escape that the dashboard's JSON reader rejects. Replace it as captions and filenames are, here rather than in the frozen metadata_manifest, so a spool written by an older client still replays the bytes it published. Escaped non-BMP text also matches and comes back unchanged.
-            if b"\\ud" in manifest:
-                data = readable_metadata(data)
+        if batch[0] in _METADATA_KINDS:
+            # Freeze metadata to its JSON tree, as a config is, so the payload never carries tensors or other objects the worker might fail to unpickle.
+            data = _freeze_json(batch[3].data, f"metadata metric {batch[1]!r}")
             batch = (*batch[:3], Metadata(data), *batch[4:])
         try:
-            # Standard pickle copies array/tensor storage into this byte string;
-            # multiprocessing reducers may instead publish shared storage whose
-            # later mutation would violate log()'s snapshot semantics.
+            # Standard pickle copies array/tensor storage into this byte string; multiprocessing reducers may instead publish shared storage whose later mutation would violate log()'s snapshot semantics.
             buffer = io.BytesIO()
             _HostTensorPickler(buffer, protocol=pickle.HIGHEST_PROTOCOL).dump(batch)
             payload = buffer.getvalue()
@@ -1226,7 +1209,7 @@ def _snapshot_rich_queue_items(cdn_batches: list[tuple]) -> list[tuple]:
                 "its payload is not multiprocessing-serializable"
             ) from error
         snapshot = (_SERIALIZED_RICH_QUEUE_ITEM, payload)
-        if batch[0] in ("cdn_batch", "cdn_batch_mutation"):
+        if batch[0] in _GALLERY_KINDS:
             snapshot = _GalleryQueueItem(snapshot)
         snapshots.append(snapshot)
     return snapshots
@@ -2222,13 +2205,7 @@ def _snapshot_config(config: dict) -> dict:
     """Own the config tree exactly as the metadata JSON will represent it."""
     if not isinstance(config, dict):
         raise TypeError(f"kymo config must be dict, got {type(config).__name__}")
-    try:
-        encoded = json.dumps(config, default=str, allow_nan=False)
-        return json.loads(encoded)
-    except (TypeError, ValueError) as error:
-        raise ValueError(
-            "kymo config must contain finite JSON-serializable values"
-        ) from error
+    return _freeze_json(config, "kymo config")
 
 
 def _strip_url_userinfo(value: str) -> str:
@@ -2346,7 +2323,7 @@ def _collect_run_metadata(config: Optional[dict]) -> dict:
         meta["slurm"] = slurm
 
     result = {"meta": meta}
-    if config:
+    if config is not None:
         result["config"] = config
     return result
 
@@ -2376,9 +2353,9 @@ def _push_run_metadata():
 def update_config(config: dict) -> None:
     """Merge new entries into the run's config and re-upload the metadata blob.
 
-    Keys present in ``config`` overwrite existing keys (shallow merge); other
-    fields (time, system, git, slurm) carry over bit-identical from the
-    initial upload — only the ``config`` field is mutated.
+    Keys present in ``config`` overwrite existing keys with the same JSON text (shallow merge): ``1`` and ``"1"`` are one key, ``1`` and ``1.0`` two. Other fields (time, system, git, slurm) carry over bit-identical from the initial upload — only the ``config`` field is mutated.
+
+    Values and keys are stored by the rules on ``kymo.Metadata``. A config that cannot be stored exactly raises ValueError and changes nothing.
     """
     global _run_metadata
     if not _is_initialized:
