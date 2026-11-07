@@ -303,7 +303,7 @@ let fmtX=function(v){
   if(!zoomRefetch)return v.toPrecision(4);
   return fmtNum(v,true,2);
 };
-// Nearest-point marker, drawn by the setCursor hook.
+// The hot run's dot (the run nearest the mouse in the hovered column), placed by the setCursor hook.
 let hotpt=document.createElement('div');
 hotpt.className='kymo-hotpt';
 hotpt.style.display='none';
@@ -357,7 +357,7 @@ let yNiceLog=function(u,mn,mx){
 // NaN-marker geometry, in CSS px: hollow circles of radius markR, with their
 // bottom edge markGap above the plot's bottom edge (center markR+markGap up).
 // The draw hook paints them; setCursor measures the cursor to the same spot so
-// a NaN reads as a hoverable sample. One source so the two can't drift apart.
+// a NaN, or a clipped log-y value at its slot's circle, reads as a hoverable sample. One source so the two can't drift apart.
 let markR=3.5,markGap=1.5;
 // Line series span their gaps and draw samples only as segments, so a series whose column holds one sample on the chart (one raw point, or one bucket) would draw nothing: linePaths builds it a mark and keeps it on the line path, which lasts until the data, scales or size change, the mark's inputs.
 // The mark: a dot, or on an envelope's min edge (this series; the max edge is the next) a bar from the bucket's min to its max, points.bar CSS px wide and cut at the plot's top and bottom like its band, unless they're within a dot of each other (canvas y grows downward). A bar cut to nothing at a log axis's floor draws nothing, like its band; the border circle for its nonpositive min marks it.
@@ -411,7 +411,7 @@ let u=new uPlot({
   hooks:{
     draw:[function(u){
       if(!nanCols)return;
-      // Hollow NaN-marker circles, a fixed pixel offset inside the plot's border. A marker flags WHERE a NaN happened and has no y value for the series machinery to place.
+      // Hollow NaN-marker circles (uplot_chart.rs lists the kinds), a fixed pixel offset inside the plot's border.
       let ctx=u.ctx,dpr=devicePixelRatio;
       let r=markR*dpr;
       // +∞ (kind 2) seats at the TOP border — the side its data exceeds; every other kind at the bottom.

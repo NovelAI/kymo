@@ -398,11 +398,15 @@ test("borrowed NaN and Infinity stay readable and exact-column markers stay sele
   }
 });
 
-test("marker-only rows sort after every valued row", () => {
-  const f = fixture({ nanCols: 2 });
-  f.chart.data = [[0, 10, 20], [null, null, null], [-5, -5, -5], [null, 1, null], [null, null, null]];
+test("marker-only rows sort after every valued row, and a row out of series order keeps its own marker kind and count", () => {
+  const f = fixture({ nanCols: 2, xnanC: [3, 0] });
+  f.chart.data = [[0, 10, 20], [1, null, null], [9, -5, -5], [4, 2, null], [null, null, null]];
   f.run();
   assert.deepEqual(tooltipRows(f.tip).map(row => row.series), [1, 0]);
+  assert.equal(tooltipCell(f.tip, 0, "val").text, "+∞");
+  f.chart.cursor.idx = 0;
+  f.run();
+  assert.equal(tooltipCell(f.tip, 0, "val").text, "1.000 ×3");
 });
 
 test("a marker beside a finite value (a duplicate-x non-finite sample, a log-y border circle) reads as the value", () => {
@@ -415,15 +419,52 @@ test("a marker beside a finite value (a duplicate-x non-finite sample, a log-y b
   }
 });
 
+test("on log y a value below the scale is measured at its slot's marker, and a tie keeps the earlier run", () => {
+  // A stub of uPlot's 1..100 log scale over a 200 px plot: a value <= 0 maps a decade below the plot; the bottom marker sits at 195, the top one at 5.
+  const f = fixture({ nanCols: 2 });
+  f.chart.scales.y = { min: 1, max: 100, distr: 3 };
+  f.chart.valToPos = value => (value > 0 ? 200 * (1 - Math.log10(value) / 2) : 300);
+  const hot = (dense, sparse, denseMark, sparseMark, top, g = f) => {
+    g.chart.data = [[0, 10, 20], ...[dense, sparse, denseMark, sparseMark].map(v => [v, v, v])];
+    g.chart.cursor.top = top;
+    g.run();
+    return g.window.hot.run;
+  };
+  for (const k of [5, 1, 3, 4]) assert.equal(hot(1.12, 0, null, k, 195), "sparse-run", `the cursor on a clipped run's circle (kind ${k}) highlights that run`);
+  assert.equal(f.hotpt.style.display, "none", "the circle is its mark");
+  assert.equal(hot(0.5, 1.12, 5, null, 195), "dense-run", "a bucket mean above 0 but below the scale is measured at its clipped minimum's circle");
+  assert.equal(hot(-7, 89, 2, null, 5), "dense-run", "a clipped value beside a logged +inf is measured at the top circle");
+  assert.equal(hot(-7, 50, 2, null, 199), "sparse-run", "and has no bottom target");
+  assert.equal(hot(-0.4, 1.12, null, null, 195), "sparse-run", "a clipped value without a circle (a smoothing undershoot) is measured where uPlot puts it");
+  // Without marker columns the x-range columns follow the values, so nothing there is a marker.
+  const bare = fixture({ hasXr: true });
+  Object.assign(bare.chart, { scales: f.chart.scales, valToPos: f.chart.valToPos });
+  assert.equal(hot(-0.4, 1.12, 9, 11, 195, bare), "sparse-run", "and so on a chart without marker columns");
+  // At device pixel ratio 2 the plot is 400 device px tall and the bottom marker still sits at 195 CSS px.
+  const hi = fixture({ nanCols: 2, devicePixelRatio: 2 });
+  Object.assign(hi.chart, { scales: f.chart.scales, valToPos: f.chart.valToPos, bbox: { left: 0, top: 0, width: 1000, height: 400 } });
+  assert.equal(hot(1.12, 0, null, 5, 195, hi), "sparse-run", "at device pixel ratio 2 too");
+  assert.equal(hot(3, 1.12, 5, null, 195), "sparse-run", "a value in range is measured where uPlot puts it, even beside a circle");
+  assert.equal(hot(1, 1.02, 5, null, 200), "dense-run", "a value at the scale's minimum is in range");
+  assert.equal(f.hotpt.style.display, "block", "and has its dot");
+  for (const [dense, sparse, denseMark, sparseMark] of [[-7, null, 5, 1], [null, -7, 1, 5], [-7, 0, 5, 5], [1.12, 1.12, null, null]]) {
+    assert.equal(hot(dense, sparse, denseMark, sparseMark, 195), "dense-run", `a tie keeps the earlier run: ${dense}/${sparse} with markers ${denseMark}/${sparseMark}`);
+  }
+  f.chart.scales.y = { min: 0, max: 200, distr: 1 };
+  f.chart.valToPos = value => 200 - value;
+  assert.equal(hot(-7, 2, 1, null, 195), "sparse-run", "linear y measures every value where uPlot puts it");
+  assert.equal(hot(3, 3, null, null, 197), "dense-run", "and a linear tie keeps the earlier run too");
+});
+
 test("kind-4 counts and log-time rendering shifts use the selected index", () => {
-  const f = fixture({ nanCols: 2, xnanC: [0, 3], readoutXShift: 0.001 });
+  const f = fixture({ nanCols: 2, xnanC: [0, 2], readoutXShift: 0.001 });
   f.enable();
   f.chart.data = [
     [0.001, 10.001, 20.001], [100, 100, 100], [5, null, 8],
     [null, null, null], [4, null, null],
   ];
   f.run();
-  assert.equal(tooltipCell(f.tip, 1, "val").text, "5.000 ×3");
+  assert.equal(tooltipCell(f.tip, 1, "val").text, "5.000 ×2");
   assert.equal(tooltipCell(f.tip, 1, "x").text, "@ 0");
   f.chart.data = [
     [0.001, 10.001, 20.001], [100, 100, 100], [5, null, 8],
@@ -478,7 +519,6 @@ test("exact-column values outside the plot stay readable without painting into a
   f.run();
   assert.equal(f.window.hot.run, "dense-run");
   assert.equal(tooltipCell(f.tip, 0, "val").text, "500.0");
-  assert.equal(f.hotpt.style.top, "500px");
   assert.equal(f.hotpt.style.display, "none");
 });
 

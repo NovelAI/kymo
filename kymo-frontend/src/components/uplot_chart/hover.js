@@ -23,38 +23,29 @@ function updateHover(u){
   let hit=!!tc&&tc.key===key;
   // Each series keeps its exact-column sample when present; its fallback uses the nearest sampled data x, including non-finite markers. The lookup cache expires with u.data.
   let pointIndex=u.data.__kymo_pointIndex||(u.data.__kymo_pointIndex=createHoverPointLookup(u.data,lineBase,nanBase,nanCols));
-  let vals=[],nks=[],idxs=[],hot=-1,hotD=1e9;
+  let vals=[],idxs=[],hot=-1,hotD=1e9;
   // Markers sit markR+markGap CSS px inside their border (bottom, or top for +∞) — the cursor-space mirror of the draw hook's device-px placement.
-  let markerY=u.bbox.height/devicePixelRatio-(markR+markGap);
-  let markerYT=markR+markGap;
+  let ph=u.bbox.height/devicePixelRatio,markerYT=markR+markGap,markerY=ph-markerYT,sy=u.scales.y;
   if(isSrc||!hit)for(let i=0;i<labels.length;i++){
     let pi=pointIndex(i,idx,showNearest);
-    let has=pi>=0;
     idxs.push(pi);
-    let v=has?u.data[lineBase+i][pi]:null;
-    // A selected point without a value has only a marker, of any kind; an anchored kind 4 keeps its anchor's finite value.
-    nks.push(v==null&&has?u.data[nanBase+i][pi]:0);
+    let v=pi>=0?u.data[lineBase+i][pi]:null;
     vals.push(v);
     // Borrowed points add readouts; only the hovered column drives highlighting.
     if(isSrc&&pi===idx){
-      // Measure marker-only samples at their hollow marker so they remain selectable and keep the run highlighted through gaps.
-      let py=v==null?(nks[i]===2?markerYT:markerY):u.valToPos(v,'y');
+      // A marker-only sample, or a below-scale value on log y, is measured at its slot's hollow marker when the slot has one, so the run stays selectable; every other value is measured where uPlot puts it.
+      let nk=v==null||sy.distr===3&&v<sy.min&&nanCols>0?u.data[nanBase+i][pi]:0;
+      let py=nk?(nk===2?markerYT:markerY):u.valToPos(v,'y');
       let d=Math.abs(py-t);
       if(d<hotD){hotD=d;hot=i;}
     }
   }
-  if(isSrc&&hot>=0&&vals[hot]!=null){
-    let x=u.data[0][idx],v=vals[hot],sx=u.scales.x,sy=u.scales.y;
-    hotpt.style.left=u.valToPos(x,'x')+'px';
-    hotpt.style.top=u.valToPos(v,'y')+'px';
-    hotpt.style.borderColor=colors[hot];
-    // u.over does not clip children; keep offscreen endpoints readable without painting their dots into axes. Decided in value space, where the plot bounds are exact (bbox is rounded to half device pixels).
-    hotpt.style.display=x>=sx.min&&x<=sx.max&&v>=sy.min&&v<=sy.max?'block':'none';
-  }else{
-    // A marker-only winner has no y to dot — its hollow marker is its mark.
-    hotpt.style.display='none';
-  }
-  // Marker-only samples also drive the highlight, scoped to this chart.
+  // The winner's dot, none for a marker-only winner (its hollow marker is its mark) or off the plot (u.over does not clip children; offscreen endpoints keep their readouts without dots painted into the axes). Decided in value space, where the plot bounds are exact (bbox is rounded to half device pixels).
+  let x=u.data[0][idx],y=hot>=0?vals[hot]:null,sx=u.scales.x;
+  let on=y!=null&&x>=sx.min&&x<=sx.max&&y>=sy.min&&y<=sy.max;
+  if(on){hotpt.style.left=u.valToPos(x,'x')+'px';hotpt.style.top=u.valToPos(y,'y')+'px';hotpt.style.borderColor=colors[hot];}
+  hotpt.style.display=on?'block':'none';
+  // Marker-only samples and clipped values also drive the highlight, scoped to this chart.
   if(isSrc)window.__kymo_setHl(hot>=0?runIds[hot]:null,hot>=0?runNames[hot]:null,el.id);
   if(hit){
     if(tc.empty){tip.style.display='none';return}
@@ -82,9 +73,11 @@ function updateHover(u){
       let i=order[oi];
       let pi=idxs[i];
       let v=vals[i];
-      let vs=v==null?(nks[i]===2?'+∞':nks[i]===3?'-∞':nks[i]===4?'no plottable x':'NaN'):v.toPrecision(4);
-      // A kind-4 marker collapses this run's unplottable-x samples onto one anchor slot: surface how many when it's more than one.
-      if(xnanC[i]>1&&nanCols>0&&u.data[nanBase+i][pi]===4)vs+=' ×'+xnanC[i];
+      // A selected point without a value has only a marker, of any kind; an anchored kind 4 keeps its anchor's finite value.
+      let nk=v==null?u.data[nanBase+i][pi]:0;
+      let vs=v==null?(nk===2?'+∞':nk===3?'-∞':nk===4?'no plottable x':'NaN'):v.toPrecision(4);
+      // A counted run has marker columns; show its unplottable-x count at kind-4 anchors (one per custom-x gap).
+      if(xnanC[i]>1&&u.data[nanBase+i][pi]===4)vs+=' ×'+xnanC[i];
       let rowOpen='<div class="kymo-tip-row" data-r="'+i+'">';
       let pointX=hasPointX?'<span class="kymo-tip-x">'+(pi!==idx?'@ '+fmtPointX(pi):'')+'</span>':'';
       if(isSrc){
@@ -139,7 +132,6 @@ function updateHover(u){
     if(ty+th>window.innerHeight-4)ty=Math.max(4,window.innerHeight-4-th);
   }else{
     // Center synced readouts beside the mirrored crosshair.
-    let ph=u.bbox.height/devicePixelRatio;
     tx=cx+12;
     if(tx+tw>window.innerWidth-4)tx=cx-12-tw;
     ty=bx.top+u.bbox.top/devicePixelRatio+ph/2-th/2;
