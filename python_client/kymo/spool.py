@@ -13,16 +13,18 @@ Record kinds:
     ("numeric_ts",        name, step, value, timestamp_ms)
     ("numeric_tagged_ts", name, step, value, tag, timestamp_ms)
     ("text_ts",           name, step, text, timestamp_ms)
-    ("cdn_ts",            name, step, cdn_key, timestamp_ms)
-    ("cdn",               name, step, cdn_key)
-    ("metadata_json",     name, step, dict)
-    ("cdn_batch_encoded", name, step, [ {kind, data: bytes, ext, ...}, ... ])
     ("cdn_key_mutation", name, step, cdn_key, timestamp_ms, mutation_version)
     ("metadata_json_mutation", name, step, dict, timestamp_ms, mutation_version)
     ("cdn_batch_encoded_mutation", name, step, entries, timestamp_ms,
      mutation_version)
     ("cdn_batch_encoded_mutation_reserved", name, step, entries, timestamp_ms,
      mutation_version, reduced_mutation_version)
+
+Replayed only (pymkdb2 clients without a writer epoch wrote them):
+    ("cdn_ts",            name, step, cdn_key, timestamp_ms)
+    ("cdn",               name, step, cdn_key)
+    ("metadata_json",     name, step, dict)
+    ("cdn_batch_encoded", name, step, [ {kind, data: bytes, ext, ...}, ... ])
 """
 
 import bisect

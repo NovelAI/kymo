@@ -17,6 +17,7 @@ import types
 import unittest
 from unittest import mock
 
+import httpx
 import numpy as np
 
 from kymo import _wire as wire_module
@@ -45,11 +46,11 @@ from test_pipelined_upload import (
     _Channel,
     _charged_queue,
     _channel_stand_ins,
+    _gallery,
     _ImmediateConnectionAttempt,
+    _queued_gallery,
     _QueueStatus,
-    _unversioned_gallery,
     _upload_state,
-    _versioned_gallery,
     _wait_for,
     _worker_thread,
 )
@@ -115,7 +116,33 @@ def _replay_record(stub, record, replayed_keys=None, reduced_galleries=None) -> 
     )
 
 
+def _accepting_stub(version: int) -> mock.Mock:
+    """A stub whose PublishRichMutation accepts version."""
+    stub = mock.Mock()
+    stub.PublishRichMutation.return_value = (
+        sync_module.kymo_pb2.PublishRichMutationResponse(
+            disposition=sync_module.kymo_pb2.RICH_MUTATION_ACCEPTED,
+            stored_version=version,
+        )
+    )
+    return stub
+
+
 class FrameValidationTests(unittest.TestCase):
+    def test_a_replayed_direct_key_counts_as_sent(self):
+        version = (3 << 32) | 7
+        stub = _accepting_stub(version)
+        record = (
+            "cdn_key_mutation",
+            "demo/key",
+            1,
+            "key.png",
+            1_700_000_000_000,
+            version,
+        )
+        self.assertTrue(_replay_record(stub, record))
+        stub.PublishRichMutation.assert_called_once()
+
     def test_rich_mutation_accepts_only_consistent_final_dispositions(self):
         version = (1 << 32) | 11
         stub = mock.Mock()
@@ -126,10 +153,8 @@ class FrameValidationTests(unittest.TestCase):
             )
         )
         with self.assertLogs(wire_module._log, level="WARNING") as logs:
-            self.assertTrue(
-                wire_module._publish_rich_mutation(
-                    stub, "project", "run", "metric", 1, "value.json", 100, version
-                )
+            wire_module._publish_rich_mutation(
+                stub, "project", "run", "metric", 1, "value.json", 100, version
             )
         self.assertIn("was superseded", "\n".join(logs.output))
         request = stub.PublishRichMutation.call_args.args[0]
@@ -277,13 +302,7 @@ class FrameValidationTests(unittest.TestCase):
             original_version,
             replacement_version,
         )
-        stub = mock.Mock()
-        stub.PublishRichMutation.return_value = (
-            sync_module.kymo_pb2.PublishRichMutationResponse(
-                disposition=sync_module.kymo_pb2.RICH_MUTATION_ACCEPTED,
-                stored_version=replacement_version,
-            )
-        )
+        stub = _accepting_stub(replacement_version)
 
         with mock.patch.object(
             sync_module, "_upload_to_cdn", side_effect=_reject_bad_items
@@ -331,10 +350,12 @@ class FrameValidationTests(unittest.TestCase):
         self.assertIn("unsupported image format ''", "\n".join(logs.output))
         self.assertTrue(encoded.dropped)
         self.assertEqual([entry["ext"] for entry in encoded.entries], ["png"])
-        record = ("cdn_batch_encoded", "gallery", 4, encoded.entries)
+        record = client_module._spool_record(_gallery(4, encoded, "gallery"))
         self.assertEqual(
-            sync_module._validate_spool_record(record, {"cdn_batch_encoded"}),
-            "cdn_batch_encoded",
+            sync_module._validate_spool_record(
+                record, set(sync_module._VERSIONED_RICH_KINDS)
+            ),
+            "cdn_batch_encoded_mutation",
         )
 
     def test_a_camera_multi_picture_jpeg_is_published_as_jpeg(self):
@@ -372,7 +393,7 @@ class FrameValidationTests(unittest.TestCase):
             _replay_record(mock.Mock(), record)
 
     def test_a_replay_reports_a_gallery_it_published_cut_short(self):
-        # Either ending, a versioned mutation or an old server's single point, reports each gallery it published without an item the CDN rejected, two at one step included; one it could not publish is not reported.
+        # A replay reports each versioned gallery it published without an item the CDN rejected, two at one step included; one it could not publish is not reported.
         items = [
             {"kind": "image", "data": b"bad", "ext": "png"},
             {"kind": "image", "data": b"good", "ext": "png"},
@@ -393,46 +414,29 @@ class FrameValidationTests(unittest.TestCase):
         )
         unavailable = _RunRejectedRpcError(sync_module.grpc.StatusCode.UNAVAILABLE)
 
-        for name, record, answer, published in (
-            ("versioned", versioned, {"return_value": accepted}, True),
-            ("versioned, unavailable", versioned, {"side_effect": unavailable}, False),
-            (
-                "legacy",
-                legacy,
-                {"return_value": mock.Mock(points_received=1)},
-                True,
-            ),
-            (
-                "legacy, accepting none",
-                legacy,
-                {"return_value": mock.Mock(points_received=0)},
-                False,
-            ),
-            ("legacy, unavailable", legacy, {"side_effect": unavailable}, False),
+        for name, answer, published in (
+            ("accepted", {"return_value": accepted}, True),
+            ("unavailable", {"side_effect": unavailable}, False),
         ):
             stub = mock.Mock()
-            rpc = (
-                stub.PublishRichMutation if record is versioned else stub.IngestMetrics
-            )
-            rpc.configure_mock(**answer)
+            stub.PublishRichMutation.configure_mock(**answer)
             reduced = []
             with (
                 self.subTest(name),
                 mock.patch.object(
                     sync_module, "_upload_to_cdn", side_effect=_reject_bad_items
                 ),
-                mock.patch.object(sync_module, "_current_cdn_key", return_value=""),
                 self.assertLogs("kymo", level="WARNING"),
             ):
                 for _ in range(2):
                     self.assertEqual(
-                        _replay_record(stub, record, reduced_galleries=reduced),
+                        _replay_record(stub, versioned, reduced_galleries=reduced),
                         published,
                     )
-                self.assertEqual(rpc.call_count, 2)
+                self.assertEqual(stub.PublishRichMutation.call_count, 2)
                 self.assertEqual(reduced, [("gallery", 4)] * 2 if published else [])
-        # An old server's gallery that an earlier attempt of the replay published is reported again, found on the server and sent no more.
-        stub, keys, reduced = mock.Mock(), {}, []
+        # An older client's unversioned gallery that an earlier attempt of the replay published is found on the server and sent no more.
+        stub, keys = mock.Mock(), {}
         stub.IngestMetrics.return_value = mock.Mock(points_received=1)
         with (
             mock.patch.object(
@@ -442,12 +446,11 @@ class FrameValidationTests(unittest.TestCase):
             self.assertLogs("kymo", level="WARNING"),
         ):
             for _ in range(2):
-                self.assertTrue(_replay_record(stub, legacy, keys, reduced))
+                self.assertTrue(_replay_record(stub, legacy, keys))
                 if key.return_value == "":
                     (batch,) = stub.IngestMetrics.call_args.args[0]
                     key.return_value = batch.points[0].cdn_key
         self.assertEqual(stub.IngestMetrics.call_count, 1)
-        self.assertEqual(reduced, [("gallery", 4)] * 2)
 
     def test_spool_failure_outranks_a_later_terminal_rejection(self):
         self.assertEqual(
@@ -540,36 +543,27 @@ class FrameValidationTests(unittest.TestCase):
         self.assertNotIn("timeout", http_client.post.call_args.kwargs)
 
     def test_log_cdn_rejects_bad_keys_before_publication(self):
-        bad_keys = [object(), "\ud800", "x" * client_module._MAX_POINT_BYTES]
-        for key in bad_keys:
+        for key, message in (
+            (object(), "must be str"),
+            ("\ud800", "not valid UTF-8"),
+            ("key\x00", "contains a NUL byte"),
+            ("x" * (wire_module._MAX_RICH_RESOURCE_ID_BYTES + 1), "exceeds 2048 bytes"),
+        ):
             with (
-                self.subTest(key_type=type(key).__name__),
+                self.subTest(message=message),
                 mock.patch.object(client_module, "_is_initialized", True),
                 mock.patch.object(client_module, "_publish_queue_items") as publish,
-                self.assertRaises((TypeError, ValueError)),
+                self.assertRaisesRegex((TypeError, ValueError), message),
             ):
                 client_module.log_cdn({"demo/key": key}, step=1)
             publish.assert_not_called()
-
-    def test_versioned_log_cdn_enforces_the_rich_resource_id_bound(self):
-        with (
-            mock.patch.object(client_module, "_is_initialized", True),
-            mock.patch.object(client_module, "_rich_writer_epoch", 1),
-            mock.patch.object(client_module, "_publish_queue_items") as publish,
-            self.assertRaisesRegex(ValueError, "versioned rich-write limit"),
-        ):
-            client_module.log_cdn(
-                {"demo/key": "x" * (wire_module._MAX_RICH_RESOURCE_ID_BYTES + 1)},
-                step=1,
-            )
-        publish.assert_not_called()
 
     def test_oversized_non_text_record_is_permanently_invalid(self):
         record = (
             "cdn_ts",
             "demo/key",
             1,
-            "x" * client_module._MAX_POINT_BYTES,
+            "x" * wire_module._MAX_POINT_BYTES,
             1_700_000_000_000,
         )
         with self.assertRaisesRegex(
@@ -606,37 +600,6 @@ class FrameValidationTests(unittest.TestCase):
 
         stub.IngestMetrics.assert_called_once()
 
-    def test_live_rich_upload_rejects_a_short_server_response(self):
-        stub = mock.Mock()
-        stub.IngestMetrics.return_value = sync_module.kymo_pb2.IngestResponse(
-            points_received=0
-        )
-        with (
-            mock.patch.object(
-                client_module,
-                "_upload_to_cdn",
-                side_effect=["payload.bin", "manifest.json"],
-            ),
-            self.assertLogs("kymo", level="WARNING"),
-        ):
-            self.assertFalse(
-                client_module._process_cdn_batch(
-                    stub,
-                    object(),
-                    "unused",
-                    "project",
-                    "run",
-                    "gallery",
-                    7,
-                    client_module._encode_cdn_items(
-                        "gallery",
-                        7,
-                        [client_module.Resource(b"payload", "payload.bin")],
-                    ),
-                    send_placeholder=False,
-                )
-            )
-
     def test_a_live_gallery_that_lost_an_item_publishes_its_reduced_version(self):
         encoded = client_module._encode_cdn_items(
             "gallery", 7, [client_module.Resource(b"payload", "payload.bin")]
@@ -647,11 +610,9 @@ class FrameValidationTests(unittest.TestCase):
                 "_upload_to_cdn",
                 side_effect=["payload.bin", "manifest.json"],
             ),
-            mock.patch.object(
-                client_module, "_publish_rich_mutation", return_value=True
-            ) as publish,
+            mock.patch.object(client_module, "_publish_rich_mutation") as publish,
         ):
-            self.assertTrue(
+            self.assertEqual(
                 client_module._process_cdn_batch(
                     mock.Mock(),
                     object(),
@@ -661,13 +622,51 @@ class FrameValidationTests(unittest.TestCase):
                     "gallery",
                     7,
                     client_module._EncodedItems(encoded.entries, dropped=True),
-                    send_placeholder=False,
+                    deadline_fn=lambda: False,
                     timestamp_ms=1,
                     mutation_version=10,
                     reduced_mutation_version=11,
-                )
+                ),
+                client_module._WORKER_GALLERY_CUT_SHORT,
             )
         self.assertEqual(publish.call_args.args[-1], 11)
+
+    def test_a_live_gallery_whose_item_upload_fails_transiently_raises_unpublished(
+        self,
+    ):
+        # Only a permanent CDN rejection drops an item; a transient failure fails the whole batch for retry rather than thin the gallery.
+        encoded = client_module._encode_cdn_items(
+            "gallery", 7, [client_module.Resource(b"payload", "payload.bin")]
+        )
+        unavailable = httpx.HTTPStatusError(
+            "unavailable",
+            request=httpx.Request("POST", "https://cdn.invalid/cdn/upload"),
+            response=httpx.Response(503),
+        )
+        with (
+            mock.patch.object(
+                client_module,
+                "_upload_to_cdn",
+                side_effect=unavailable,
+            ),
+            mock.patch.object(client_module, "_publish_rich_mutation") as publish,
+            self.assertRaises(httpx.HTTPStatusError),
+        ):
+            client_module._process_cdn_batch(
+                mock.Mock(),
+                object(),
+                "unused",
+                "project",
+                "run",
+                "gallery",
+                7,
+                encoded,
+                deadline_fn=lambda: False,
+                timestamp_ms=1,
+                mutation_version=10,
+                reduced_mutation_version=11,
+            )
+        publish.assert_not_called()
 
     def test_sync_connect_closes_a_channel_that_never_becomes_ready(self):
         channel = mock.Mock()
@@ -751,7 +750,6 @@ class LaneFailoverTests(unittest.TestCase):
             ),
             _channel_stand_ins(),
             mock.patch.object(client_module, "_upload_to_cdn", side_effect=upload),
-            mock.patch.object(client_module, "_send_unary_point", return_value=True),
             mock.patch.object(
                 client_module,
                 "_encode_image",
@@ -766,9 +764,7 @@ class LaneFailoverTests(unittest.TestCase):
                 or (lambda failures, rng: 0.0 if replay else 3600.0),
             ),
             mock.patch("kymo.sync.replay_file", side_effect=replay) as replay_file,
-            mock.patch.object(
-                client_module, "_publish_rich_mutation", return_value=True
-            ) as lane.publish,
+            mock.patch.object(client_module, "_publish_rich_mutation") as lane.publish,
             mock.patch.dict(os.environ, env),
             mock.patch.object(client_module, "_IDLE_POLL_TIMEOUT", 0.001),
         ):
@@ -798,7 +794,14 @@ class LaneFailoverTests(unittest.TestCase):
 
     @staticmethod
     def _metadata(value: int) -> tuple:
-        return ("metadata_batch", "info/run_info", 0, Metadata({"v": value}))
+        return (
+            "metadata_batch_mutation",
+            "info/run_info",
+            0,
+            Metadata({"v": value}),
+            value,
+            (1 << 32) | value,
+        )
 
     @staticmethod
     def _upload_recorder(uploads: list):
@@ -872,8 +875,16 @@ class LaneFailoverTests(unittest.TestCase):
                 # The disk fills: the next spill's flush tears its record.
                 failing.set()
                 lane.put([self._metadata(3)])
-            _, records = read_spool(lane.path)
+            records = list(read_spool(lane.path)[1])
             self.assertEqual([record[3]["v"] for record in records], [1, 2])
+            # Spooled as versioned records, which replay under the server's version check.
+            self.assertEqual(
+                [(record[0], record[4:]) for record in records],
+                [
+                    ("metadata_json_mutation", (1, (1 << 32) | 1)),
+                    ("metadata_json_mutation", (2, (1 << 32) | 2)),
+                ],
+            )
 
     # A rich byte cap that _overflowing() exceeds on arrival, before any encode, and that an encoded _small() gallery fits under.
     _RICH_CAP_1K = {"KYMO_MAX_RICH_BUFFER_BYTES": "1024"}
@@ -881,11 +892,11 @@ class LaneFailoverTests(unittest.TestCase):
 
     @classmethod
     def _overflowing(cls, step: int) -> tuple:
-        return _versioned_gallery(step, cls._OVERFLOW)
+        return _queued_gallery(step, cls._OVERFLOW)
 
     @staticmethod
     def _small(step: int) -> tuple:
-        return _versioned_gallery(step, [Image(PILImage.new("RGB", (8, 8)))])
+        return _queued_gallery(step, [Image(PILImage.new("RGB", (8, 8)))])
 
     @staticmethod
     def _held_replay():
@@ -991,7 +1002,7 @@ class LaneFailoverTests(unittest.TestCase):
                         expected_failure=client_module._WORKER_GALLERY_CUT_SHORT,
                     ) as lane,
                 ):
-                    lane.put(_versioned_gallery(1, gallery))
+                    lane.put(_queued_gallery(1, gallery))
                     self.assertTrue(_wait_for(lambda: lane.publish.called))
                 # Published once, under the reserved reduced version.
                 self.assertEqual(
@@ -1041,7 +1052,7 @@ class LaneFailoverTests(unittest.TestCase):
                         expected_failure=client_module._WORKER_GALLERY_CUT_SHORT,
                     ) as lane,
                 ):
-                    lane.put(_versioned_gallery(1, gallery + items))
+                    lane.put(_queued_gallery(1, gallery + items))
                     self.assertTrue(
                         _wait_for(lambda: replayed and lane.on_disk.value == 0)
                     )
@@ -1185,7 +1196,7 @@ class LaneFailoverTests(unittest.TestCase):
                     lane.last_step = step - 1
 
                 big = [client_module.Resource(b"x" * (2 << 20), "big.bin")]
-                lane.put(_versioned_gallery(1, big))
+                lane.put(_queued_gallery(1, big))
                 producer = threading.Thread(target=log_galleries, daemon=True)
                 producer.start()
                 try:
@@ -1253,19 +1264,7 @@ class LaneFailoverTests(unittest.TestCase):
                     gates[2].set()
 
     def test_a_live_metadata_conflict_is_data_loss_not_a_retry(self):
-        version = (1 << 32) | 1
-        (item,) = client_module._snapshot_rich_queue_items(
-            [
-                (
-                    "metadata_batch_mutation",
-                    "info/run_info",
-                    0,
-                    Metadata({"v": 1}),
-                    1,
-                    version,
-                )
-            ]
-        )
+        (item,) = client_module._snapshot_rich_queue_items([self._metadata(1)])
         with tempfile.TemporaryDirectory() as spool_dir:
             with (
                 self.assertLogs("kymo", level="ERROR"),
@@ -1404,7 +1403,7 @@ class LaneFailoverTests(unittest.TestCase):
         # A fork child of the initializing process snapshots these galleries.
         with mock.patch.object(client_module, "_init_pid", os.getpid() + 1):
             small = self._small(1)
-            large = _versioned_gallery(2, [Image(PILImage.new("RGB", (32, 32)))])
+            large = _queued_gallery(2, [Image(PILImage.new("RGB", (32, 32)))])
         with tempfile.TemporaryDirectory() as spool_dir:
             with (
                 self.assertLogs("kymo", level="WARNING"),
@@ -1522,20 +1521,6 @@ class LaneFailoverTests(unittest.TestCase):
         # The harness's join proves the worker left instead of retrying an unproven circuit until a deadline it does not have.
         self.assertEqual(lane.spooled.value, 1)
 
-    def test_an_unversioned_rich_lane_stays_on_disk(self):
-        replay = mock.Mock(return_value=True)
-        with tempfile.TemporaryDirectory() as spool_dir:
-            with (
-                self.assertLogs("kymo", level="WARNING"),
-                self._lane_worker(spool_dir, self._RICH_CAP_1K, replay=replay) as lane,
-            ):
-                # An old server's records carry no logical versions, so a replay could skip one behind a predecessor delivered live and still report success.
-                lane.put(_unversioned_gallery(1, self._OVERFLOW))
-                self.assertTrue(_wait_for(lambda: lane.spooled.value == 1))
-                time.sleep(0.2)
-        replay.assert_not_called()
-        self.assertEqual(lane.spooled.value, 1)
-
     def test_a_failing_rich_seal_backs_off_the_rich_catch_up(self):
         def delay(failures, rng):
             # The failover's first catch-up runs at once; any later retry waits.
@@ -1578,15 +1563,15 @@ class LaneFailoverTests(unittest.TestCase):
     def test_rich_byte_cap_counts_encoded_gallery_bytes_not_raw_pixels(self):
         gallery = [Image(PILImage.new("RGB", (128, 128))) for _ in range(4)]
         cap = 100_000
-        self.assertGreater(len(_unversioned_gallery(1, gallery)[1]), cap)
+        self.assertGreater(len(_queued_gallery(1, gallery)[1]), cap)
         uploads = []
         env = {"KYMO_MAX_RICH_BUFFER_BYTES": str(cap)}
         with tempfile.TemporaryDirectory() as spool_dir:
             with self._lane_worker(
                 spool_dir, env, self._upload_recorder(uploads)
             ) as lane:
-                lane.put(_unversioned_gallery(1, gallery))
-                lane.put(_unversioned_gallery(2, gallery))
+                lane.put(_queued_gallery(1, gallery))
+                lane.put(_queued_gallery(2, gallery))
             self.assertFalse(os.path.exists(lane.path))
         self.assertEqual(lane.spooled.value, 0)
         self.assertEqual(uploads, (["png"] * 4 + ["json"]) * 2)
@@ -1607,7 +1592,7 @@ class LaneFailoverTests(unittest.TestCase):
                     spool_dir, env, self._upload_recorder(uploads), encode
                 ) as lane,
             ):
-                lane.put(_unversioned_gallery(1, images))
+                lane.put(_queued_gallery(1, images))
         self.assertEqual(lane.spooled.value, 0)
         self.assertEqual(uploads, ["webp"] * 3 + ["json"])
         self.assertEqual(lane.encode.call_count, 4)
@@ -1625,7 +1610,7 @@ class LaneFailoverTests(unittest.TestCase):
                 ) as lane,
             ):
                 # The encoder gives up on the gallery and fails the lane over; the spool cannot encode it either.
-                lane.put(_unversioned_gallery(1, [Image(PILImage.new("RGB", (8, 8)))]))
+                lane.put(_queued_gallery(1, [Image(PILImage.new("RGB", (8, 8)))]))
                 lane.put([self._metadata(1)])
                 self.assertTrue(lane.first_spill.wait(timeout=5))
                 lane.put([self._metadata(2)])
@@ -1659,10 +1644,10 @@ class LaneFailoverTests(unittest.TestCase):
                     spool_dir, env, self._upload_recorder(uploads), encode
                 ) as lane,
             ):
-                lane.put(_unversioned_gallery(1, gallery))
+                lane.put(_queued_gallery(1, gallery))
                 self.assertTrue(retrying.wait(timeout=1))
                 # Its arrays alone exceed the cap; charged nothing, it would wait behind the failing encode.
-                lane.put(_unversioned_gallery(2, gallery))
+                lane.put(_queued_gallery(2, gallery))
                 release_later = threading.Timer(0.2, release.set)
                 release_later.start()
             release_later.join()
@@ -1686,7 +1671,7 @@ class LaneFailoverTests(unittest.TestCase):
             raise OSError("spool unavailable")
 
         def gallery(step, byte):
-            return _unversioned_gallery(step, [Image(byte * 8, format="webp")])
+            return _queued_gallery(step, [Image(byte * 8, format="webp")])
 
         env = {"KYMO_MAX_RICH_BUFFER_BYTES": str(1 << 20)}
         # The encoder stays blocked until after the harness has checked that the worker exited.
@@ -1719,12 +1704,13 @@ class LaneFailoverTests(unittest.TestCase):
         env = {"KYMO_MAX_RICH_BUFFER_BYTES": str(len(encoded))}
         with tempfile.TemporaryDirectory() as spool_dir:
             with self._lane_worker(spool_dir, env, upload) as lane:
-                lane.put(_unversioned_gallery(1, gallery))
+                lane.put(_queued_gallery(1, gallery))
             records = list(read_spool(lane.path)[1])
         upload.assert_not_called()
         self.assertEqual(lane.spooled.value, 1)
         self.assertEqual(
-            [(record[0], record[2]) for record in records], [("cdn_batch_encoded", 1)]
+            [(record[0], record[2]) for record in records],
+            [("cdn_batch_encoded_mutation_reserved", 1)],
         )
         self.assertEqual([entry["data"] for entry in records[0][3]], [encoded] * 2)
         # The spool wrote the encoder's bytes rather than encoding the gallery again.
@@ -1748,10 +1734,10 @@ class LaneFailoverTests(unittest.TestCase):
                 self.assertLogs("kymo", level="WARNING"),
                 self._lane_worker(spool_dir, env, encode=blocked_encode) as lane,
             ):
-                lane.put(_unversioned_gallery(1, gallery))
+                lane.put(_queued_gallery(1, gallery))
                 self.assertTrue(started.wait(timeout=1))
                 # A second entry exceeds the one-entry cap while the first gallery is still encoding.
-                lane.put(_unversioned_gallery(2, gallery))
+                lane.put(_queued_gallery(2, gallery))
                 release_later = threading.Timer(0.2, release.set)
                 release_later.start()
             release_later.join()
@@ -1760,7 +1746,7 @@ class LaneFailoverTests(unittest.TestCase):
         # Three by the encoder for the first gallery and three by the spool for the second.
         self.assertEqual(lane.encode.call_count, 6)
 
-    def test_versioned_direct_cdn_key_counts_its_retained_bytes(self):
+    def test_a_direct_cdn_key_counts_its_retained_bytes(self):
         version = (3 << 32) | 1
         direct = (
             "cdn_key_mutation",
@@ -2978,7 +2964,7 @@ class ReplayTests(unittest.TestCase):
                 "cdn_ts",
                 "train/loss",
                 7,
-                "x" * client_module._MAX_POINT_BYTES,
+                "x" * wire_module._MAX_POINT_BYTES,
                 1_700_000_000_001,
             )
             self._write(path, [numeric(1.0), oversized])
@@ -3453,13 +3439,7 @@ class ReplayTests(unittest.TestCase):
         expected_id = sync_module.content_id(
             sync_module.metadata_manifest(metadata), "json"
         )
-        stub = mock.Mock()
-        stub.PublishRichMutation.return_value = (
-            sync_module.kymo_pb2.PublishRichMutationResponse(
-                disposition=sync_module.kymo_pb2.RICH_MUTATION_ACCEPTED,
-                stored_version=version,
-            )
-        )
+        stub = _accepting_stub(version)
         with (
             mock.patch.object(
                 sync_module,

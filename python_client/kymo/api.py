@@ -293,7 +293,7 @@ class Api:
         step_min: Optional[int] = None,
         step_max: Optional[int] = None,
     ) -> list[tuple[int, Optional[str]]]:
-        """A cdn metric's ``(step, key)`` entries, ascending, one per step and tag (kymo's own client never tags media); ``key`` is None while that step's upload is still in flight.
+        """A cdn metric's ``(step, key)`` entries, ascending, one per step and tag (kymo's own client never tags media); ``key`` is None whenever the stored key begins ``pending:``; that prefix alone identifies neither its writer nor whether an upload is still running.
 
         Fetch a key with ``fetch``. Image and metadata metrics store JSON manifests: ``{"class": "image_gallery", "items": [{"resource": key, ...}]}`` or ``{"class": "metadata", "data": {...}}``.
         """

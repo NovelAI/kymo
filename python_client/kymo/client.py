@@ -61,16 +61,12 @@ from kymo._wire import (
     _MAX_ID_BYTES,
     _MAX_METRIC_NAME_BYTES,
     _MAX_POINTS_PER_MSG,
-    _MAX_POINT_BYTES,
     _MAX_RICH_RESOURCE_ID_BYTES,
     _SEND_CALL_TIMEOUT,
     _SEND_MAX_DELAY,
-    _estimate_tuple_bytes,
     _is_permanent_upload_error,
     _normalize_numeric_value,
     _publish_rich_mutation,
-    _reduced_mutation_version,
-    _send_unary_point,
     _upload_to_cdn,
     _validate_ident,
     _validate_project_id,
@@ -380,10 +376,9 @@ _original_excepthook = None
 _original_sys_exit = None
 # This run's metadata dict, whose config field update_config() changes before queueing a fresh snapshot; None when init() published none, as a resume that keeps the run's stored one doesn't.
 _run_metadata: Optional[dict] = None
-# Presence is negotiated by InitRunResponse. An older server leaves this None,
-# preserving the existing hosted rich-write path byte-for-byte.
+# The writer epoch InitRun allocated to the last run, and the shared counter of the mutation sequence numbers reserved under it (_rich_queue_tuple): a rich write's logical version is (epoch << 32) | sequence. None until the first init(); kept through a shutdown, so a log() racing it still finds a counter.
 _rich_writer_epoch: Optional[int] = None
-_rich_mutation_seq = None  # multiprocessing.Value("I") when versioning is negotiated
+_rich_mutation_seq = None  # multiprocessing.Value("I")
 # log() calls whose GPU values are still being copied to the host (kymo._gpu), oldest first; log_cdn() and update_config() writes queue behind them. All are published in that order. System metrics and captured text never wait here: the poller publishes them directly, and log() publishes the captured text at once even when its call waits.
 _pending: collections.deque = collections.deque()
 # Reentrant: the shutdown signal handler runs on the main thread, possibly inside log().
@@ -402,21 +397,8 @@ _unproven_lock = threading.RLock()
 _PENDING_MAX_BYTES = 256 << 20
 
 
-def _reserve_rich_mutation_versions(count: int) -> Optional[tuple[int, ...]]:
-    """Atomically reserve persisted logical versions, or select legacy behavior."""
-    if _rich_writer_epoch is None:
-        return None
-    if _rich_mutation_seq is None:
-        raise RuntimeError("kymo rich mutation allocator is not initialized")
-    try:
-        return _reserve_versions(count)
-    finally:
-        if _deferred_signals:
-            _run_deferred_signals()
-
-
 def _reserve_versions(count: int) -> tuple[int, ...]:
-    """The reservation for _reserve_rich_mutation_versions, a held section (_HELD_SECTIONS): the allocator's lock is reentrant, so a handler kymo chains to that logs a gallery from inside it would reserve the same versions, and the server would reject one gallery as DATA_LOSS."""
+    """The reservation for _rich_queue_tuple, a held section (_HELD_SECTIONS): the allocator's lock is reentrant, so a handler kymo chains to that logs a gallery from inside it would reserve the same versions, and the server would reject one gallery as DATA_LOSS."""
     lock = _rich_mutation_seq.get_lock()
     if not lock.acquire(timeout=_STATUS_LOCK_TIMEOUT):
         raise RuntimeError("kymo rich mutation allocator lock is unavailable")
@@ -643,12 +625,11 @@ def init(
         local_endpoint=local_endpoint,
     )
     run_info = resp.run
-    _rich_writer_epoch = resp.writer_epoch if resp.HasField("writer_epoch") else None
-    if _rich_writer_epoch == 0:
+    # An absent epoch reads 0.
+    if not resp.writer_epoch:
         raise RuntimeError("kymo returned an invalid rich writer epoch")
-    _rich_mutation_seq = (
-        multiprocessing.Value("I", 0) if _rich_writer_epoch is not None else None
-    )
+    _rich_writer_epoch = resp.writer_epoch
+    _rich_mutation_seq = multiprocessing.Value("I", 0)
     # Existing run IDs are first-write-wins on name. Recovery metadata must use the server's canonical value rather than this caller's rejected proposal.
     run_name = run_info.run_name
     _run_name = run_name
@@ -768,7 +749,7 @@ def init(
     )
 
     # Collected once: update_config() changes only its config field, so the time, system and git fields never drift between uploads. A resume without a config (a writer epoch past 1) publishes no run_info, so the run keeps its stored one, config included.
-    resumed = _rich_writer_epoch is not None and _rich_writer_epoch > 1
+    resumed = _rich_writer_epoch > 1
     if _is_initialized and not (resumed and config is None):
         _run_metadata = _collect_run_metadata(config)
         _push_run_metadata()
@@ -976,7 +957,7 @@ def log(metrics: dict, step: int) -> None:
                 numeric_tags.append(None)
         elif isinstance(value, Metadata):
             cdn_batches.append(
-                _rich_queue_tuple("metadata_batch", name, step, value, now_ms)
+                _rich_queue_tuple("metadata_batch_mutation", name, step, value, now_ms)
             )
         elif isinstance(value, (Image, Resource)) or (
             isinstance(value, list)
@@ -999,7 +980,9 @@ def log(metrics: dict, step: int) -> None:
                 batches = gpu_batches
             else:
                 galleries = True
-            batches.append(_rich_queue_tuple("cdn_batch", name, step, items, now_ms))
+            batches.append(
+                _rich_queue_tuple("cdn_batch_mutation", name, step, items, now_ms)
+            )
         elif isinstance(value, list):
             if not numeric_tags:
                 numeric_tags = [None] * len(numeric_names)
@@ -1143,8 +1126,6 @@ _NUMERIC_BATCH_QUEUE_ITEM = "__kymo_numeric_batch_v1__"
 # Such a batch with a 7th field, the text points of the captured output its publication drained (_publish_held), so the call makes one put; a kind of its own, so sizing the plain batch most log() calls publish takes no extra check.
 _NUMERIC_TEXT_BATCH_QUEUE_ITEM = "__kymo_numeric_text_batch_v1__"
 _NUMERIC_BATCH_KINDS = (_NUMERIC_BATCH_QUEUE_ITEM, _NUMERIC_TEXT_BATCH_QUEUE_ITEM)
-_GALLERY_KINDS = ("cdn_batch", "cdn_batch_mutation")
-_METADATA_KINDS = ("metadata_batch", "metadata_batch_mutation")
 
 
 class _HostTensorPickler(pickle.Pickler):
@@ -1196,9 +1177,9 @@ def _snapshot_rich_queue_items(cdn_batches: list[tuple]) -> list[tuple]:
     unpaced = in_child or bool(_lanes_on_disk is not None and _lanes_on_disk.value)
     marker = _ChildGalleryItems if in_child else _UnpacedGalleryItems
     for batch in cdn_batches:
-        if unpaced and batch[0] in _GALLERY_KINDS:
+        if unpaced and batch[0] == "cdn_batch_mutation":
             batch = (*batch[:3], marker(batch[3]), *batch[4:])
-        if batch[0] in _METADATA_KINDS:
+        if batch[0] == "metadata_batch_mutation":
             # Freeze metadata to its JSON tree, as a config is, so the payload never carries tensors or other objects the worker might fail to unpickle.
             data = _freeze_json(batch[3].data, f"metadata metric {batch[1]!r}")
             batch = (*batch[:3], Metadata(data), *batch[4:])
@@ -1213,7 +1194,7 @@ def _snapshot_rich_queue_items(cdn_batches: list[tuple]) -> list[tuple]:
                 "its payload is not multiprocessing-serializable"
             ) from error
         snapshot = (_SERIALIZED_RICH_QUEUE_ITEM, payload)
-        if batch[0] in _GALLERY_KINDS:
+        if batch[0] == "cdn_batch_mutation":
             snapshot = _GalleryQueueItem(snapshot)
         snapshots.append(snapshot)
     return snapshots
@@ -1232,12 +1213,12 @@ def _rich_queue_tuple(
     kind: str, name: str, step: int, payload, timestamp_ms: int
 ) -> tuple:
     # A gallery also reserves its successor, before any later logical mutation: a replay may have to omit a child that the CDN now rejects permanently, and the reduced rebuild must stay in this writer's causal order.
-    versions = _reserve_rich_mutation_versions(2 if kind == "cdn_batch" else 1)
-    if versions is None:
-        return (kind, name, step, payload)
-    if kind != "cdn_batch":
-        return (f"{kind}_mutation", name, step, payload, timestamp_ms, versions[0])
-    return (f"{kind}_mutation", name, step, payload, timestamp_ms) + versions
+    try:
+        versions = _reserve_versions(2 if kind == "cdn_batch_mutation" else 1)
+    finally:
+        if _deferred_signals:
+            _run_deferred_signals()
+    return (kind, name, step, payload, timestamp_ms, *versions)
 
 
 def _queue_item_size(item) -> int:
@@ -1937,7 +1918,7 @@ def log_cdn(cdn_keys: dict[str, str], step: int) -> None:
         raise RuntimeError("kymo not initialised — call kymo.init() first")
 
     step = _normalize_step(step)
-    # cdn_ts, not the legacy timestampless "cdn": a zero timestamp never advances the run's heartbeat, so a CDN-only run read as STUCK/presumed-dead while actively logging.
+    # A zero timestamp never advances the run's heartbeat, so a CDN-only run would read as STUCK/presumed-dead while actively logging.
     now_ms = int(time.time() * 1000)
     points = []
     for name, key in cdn_keys.items():
@@ -1946,30 +1927,13 @@ def log_cdn(cdn_keys: dict[str, str], step: int) -> None:
             raise TypeError(
                 f"CDN key for {name!r} must be str, got {type(key).__name__}"
             )
+        # An exact str, not a subclass, goes on the wire, as _normalize_metric_name makes of a name.
         key = str(key)
         try:
-            point_bytes = _estimate_tuple_bytes(("cdn_ts", name, step, key, now_ms))
+            _validate_ident(f"CDN key for {name!r}", key, _MAX_RICH_RESOURCE_ID_BYTES)
         except UnicodeEncodeError as error:
             raise ValueError(f"CDN key for {name!r} is not valid UTF-8") from error
-        if point_bytes > _MAX_POINT_BYTES:
-            raise ValueError(
-                f"CDN key for {name!r} is too large to ingest "
-                f"({point_bytes} encoded bytes; limit {_MAX_POINT_BYTES})"
-            )
-        if (
-            _rich_writer_epoch is not None
-            and len(key.encode("utf-8")) > _MAX_RICH_RESOURCE_ID_BYTES
-        ):
-            raise ValueError(
-                f"CDN key for {name!r} exceeds the versioned rich-write limit "
-                f"of {_MAX_RICH_RESOURCE_ID_BYTES} UTF-8 bytes"
-            )
-        versions = _reserve_rich_mutation_versions(1)
-        points.append(
-            ("cdn_ts", name, step, key, now_ms)
-            if versions is None
-            else ("cdn_key_mutation", name, step, key, now_ms, versions[0])
-        )
+        points.append(_rich_queue_tuple("cdn_key_mutation", name, step, key, now_ms))
 
     _publish_in_log_order(_PendingLog(points, [], step=step))
     _warn_if_backlogged()
@@ -2342,7 +2306,7 @@ def _push_run_metadata():
             _snapshot_rich_queue_items(
                 [
                     _rich_queue_tuple(
-                        "metadata_batch",
+                        "metadata_batch_mutation",
                         "info/run_info",
                         0,
                         Metadata(_run_metadata),
@@ -3475,8 +3439,6 @@ def _drain_and_shutdown(
         _mode, \
         _local_installation_uuid, \
         _url_base, \
-        _rich_writer_epoch, \
-        _rich_mutation_seq, \
         _finishing
 
     if not _is_initialized:
@@ -3537,8 +3499,6 @@ def _drain_and_shutdown(
         _mode = "hosted"
         _local_installation_uuid = ""
         _url_base = ""
-        _rich_writer_epoch = None
-        _rich_mutation_seq = None
         # Groups still held back now were never put, and the next init() must not put them: after a handoff, those the queue had no room for or the accounting lock did not let it charge; else those no salvage took (a deleted run, a worker alive after SIGKILL, no time left) and those a log() on another thread held back behind the drain.
         dropped = sum(
             map(_queue_item_size, _take_held_back() + _take_held_back(_uncharged))
@@ -3935,7 +3895,7 @@ def _encode_resource(res: "Resource") -> tuple[bytes, str]:
 
 
 class _EncodedItems:
-    """A gallery's items encoded once, in the spool's entry form, replacing the Image/Resource list in a worker's queued cdn_batch tuple."""
+    """A gallery's items encoded once, in the spool's entry form, replacing the Image/Resource list in a worker's queued gallery tuple."""
 
     __slots__ = ("entries", "dropped", "nbytes")
 
@@ -3955,7 +3915,7 @@ class _EncodedItems:
 
 
 def _encode_cdn_items(name: str, step: int, items: list) -> _EncodedItems:
-    """Encode a gallery's items in place, each into its spool entry, or None when it cannot be encoded (dropped with a warning, since a retry can never fix it).
+    """Encode a gallery's items in place into spool entries, replacing each one that cannot be encoded with None and a warning, since a retry can never fix it.
 
     Replacing each item as it is encoded releases its arrays at once, so a gallery is never held both whole and encoded, and a retry after a MemoryError resumes at the item that raised. Callers pass a decoded snapshot, never a list given to log().
     """
@@ -3996,37 +3956,6 @@ def _encode_cdn_items(name: str, step: int, items: list) -> _EncodedItems:
     return _EncodedItems(entries, dropped=len(entries) < len(items))
 
 
-def _publish_manifest_point(
-    stub,
-    project_id: str,
-    run_id: str,
-    metric_name: str,
-    step: int,
-    cdn_key: str,
-    timestamp_ms: Optional[int],
-    mutation_version: Optional[int],
-) -> bool:
-    """Publish a rich record's manifest key: as its versioned mutation, or to an old server as a point stamped at publication."""
-    if mutation_version is not None:
-        return _publish_rich_mutation(
-            stub,
-            project_id,
-            run_id,
-            metric_name,
-            step,
-            cdn_key,
-            timestamp_ms,
-            mutation_version,
-        )
-    point = kymo_pb2.MetricPoint(
-        metric_name=metric_name,
-        step=step,
-        cdn_key=cdn_key,
-        timestamp_ms=int(time.time() * 1000),
-    )
-    return _send_unary_point(stub, project_id, run_id, point)
-
-
 def _process_cdn_batch(
     stub,
     http_client,
@@ -4036,38 +3965,23 @@ def _process_cdn_batch(
     metric_name: str,
     step: int,
     items: _EncodedItems,
-    deadline_fn=None,
-    send_placeholder: bool = True,
-    timestamp_ms: Optional[int] = None,
-    mutation_version: Optional[int] = None,
-    reduced_mutation_version: Optional[int] = None,
+    *,
+    deadline_fn,
+    timestamp_ms: int,
+    mutation_version: int,
+    reduced_mutation_version: int,
 ) -> bool | int:
     """Upload encoded items and publish their gallery's manifest.
 
-    Return True for a complete gallery, _WORKER_GALLERY_CUT_SHORT once the manifest went out without items its encode dropped or the CDN rejected, and False for a failure the caller retries, keeping the batch queued: running this again is safe, since re-uploads dedup by content hash and a manifest's re-send replaces itself. A legacy retry must pass send_placeholder=False: those rows take the server's arrival order, so its placeholder could overwrite a real point whose commit succeeded but whose ack was lost. Versioned writers publish no placeholders.
+    Return True for a complete gallery and _WORKER_GALLERY_CUT_SHORT once the manifest went out without items its encode dropped or the CDN rejected; any other failure raises, leaving the batch queued for process_cdn_entry's owner loop to retry or spool. Running this again is safe: re-uploads dedup by content hash, and publishing the same version and manifest again is idempotent.
 
-    Return False as soon as deadline_fn fires, so a shutdown spools the batch instead of finishing slow uploads.
+    Check deadline_fn before each item's upload and return False once it has fired: past the deadline the owner spools the batch without waiting for this helper, so its remaining uploads would be wasted.
     """
-    # 1. Send placeholder (first attempt only, see docstring)
-    if send_placeholder and mutation_version is None:
-        placeholder_key = f"pending:{uuid.uuid4().hex[:16]}"
-        placeholder_point = kymo_pb2.MetricPoint(
-            metric_name=metric_name,
-            step=step,
-            cdn_key=placeholder_key,
-            # Without a timestamp the server's heartbeat sees epoch 0 and an image-only run reads as STUCK/dead.
-            timestamp_ms=int(time.time() * 1000),
-        )
-        try:
-            _send_unary_point(stub, project_id, run_id, placeholder_point)
-        except grpc.RpcError as e:
-            _log.error("failed to send placeholder: %s", e.details())
-
-    # 2. Upload the encoded items. A CDN rejection drops its item, like an encode failure; any other upload failure is transient and fails the whole batch for retry — committing a manifest missing the failed items would silently thin the gallery. A retry re-uploads the already-uploaded prefix (the CDN dedups by content hash). Past the deadline the caller spools the batch, so finishing uploads here is pure shutdown latency against the parent's kill grace.
+    # 1. Upload the encoded items. A CDN rejection drops its item, like an encode failure; any other upload failure is transient and fails the whole batch for retry — committing a manifest missing the failed items would silently thin the gallery.
     manifest_items = []
     manifest_changed = items.dropped
     for entry in items.entries:
-        if deadline_fn is not None and deadline_fn():
+        if deadline_fn():
             return False
         try:
             resource_id = _upload_to_cdn(
@@ -4083,49 +3997,34 @@ def _process_cdn_batch(
                     e,
                 )
                 continue
-            _log.warning("failed to upload resource: %s", e)
-            return False
+            raise
         manifest_items.append(encoded_gallery_item(entry, resource_id))
 
     if not manifest_items:
-        # Fall through and log an EMPTY manifest rather than returning early: the placeholder is already in the store, and consuming the batch without replacing it left the gallery cell "Uploading…" forever (a re-logged step even masked its previous valid manifest with an eternal placeholder).
+        # Publish an EMPTY manifest rather than returning early: an empty gallery is still a real mutation of its step.
         _log.error(
             "no encodable/accepted items in CDN batch %s step %d — logging an empty gallery",
             metric_name,
             step,
         )
 
-    # 3. Build and upload manifest
+    # 2. Build and upload manifest
     encoded_manifest = gallery_manifest(manifest_items)
-    try:
-        manifest_id = _upload_to_cdn(http_client, cdn_url, encoded_manifest, "json")
-    except Exception as e:
-        _log.error("failed to upload manifest: %s", e)
-        return False
+    manifest_id = _upload_to_cdn(http_client, cdn_url, encoded_manifest, "json")
 
-    # 4. Publish the immutable manifest. New servers compare the parent-issued
-    # logical version before inserting, so a delayed retry cannot overwrite a
-    # newer same-step value. Legacy servers retain arrival-order replacement.
-    if mutation_version is not None:
-        assert timestamp_ms is not None
-        if manifest_changed:
-            mutation_version = _reduced_mutation_version(reduced_mutation_version)
-    try:
-        published = _publish_manifest_point(
-            stub,
-            project_id,
-            run_id,
-            metric_name,
-            step,
-            manifest_id,
-            timestamp_ms,
-            mutation_version,
-        )
-    except grpc.RpcError as e:
-        _log.error("failed to publish manifest %s: %s", manifest_id, e.details())
-        return False
-    if not published:
-        return False
+    # 3. Publish the immutable manifest. The server compares the parent-issued logical version before inserting, so a delayed retry cannot overwrite a newer same-step value.
+    if manifest_changed:
+        mutation_version = reduced_mutation_version
+    _publish_rich_mutation(
+        stub,
+        project_id,
+        run_id,
+        metric_name,
+        step,
+        manifest_id,
+        timestamp_ms,
+        mutation_version,
+    )
     _log.info(
         "CDN %s step=%d → %s (%d items)",
         metric_name,
@@ -4143,7 +4042,7 @@ _CONNECT_POLL_TIMEOUT = 0.25
 # workers that observed the same restart from hammering the replacement pod in
 # lockstep. Ordinary in-memory stream retries retain the low-latency 5s cap.
 _RECOVERY_MAX_DELAY = 60.0
-# Attempts on one CDN batch before the rich lane fails over to the spool (exponential backoff, 2s..60s — a few minutes of outage total). Permanent rejections (server 400s the content) also land here rather than wedging the queue head forever.
+# Attempts on one rich-lane entry before the lane fails over to the spool, retry delays growing from 2 s to 60 s; a gallery item the CDN rejects permanently is dropped instead.
 _CDN_MAX_ATTEMPTS = 8
 # Worker exit code: some points reached neither the server nor the spool (a spool write failed, e.g. disk full, a gallery could not be encoded for the spool, a queued snapshot would not unpickle in the worker, its spill end passed before it spilled them, or it never read them and no salvage follows). finish() must not report success.
 _WORKER_EXIT_SPOOL_FAILED = 2
@@ -4201,8 +4100,6 @@ _NUMERIC_OUTAGE_FAILOVER = 180.0
 _MAX_CDN_QUEUE = 1_000
 _DEFAULT_MAX_RICH_BUFFER_BYTES = 2 * 1024 * 1024 * 1024
 _ORDERED_CDN_KINDS = (
-    "cdn_batch",
-    "metadata_batch",
     "cdn_batch_mutation",
     "metadata_batch_mutation",
     "cdn_key_mutation",
@@ -4355,23 +4252,26 @@ def _spool_header(
 def _spool_record(point_tuple: tuple) -> tuple:
     """The spool record for one queue tuple, encoding CDN payloads not yet encoded so the file is self-contained."""
     kind = point_tuple[0]
-    if kind in _METADATA_KINDS:
+    if kind == "metadata_batch_mutation":
         # Its data is already JSON, frozen as it was queued (_snapshot_rich_queue_items).
-        _, name, step, metadata, *versions = point_tuple
-        record_kind = "metadata_json_mutation" if versions else "metadata_json"
-        return (record_kind, name, step, metadata.data, *versions)
-    if kind not in _GALLERY_KINDS:
+        _, name, step, metadata, timestamp_ms, mutation_version = point_tuple
+        return (
+            "metadata_json_mutation",
+            name,
+            step,
+            metadata.data,
+            timestamp_ms,
+            mutation_version,
+        )
+    if kind != "cdn_batch_mutation":
         return point_tuple
-    _, name, step, items, *versions = point_tuple
+    _, name, step, items, timestamp_ms, mutation_version, reduced_mutation_version = (
+        point_tuple
+    )
     # The worker's encoder may already have encoded this gallery.
     if not isinstance(items, _EncodedItems):
         items = _encode_cdn_items(name, step, items)
-    # Recorded even when every item failed to encode. Legacy batches may
-    # need an empty manifest to clear their pending:* placeholder;
-    # versioned batches still represent a real empty-gallery mutation.
-    if not versions:
-        return ("cdn_batch_encoded", name, step, items.entries)
-    timestamp_ms, _, reduced_mutation_version = versions
+    # Recorded even when every item failed to encode: an empty gallery is still a real mutation.
     if items.dropped:
         # Under the version reserved for the reduced gallery, which leaves none in reserve.
         return (
@@ -4383,7 +4283,15 @@ def _spool_record(point_tuple: tuple) -> tuple:
             reduced_mutation_version,
         )
     # A distinct kind makes the extra field forward-safe: older replay tools preserve unknown records instead of rejecting a valid newer tuple as malformed.
-    return ("cdn_batch_encoded_mutation_reserved", name, step, items.entries, *versions)
+    return (
+        "cdn_batch_encoded_mutation_reserved",
+        name,
+        step,
+        items.entries,
+        timestamp_ms,
+        mutation_version,
+        reduced_mutation_version,
+    )
 
 
 def _spill_tuple(spool, point_tuple: tuple) -> bool:

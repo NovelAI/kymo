@@ -155,7 +155,7 @@ class KymoServicer:
         """Pipelined ingest: server acks cumulatively as bounded flush cuts commit
         (normally 10k rows or about 8 MiB, plus timer/half-close tails), so the
         cut — not the whole call — is the durability/retry unit. Unary
-        IngestMetrics stays for CDN sends, simple callers, and kymo.sync replay.
+        IngestMetrics stays for simple callers and spool replay.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')

@@ -111,10 +111,7 @@ def recorded(p):
 
 
 class FakeKymo(kymo_pb2_grpc.KymoServicer):
-    """Counts everything. `call_delay` + `per_point_delay` model an overloaded
-    server (fixed per-flush cost + throughput bound). Delays use an Event so
-    stop() releases in-flight handlers instead of leaving non-daemon executor
-    threads sleeping."""
+    """Counts the points it ingests. `call_delay` + `per_point_delay` model an overloaded server (fixed per-flush cost + throughput bound). Delays use an Event so stop() releases in-flight handlers instead of leaving non-daemon executor threads sleeping."""
 
     def __init__(
         self,
@@ -157,7 +154,8 @@ class FakeKymo(kymo_pb2_grpc.KymoServicer):
                 run_id=request.run_id,
                 run_name=request.run_name,
                 ordinal=1,
-            )
+            ),
+            writer_epoch=1,
         )
 
     def TerminateRun(self, request, context):
@@ -166,9 +164,14 @@ class FakeKymo(kymo_pb2_grpc.KymoServicer):
             self.terminated_at.append(time.monotonic())
         return kymo_pb2.TerminateRunResponse()
 
-    def QueryCdnKeys(self, request, context):
-        # The replay of a legacy rich record reads its step's key (kymo.sync._current_cdn_key), as for the metadata record a deadline spill can leave in a segment of its own: none is stored here, so every step reads empty.
-        return kymo_pb2.QueryCdnKeysResponse()
+    def PublishRichMutation(self, request, context):
+        # Delayed as IngestMetrics is, so a hung server publishes no rich head either. Accepts every version: the rich heads these scenarios publish never conflict.
+        if self.call_delay:
+            self.stop_event.wait(self.call_delay)
+        return kymo_pb2.PublishRichMutationResponse(
+            disposition=kymo_pb2.RICH_MUTATION_ACCEPTED,
+            stored_version=request.mutation_version,
+        )
 
     def IngestMetrics(self, request_iterator, context):
         n = 0
@@ -686,10 +689,8 @@ def scenario_fast_server(spool_dir):
     )
     assert rc == 0, out
     assert "fully_delivered=True" in out, out
-    # info/run_info cdn point rides along with the numeric points
-    assert servicer.point_count >= total, (
-        f"server got {servicer.point_count} < {total}\n{out}"
-    )
+    delivered = servicer.train_point_count()
+    assert delivered == total, f"delivered {delivered} != {total}\n{out}"
     assert not spool_files(spool_dir, run_id), "unexpected spool file on clean run"
     assert servicer.terminates and servicer.terminates[-1][1] == 0, (
         "TerminateRun(0) not received"
@@ -850,7 +851,7 @@ def scenario_hung_server(spool_dir):
     spooled_imgs = 0
     for f in files:
         for rec in read_spool_records(f):
-            if rec[0] == "cdn_batch_encoded":
+            if rec[0] == "cdn_batch_encoded_mutation_reserved":
                 spooled_imgs += 1
                 assert rec[3][0]["data"][:8] == b"\x89PNG\r\n\x1a\n", (
                     "spooled image is not a PNG"

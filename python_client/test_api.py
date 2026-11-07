@@ -180,7 +180,7 @@ class RecordTests(unittest.TestCase):
             ],
         )
 
-    def test_media_marks_pending_uploads(self):
+    def test_media_maps_pending_placeholders_to_none(self):
         series = NS(
             entries=[NS(step=0, cdn_key="a.png"), NS(step=1, cdn_key="pending:x")]
         )
@@ -388,7 +388,7 @@ class FetchTests(unittest.TestCase):
         api = self.cdn_api(
             lambda request: httpx.Response(200, content=json.dumps(manifest).encode())
         )
-        # kymo writes info/run_info at step 0, and the server keeps one entry per step: its latest manifest, or a pending placeholder
+        # kymo writes info/run_info at step 0, and the server keeps one entry per step: its latest manifest, or a pending: placeholder
         for key, expected in (("run.json", {"config": {"lr": 2}}), ("pending:x", None)):
             api._stub = NS(
                 QueryCdnKeys=lambda req, timeout: NS(

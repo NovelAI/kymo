@@ -2090,12 +2090,11 @@ print(k > 50, str(late).replace(" ", ""), 0.9 < armed <= 1)
         connect.assert_not_called()
 
     @contextlib.contextmanager
-    def _init_without_a_server(self, process, writer_epoch=None, **patches):
-        """Patch kymo.client so init() runs without a server: a module state no run has touched, patches on top, an InitRun that names the run "canonical run" and allocates writer_epoch (or none), and mocks for its queue, values, run metadata upload and upload worker, process. Yields the mocks of Process and make_spool_path."""
-        response = types.SimpleNamespace(
-            run=types.SimpleNamespace(run_name="canonical run", ordinal=1),
+    def _init_without_a_server(self, process, writer_epoch=1, **patches):
+        """Patch kymo.client so init() runs without a server: a module state no run has touched, patches on top, an InitRun that names the run "canonical run" and allocates writer_epoch (None leaves it unset), and mocks for its queue, values, run metadata upload and upload worker, process. Yields the mocks of Process and make_spool_path."""
+        response = client_module.kymo_pb2.InitRunResponse(
+            run=client_module.kymo_pb2.RunInfo(run_name="canonical run", ordinal=1),
             writer_epoch=writer_epoch,
-            HasField=lambda name: name == "writer_epoch" and writer_epoch is not None,
         )
         with (
             mock.patch.multiple(
@@ -2223,15 +2222,26 @@ print(k > 50, str(late).replace(" ", ""), 0.9 < armed <= 1)
                     client_module._run_metadata.get("config", "absent"), expected
                 )
 
+    def test_init_refuses_a_missing_or_zero_writer_epoch(self):
+        # Every server that serves kymo.Kymo/InitRun allocates one; an absent epoch reads 0.
+        for writer_epoch in (None, 0):
+            process = mock.Mock()
+            with (
+                self.subTest(writer_epoch=writer_epoch),
+                self._init_without_a_server(process, writer_epoch=writer_epoch),
+                self.assertRaisesRegex(RuntimeError, "invalid rich writer epoch"),
+            ):
+                self._init()
+            process.start.assert_not_called()
+
     def test_a_resume_without_a_config_keeps_the_stored_run_info(self):
-        # Epoch 2 is a resume: an earlier InitRun of the run took epoch 1. A resume without a config publishes nothing and collects no meta of this process, so update_config raises; {} or a config, a first init, and a missing epoch publish, and update_config merges into that (basedformer calls it after a first init without a config, which publishes no config field). Each case starts from the metadata a forked child would still hold (its shutdown leaves it: another process's run).
+        # Epoch 2 is a resume: an earlier InitRun of the run took epoch 1. A resume without a config publishes nothing and collects no meta of this process, so update_config raises; a resume with {} or a config publishes, as a first init does, and update_config merges into that (basedformer calls it after a first init without a config, which publishes no config field). Each case starts from the metadata a forked child would still hold (its shutdown leaves it: another process's run).
         for writer_epoch, config, publishes in (
             (2, None, False),
             (3, None, False),
             (2, {}, True),
             (2, {"lr": 1}, True),
             (1, None, True),
-            (None, None, True),
         ):
             with (
                 self.subTest(writer_epoch=writer_epoch, config=config),
@@ -3232,7 +3242,7 @@ class BatchBoundTests(unittest.TestCase):
         ):
             written = client_module._spill_tuple(
                 spool,
-                ("cdn_batch", "demo/image", 1, [Image(b"valid")]),
+                _gallery(1, [Image(b"valid")], "demo/image"),
             )
 
         self.assertEqual(written, 0)
@@ -3295,9 +3305,11 @@ class AccountingTests(unittest.TestCase):
             ),
         ):
             first = client_module._rich_queue_tuple(
-                "metadata_batch", "info/run_info", 0, Metadata({}), 100
+                "metadata_batch_mutation", "info/run_info", 0, Metadata({}), 100
             )
-            second = client_module._rich_queue_tuple("cdn_batch", "gallery", 1, [], 101)
+            second = client_module._rich_queue_tuple(
+                "cdn_batch_mutation", "gallery", 1, [], 101
+            )
 
         self.assertEqual(first[:3], ("metadata_batch_mutation", "info/run_info", 0))
         self.assertEqual(first[4:], (100, (7 << 32) | 1))
@@ -3363,12 +3375,14 @@ class AccountingTests(unittest.TestCase):
 
         def reserve_gallery():
             gallery.append(
-                client_module._rich_queue_tuple("cdn_batch", "gallery", 1, [], 101)
+                client_module._rich_queue_tuple(
+                    "cdn_batch_mutation", "gallery", 1, [], 101
+                )
             )
 
         def reserve_contender():
             start_contender.wait(1)
-            contender.extend(client_module._reserve_rich_mutation_versions(1))
+            contender.extend(client_module._reserve_versions(1))
             contender_done.set()
 
         with (
@@ -3389,23 +3403,14 @@ class AccountingTests(unittest.TestCase):
         self.assertEqual(contender, [(7 << 32) | 3])
         self.assertEqual(sequence._lock.gallery_acquires, 1)
 
-    def test_absent_writer_epoch_keeps_the_legacy_rich_tuple(self):
-        with mock.patch.object(client_module, "_rich_writer_epoch", None):
-            item = client_module._rich_queue_tuple(
-                "metadata_batch", "info/run_info", 0, Metadata({}), 100
-            )
-        self.assertEqual(item[:3], ("metadata_batch", "info/run_info", 0))
-        self.assertEqual(len(item), 4)
-
     def test_rich_mutation_allocator_fails_instead_of_waiting_on_a_dead_owner(self):
         sequence = mock.Mock()
         sequence.get_lock.return_value.acquire.return_value = False
         with (
-            mock.patch.object(client_module, "_rich_writer_epoch", 7),
             mock.patch.object(client_module, "_rich_mutation_seq", sequence),
             self.assertRaisesRegex(RuntimeError, "allocator lock is unavailable"),
         ):
-            client_module._reserve_rich_mutation_versions(1)
+            client_module._reserve_versions(1)
         sequence.get_lock.return_value.acquire.assert_called_once_with(
             timeout=client_module._STATUS_LOCK_TIMEOUT
         )
@@ -3413,13 +3418,13 @@ class AccountingTests(unittest.TestCase):
 
     def test_a_handler_kymo_chains_to_never_takes_a_reservations_versions(self):
         # A handler kymo chains to logs a gallery at each opcode of a reservation. The allocator's lock is reentrant, so inside it the handler would read the sequence the reservation had read and take the same versions, one gallery's of which the server rejects as DATA_LOSS: the reservation defers it, and every version is reserved once.
-        reservation = client_module._reserve_rich_mutation_versions
+        reservation = client_module._rich_queue_tuple
         traced = {reservation.__code__, client_module._reserve_versions.__code__}
         for k in itertools.count():
             nested = []
 
             def handler(signum, frame):
-                nested.extend(reservation(2))
+                nested.extend(reservation("cdn_batch_mutation", "g", 1, [], 1)[5:])
 
             tracer, fired = _opcode_tracer(
                 traced, k, lambda frame: signal.raise_signal(signal.SIGUSR1)
@@ -3433,7 +3438,7 @@ class AccountingTests(unittest.TestCase):
                 _kymo_handles({signal.SIGUSR1: handler}),
             ):
                 with _tracing(tracer):
-                    outer = reservation(2)
+                    outer = reservation("cdn_batch_mutation", "g", 1, [], 1)[5:]
                 reserved = client_module._rich_mutation_seq.value
             if not fired:
                 break
@@ -3447,6 +3452,8 @@ class AccountingTests(unittest.TestCase):
         metadata = {"config": {"learning_rate": 0.1}}
         with (
             mock.patch.object(client_module, "_is_initialized", True),
+            mock.patch.object(client_module, "_rich_writer_epoch", 7),
+            mock.patch.object(client_module, "_rich_mutation_seq", _QueueStatus()),
             mock.patch.object(client_module, "_run_metadata", metadata),
             mock.patch.object(client_module, "_publish_queue_items") as publish,
         ):
@@ -3458,8 +3465,11 @@ class AccountingTests(unittest.TestCase):
         self.assertEqual(len(queued), 1)
         decoded = client_module._decode_queue_item(queued[0])
         self.assertEqual(len(decoded), 1)
-        kind, name, step, snapshot = decoded[0]
-        self.assertEqual((kind, name, step), ("metadata_batch", "info/run_info", 0))
+        kind, name, step, snapshot, _, version = decoded[0]
+        self.assertEqual(
+            (kind, name, step, version),
+            ("metadata_batch_mutation", "info/run_info", 0, (7 << 32) | 1),
+        )
         self.assertEqual(snapshot.data["config"]["learning_rate"], 0.1)
 
     def test_ack_delta_accepts_duplicate_and_advance(self):
@@ -3664,26 +3674,22 @@ class AccountingTests(unittest.TestCase):
             "converted": [np.int64(5), np.arange(2, dtype=np.uint8), {2, 1}],
         }
         manifest = metadata_manifest(data)
-        for batch in (
-            ("metadata_batch", "demo/meta", 1, Metadata(data)),
-            ("metadata_batch_mutation", "demo/meta", 1, Metadata(data), 7, 9),
-        ):
-            with self.subTest(kind=batch[0]):
-                # No torch in sys.modules: the stub tensor would refuse to pickle if it reached the payload.
-                with mock.patch.dict(sys.modules, {"torch": None}):
-                    ((_, payload),) = client_module._snapshot_rich_queue_items([batch])
-                (decoded,) = client_module._decode_queue_item(
-                    (client_module._SERIALIZED_RICH_QUEUE_ITEM, payload)
-                )
-                self.assertEqual(decoded[:3] + decoded[4:], batch[:3] + batch[4:])
-                self.assertEqual(metadata_manifest(decoded[3].data), manifest)
+        batch = ("metadata_batch_mutation", "demo/meta", 1, Metadata(data), 7, 9)
+        # No torch in sys.modules: the stub tensor would refuse to pickle if it reached the payload.
+        with mock.patch.dict(sys.modules, {"torch": None}):
+            ((_, payload),) = client_module._snapshot_rich_queue_items([batch])
+        (decoded,) = client_module._decode_queue_item(
+            (client_module._SERIALIZED_RICH_QUEUE_ITEM, payload)
+        )
+        self.assertEqual(decoded[:3] + decoded[4:], batch[:3] + batch[4:])
+        self.assertEqual(metadata_manifest(decoded[3].data), manifest)
 
     def test_metadata_snapshot_keeps_lone_surrogates_exactly(self):
         # os.fsdecode(b"file-\xff.png"): a POSIX filename, cwd or argument that is not UTF-8. It is kept exactly, and keys that differ only there stay apart.
         name, readable = "file-\udcff.png", "file-?.png"
         data = {readable: "old", "path": name, name: [name, {"inner": name}]}
         (item,) = client_module._snapshot_rich_queue_items(
-            [("metadata_batch", "demo/meta", 1, Metadata(data))]
+            [("metadata_batch_mutation", "demo/meta", 1, Metadata(data), 7, 9)]
         )
         (decoded,) = client_module._decode_queue_item(item)
         self.assertEqual(decoded[3].data, data)
@@ -3710,69 +3716,53 @@ class AccountingTests(unittest.TestCase):
         self.assertEqual(target.items, [])
         self.assertEqual(status.value, 0)
 
-    @staticmethod
-    def _epoch_states():
-        """Both queue shapes: legacy servers (no writer epoch -> metadata_batch) and current servers (negotiated epoch -> metadata_batch_mutation)."""
-        return (
-            (None, None, "metadata_batch"),
-            (1, multiprocessing.Value("I", 0), "metadata_batch_mutation"),
-        )
-
     def test_nonfinite_metadata_is_queued_as_logged(self):
-        for epoch, seq, kind in self._epoch_states():
-            with self.subTest(kind=kind):
-                target = _ListQueue()
-                with (
-                    _upload_state(_metric_queue=target),
-                    mock.patch.object(client_module, "_rich_writer_epoch", epoch),
-                    mock.patch.object(client_module, "_rich_mutation_seq", seq),
-                    mock.patch("kymo._capture.drain_buffers", return_value=("", "")),
-                ):
-                    client_module.log(
-                        {
-                            "demo/meta": Metadata(
-                                {"bounds": [-math.inf, math.inf], math.nan: math.nan}
-                            )
-                        },
-                        step=1,
+        target = _ListQueue()
+        with (
+            _upload_state(_metric_queue=target),
+            mock.patch("kymo._capture.drain_buffers", return_value=("", "")),
+        ):
+            client_module.log(
+                {
+                    "demo/meta": Metadata(
+                        {"bounds": [-math.inf, math.inf], math.nan: math.nan}
                     )
+                },
+                step=1,
+            )
 
-                (item,) = target.items
-                (batch,) = client_module._decode_queue_item(item)
-                self.assertEqual(batch[0], kind)
-                stored = batch[3].data
-                self.assertEqual(list(stored), ["bounds", "NaN"])
-                self.assertEqual(stored["bounds"], [-math.inf, math.inf])
-                self.assertTrue(math.isnan(stored["NaN"]))
+        (item,) = target.items
+        (batch,) = client_module._decode_queue_item(item)
+        self.assertEqual(batch[0], "metadata_batch_mutation")
+        stored = batch[3].data
+        self.assertEqual(list(stored), ["bounds", "NaN"])
+        self.assertEqual(stored["bounds"], [-math.inf, math.inf])
+        self.assertTrue(math.isnan(stored["NaN"]))
 
     def test_colliding_metadata_keys_fail_before_capture_or_publication(self):
-        for epoch, seq, kind in self._epoch_states():
-            with self.subTest(kind=kind):
-                target = mock.Mock()
-                status = _QueueStatus()
-                capture = mock.Mock(return_value=("captured", ""))
-                with (
-                    _upload_state(_metric_queue=target, _queue_status=status),
-                    mock.patch.object(client_module, "_rich_writer_epoch", epoch),
-                    mock.patch.object(client_module, "_rich_mutation_seq", seq),
-                    mock.patch("kymo._capture.has_output", return_value=True),
-                    mock.patch("kymo._capture.drain_buffers", capture),
-                    self.assertRaisesRegex(
-                        ValueError,
-                        "^metadata metric 'demo/meta' cannot be stored as JSON: more than one key of a dict is stored as '1'$",
-                    ),
-                ):
-                    client_module.log(
-                        {
-                            "train/loss": 1.0,
-                            "demo/meta": Metadata({"nested": {1: "a", "1": "b"}}),
-                        },
-                        step=1,
-                    )
+        target = mock.Mock()
+        status = _QueueStatus()
+        capture = mock.Mock(return_value=("captured", ""))
+        with (
+            _upload_state(_metric_queue=target, _queue_status=status),
+            mock.patch("kymo._capture.has_output", return_value=True),
+            mock.patch("kymo._capture.drain_buffers", capture),
+            self.assertRaisesRegex(
+                ValueError,
+                "^metadata metric 'demo/meta' cannot be stored as JSON: more than one key of a dict is stored as '1'$",
+            ),
+        ):
+            client_module.log(
+                {
+                    "train/loss": 1.0,
+                    "demo/meta": Metadata({"nested": {1: "a", "1": "b"}}),
+                },
+                step=1,
+            )
 
-                capture.assert_not_called()
-                target.put.assert_not_called()
-                self.assertEqual(status.value, 0)
+        capture.assert_not_called()
+        target.put.assert_not_called()
+        self.assertEqual(status.value, 0)
 
     def test_mixed_invalid_rich_list_fails_before_capture_or_publication(self):
         target = mock.Mock()
@@ -5582,7 +5572,6 @@ def _patch_log_client(case, *extra) -> mock.Mock:
         _upload_state(
             _metric_queue=queue,
             _last_log_duration_ms=0.0,
-            _rich_writer_epoch=None,
             # No encoder pacing unless a test sets it up (_patch_encoder_pacing).
             _galleries_released=None,
         ),
@@ -6103,8 +6092,10 @@ class PendingGpuLogTests(unittest.TestCase):
 
         gpu, cdn, (metadata,) = self.published()
         self.assertEqual(gpu, [("numeric_ts", "gpu", 1, 1.0, 1234)])
-        self.assertEqual(cdn, [("cdn_ts", "cdn/key", 1, "abc", 1234)])
-        self.assertEqual(metadata[:3], ("metadata_batch", "info/run_info", 0))
+        self.assertEqual(
+            cdn, [("cdn_key_mutation", "cdn/key", 1, "abc", 1234, (1 << 32) | 1)]
+        )
+        self.assertEqual(metadata[:3], ("metadata_batch_mutation", "info/run_info", 0))
         self.assertEqual(metadata[3].data["config"], {"lr": 0.1})
 
     def test_wait_for_upload_bounds_its_wait_for_the_pending_calls_lock(self):
@@ -6281,7 +6272,7 @@ class PendingGpuLogTests(unittest.TestCase):
         client_module.log({}, step=2)
 
         ((single,), (gallery,)) = self.published()
-        self.assertEqual(single[:3], ("cdn_batch", "single", 1))
+        self.assertEqual(single[:3], ("cdn_batch_mutation", "single", 1))
         self.assertEqual(single[3][0].caption, "c")
         np.testing.assert_array_equal(single[3][0].data, pixels)
         np.testing.assert_array_equal(gallery[3][0].data, pixels)
@@ -6555,7 +6546,7 @@ class EncoderPacingTests(unittest.TestCase):
         )
 
     def test_a_gallery_reaches_the_worker_as_a_plain_tuple(self):
-        item = _unversioned_gallery(1, self.gallery())
+        item = _queued_gallery(1, self.gallery())
         self.assertIs(type(item), client_module._GalleryQueueItem)
         copied = multiprocessing.reduction.ForkingPickler.loads(
             multiprocessing.reduction.ForkingPickler.dumps(item)
@@ -6573,7 +6564,7 @@ class EncoderPacingTests(unittest.TestCase):
                     raise queue.Full
                 super().put(item)
 
-        target, gallery = FullForGalleries(), _unversioned_gallery(1, self.gallery())
+        target, gallery = FullForGalleries(), _queued_gallery(1, self.gallery())
         with mock.patch.object(client_module, "_metric_queue", target):
             with self.assertRaises(queue.Full):
                 client_module._publish_queue_items(
@@ -6601,7 +6592,7 @@ class EncoderPacingTests(unittest.TestCase):
                 raise client_module._AccountingLockUnavailable("busy")
             change(points, hard_deadline)
 
-        gallery = _unversioned_gallery(1, self.gallery())
+        gallery = _queued_gallery(1, self.gallery())
         client_module._pending.append(
             client_module._PendingLog([[numeric(1)]], [gallery], galleries=True)
         )
@@ -6622,7 +6613,7 @@ class EncoderPacingTests(unittest.TestCase):
             if type(item) is client_module._GalleryQueueItem:
                 raise Interrupted
 
-        galleries = [_unversioned_gallery(step, self.gallery()) for step in (1, 2)]
+        galleries = [_queued_gallery(step, self.gallery()) for step in (1, 2)]
         with (
             mock.patch.object(
                 client_module, "_metric_queue", _ListQueue(on_put=interrupt)
@@ -6951,7 +6942,7 @@ class _CudaLogTests:
             with self.subTest(name=name):
                 expected = client_module._decode_queue_item(
                     client_module._snapshot_rich_queue_items(
-                        [("cdn_batch", name, 1, [Image(data)])]
+                        [_gallery(1, [Image(data)], name)]
                     )[0]
                 )[0][3][0].data
                 if isinstance(expected, np.ndarray):
@@ -7519,10 +7510,8 @@ class QueueDrainTests(unittest.TestCase):
 
     def test_owner_drain_skips_unencodable_points_and_stops_at_a_failed_write(self):
         image = Image(b"\x89PNG\r\n\x1a\n", format="webp")
-        gallery = ("cdn_batch", "samples", 1, [image])
-        (later,) = client_module._snapshot_rich_queue_items(
-            [("cdn_batch", "samples", 5, [image])]
-        )
+        gallery = _gallery(1, [image])
+        later = _queued_gallery(5, [image])
         source = self.ScriptedQueue(
             [[numeric(1), gallery, numeric(2), numeric(3), numeric(4)], later]
         )
@@ -7559,9 +7548,7 @@ class QueueDrainTests(unittest.TestCase):
         spool.write.side_effect = lambda record: setattr(
             spool, "count", spool.count + 1
         )
-        source = self.ScriptedQueue(
-            [undecodable, [("cdn_batch", "samples", 1, [image]), numeric(1)]]
-        )
+        source = self.ScriptedQueue([undecodable, [_gallery(1, [image]), numeric(1)]])
         with (
             mock.patch.object(
                 client_module, "_encode_image", side_effect=MemoryError("pressure")
@@ -11721,6 +11708,8 @@ def _upload_state(**patches):
             "_unproven_points": 0,
             "_last_log_duration_ms": 0.0,
             "_last_capture_step": None,
+            "_rich_writer_epoch": 1,
+            "_rich_mutation_seq": _QueueStatus(),
             **patches,
         },
     )
@@ -11821,20 +11810,15 @@ def _kymo_handles(originals: dict):
         client_module._deferred_signals.clear()
 
 
-def _unversioned_gallery(step: int, gallery: list) -> tuple:
-    """A gallery as an old server's writer queues it, without logical versions."""
-    (item,) = client_module._snapshot_rich_queue_items(
-        [("cdn_batch", "samples", step, gallery)]
-    )
-    return item
-
-
-def _versioned_gallery(step: int, gallery: list) -> tuple:
-    """A gallery as a current server's writer queues it, its two versions' sequences 2 * step - 1 and 2 * step: only versioned rich records replay while a lane goes live again."""
+def _gallery(step: int, items: list, name: str = "samples") -> tuple:
+    """A gallery's tuple as log() builds it: timestamp step, versions (1 << 32) | (2 * step - 1) and its reserved successor."""
     version = (1 << 32) | (2 * step - 1)
-    (item,) = client_module._snapshot_rich_queue_items(
-        [("cdn_batch_mutation", "samples", step, gallery, step, version, version + 1)]
-    )
+    return ("cdn_batch_mutation", name, step, items, step, version, version + 1)
+
+
+def _queued_gallery(step: int, gallery: list) -> tuple:
+    """_gallery's tuple as log() queues it."""
+    (item,) = client_module._snapshot_rich_queue_items([_gallery(step, gallery)])
     return item
 
 
@@ -11985,7 +11969,7 @@ class WorkerResponsivenessTests(unittest.TestCase):
                 encode = _held_encode()
                 image = Image(np.zeros((2, 2, 3), dtype=np.uint8))
                 source, status = _charged_queue(
-                    [numeric(1)], _unversioned_gallery(2, [image])
+                    [numeric(1)], _queued_gallery(2, [image])
                 )
                 try:
                     with (
@@ -12033,7 +12017,7 @@ class WorkerResponsivenessTests(unittest.TestCase):
         encode = _held_encode()
         image = Image(np.zeros((2, 2, 3), dtype=np.uint8))
         source, status = _charged_queue(
-            [numeric(1)], _unversioned_gallery(2, [image]), [numeric(3)], None
+            [numeric(1)], _queued_gallery(2, [image]), [numeric(3)], None
         )
         delivered_by = _QueueStatus(time.monotonic() - 1)
         spill_by = _QueueStatus(time.monotonic() + 0.3)
@@ -12070,9 +12054,7 @@ class WorkerResponsivenessTests(unittest.TestCase):
         # A raw gallery the deadline spill encodes comes after a flush: the records the spill wrote before it are on disk while the encode runs, so a kill during a slow encode loses none of them with the writer's buffer.
         encode = _held_encode()
         image = Image(np.zeros((2, 2, 3), dtype=np.uint8))
-        source, status = _charged_queue(
-            [numeric(1), ("cdn_batch", "samples", 2, [image])], None
-        )
+        source, status = _charged_queue([numeric(1), _gallery(2, [image])], None)
         delivered_by = _QueueStatus(time.monotonic() - 1)
         spill_by = _QueueStatus(time.monotonic() + 30)
         try:
@@ -12150,7 +12132,7 @@ class WorkerResponsivenessTests(unittest.TestCase):
         for in_lane in (True, False):
             source, status = _charged_queue(
                 [numeric(1), numeric(2)],
-                _unversioned_gallery(3, [Resource(b"x" * 1000, "a.bin")]),
+                _queued_gallery(3, [Resource(b"x" * 1000, "a.bin")]),
                 *([] if in_lane else [None]),
             )
             released = _QueueStatus()
@@ -12191,7 +12173,11 @@ class WorkerResponsivenessTests(unittest.TestCase):
                 self.assertEqual(worker.code, 0)
                 self.assertEqual(status.value, 0)
                 self.assertEqual(
-                    kinds, [["numeric_ts", "numeric_ts"], ["cdn_batch_encoded"]]
+                    kinds,
+                    [
+                        ["numeric_ts", "numeric_ts"],
+                        ["cdn_batch_encoded_mutation_reserved"],
+                    ],
                 )
 
     def test_a_queue_that_can_no_longer_be_read_ends_the_worker_as_a_drain_cut_short(
@@ -12908,8 +12894,8 @@ class WorkerResponsivenessTests(unittest.TestCase):
 
     @staticmethod
     def _resource_gallery(step, data) -> tuple:
-        """A versioned one-resource gallery, charged len(data) bytes on arrival."""
-        return _versioned_gallery(step, [client_module.Resource(data, "item.bin")])
+        """A one-resource gallery, charged len(data) bytes on arrival."""
+        return _queued_gallery(step, [client_module.Resource(data, "item.bin")])
 
     @staticmethod
     def _steps_on_disk(spool_dir) -> list:
@@ -12940,9 +12926,7 @@ class WorkerResponsivenessTests(unittest.TestCase):
         stack = contextlib.ExitStack()
         for patch in (
             mock.patch.object(client_module, "_upload_to_cdn", side_effect=upload),
-            mock.patch.object(
-                client_module, "_publish_rich_mutation", return_value=True
-            ),
+            mock.patch.object(client_module, "_publish_rich_mutation"),
             mock.patch.object(client_module, "_cdn_retry_delay", return_value=0.0),
             mock.patch("kymo._local_runtime.grpc_channel", return_value=_Channel()),
             mock.patch.object(
@@ -13230,12 +13214,12 @@ class WorkerResponsivenessTests(unittest.TestCase):
 
     def test_a_gallery_log_did_not_pace_is_charged_whole(self):
         pixels = [Image(np.zeros((512, 512, 3), np.uint8))]
-        paced = _versioned_gallery(1001, pixels)
+        paced = _queued_gallery(1001, pixels)
         # Published while a lane wrote to disk, so log() did not wait for the encoder.
         with mock.patch.object(
             client_module, "_lanes_on_disk", types.SimpleNamespace(value=1)
         ):
-            unpaced = _versioned_gallery(1002, pixels)
+            unpaced = _queued_gallery(1002, pixels)
         replay = self._replay_stand_in()
         with (
             self.assertLogs("kymo", level="WARNING"),
@@ -13394,7 +13378,7 @@ class WorkerResponsivenessTests(unittest.TestCase):
             self.assertTrue(_wait_for(lambda: lane.live == [1, 2, 3, 4, 5]))
 
     def test_galleries_log_did_not_pace_are_marked_for_the_worker(self):
-        gallery = ("cdn_batch", "samples", 1, [Image(np.zeros((2, 2, 3), np.uint8))])
+        gallery = _gallery(1, [Image(np.zeros((2, 2, 3), np.uint8))])
 
         def items(pid, lanes_on_disk):
             with (
@@ -13860,7 +13844,7 @@ class WorkerResponsivenessTests(unittest.TestCase):
             live_point.set()
 
         # Its 2 KiB resource is charged on arrival, over the 1 KiB cap, so the rich lane fails over and its replay holds before the first connect.
-        gallery = _versioned_gallery(
+        gallery = _queued_gallery(
             1, [client_module.Resource(b"x" * 2048, "overflow.bin")]
         )
         source, status = _charged_queue(gallery, [numeric(7)])
@@ -14240,7 +14224,7 @@ class WorkerResponsivenessTests(unittest.TestCase):
         source.put(
             [
                 numeric(1),
-                ("cdn_batch", "demo/first", 1, [Resource(b"one", "bin")]),
+                _gallery(1, [Resource(b"one", "bin")], "demo/first"),
             ]
         )
         status = _QueueStatus(4)
@@ -14270,12 +14254,7 @@ class WorkerResponsivenessTests(unittest.TestCase):
                 source.put(
                     [
                         numeric(2),
-                        (
-                            "cdn_batch",
-                            "demo/second",
-                            2,
-                            [Resource(b"two", "bin")],
-                        ),
+                        _gallery(2, [Resource(b"two", "bin")], "demo/second"),
                     ]
                 )
                 source.put(None)
@@ -14290,31 +14269,26 @@ class WorkerResponsivenessTests(unittest.TestCase):
         self.assertEqual(cdn_calls, ["demo/first", "demo/second"])
         self.assertEqual(status.value, 0)
 
-    def test_outage_retries_cdn_and_metadata_until_real_points_commit(self):
-        class TransientRpcError(client_module.grpc.RpcError):
-            def details(self):
-                return "ingest unavailable"
-
+    def test_outage_retries_cdn_and_metadata_until_their_publications_commit(self):
         source = queue.Queue()
         source.put(
             [
-                ("cdn_batch", "demo/gallery", 1, [Resource(b"image", "bin")]),
+                _gallery(1, [Resource(b"image", "bin")], "demo/gallery"),
+                ("cdn_key_mutation", "demo/key", 2, "direct-key", 1, (1 << 32) | 3),
                 (
-                    "metadata_batch",
+                    "metadata_batch_mutation",
                     "info/run_info",
                     0,
                     Metadata({"model": "test"}),
+                    1,
+                    (1 << 32) | 4,
                 ),
             ]
         )
         source.put(None)
-        status = _QueueStatus(2)
+        status = _QueueStatus(3)
 
-        # The first gallery attempt sees the ingest side of a server rollout:
-        # both its best-effort placeholder and its real point fail. Metadata's
-        # real point then fails independently. The content-addressed uploads
-        # succeed throughout, so only retaining each queue head can make its
-        # already-uploaded content visible after ingest recovers.
+        # The gallery's first publication sees the gRPC side of a server rollout, and metadata's first fails independently. The content-addressed uploads succeed throughout, so only retaining each queue head can make its already-uploaded content visible once publication recovers.
         upload_results = [
             "resource.bin",
             "manifest.json",
@@ -14323,12 +14297,12 @@ class WorkerResponsivenessTests(unittest.TestCase):
             "metadata.json",
             "metadata.json",
         ]
-        point_results = [
-            TransientRpcError(),
-            TransientRpcError(),
-            True,
-            TransientRpcError(),
-            True,
+        publish_results = [
+            client_module.grpc.RpcError(),
+            None,
+            None,
+            client_module.grpc.RpcError(),
+            None,
         ]
 
         with tempfile.TemporaryDirectory() as spool_dir:
@@ -14344,9 +14318,9 @@ class WorkerResponsivenessTests(unittest.TestCase):
                 ) as upload,
                 mock.patch.object(
                     client_module,
-                    "_send_unary_point",
-                    side_effect=point_results,
-                ) as send_point,
+                    "_publish_rich_mutation",
+                    side_effect=publish_results,
+                ) as publish,
                 mock.patch.object(client_module, "_cdn_retry_delay", return_value=0.0),
             ):
                 worker = _worker_thread(
@@ -14370,12 +14344,12 @@ class WorkerResponsivenessTests(unittest.TestCase):
             self.assertFalse(os.path.exists(spool_path))
 
         self.assertEqual(upload.call_count, 6)
-        self.assertEqual(send_point.call_count, 5)
-        sent_keys = [call.args[3].cdn_key for call in send_point.call_args_list]
-        self.assertTrue(sent_keys[0].startswith("pending:"))
+        # Each publication under its own name, step, timestamp and version.
         self.assertEqual(
-            sent_keys[1:],
-            ["manifest.json", "manifest.json", "metadata.json", "metadata.json"],
+            [call.args[3:] for call in publish.call_args_list],
+            [("demo/gallery", 1, "manifest.json", 1, (1 << 32) | 1)] * 2
+            + [("demo/key", 2, "direct-key", 1, (1 << 32) | 3)]
+            + [("info/run_info", 0, "metadata.json", 1, (1 << 32) | 4)] * 2,
         )
         self.assertEqual(status.value, 0)
 
@@ -14698,92 +14672,6 @@ class WorkerResponsivenessTests(unittest.TestCase):
             self.assertFalse(os.path.exists(spool_path))
 
         self.assertFalse(worker.is_alive())
-        self.assertEqual(status.value, 0)
-
-    def test_blocked_rich_write_does_not_stall_direct_cdn_bidi_point(self):
-        rich_started = threading.Event()
-        release_rich = threading.Event()
-        direct_fed = threading.Event()
-        commits = []
-
-        def process_rich(
-            _stub,
-            _http_client,
-            _cdn_url,
-            _project_id,
-            _run_id,
-            _name,
-            _step,
-            _items,
-            **_kwargs,
-        ):
-            rich_started.set()
-            release_rich.wait(timeout=3)
-            commits.append("rich-manifest")
-            return True
-
-        def record_bidi_leak(batch):
-            for point in batch.points:
-                if point.cdn_key == "new-direct-key":
-                    commits.append("new-direct-key")
-                    direct_fed.set()
-
-        source = queue.Queue()
-        source.put(
-            [
-                (
-                    "cdn_batch",
-                    "demo/gallery",
-                    7,
-                    [Resource(b"old-rich", "bin")],
-                )
-            ]
-        )
-        status = _QueueStatus(2)
-
-        with tempfile.TemporaryDirectory() as spool_dir:
-            with contextlib.ExitStack() as stack:
-                stack.enter_context(
-                    _connected(self._immediate_stream_class(record_bidi_leak))
-                )
-                stack.enter_context(_channel_stand_ins())
-                stack.enter_context(
-                    mock.patch("httpx.Client", return_value=self._HttpClient())
-                )
-                stack.enter_context(
-                    mock.patch.object(
-                        client_module, "_process_cdn_batch", side_effect=process_rich
-                    )
-                )
-                worker = _worker_thread(
-                    self,
-                    source,
-                    status,
-                    os.path.join(spool_dir, "cdn-order.mkspool"),
-                    cdn_url="http://unused",
-                )
-                self.assertTrue(rich_started.wait(timeout=1))
-                source.put(
-                    [
-                        (
-                            "cdn_ts",
-                            "demo/gallery",
-                            7,
-                            "new-direct-key",
-                            1_700_000_000_001,
-                        )
-                    ]
-                )
-                source.put(None)
-                try:
-                    direct_progressed = direct_fed.wait(timeout=0.5)
-                finally:
-                    release_rich.set()
-                    worker.join(timeout=3)
-
-        self.assertTrue(direct_progressed)
-        self.assertFalse(worker.is_alive())
-        self.assertEqual(commits, ["new-direct-key", "rich-manifest"])
         self.assertEqual(status.value, 0)
 
     def test_first_spool_failure_breaks_the_write_loop_and_accounts_suffix(self):

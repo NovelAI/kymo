@@ -60,7 +60,6 @@ from kymo._wire import (
     _MAX_RICH_RESOURCE_ID_BYTES,
     _RichMutationDataLoss,
     _chunk_tuples,
-    _reduced_mutation_version,
     _estimate_tuple_bytes,
     _is_permanent_upload_error,
     _is_terminal_run_error,
@@ -330,7 +329,7 @@ def _replay_cdn_record(
     try:
         if kind == "cdn_key_mutation":
             _, _, _, resource_id, timestamp_ms, mutation_version = record
-            return _publish_rich_mutation(
+            _publish_rich_mutation(
                 stub,
                 project_id,
                 run_id,
@@ -340,7 +339,9 @@ def _replay_cdn_record(
                 timestamp_ms,
                 mutation_version,
             )
-        if kind in ("metadata_json", "metadata_json_mutation"):
+            return True
+        metadata = kind in ("metadata_json", "metadata_json_mutation")
+        if metadata:
             prospective_bytes = metadata_manifest(record[3])
         else:
             expected_resources = [
@@ -353,9 +354,7 @@ def _replay_cdn_record(
                 ]
             )
         prospective_id = content_id(prospective_bytes, "json")
-        # Legacy records lack logical versions, so retain their conservative
-        # server-wins guard and its known recency limitation. Versioned records
-        # bypass both probes below and let the authoritative server CAS decide.
+        # A legacy record has no logical version, so the server wins: a step that already holds another key keeps it, even an older one, unless that key is a `pending:` placeholder or one this sync already replayed there; this is checked here and again just before the point write. A versioned record leaves it to the server's version check.
         if not versioned:
             current = _current_cdn_key(stub, project_id, run_id, name, step)
             if current is None:
@@ -375,7 +374,7 @@ def _replay_cdn_record(
                 return True
 
         manifest_changed = False
-        if kind not in ("metadata_json", "metadata_json_mutation"):
+        if not metadata:
             items = []
             for entry, expected_id in expected_resources:
                 try:
@@ -387,7 +386,7 @@ def _replay_cdn_record(
                         expected_id=expected_id,
                     )
                 except Exception as e:
-                    # 4xx = the CDN will reject this item on every future replay too — dropping it is the only way the rest of the record (and file) can ever finish.
+                    # A permanent rejection (4xx but 408, 425 and 429) will recur on every future replay too — dropping the item is the only way the rest of the record (and file) can ever finish.
                     if _is_permanent_upload_error(e):
                         _log.warning(
                             "CDN rejected spooled item (%s step %s) — dropping it: %s",
@@ -400,15 +399,13 @@ def _replay_cdn_record(
                     raise
                 items.append(encoded_gallery_item(entry, resource_id))
         if manifest_changed:
-            # Even with zero usable items, log an EMPTY manifest: the original run may have left a pending:* placeholder at this step, and only a real manifest clears it (see _process_cdn_batch).
+            # Even with zero usable items, log an EMPTY manifest: it is a real mutation of the step, and an older client's run may have left a pending:* placeholder there that only a real manifest clears.
             encoded_manifest = gallery_manifest(items)
             manifest_id = content_id(encoded_manifest, "json")
         else:
             encoded_manifest = prospective_bytes
             manifest_id = prospective_id
-        # Uploading a content-addressed manifest is harmless until its key is
-        # published. Do that potentially slow work first, then recheck every
-        # rich kind immediately before the final point write.
+        # Upload the manifest before publishing its key.
         _upload_to_cdn(
             http_client,
             cdn_url,
@@ -419,10 +416,13 @@ def _replay_cdn_record(
         if versioned:
             timestamp_ms, mutation_version = record[4], record[5]
             if manifest_changed:
-                mutation_version = _reduced_mutation_version(
-                    record[6] if kind == "cdn_batch_encoded_mutation_reserved" else None
-                )
-            published = _publish_rich_mutation(
+                # A gallery that lost an item publishes under the successor its writer reserved, which only the reserved kind records.
+                if kind != "cdn_batch_encoded_mutation_reserved":
+                    raise _RichMutationDataLoss(
+                        "reduced gallery has no causally reserved mutation identity"
+                    )
+                mutation_version = record[6]
+            _publish_rich_mutation(
                 stub,
                 project_id,
                 run_id,
@@ -434,12 +434,12 @@ def _replay_cdn_record(
             )
             if manifest_changed and reduced_galleries is not None:
                 reduced_galleries.append((name, step))
-            return published
+            return True
 
         current = _current_cdn_key(stub, project_id, run_id, name, step)
         if current is None:
             return False
-        # A manifest already there (an earlier attempt of this replay published it, say) counts as published, and is reported as one sent would be.
+        # A manifest already there (an earlier attempt of this replay published it, say) counts as published.
         if current != manifest_id:
             if (
                 current
@@ -460,14 +460,10 @@ def _replay_cdn_record(
             if not _send_unary_point(stub, project_id, run_id, point):
                 return False
         replayed_keys[storage_key] = manifest_id
-        if manifest_changed and reduced_galleries is not None:
-            reduced_galleries.append((name, step))
         return True
     except (_TerminalRunError, _RichMutationDataLoss):
         raise
     except Exception as e:
-        if _is_terminal_run_error(e):
-            raise _terminal_run_error(e) from e
         _log.error("failed to replay CDN record %s step %s: %s", name, step, e)
         return False
 
@@ -617,7 +613,7 @@ def _replay_file(
 ) -> bool:
     """replay_file's replay, under its claim.
 
-    ``reduced_galleries`` collects the (name, step) of each gallery it published without items the CDN rejected, once per gallery, two at one step included.
+    ``reduced_galleries`` collects the (name, step) of each versioned gallery it published without items the CDN rejected, once per gallery, two at one step included; the worker, which alone passes it, spools no unversioned record.
     """
     if quarantined_files is None:
         quarantined_files = set()
@@ -804,11 +800,7 @@ def _replay_file(
                         break
                 pending.append(record)
                 pending_bytes += record_bytes
-            elif kind in (
-                "cdn_batch_encoded",
-                "metadata_json",
-                *_VERSIONED_RICH_KINDS,
-            ):
+            elif kind in known_kinds:
                 if not flush_pending():
                     ok = False
                     break

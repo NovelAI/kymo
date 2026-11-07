@@ -39,15 +39,6 @@ class _RichMutationDataLoss(RuntimeError):
     """A versioned rich mutation conflicts with authoritative server state."""
 
 
-def _reduced_mutation_version(reduced_mutation_version: Optional[int]) -> int:
-    """The version a gallery that lost an item publishes under: the successor its writer reserved for that case."""
-    if reduced_mutation_version is None:
-        raise _RichMutationDataLoss(
-            "reduced gallery has no causally reserved mutation identity"
-        )
-    return reduced_mutation_version
-
-
 def _is_terminal_run_error(error: BaseException) -> bool:
     """Return whether queued data must never be retried for this run."""
     code = error.code() if hasattr(error, "code") else None
@@ -86,17 +77,8 @@ def _publish_rich_mutation(
     cdn_key: str,
     timestamp_ms: int,
     mutation_version: int,
-) -> bool:
-    """Publish one versioned rich head; every successful disposition is final."""
-    if (
-        type(mutation_version) is not int
-        or not 0 < mutation_version < (1 << 64)
-        or mutation_version >> 32 == 0
-        or mutation_version & 0xFFFFFFFF == 0
-    ):
-        raise ValueError(
-            "mutation version must contain nonzero uint32 epoch and sequence fields"
-        )
+) -> None:
+    """Publish one versioned rich head; every successful disposition is final, and every failure raises."""
     try:
         response = stub.PublishRichMutation(
             kymo_pb2.PublishRichMutationRequest(
@@ -143,7 +125,6 @@ def _publish_rich_mutation(
         )
     elif response.stored_version != mutation_version:
         raise RuntimeError("server returned an inconsistent rich mutation version")
-    return True
 
 
 def _validate_ident(what: str, value: str, max_bytes: int) -> None:

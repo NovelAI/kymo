@@ -7,7 +7,7 @@ service Kymo {
   // Pipelined ingest: server acks cumulatively as bounded flush cuts commit
   // (normally 10k rows or about 8 MiB, plus timer/half-close tails), so the
   // cut — not the whole call — is the durability/retry unit. Unary
-  // IngestMetrics stays for CDN sends, simple callers, and kymo.sync replay.
+  // IngestMetrics stays for simple callers and spool replay.
   rpc IngestMetricsBidi (stream MetricsBatch) returns (stream IngestAck);
   // Ordered publication for rich CDN-backed values. Kept separate from the
   // high-throughput stream so numeric ingest retains its acknowledgement
@@ -138,8 +138,7 @@ message InitRunRequest {
 
 message InitRunResponse {
   RunInfo run = 1;  // echoes stored row; idempotent hit returns the first-write row
-  // Allocated on every successful InitRun call. Absence means the server uses
-  // the legacy rich-write contract.
+  // Allocated on every successful InitRun call; the Python client refuses a response without it or with 0.
   optional uint32 writer_epoch = 2;
 }
 

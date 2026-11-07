@@ -247,8 +247,7 @@ def _upload_worker(
     """Runs in a child process, streaming metrics over one long-lived
     IngestMetricsBidi call: feed a bounded in-flight window, free points as the
     server's cumulative acks arrive (see _BidiStream).
-    Rich CDN, metadata, and version-aware direct keys share one ordered unary
-    lane. Legacy direct CDN keys remain ordinary bidi points.
+    Rich CDN, metadata, and direct CDN keys share one ordered unary lane.
 
     Degradation ladder when the server can't keep up:
     1. in-flight window — ≤ _MAX_UNACKED_POINTS fed-but-unacked; feeding stops
@@ -289,7 +288,6 @@ def _upload_worker(
         _MAX_UNACKED_POINTS,
         _NUMERIC_OUTAGE_FAILOVER,
         _ORDERED_CDN_KINDS,
-        _GALLERY_KINDS,
         _RECOVERY_MAX_BUFFER_BYTES,
         _RECOVERY_MAX_BUFFER_POINTS,
         _RetainedLane,
@@ -305,11 +303,9 @@ def _upload_worker(
         _decode_queue_item,
         _encode_cdn_items,
         _equal_jitter_delay,
-        _estimate_tuple_bytes,
         _merged_worker_failure,
         _next_connect_retry_delay,
         _process_cdn_batch,
-        _publish_manifest_point,
         _publish_rich_mutation,
         _queue_item_size,
         _recovery_retry_delay,
@@ -323,13 +319,13 @@ def _upload_worker(
     )
     from kymo._wire import (
         _MAX_POINTS_PER_MSG,
-        _PermanentPointError,
         _RichMutationDataLoss,
         _SEND_INITIAL_DELAY,
         _SEND_MAX_DELAY,
         _SEND_MAX_RETRIES,
         _TerminalRunError,
         _chunk_tuples,
+        _estimate_tuple_bytes,
         _is_terminal_run_error,
         _terminal_run_error,
     )
@@ -482,14 +478,11 @@ def _upload_worker(
     replay_proved_circuit = False
     # Whether the replay in flight may set that proof: a lane failing over from live while it runs is newer evidence.
     replay_can_prove = False
-    replayed_cdn_keys: dict[tuple, str] = {}
     quarantined_spool_paths: list[str] = []
     # Sealed segments another process took before their replay: whether they were delivered is unknown, so they keep the owner reporting spooled data.
     vanished_spool_paths: list[str] = []
     # The disk circuit's next catch-up, whichever lane owns it; stream_retry_at times only the live numeric stream's reopens.
     recovery_retry_at = 0.0
-    # Rich records without logical versions (an old server) keep rich-only failover one-way: their replay guard cannot tell a predecessor delivered live from a newer write, so it would skip the newer record and report it delivered.
-    unversioned_rich = False
     shutdown = False
     input_closed = False  # the explicit queue sentinel was consumed
     queue_lost = False  # the queue can no longer be read (read_queue)
@@ -719,7 +712,7 @@ def _upload_worker(
             unwritten = 0
             error = None
             for index, t in enumerate(tuples):
-                gallery = t[0] in _GALLERY_KINDS
+                gallery = t[0] == "cdn_batch_mutation"
                 # Checked before each gallery and every 512th point, and only a gallery is asked whether it awaits encoding or was cut short: those checks on every point made a numeric spill take 17% longer. The writer still cuts a record the end catches it sending (SpoolWriter.until), so what goes out past the end stays within the megabyte it buffers.
                 if (gallery or not index & 511) and spill_end() <= time.monotonic():
                     # The spill end has passed: leave the rest charged and lost, and exit by itself.
@@ -867,11 +860,10 @@ def _upload_worker(
             quarantined_files: set[str] = set()
             reduced_galleries: list[tuple[str, int]] = []
             try:
-                # Delete consumed segments: their records were delivered, superseded, or on an old server skipped as older than the server's.
+                # Delete consumed segments: their records were delivered or superseded.
                 delivered = replay_file(
                     segment.path,
                     delete=True,
-                    replayed_keys=replayed_cdn_keys,
                     terminal_runs=terminal_runs,
                     quarantined_files=quarantined_files,
                     reduced_galleries=reduced_galleries,
@@ -911,7 +903,9 @@ def _upload_worker(
         return True
 
     def awaits_encoding(entry: tuple) -> bool:
-        return entry[0] in _GALLERY_KINDS and not isinstance(entry[3], _EncodedItems)
+        return entry[0] == "cdn_batch_mutation" and not isinstance(
+            entry[3], _EncodedItems
+        )
 
     def counted_raw(entry: tuple) -> bool:
         """A gallery still raw that the initializing process counted: one log()'s encoder wait waits on, unlike a fork child's."""
@@ -993,7 +987,7 @@ def _upload_worker(
             encode_attempt = _ThreadAttempt(entry, encode, name="kymo-cdn-encode")
 
     def retain_queue_item(item) -> None:
-        nonlocal undecodable, unversioned_rich
+        nonlocal undecodable
         if terminal_rejected:
             resolve_points(
                 _queue_item_size(item),
@@ -1023,7 +1017,6 @@ def _upload_worker(
         serialized_bytes = len(item[1]) if serialized else 0
         for point_tuple in point_tuples:
             is_rich = point_tuple[0] in _ORDERED_CDN_KINDS
-            unversioned_rich |= point_tuple[0] in ("cdn_batch", "metadata_batch")
             if (rich_lane if is_rich else numeric_lane) == _TO_DISK:
                 pending_spill.append(point_tuple)
                 continue
@@ -1041,7 +1034,7 @@ def _upload_worker(
                         if isinstance(element.data, bytes)
                     )
                 else:
-                    # Galleries and metadata arrive in one serialized envelope; direct versioned CDN keys use raw tuples and must retain their actual string bytes or large keys bypass the rich RAM cap.
+                    # Galleries and metadata arrive in one serialized envelope; direct CDN keys arrive as raw tuples, charged their estimated size.
                     retained_bytes = serialized_bytes or _estimate_tuple_bytes(
                         point_tuple
                     )
@@ -1070,25 +1063,10 @@ def _upload_worker(
         if pending_spill:
             spill(pending_spill)
 
-    def process_cdn_entry(entry: tuple, *, first_attempt: bool) -> bool | int:
-        """Complete one CDN head entry; the owner loop applies its result (_process_cdn_batch's for a gallery)."""
-        kind, name, step, payload, *versions = entry
-        # Legacy entries carry no versions; a direct key and metadata carry no reduced one.
-        timestamp_ms, mutation_version, reduced_mutation_version = (
-            versions + [None] * 3
-        )[:3]
-        if kind == "cdn_key_mutation":
-            return _publish_rich_mutation(
-                cdn_stub,
-                project_id,
-                run_id,
-                name,
-                step,
-                payload,
-                timestamp_ms,
-                mutation_version,
-            )
-        if kind in _GALLERY_KINDS:
+    def process_cdn_entry(entry: tuple) -> bool | int:
+        """Complete one CDN head entry; the owner loop applies its result (_process_cdn_batch's for a gallery) and handles what it raises: a terminal answer, DATA_LOSS, or a failure it logs before retrying or spooling the entry."""
+        kind, name, step, payload, timestamp_ms, mutation_version = entry[:6]
+        if kind == "cdn_batch_mutation":
             return _process_cdn_batch(
                 cdn_stub,
                 http_client,
@@ -1099,26 +1077,26 @@ def _upload_worker(
                 step,
                 payload,
                 deadline_fn=past_deadline,
-                send_placeholder=first_attempt,
                 timestamp_ms=timestamp_ms,
                 mutation_version=mutation_version,
-                reduced_mutation_version=reduced_mutation_version,
+                reduced_mutation_version=entry[6],
             )
-        # The owner loop handles what this raises: a terminal answer, DATA_LOSS, or a failure it logs and retries.
-        encoded_manifest = metadata_manifest(payload.data)
-        resource_id = _upload_to_cdn(http_client, cdn_url, encoded_manifest, "json")
-        if not _publish_manifest_point(
+        key = payload
+        if kind == "metadata_batch_mutation":
+            key = _upload_to_cdn(
+                http_client, cdn_url, metadata_manifest(payload.data), "json"
+            )
+            _log.info("metadata %s step=%d uploaded as %s", name, step, key)
+        _publish_rich_mutation(
             cdn_stub,
             project_id,
             run_id,
             name,
             step,
-            resource_id,
+            key,
             timestamp_ms,
             mutation_version,
-        ):
-            return False
-        _log.info("metadata %s step=%d → %s", name, step, resource_id)
+        )
         return True
 
     def reject_deleted_run(error: BaseException) -> None:
@@ -1245,7 +1223,7 @@ def _upload_worker(
         return count
 
     def failover_rich() -> int:
-        """Move the whole ordered rich lane to disk; versioned records return to live delivery once the disk FIFO has been replayed."""
+        """Move the whole ordered rich lane to disk; it returns to live delivery once the disk FIFO has been replayed."""
         nonlocal rich_lane, cdn_attempt, cdn_fails, cdn_backoff_until
         nonlocal abandoned_upload
         nonlocal encode_attempt, encode_fails, encode_backoff_until
@@ -1255,7 +1233,7 @@ def _upload_worker(
             void_circuit_proof()
         rich_lane = _TO_DISK
         publish_lanes_on_disk()
-        # The daemon helper owns no accounting; ignore a late result once its head is on disk. Its publish may still land after a replay's: a versioned server rejects it as older, but an old server keeps arrival order, so there it can replace a newer record that a numeric-circuit replay delivered first.
+        # The daemon helper owns no accounting; ignore a late result once its head is on disk. Its publish may still land after a replay's, and cannot overwrite a newer mutation.
         if cdn_attempt is not None:
             abandoned_upload = cdn_attempt
         cdn_attempt = None
@@ -1544,7 +1522,6 @@ def _upload_worker(
         if (
             rich_lane != _LIVE
             and numeric_lane == _LIVE
-            and not unversioned_rich
             and replay_attempt is None
             and time.monotonic() >= recovery_retry_at
             and may_start_transport()
@@ -1767,22 +1744,13 @@ def _upload_worker(
                 )
                 if take <= 0:
                     break
-                try:
-                    # The first chunk: fewer than take points when a text point trips the byte cap.
-                    points = next(
-                        _chunk_tuples(
-                            buffer.items[inflight_n : inflight_n + take],
-                            buffer.sizes[inflight_n : inflight_n + take],
-                        )
+                # The first chunk: fewer than take points when a text point trips the byte cap.
+                points = next(
+                    _chunk_tuples(
+                        buffer.items[inflight_n : inflight_n + take],
+                        buffer.sizes[inflight_n : inflight_n + take],
                     )
-                except _PermanentPointError as error:
-                    # Unreachable for live points — log_cdn size-checks keys, text truncates, numerics are tiny — but if a future buffered kind is ever permanently unencodable, degrade instead of crashing: fail the whole numeric lane over to disk (as the RAM cap does) so sync quarantines the offending record, rather than the worker dying with its buffer unspilled.
-                    _log.error(
-                        "unencodable buffered point — spooling the numeric lane: %s",
-                        error,
-                    )
-                    failover_numeric()
-                    break
+                )
                 # A full feed queue: retry next cycle.
                 if not stream.feed(
                     kymo_pb2.MetricsBatch(
@@ -1894,9 +1862,7 @@ def _upload_worker(
             # Bound only in the helper's arguments, so a delivered gallery is not kept alive by this frame.
             cdn_attempt = _ThreadAttempt(
                 cdn_queue.items[0],
-                lambda entry=cdn_queue.items[0], first=cdn_fails == 0: (
-                    process_cdn_entry(entry, first_attempt=first)
-                ),
+                lambda entry=cdn_queue.items[0]: process_cdn_entry(entry),
                 name="kymo-cdn-attempt",
             )
 

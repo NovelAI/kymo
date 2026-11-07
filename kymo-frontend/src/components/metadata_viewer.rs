@@ -1,4 +1,3 @@
-use std::borrow::Borrow;
 use std::collections::{BTreeSet, HashMap};
 use std::hash::Hash;
 
@@ -93,39 +92,20 @@ pub fn MetadataViewer(
     /// When true, hide rows whose values match across all runs (and any branches whose subtree contains no diffs). Comparison is meaningful only with two or more runs, so single-run views retain every key.
     diff_only: bool,
 ) -> Element {
-    if columns.is_empty() {
+    let collapsed = use_signal(BTreeSet::<String>::new);
+
+    let all_keys = column_keys(&columns);
+    if all_keys.is_empty() {
         return rsx! { div { class: "metadata-empty", "No metadata" } };
     }
 
-    let all_keys = collect_all_keys(
-        &columns
-            .iter()
-            .map(|column| &column.data)
-            .collect::<Vec<_>>(),
-    );
-
-    let has_metadata = !all_keys.is_empty();
-
-    // Diff-only mode strips out subtrees with no diffs. For single-run views
-    // there are no diffs so we leave the tree intact — diff-only is only
-    // meaningful when comparing two or more runs.
-    let display_keys: Vec<KeyNode> = if diff_only && columns.len() > 1 {
+    let display_keys = if diff_only && columns.len() > 1 {
         filter_diff_only(&all_keys, &columns, "")
     } else {
         all_keys
     };
-
-    // Collapsed state: track which paths are collapsed
-    let collapsed = use_signal(BTreeSet::<String>::new);
-
     if display_keys.is_empty() {
-        // Distinguish "the runs logged no metadata" from "diff-only filtering removed every key".
-        let message = if has_metadata {
-            "No differing keys"
-        } else {
-            "No metadata"
-        };
-        return rsx! { div { class: "metadata-empty", "{message}" } };
+        return rsx! { div { class: "metadata-empty", "No differing keys" } };
     }
 
     rsx! {
@@ -135,12 +115,7 @@ pub fn MetadataViewer(
                     tr {
                         th { class: "metadata-key-col", "Key" }
                         for column in &columns {
-                            {
-                                let style = format!("color: {};", column.color);
-                                rsx! {
-                                    th { class: "metadata-val-col", style: "{style}", "{column.label}" }
-                                }
-                            }
+                            th { class: "metadata-val-col", style: "color: {column.color};", "{column.label}" }
                         }
                     }
                 }
@@ -152,36 +127,23 @@ pub fn MetadataViewer(
     }
 }
 
-/// Prunes the key tree to only paths that contain at least one leaf whose
-/// values differ across runs. Branches whose entire subtree is uniform are
-/// dropped.
+/// Prunes the key tree to the leaves whose values differ across runs and the branches holding them.
 fn filter_diff_only(
     keys: &[KeyNode],
     columns: &[MetadataColumn],
     parent_path: &str,
 ) -> Vec<KeyNode> {
     keys.iter()
-        .filter_map(|node| {
-            let key = match node {
-                KeyNode::Leaf(key) | KeyNode::Branch(key, _) => key,
-            };
-            let path = child_pointer(parent_path, key);
-            match node {
-                KeyNode::Leaf(_) => {
-                    if all_equal(&comparable_row(columns, &path)) {
-                        None
-                    } else {
-                        Some(KeyNode::Leaf(key.clone()))
-                    }
-                }
-                KeyNode::Branch(_, children) => {
-                    let kept = filter_diff_only(children, columns, &path);
-                    if kept.is_empty() {
-                        None
-                    } else {
-                        Some(KeyNode::Branch(key.clone(), kept))
-                    }
-                }
+        .filter_map(|node| match node {
+            KeyNode::Leaf(key) => {
+                let row = comparable_row(columns, &child_pointer(parent_path, key));
+                row.windows(2)
+                    .any(|pair| pair[0] != pair[1])
+                    .then(|| node.clone())
+            }
+            KeyNode::Branch(key, children) => {
+                let kept = filter_diff_only(children, columns, &child_pointer(parent_path, key));
+                (!kept.is_empty()).then(|| KeyNode::Branch(key.clone(), kept))
             }
         })
         .collect()
@@ -195,10 +157,10 @@ enum KeyNode {
 }
 
 /// Collect all keys from multiple JSON values into a unified tree.
-fn collect_all_keys<V: Borrow<Value>>(values: &[V]) -> Vec<KeyNode> {
+fn collect_all_keys(values: &[&Value]) -> Vec<KeyNode> {
     let mut keys = BTreeSet::new();
     for v in values {
-        if let Value::Object(map) = v.borrow() {
+        if let Value::Object(map) = v {
             for k in map.keys() {
                 keys.insert(k.clone());
             }
@@ -207,18 +169,28 @@ fn collect_all_keys<V: Borrow<Value>>(values: &[V]) -> Vec<KeyNode> {
 
     keys.into_iter()
         .map(|k| {
-            let children: Vec<&Value> = values.iter().filter_map(|v| v.borrow().get(&k)).collect();
+            let children: Vec<&Value> = values.iter().filter_map(|v| v.get(&k)).collect();
 
-            let all_nonempty_objects = children
-                .iter()
-                .all(|child| child.as_object().is_some_and(|object| !object.is_empty()));
-            if all_nonempty_objects {
-                KeyNode::Branch(k.clone(), collect_all_keys(&children))
-            } else {
-                KeyNode::Leaf(k)
+            // A key whose values are all objects is a branch when any of them holds a key, since a branch of only `{}` would open to nothing; each `{}` among them shows on the branch row (empty_object_cells).
+            if children.iter().all(|child| child.is_object()) {
+                let grandchildren = collect_all_keys(&children);
+                if !grandchildren.is_empty() {
+                    return KeyNode::Branch(k, grandchildren);
+                }
             }
+            KeyNode::Leaf(k)
         })
         .collect()
+}
+
+/// The key tree of every run's metadata.
+fn column_keys(columns: &[MetadataColumn]) -> Vec<KeyNode> {
+    collect_all_keys(
+        &columns
+            .iter()
+            .map(|column| &column.data)
+            .collect::<Vec<_>>(),
+    )
 }
 
 /// Render table rows recursively.
@@ -247,34 +219,15 @@ fn render_rows(
                                 "{key}"
                             }
                             for (column, tint) in columns.iter().zip(tints) {
-                                {
-                                    let bg = if tint {
-                                        format!("background: {}22;", column.color)
-                                    } else {
-                                        String::new()
-                                    };
-                                    let cell = resolve_path(&column.data, &path).map(|value| {
-                                        let display = format_value(value);
-                                        (copy_payload(value, &display).to_owned(), display)
-                                    });
-                                    rsx! {
-                                        td { class: "metadata-val-cell", style: "{bg}",
-                                            if let Some((text, display)) = cell {
-                                                CopyText {
-                                                    text,
-                                                    display,
-                                                    class: "metadata-copy-value",
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
+                                {value_cell(column, tint, resolve_path(&column.data, &path))}
                             }
                         }
                     }
                 },
                 KeyNode::Branch(key, children) => {
                     let path = child_pointer(parent_path, key);
+                    let cells = empty_object_cells(columns, &path);
+                    let tints = cells.iter().any(Option::is_some).then(|| difference_tints(&cells));
                     let is_collapsed = collapsed.read().contains(&path);
                     let toggle_path = path.clone();
 
@@ -290,9 +243,7 @@ fn render_rows(
                                     aria_expanded: !is_collapsed,
                                     onmousedown: primary(move |_| {
                                         let mut set = collapsed.write();
-                                        if set.contains(&toggle_path) {
-                                            set.remove(&toggle_path);
-                                        } else {
+                                        if !set.remove(&toggle_path) {
                                             set.insert(toggle_path.clone());
                                         }
                                     }),
@@ -302,8 +253,15 @@ fn render_rows(
                                     "{key}"
                                 }
                             }
-                            for _ in columns {
-                                td { class: "metadata-val-cell" }
+                            if let Some(tints) = tints {
+                                for ((column, cell), tint) in columns.iter().zip(cells).zip(tints) {
+                                    {value_cell(column, tint, cell)}
+                                }
+                            } else {
+                                // No `{}` on this row: plain cells, which skip value_cell's style edit and placeholder.
+                                for _ in columns {
+                                    td { class: "metadata-val-cell" }
+                                }
                             }
                         }
                         if !is_collapsed {
@@ -314,6 +272,33 @@ fn render_rows(
             }}
         }
     }
+}
+
+/// A run's value cell: its value, if any, as copyable text, tinted in the run's color when `tint`.
+fn value_cell(column: &MetadataColumn, tint: bool, value: Option<&Value>) -> Element {
+    let cell = value.map(|value| {
+        let display = format_value(value);
+        (copy_payload(value, &display).to_owned(), display)
+    });
+    rsx! {
+        // An untinted cell has no style: Dioxus keeps the old background when it sets `style: ""`.
+        td { class: "metadata-val-cell", style: tint.then(|| format!("background: {}22;", column.color)),
+            if let Some((text, display)) = cell {
+                CopyText { text, display, class: "metadata-copy-value" }
+            }
+        }
+    }
+}
+
+/// A branch row's cells: each run's empty object, or nothing for a non-empty object or an absent key.
+fn empty_object_cells<'a>(columns: &'a [MetadataColumn], path: &str) -> Vec<Option<&'a Value>> {
+    columns
+        .iter()
+        .map(|column| {
+            resolve_path(&column.data, path)
+                .filter(|value| value.as_object().is_some_and(|object| object.is_empty()))
+        })
+        .collect()
 }
 
 /// Append an object key to an RFC 6901 JSON Pointer.
@@ -336,10 +321,6 @@ fn resolve_path<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
     Some(current)
 }
 
-fn all_equal<T: PartialEq>(values: &[T]) -> bool {
-    values.windows(2).all(|pair| pair[0] == pair[1])
-}
-
 /// Tint values outside a unique plurality; a tie tints every value.
 fn difference_tints<T: Eq + Hash>(values: &[T]) -> Vec<bool> {
     let mut counts: HashMap<&T, usize> = HashMap::new();
@@ -354,30 +335,19 @@ fn difference_tints<T: Eq + Hash>(values: &[T]) -> Vec<bool> {
         .collect()
 }
 
-/// A leaf's per-run values under the diff's notion of equality, as JSON text (serde_json maps are sorted; numbers stay as written, but for serde_json's spelling of an exponent), so a row groups in linear time.
+/// A leaf's per-run values under the diff's notion of equality, as JSON text (serde_json maps are sorted; numbers stay as written, but for serde_json's spelling of an exponent), so a row groups in linear time. A run that ignores server timing compares as absent under `/meta/server_time`; a `/meta` leaf (some present `meta` is not an object) compares with its timing.
 fn comparable_row(columns: &[MetadataColumn], path: &str) -> Vec<Option<String>> {
+    let server_timing = path == "/meta/server_time" || path.starts_with("/meta/server_time/");
     columns
         .iter()
-        .map(|column| diff_comparable_text(&column.data, path, column.ignore_server_timing_in_diff))
+        .map(|column| {
+            if server_timing && column.ignore_server_timing_in_diff {
+                None
+            } else {
+                resolve_path(&column.data, path).map(Value::to_string)
+            }
+        })
         .collect()
-}
-
-/// JSON text for diff comparison, ignoring server timing even when `/meta` renders as one leaf.
-fn diff_comparable_text(root: &Value, path: &str, ignore_server_timing: bool) -> Option<String> {
-    if ignore_server_timing
-        && (path == "/meta/server_time" || path.starts_with("/meta/server_time/"))
-    {
-        return None;
-    }
-    let value = resolve_path(root, path)?;
-    if !ignore_server_timing || path != "/meta" {
-        return Some(value.to_string());
-    }
-    let mut comparable = value.clone();
-    if let Some(meta) = comparable.as_object_mut() {
-        meta.remove("server_time");
-    }
-    Some(comparable.to_string())
 }
 
 /// Only strings receive display-only quoting.
@@ -407,22 +377,19 @@ fn shows_quoted(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dioxus::dioxus_core::{AttributeValue, Mutation};
     use serde_json::json;
 
-    fn columns(runs: Vec<(String, Value)>) -> Vec<MetadataColumn> {
-        columns_with_timing_policy(runs, true)
-    }
-
-    fn columns_with_timing_policy(
-        runs: Vec<(String, Value)>,
-        ignore_server_timing_in_diff: bool,
-    ) -> Vec<MetadataColumn> {
+    fn columns(runs: Vec<(impl Into<String>, Value)>) -> Vec<MetadataColumn> {
         runs.into_iter()
-            .map(|(label, data)| MetadataColumn {
-                color: format!("#{label}"),
-                label,
-                data,
-                ignore_server_timing_in_diff,
+            .map(|(label, data)| {
+                let label = label.into();
+                MetadataColumn {
+                    color: format!("#{label}"),
+                    label,
+                    data,
+                    ignore_server_timing_in_diff: true,
+                }
             })
             .collect()
     }
@@ -520,7 +487,7 @@ mod tests {
     fn diff_only_excludes_server_timing_but_keeps_client_metadata_differences() {
         let runs = columns(vec![
             (
-                "one".to_string(),
+                "one",
                 json!({
                     "config": {"size": 1},
                     "meta": {
@@ -531,7 +498,7 @@ mod tests {
                 }),
             ),
             (
-                "two".to_string(),
+                "two",
                 json!({
                     "config": {"size": 2},
                     "meta": {
@@ -542,12 +509,7 @@ mod tests {
                 }),
             ),
         ]);
-        let keys = collect_all_keys(
-            &runs
-                .iter()
-                .map(|column| column.data.clone())
-                .collect::<Vec<_>>(),
-        );
+        let keys = column_keys(&runs);
 
         let filtered = filter_diff_only(&keys, &runs, "");
 
@@ -623,7 +585,7 @@ mod tests {
     fn diff_only_distinguishes_literal_paths_from_nested_server_timing() {
         let runs = columns(vec![
             (
-                "one".to_string(),
+                "one",
                 json!({
                     "a.b": 1,
                     "a": {"b": 7},
@@ -632,7 +594,7 @@ mod tests {
                 }),
             ),
             (
-                "two".to_string(),
+                "two",
                 json!({
                     "a.b": 2,
                     "a": {"b": 7},
@@ -641,12 +603,7 @@ mod tests {
                 }),
             ),
         ]);
-        let keys = collect_all_keys(
-            &runs
-                .iter()
-                .map(|column| column.data.clone())
-                .collect::<Vec<_>>(),
-        );
+        let keys = column_keys(&runs);
 
         assert_eq!(
             filter_diff_only(&keys, &runs, ""),
@@ -658,26 +615,38 @@ mod tests {
     }
 
     #[test]
-    fn mixed_and_empty_object_shapes_render_as_lossless_leaves() {
-        let values = vec![
-            json!({
-                "empty": {},
-                "optimizer": "adam",
-                "optional": {"x": 1}
-            }),
-            json!({
-                "empty": {"x": 1},
-                "optimizer": {"lr": 0.001},
-                "optional": {"y": 2}
-            }),
-            json!({}),
-        ];
-        let keys = collect_all_keys(&values);
+    fn mixed_and_empty_object_shapes_render_losslessly() {
+        let runs = columns(vec![
+            (
+                "0",
+                json!({
+                    "array": {"x": 1},
+                    "both_empty": {},
+                    "empty": {},
+                    "optimizer": "adam",
+                    "optional": {"x": 1}
+                }),
+            ),
+            (
+                "1",
+                json!({
+                    "array": [],
+                    "both_empty": {},
+                    "empty": {"x": 1},
+                    "optimizer": {"lr": 0.001},
+                    "optional": {"y": 2}
+                }),
+            ),
+            ("2", json!({})),
+        ]);
+        let keys = column_keys(&runs);
 
         assert_eq!(
             keys,
             vec![
-                KeyNode::Leaf("empty".to_string()),
+                KeyNode::Leaf("array".to_string()),
+                KeyNode::Leaf("both_empty".to_string()),
+                KeyNode::Branch("empty".to_string(), vec![KeyNode::Leaf("x".to_string())]),
                 KeyNode::Leaf("optimizer".to_string()),
                 KeyNode::Branch(
                     "optional".to_string(),
@@ -689,9 +658,8 @@ mod tests {
             ]
         );
         assert_eq!(
-            values
-                .iter()
-                .map(|value| resolve_path(value, "/optimizer").map(format_value))
+            runs.iter()
+                .map(|run| resolve_path(&run.data, "/optimizer").map(format_value))
                 .collect::<Vec<_>>(),
             vec![
                 Some("adam".to_string()),
@@ -699,107 +667,227 @@ mod tests {
                 None,
             ]
         );
-        let runs = values
-            .iter()
-            .enumerate()
-            .map(|(index, value)| (index.to_string(), value.clone()))
-            .collect();
-        let runs = columns(runs);
         assert_eq!(filter_diff_only(&keys, &runs, ""), keys);
     }
 
     #[test]
-    fn leaf_shaped_meta_still_excludes_server_timing_from_diffs() {
+    fn server_timing_beside_an_empty_meta_is_no_difference() {
         let timing_only = columns(vec![
-            ("one".to_string(), json!({"meta": {}})),
-            (
-                "two".to_string(),
-                json!({"meta": {"server_time": {"end": "two"}}}),
-            ),
+            ("one", json!({"meta": {}})),
+            ("two", json!({"meta": {"server_time": {"end": "two"}}})),
         ]);
-        let timing_keys = collect_all_keys(
-            &timing_only
-                .iter()
-                .map(|column| column.data.clone())
-                .collect::<Vec<_>>(),
-        );
-        assert_eq!(timing_keys, vec![KeyNode::Leaf("meta".to_string())]);
+        let timing_keys = column_keys(&timing_only);
         assert!(filter_diff_only(&timing_keys, &timing_only, "").is_empty());
+        // A documented limit: an empty meta hides beside timing alone, even against a run without meta.
+        let mut with_absent = timing_only.clone();
+        with_absent.extend(columns(vec![("absent", json!({}))]));
+        assert!(filter_diff_only(&timing_keys, &with_absent, "").is_empty());
 
         let client_difference = columns(vec![
-            ("one".to_string(), json!({"meta": {}})),
+            ("one", json!({"meta": {}})),
             (
-                "two".to_string(),
+                "two",
                 json!({"meta": {"client": 2, "server_time": {"end": "two"}}}),
             ),
         ]);
-        let client_keys = collect_all_keys(
-            &client_difference
-                .iter()
-                .map(|column| column.data.clone())
-                .collect::<Vec<_>>(),
-        );
+        let client_keys = column_keys(&client_difference);
         assert_eq!(
             filter_diff_only(&client_keys, &client_difference, ""),
-            vec![KeyNode::Leaf("meta".to_string())]
+            vec![KeyNode::Branch(
+                "meta".to_string(),
+                vec![KeyNode::Leaf("client".to_string())]
+            )]
         );
+    }
+
+    #[test]
+    fn a_meta_leaf_compares_with_its_server_timing() {
+        // A user-authored info/run_info can have a non-object meta, which keeps /meta a leaf: objects that differ by their timing alone still tint.
+        let runs = columns(vec![
+            ("none", json!({"meta": null})),
+            ("one", json!({"meta": {"server_time": {"end": "one"}}})),
+            ("two", json!({"meta": {"server_time": {"end": "two"}}})),
+        ]);
+        let keys = column_keys(&runs);
+        assert_eq!(keys, vec![KeyNode::Leaf("meta".to_string())]);
+        assert_eq!(
+            difference_tints(&comparable_row(&runs, "/meta")),
+            vec![true, true, true]
+        );
+    }
+
+    /// What a table renders, in document order: each tinted cell's `background` style, and each copyable value's `title`.
+    fn rendered(columns: Vec<MetadataColumn>, diff_only: bool) -> Vec<String> {
+        shown(VirtualDom::new_with_props(
+            MetadataViewer,
+            MetadataViewerProps { columns, diff_only },
+        ))
+    }
+
+    /// What a VirtualDom's first render shows, as `rendered` reads a table.
+    fn shown(mut dom: VirtualDom) -> Vec<String> {
+        let mut shown = Vec::new();
+        for edit in dom.rebuild_to_vec().edits {
+            if let Mutation::SetAttribute {
+                name,
+                value: AttributeValue::Text(value),
+                ..
+            } = edit
+            {
+                if name == "title" || (name == "style" && value.starts_with("background")) {
+                    shown.push(value);
+                }
+            }
+        }
+        shown
+    }
+
+    #[test]
+    fn an_empty_object_shows_on_its_branch_row() {
+        let runs = columns(vec![
+            ("empty", json!({"config": {}})),
+            ("full", json!({"config": {"lr": 1, "kw": {}}})),
+            ("absent", json!({"other": 2})),
+        ]);
+        let tied = columns(vec![
+            ("e1", json!({"config": {}})),
+            ("e2", json!({"config": {}})),
+            ("full", json!({"config": {"lr": 1}})),
+            ("absent", json!({})),
+        ]);
+        for diff_only in [false, true] {
+            // The empty run's tinted `{}` on the config row, then the full run's kw and lr and the absent run's other, each tinted alone on its row.
+            assert_eq!(
+                rendered(runs.clone(), diff_only),
+                [
+                    "background: #empty22;",
+                    "{}",
+                    "background: #full22;",
+                    "{}",
+                    "background: #full22;",
+                    "1",
+                    "background: #absent22;",
+                    "2"
+                ]
+            );
+            // Two `{}` beside two blanks tie on the config row, so every cell there is tinted and the `{}` stay in the e1 and e2 columns, then the full run's lr.
+            assert_eq!(
+                rendered(tied.clone(), diff_only),
+                [
+                    "background: #e122;",
+                    "{}",
+                    "background: #e222;",
+                    "{}",
+                    "background: #full22;",
+                    "background: #absent22;",
+                    "background: #full22;",
+                    "1"
+                ]
+            );
+        }
+        // Collapsed, the config row still shows the empty run's tinted `{}`; its children are hidden, and the absent run's other follows.
+        let panel = |runs: Vec<MetadataColumn>| {
+            let collapsed = use_signal(|| BTreeSet::from(["/config".to_string()]));
+            render_rows(&column_keys(&runs), &runs, "", 0, collapsed)
+        };
+        assert_eq!(
+            shown(VirtualDom::new_with_props(panel, runs)),
+            ["background: #empty22;", "{}", "background: #absent22;", "2"]
+        );
+    }
+
+    /// The edits that re-rendering a table in place makes when its runs or diff-only mode change from before to after.
+    fn edits_on_update(
+        before: (Vec<(&'static str, Value)>, bool),
+        after: (Vec<(&'static str, Value)>, bool),
+    ) -> Vec<Mutation> {
+        thread_local! {
+            static TABLE: std::cell::RefCell<(Vec<(&'static str, Value)>, bool)> = const { std::cell::RefCell::new((Vec::new(), false)) };
+        }
+        fn panel() -> Element {
+            let (runs, diff_only) = TABLE.with_borrow(Clone::clone);
+            rsx! { MetadataViewer { columns: columns(runs), diff_only } }
+        }
+        TABLE.set(before);
+        let mut dom = VirtualDom::new(panel);
+        dom.rebuild_in_place();
+        TABLE.set(after);
+        dom.mark_dirty(ScopeId::APP);
+        dom.render_immediate_to_vec().edits
+    }
+
+    #[test]
+    fn a_cell_that_loses_its_tint_drops_its_style() {
+        // Dioxus keeps the old properties when it sets a style, so `style: ""` would leave the stale background: the style is removed instead.
+        let branch = vec![
+            ("one", json!({"config": {}})),
+            ("two", json!({"config": {"lr": 1}})),
+            ("three", json!({"config": {}})),
+        ];
+        let rows = vec![
+            ("one", json!({"a": 1, "b": 1})),
+            ("two", json!({"a": 1, "b": 2})),
+        ];
+        for (before, after) in [
+            // The third run makes `{}` the config row's plurality and a blank the lr row's, so run one's `{}` and its blank lr cell lose their tints.
+            ((branch[..2].to_vec(), false), (branch, false)),
+            // Turning diff-only off, as the sidebar does, puts the equal a in the row where the tinted b was.
+            ((rows.clone(), true), (rows, false)),
+        ] {
+            let styles: Vec<_> = edits_on_update(before, after)
+                .into_iter()
+                .filter_map(|edit| match edit {
+                    Mutation::SetAttribute {
+                        name: "style",
+                        value,
+                        ..
+                    } => Some(value),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                styles
+                    .iter()
+                    .any(|value| matches!(value, AttributeValue::None)),
+                "{styles:?}"
+            );
+            assert!(
+                !styles.iter().any(|value| matches!(
+                    value,
+                    AttributeValue::Text(text) if text.trim().is_empty()
+                )),
+                "{styles:?}"
+            );
+        }
     }
 
     #[test]
     fn custom_metadata_keeps_server_time_differences() {
-        let custom_objects = columns_with_timing_policy(
-            vec![
-                (
-                    "one".to_string(),
-                    json!({"meta": {"server_time": {"source": "one"}}}),
-                ),
-                (
-                    "two".to_string(),
-                    json!({"meta": {"server_time": {"source": "two"}}}),
-                ),
-            ],
-            false,
-        );
-        let object_keys = collect_all_keys(
-            &custom_objects
-                .iter()
-                .map(|column| column.data.clone())
-                .collect::<Vec<_>>(),
-        );
-        assert_eq!(
-            filter_diff_only(&object_keys, &custom_objects, ""),
-            object_keys
-        );
-
-        let custom_scalars = columns_with_timing_policy(
-            vec![
-                ("one".to_string(), json!({"meta": {"server_time": "one"}})),
-                ("two".to_string(), json!({"meta": {"server_time": "two"}})),
-            ],
-            false,
-        );
-        let scalar_keys = collect_all_keys(
-            &custom_scalars
-                .iter()
-                .map(|column| column.data.clone())
-                .collect::<Vec<_>>(),
-        );
-        assert_eq!(
-            filter_diff_only(&scalar_keys, &custom_scalars, ""),
-            scalar_keys
-        );
+        for (shape, one, two) in [
+            (
+                "objects",
+                json!({"source": "one"}),
+                json!({"source": "two"}),
+            ),
+            ("scalars", json!("one"), json!("two")),
+        ] {
+            let mut custom = columns(vec![
+                ("one", json!({"meta": {"server_time": one}})),
+                ("two", json!({"meta": {"server_time": two}})),
+            ]);
+            for column in &mut custom {
+                column.ignore_server_timing_in_diff = false;
+            }
+            let keys = column_keys(&custom);
+            assert_eq!(filter_diff_only(&keys, &custom, ""), keys, "{shape}");
+        }
     }
 
     #[test]
     fn metadata_comparison_preserves_json_types() {
-        let boolean = json!(true);
-        let boolean_string = json!("true");
-        assert!(!all_equal(&[Some(&boolean), Some(&boolean_string)]));
-        assert!(all_equal(&[Some(&boolean), Some(&boolean)]));
-
         let runs = columns(vec![
             (
-                "one".to_string(),
+                "one",
                 json!({
                     "array": [1],
                     "boolean": true,
@@ -810,7 +898,7 @@ mod tests {
                 }),
             ),
             (
-                "two".to_string(),
+                "two",
                 json!({
                     "array": "[1]",
                     "boolean": "true",
@@ -820,12 +908,7 @@ mod tests {
                 }),
             ),
         ]);
-        let keys = collect_all_keys(
-            &runs
-                .iter()
-                .map(|column| column.data.clone())
-                .collect::<Vec<_>>(),
-        );
+        let keys = column_keys(&runs);
 
         assert_eq!(
             filter_diff_only(&keys, &runs, ""),
@@ -889,12 +972,7 @@ mod tests {
                     })
                     .collect(),
             );
-            let keys = collect_all_keys(
-                &runs
-                    .iter()
-                    .map(|column| column.data.clone())
-                    .collect::<Vec<_>>(),
-            );
+            let keys = column_keys(&runs);
             assert_eq!(
                 filter_diff_only(&keys, &runs, ""),
                 vec![KeyNode::Leaf("n".to_string())]
@@ -1020,18 +1098,9 @@ mod tests {
     #[test]
     fn the_number_nan_and_the_string_nan_show_and_diff_apart() {
         let runs = columns(vec![
-            (
-                "one".to_string(),
-                python_json(r#"{"loss": NaN, "best": -Infinity}"#),
-            ),
-            (
-                "two".to_string(),
-                json!({"loss": "NaN", "best": "-Infinity"}),
-            ),
-            (
-                "three".to_string(),
-                python_json(r#"{"loss": NaN, "best": Infinity}"#),
-            ),
+            ("one", python_json(r#"{"loss": NaN, "best": -Infinity}"#)),
+            ("two", json!({"loss": "NaN", "best": "-Infinity"})),
+            ("three", python_json(r#"{"loss": NaN, "best": Infinity}"#)),
         ]);
         let displays = |path| {
             runs.iter()
@@ -1084,37 +1153,10 @@ mod tests {
     }
 
     #[test]
-    fn difference_tints_ignore_server_timing_like_the_diff_filter() {
-        let runs = columns(vec![
-            (
-                "one".to_string(),
-                json!({"lr": 1, "meta": {"server_time": {"end": "one"}}}),
-            ),
-            (
-                "two".to_string(),
-                json!({"lr": 1, "meta": {"server_time": {"end": "two"}}}),
-            ),
-            (
-                "three".to_string(),
-                json!({"lr": 2, "meta": {"server_time": {"end": "three"}}}),
-            ),
-        ]);
-
-        assert_eq!(
-            difference_tints(&comparable_row(&runs, "/lr")),
-            vec![false, false, true]
-        );
-        assert_eq!(
-            difference_tints(&comparable_row(&runs, "/meta/server_time/end")),
-            vec![false, false, false]
-        );
-    }
-
-    #[test]
     fn comparable_rows_ignore_object_key_order() {
         let runs = columns(vec![
-            ("one".to_string(), json!({"opt": {"a": 1, "b": 2}})),
-            ("two".to_string(), json!({"opt": {"b": 2, "a": 1}})),
+            ("one", json!({"opt": {"a": 1, "b": 2}})),
+            ("two", json!({"opt": {"b": 2, "a": 1}})),
         ]);
         assert_eq!(
             difference_tints(&comparable_row(&runs, "/opt")),
@@ -1125,15 +1167,10 @@ mod tests {
     #[test]
     fn diff_only_treats_missing_as_different_from_any_present_value() {
         let runs = columns(vec![
-            ("one".to_string(), json!({"empty": "", "value": 1})),
-            ("two".to_string(), json!({})),
+            ("one", json!({"empty": "", "value": 1})),
+            ("two", json!({})),
         ]);
-        let keys = collect_all_keys(
-            &runs
-                .iter()
-                .map(|column| column.data.clone())
-                .collect::<Vec<_>>(),
-        );
+        let keys = column_keys(&runs);
 
         assert_eq!(
             filter_diff_only(&keys, &runs, ""),
