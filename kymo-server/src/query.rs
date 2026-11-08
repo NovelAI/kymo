@@ -98,10 +98,7 @@ fn canonicalize_chart_request(request: &mut proto::ChartRequest) -> Result<(), S
 }
 
 fn custom_x_runs(request: &proto::ChartRequest) -> Option<(&proto::SeriesRef, Vec<(&str, &str)>)> {
-    let x_series = request
-        .x_series
-        .as_ref()
-        .filter(|_| !request.use_timestamp_axis)?;
+    let x_series = request.x_series.as_ref()?;
     let mut seen = std::collections::HashSet::new();
     let runs = request
         .y_series
@@ -1385,12 +1382,10 @@ struct PreparedSeries {
     /// The single source of truth for non-finiteness: row eviction, marker
     /// emission, and the wire nan_kinds all derive from it.
     kinds: Vec<u8>,
-    /// Carried positions for samples whose x is unplottable: non-finite
-    /// custom-x, or negative x on an absolute log step/time axis. They become
-    /// kind-4 annotations on the row holding their anchor sample; they never own a row and
-    /// never evict one. Custom-x carries each gap from its last plottable
-    /// position (ascending, deduped); negative log-x attaches to the first.
-    /// A run with no plottable x carries them to −∞, the chart's first column.
+    /// Kind-4 anchors for unplottable x, ascending and distinct: custom-x gaps
+    /// use the preceding plottable sample in step order (the first for leading
+    /// gaps); a log step or time axis uses the first plottable sample. A run with none
+    /// uses −∞ (column 0). These annotations neither own nor evict a sample.
     xnan_xs: Vec<f64>,
     /// How many samples had an unplottable x (the samples behind `xnan_xs`,
     /// pre-dedup) — the tooltip's "×N" (DenseSeries::xnan_count).
@@ -1459,7 +1454,7 @@ impl SlotInputs {
     }
 }
 
-/// The emitted samples among `n` fetched ones whose steps ascend (`step` and x `key` read them): those in the step range and, on a log axis, at a nonnegative x (prepare's `is_output_position`), one range.
+/// The emitted samples among `n` fetched ones whose steps ascend (`step` and x `key` read them): those in the step range and, on a log axis, at a nonnegative key, the keys ascending there too (prepare's `is_output_position`), one range.
 fn emitted_range(
     n: usize,
     step: impl Fn(usize) -> i64,
@@ -1684,14 +1679,15 @@ fn prepare(
         drop(rs.points);
         // Trim the smoothing warmup back to the requested STEP range whatever the plot key is. The precheck exactly matches the later axis filter, so a margin-only/unplottable series can skip plan derivation and smoothing entirely.
         let in_range = |i: usize| steps_v[i] >= p.step_min && steps_v[i] <= p.step_max;
-        // Resolve this run's custom-x map once for both the output precheck and emission.
+        // Resolve this run's custom-x map once for both the output precheck and emission. A non-finite x never plots, nor on a log axis a nonpositive one: such an x becomes a kind-4 marker (docs/log-scale-buckets.md).
         let x_map = x_maps.map(|maps| maps.get(&rs.run_id));
+        let plottable = |x: f64| x.is_finite() && !(p.spec.log_buckets && x <= 0.0);
         let is_output_position = |i: usize| match x_map {
             Some(xm) => {
                 in_range(i)
                     && xm
                         .and_then(|m| m.get(&steps_v[i]))
-                        .is_some_and(|&x| x.is_finite() && !(p.spec.log_buckets && x <= 0.0))
+                        .is_some_and(|&x| plottable(x))
             }
             None => in_range(i) && !(p.spec.log_buckets && xkeys_v[i] < 0),
         };
@@ -1764,15 +1760,10 @@ fn prepare(
         let mut xnan_held = false;
         match x_map {
             Some(xm) => {
-                // (x, plot, raw, kind) per plottable point. A step whose x
-                // metric is ABSENT is normal sparse logging and stays
-                // hidden; a step whose x metric was LOGGED non-finite has
-                // no position but is real data — carry it to the last
-                // plottable x seen in step order (leading ones attach to
-                // the first), as a kind-4 annotation.
+                // (x, plot, raw) per plottable point. An absent x is sparse logging and stays hidden; an unplottable logged x is real data without a position, a kind-4 marker on the plottable x before it in step order (a leading one on the first).
                 // Beyond its prepared rows, a series holds at most these points and their sort's buffer, which stage 2 charges as any series' working copies: the key copy is freed before they are collected (at most one per row in range), the other copies before the sort.
                 drop(xkeys_v);
-                let mut pts: Vec<(f64, f64, f64, u8)> =
+                let mut pts: Vec<(f64, f64, f64)> =
                     Vec::with_capacity((0..steps_v.len()).filter(|&i| in_range(i)).count());
                 let plot_values = plot_v.as_deref().unwrap_or(&raw_v);
                 let mut leading_gap = false;
@@ -1780,10 +1771,8 @@ fn prepare(
                     let Some(&x) = xm.and_then(|m| m.get(&steps_v[i])) else {
                         continue;
                     };
-                    // A non-finite x never plots; on a log axis a nonpositive x can't either — both become exceptional kind-4 markers carried to the run's last plottable x (docs/log-scale-buckets.md).
-                    let plottable = x.is_finite() && !(p.spec.log_buckets && x <= 0.0);
-                    if plottable {
-                        pts.push((x, plot_values[i], raw_v[i], chart::nan_kind(raw_v[i])));
+                    if plottable(x) {
+                        pts.push((x, plot_values[i], raw_v[i]));
                     } else {
                         xnan_count += 1;
                         match pts.last() {
@@ -1804,13 +1793,13 @@ fn prepare(
                 // uPlot needs ascending x; an x metric need not be monotonic
                 pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
                 (xs, plot, raw, kinds, age) = columns(pts.len());
-                for (x, pv, rv, k) in pts {
+                for (x, pv, rv) in pts {
                     xs.push(x);
                     plot.push(pv);
                     if p.is_smoothed {
                         raw.push(rv);
                     }
-                    kinds.push(k);
+                    kinds.push(chart::nan_kind(rv));
                 }
             }
             None => {
@@ -6360,6 +6349,7 @@ mod chart_admission_tests {
         assert_eq!(chart_admission_weight(&request), 5);
 
         request.use_timestamp_axis = true;
+        canonicalize_chart_request(&mut request).unwrap();
         assert_eq!(chart_admission_weight(&request), 3);
     }
 
@@ -7387,6 +7377,7 @@ mod chart_admission_tests {
         let kept = plan.prepared_rows(0, &tagged);
         assert_eq!((kept.rows, kept.largest, kept.series), (20, 10, 2));
         request.use_timestamp_axis = true;
+        canonicalize_chart_request(&mut request).unwrap();
         assert_eq!(plan_off(&request).x_runs, 0, "timestamp charts read no x");
     }
 

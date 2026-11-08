@@ -531,6 +531,59 @@ fn custom_x_markers_sit_on_their_anchor_slots() {
     }
 }
 
+/// No x at or below the log ladder's shifted zero reaches its grid (chart.rs `GridKind::Log`): a log step chart's negative steps become kind-4 markers, and the ladder downsamples the rest. They share one marker, on the slot of their anchor, x = 0, whose cell is raw (chart.rs `anchor_slot`).
+#[test]
+fn negative_steps_on_a_log_step_axis_stay_off_the_ladder() {
+    let mut request = req(&["a"], 8);
+    request.log_buckets = true;
+    let rows = Arc::new(
+        [-10i64, -5]
+            .into_iter()
+            .chain(0..=40)
+            .map(|s| scalar_row(s, s as f32))
+            .collect::<Vec<_>>(),
+    );
+    let out = inflate_full(&build(&request, std::slice::from_ref(&rows)));
+    assert!(out.xr_min.iter().any(|v| v.is_finite()), "downsampled");
+    assert_eq!(out.x_values[0], 0.0);
+    let s = &out.series[0];
+    assert_eq!(
+        (
+            s.xnan_count,
+            s.nan_kinds.as_slice(),
+            s.nan_indices.as_slice()
+        ),
+        (2, &[4][..], &[0][..])
+    );
+}
+
+/// A custom-x log chart plots only finite positive x: a negative x, either sign of zero and either infinity become kind-4 markers, never ladder slots.
+#[test]
+fn nonpositive_custom_x_on_a_log_axis_stays_off_the_ladder() {
+    let mut request = req(&["a"], 8);
+    request.log_buckets = true;
+    request.x_series = Some(proto::SeriesRef {
+        metric_name: "x".into(),
+        ..Default::default()
+    });
+    let rows = rows_at(&(0..=40i64).map(|s| (s, 0.5)).collect::<Vec<_>>());
+    let x = |s: i64| match s {
+        0 => -1.5,
+        1 => -0.0,
+        2 => 0.0,
+        3 => f64::INFINITY,
+        4 => f64::NEG_INFINITY,
+        _ => (s * 3) as f64,
+    };
+    let x_maps =
+        std::collections::HashMap::from([("a".to_string(), (0..=40).map(|s| (s, x(s))).collect())]);
+    let out = inflate_full(
+        &build_response(&request, std::slice::from_ref(&rows), Some(&x_maps), false).unwrap(),
+    );
+    assert!(out.xr_min.iter().any(|v| v.is_finite()), "downsampled");
+    assert_eq!(out.series[0].xnan_count, 5);
+}
+
 /// Duplicate refs pair positionally through a continuation, and a logged y-kind at the anchor keeps the slot's marker precedence over kind 4.
 #[test]
 fn duplicate_refs_and_logged_y_kind_precedence() {

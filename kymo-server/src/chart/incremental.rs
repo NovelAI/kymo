@@ -22,7 +22,7 @@ pub(crate) enum Fallback {
     Unplottable,
     /// The smoothing plan changes: the median moved, or a first finite output.
     PlanShift,
-    /// The grid's tier or anchor moved, or a passthrough chart started downsampling.
+    /// The grid's tier moved, or a passthrough chart started downsampling.
     Regrid,
     /// An envelope cell became occupied on a chart that shipped passthrough-shaped.
     EnvelopeFlip,
@@ -62,10 +62,9 @@ impl Fallback {
 pub(crate) enum HeldAxis {
     /// The passthrough decision: the axis is the model's x values, every distinct x, so its ends are the chart's bounds.
     Passthrough,
-    /// The downsample decision's plan, and the log ladder's lowest x its grid was made from ([`log_ladder_lo`]). With no occupied envelope cell the chart ships passthrough-shaped columns over `plan.raw_xs`.
+    /// The downsample decision's plan, and the chart's first and last x. With no occupied envelope cell the chart ships passthrough-shaped columns over `plan.raw_xs`.
     Grid {
         plan: AxisPlan,
-        p_lo: f64,
         g_first: f64,
         g_last: f64,
     },
@@ -104,8 +103,8 @@ impl HeldAxis {
             return None;
         };
         let &last = xs.last()?;
-        let cell = plan.grid.index(last).filter(|&c| plan.env[c])?;
-        let first = xs.partition_point(|&x| plan.grid.index(x) != Some(cell));
+        let cell = Some(plan.grid.index(last)).filter(|&c| plan.env[c])?;
+        let first = xs.partition_point(|&x| plan.grid.index(x) != cell);
         let mut agg = CellAgg::new(cell);
         for j in first..xs.len() {
             agg.fold(xs[j], env_src[j], kinds[j]);
@@ -219,12 +218,13 @@ fn merge_raw(old_x: &[f64], mut fresh: Vec<f64>) -> Vec<f64> {
     x
 }
 
-/// The identity of the slot at `x`, ordered as slots are: below-grid raw x first (cell −1), then cells ascending, an envelope cell's one slot (its center lies in the cell) or a raw cell's x ascending. Axis x are never NaN or −0 ([`HeldAxis`]), so `<` and `==` order keys totally.
-fn slot_key(plan: &AxisPlan, x: f64) -> (i64, u8, f64) {
-    match plan.grid.index(x) {
-        None => (-1, 1, x),
-        Some(c) if plan.env[c] => (c as i64, 0, 0.0),
-        Some(c) => (c as i64, 1, x),
+/// The identity of the slot at `x`, ordered as slots are: cells ascending, an envelope cell's one slot (its center lies in the cell) or a raw cell's x ascending. Axis x are never NaN or −0 ([`HeldAxis`]), so `<` and `==` order keys totally.
+fn slot_key(plan: &AxisPlan, x: f64) -> (usize, u8, f64) {
+    let c = plan.grid.index(x);
+    if plan.env[c] {
+        (c, 0, 0.0)
+    } else {
+        (c, 1, x)
     }
 }
 
@@ -274,10 +274,11 @@ pub(crate) fn advance_axis(
                 slot_of_cell: Vec::new(),
             })
         }
-        HeldAxis::Grid { plan, p_lo, .. } => {
+        HeldAxis::Grid { plan, .. } => {
             // The decision stays Downsample: distinct x only grow, and decision_cap only shrinks as the span grows (a linear step grid's width only grows, so its cap stays the target).
-            let grid = make_grid_from(*p_lo, g_first, g_last, spec);
-            if grid.kind != plan.grid.kind || grid.base != plan.grid.base {
+            // `g_first` is the held one, so a grid of the held kind has the held base.
+            let grid = make_grid_from(g_first, g_last, spec);
+            if grid.kind != plan.grid.kind {
                 return Err(Fallback::Regrid);
             }
             let held_shaped = !plan.any_env_occupied();
@@ -291,17 +292,17 @@ pub(crate) fn advance_axis(
             // Non-step raw cells receiving new x values.
             let mut sparse: Vec<(usize, f64)> = Vec::new();
             for &x in new_xs.iter().flat_map(|xs| xs.iter()) {
-                match grid.index(x) {
-                    // A step axis's raw cells, narrower than ENV_MIN_POINTS steps, stay raw without extents, as plan_axis leaves them.
-                    Some(c) if env[c] || !spec.is_step_axis => {
-                        let e = &mut ext[c];
-                        e.0 = e.0.min(x);
-                        e.1 = e.1.max(x);
-                        if !env[c] {
-                            sparse.push((c, x));
-                        }
+                let c = grid.index(x);
+                // A step axis's raw cells, narrower than ENV_MIN_POINTS steps, stay raw without extents, as plan_axis leaves them.
+                if env[c] || !spec.is_step_axis {
+                    let e = &mut ext[c];
+                    e.0 = e.0.min(x);
+                    e.1 = e.1.max(x);
+                    if !env[c] {
+                        sparse.push((c, x));
                     }
-                    _ => raw_new.push(x),
+                } else {
+                    raw_new.push(x);
                 }
             }
             let mut raw_xs = plan.raw_xs.clone();
@@ -311,8 +312,8 @@ pub(crate) fn advance_axis(
             for group in sparse.chunk_by(|a, b| a.0 == b.0) {
                 let c = group[0].0;
                 // plan_axis settles a non-step cell as an envelope at its ENV_MIN_POINTS-th distinct x.
-                let lo = raw_xs.partition_point(|&x| grid.index(x).is_none_or(|i| i < c));
-                let hi = raw_xs.partition_point(|&x| grid.index(x).is_none_or(|i| i <= c));
+                let lo = raw_xs.partition_point(|&x| grid.index(x) < c);
+                let hi = raw_xs.partition_point(|&x| grid.index(x) <= c);
                 let fresh: Vec<f64> = group
                     .iter()
                     .map(|&(_, x)| x)
@@ -354,14 +355,13 @@ pub(crate) fn advance_axis(
                 }
                 old.push(held_at);
                 slots.push(match key {
-                    (c, 0, _) => SlotKind::Env(c as usize),
+                    (c, 0, _) => SlotKind::Env(c),
                     _ => SlotKind::Raw,
                 });
             }
             Ok(AxisStep {
                 axis: HeldAxis::Grid {
                     plan: ma.plan,
-                    p_lo: *p_lo,
                     g_first,
                     g_last,
                 },
@@ -463,12 +463,10 @@ pub(crate) fn rebuild(
     )
 }
 
-/// The first of the series' emitted samples at or past grid cell `c` (below-grid samples lead).
+/// The first of the series' emitted samples at or past grid cell `c`.
 fn cell_start(samples: &dyn Samples, step: &AxisStep, c: usize) -> usize {
     let plan = step.axis.plan().expect("envelope cells lie on a grid");
-    partition(0, samples.len(), |e| {
-        plan.grid.index(samples.x(e)).is_none_or(|i| i < c)
-    })
+    partition(0, samples.len(), |e| plan.grid.index(samples.x(e)) < c)
 }
 
 fn rebuild_series(
@@ -524,10 +522,8 @@ fn rebuild_series(
         }
         for e in s.first_new..len {
             let x = s.samples.x(e);
-            let Some(c) = plan.grid.index(x).filter(|&c| plan.env[c]) else {
-                continue;
-            };
-            if step.flipped.binary_search(&c).is_ok() {
+            let c = plan.grid.index(x);
+            if !plan.env[c] || step.flipped.binary_search(&c).is_ok() {
                 continue;
             }
             if aggs.last().is_none_or(|agg| agg.cell != c) {
@@ -703,16 +699,13 @@ fn rebuild_series(
         mins = Vec::new();
         maxs = Vec::new();
     }
-    // The series' last occupied envelope cell, whose aggregates the next step continues: re-aggregated this step, or else the held open cell (a cell no new or flipped sample touched keeps its aggregates).
+    // The series' last occupied envelope cell, whose aggregates the next step continues: re-aggregated this step (the last aggregate, as none follows the last sample's cell), or else the held open cell (a cell no new or flipped sample touched keeps its aggregates). A raw last cell finds neither, since cells only flip from raw to envelope.
     let open = plan.and_then(|plan| {
         let last = len.checked_sub(1)?;
-        let cell = plan
-            .grid
-            .index(s.samples.x(last))
-            .filter(|&c| plan.env[c])?;
-        match aggs.binary_search_by_key(&cell, |agg| agg.cell) {
-            Ok(i) => Some(aggs[i]),
-            Err(_) => s.open.filter(|open| open.cell == cell),
+        let cell = plan.grid.index(s.samples.x(last));
+        match aggs.last() {
+            Some(agg) if agg.cell == cell => Some(*agg),
+            _ => s.open.filter(|open| open.cell == cell),
         }
     });
 

@@ -261,15 +261,15 @@ pub(crate) const SAVGOL_FLOOR_R: [f64; 3] = [5.0 / 7.0, 5.0 / 7.0, 805.0 / 572.0
 /// R = ∫K² of each EMA order's kernel at its current x, which [`Floor`] widens its time constant by. Triangular has no width.
 pub(crate) const EMA_FLOOR_R: [f64; 3] = [0.5, 1.25, 33.0 / 16.0];
 
-/// The widest floor of a step chart whose emitted x lie in `lo..=hi`: a narrower span only refines the grid (a finer linear width, a deeper log ladder), so this bounds the fetch margins a zoom's smoothers need. Zero at target 0, which never downsamples.
+/// The widest floor of a step chart whose emitted x lie in `lo..=hi`: a narrower span only refines the grid (a finer linear width, a deeper log ladder), so this bounds the fetch margins a zoom's smoothers need. Zero at target 0, which never downsamples, and over a range that can hold no emitted x.
 pub(crate) fn zoom_floor(lo: f64, hi: f64, spec: GridSpec) -> Floor {
     debug_assert!(spec.is_step_axis, "a step axis's ladder (shifted at 0)");
-    if spec.target == 0 {
+    // A log axis emits no x below 0, so the range is clamped there; one reaching 0 may hold it, and the ladder then runs in log(x + 1) from 0's cell, the widest floor such a zoom can need.
+    let lo = if spec.log_buckets { lo.max(0.0) } else { lo };
+    if spec.target == 0 || hi < lo {
         return Floor::default();
     }
-    // A zoom reaching x = 0 may hold it, which shifts a step chart's ladder to log(x + 1), its widest; its lowest cell is then 0's.
-    let lo = if spec.log_buckets { lo.max(0.0) } else { lo };
-    Floor::of(make_grid_from(lo, lo, hi, spec).kind)
+    Floor::of(make_grid_from(lo, hi, spec).kind)
 }
 
 /// The axis decision over each series' emitted x, which [`shared_chart`] builds on and the delta planner compares. Prepare makes it once, for a smoothed step or time chart's [`Floor`] too.
@@ -278,8 +278,8 @@ pub(crate) enum AxisDecision {
     Empty,
     /// Every distinct x, each a slot.
     Passthrough(Vec<f64>),
-    /// The grid, the log ladder's lowest x it was made from ([`log_ladder_lo`]), and the chart's first and last x.
-    Downsample(Grid, f64, f64, f64),
+    /// The grid and the chart's first and last x.
+    Downsample(Grid, f64, f64),
 }
 
 impl AxisDecision {
@@ -290,9 +290,7 @@ impl AxisDecision {
         match decide_axis(xs, g_first, g_last, spec) {
             Decision::Passthrough(axis) => Self::Passthrough(axis),
             Decision::Downsample => {
-                let p_lo = log_ladder_lo(xs, g_first, spec);
-                let grid = make_grid_from(p_lo, g_first, g_last, spec);
-                Self::Downsample(grid, p_lo, g_first, g_last)
+                Self::Downsample(make_grid_from(g_first, g_last, spec), g_first, g_last)
             }
         }
     }
@@ -1459,7 +1457,7 @@ mod stable_grid_tests {
 
 // === Shared-axis bucketing ===
 //
-// Implements docs/chart-shared-axis.md + docs/log-scale-buckets.md. Every run — step, timestamp, or custom-x — emits on ONE shared slot sequence. Slots mix two kinds: an ENVELOPE slot is a downsampling bucket (x = average of its first and last point across runs; y = per-run min/max envelope, dense, min == max behind a single point), a RAW slot is one exact logged x shared by every run that logged it. A bucket downsamples only when it EXPECTS at least [`ENV_MIN_POINTS`] points — below that its points ship raw (two exact points render better than one envelope). Few enough distinct x skips the grid entirely (passthrough: every slot raw); a grid with no occupied envelope bucket emits the same shape. Buckets are disjoint and every point, including the chart's first and last, follows its cell's ordinary raw-or-envelope rule. Works on any ascending f64 x — custom-x is just a non-step x metric (its non-finite-x markers ride in via `xnan`).
+// Implements docs/chart-shared-axis.md + docs/log-scale-buckets.md. Every run — step, timestamp, or custom-x — emits on ONE shared slot sequence. Slots mix two kinds: an ENVELOPE slot is a downsampling bucket (x = average of its first and last point across runs; y = per-run min/max envelope, dense, min == max behind a single point), a RAW slot is one exact logged x shared by every run that logged it. A bucket downsamples only when it EXPECTS at least [`ENV_MIN_POINTS`] points — below that its points ship raw (two exact points render better than one envelope). Few enough distinct x skips the grid entirely (passthrough: every slot raw); a grid with no occupied envelope bucket emits the same shape. Buckets are disjoint and every point, including the chart's first and last, follows its cell's ordinary raw-or-envelope rule. Works on any ascending f64 x, shifted-positive on the log ladder ([`GridKind::Log`]) — custom-x is just a non-step x metric (its unplottable-x markers ride in via `xnan`).
 
 use std::borrow::Cow;
 use std::ops::ControlFlow;
@@ -1478,7 +1476,7 @@ const OCTAVE_MIN: i32 = -500;
 fn octave(x: f64) -> i32 {
     debug_assert!(x > 0.0);
     let e = ((x.to_bits() >> 52) & 0x7ff) as i32;
-    (if e == 0 { -1023 } else { e - 1023 }).max(OCTAVE_MIN)
+    (e - 1023).max(OCTAVE_MIN)
 }
 
 /// 2^k by exponent construction, exact and ~6x cheaper than powi — [`Grid::id`] runs twice per SAMPLE during planning and bucketing. Valid for normal exponents only; the grid's k stays within [OCTAVE_MIN - m, 1023].
@@ -1492,7 +1490,7 @@ fn pow2(k: i32) -> f64 {
 enum GridKind {
     /// Uniform power-of-two width anchored at x = 0 ([`stable_grid`]); id = the bucket ordinal from the anchor.
     Linear { x_lo: f64, width: f64 },
-    /// The log ladder: octave [2^k, 2^(k+1)) splits into s = 2^m buckets of width 2^(k−m) — [16,20),[20,24),[24,28),[28,32),[32,40) is m = 2 (docs/log-scale-buckets.md). id = k·s + j, consecutive across octave boundaries. `shift` = the ladder runs in log(x+1) (step/timestamp axes, where step 0 must render; the +1 is exact on their integer x). Only shifted-positive x has a cell; anything below is raw by fiat — and normally never reaches the grid, because unplottable x becomes an exceptional-point marker upstream (query.rs).
+    /// The log ladder: octave [2^k, 2^(k+1)) splits into s = 2^m buckets of width 2^(k−m) — [16,20),[20,24),[24,28),[28,32),[32,40) is m = 2 (docs/log-scale-buckets.md). id = k·s + j, consecutive across octave boundaries. `shift` = the ladder runs in log(x+1) (step/timestamp axes, where step 0 must render; the +1 is exact on their integer x). Every x reaching the ladder is shifted-positive: query.rs makes an unplottable x an exceptional-point marker, and [`make_grid_from`] asserts it of the chart's first x.
     Log { m: i32, shift: bool },
 }
 
@@ -1504,36 +1502,31 @@ pub(crate) struct Grid {
 }
 
 impl Grid {
-    /// Absolute id of the cell containing `x`; None = below the grid (log ladder, x <= 0). Exact: within an octave x − 2^k is exact (Sterbenz), and every width is a power of two.
-    #[allow(clippy::neg_cmp_op_on_partial_ord)] // `!(xe > 0)` intentionally rejects NaN coordinates too.
-    fn id(kind: GridKind, x: f64) -> Option<i64> {
+    /// Absolute id of the cell containing `x`, which on the log ladder must be shifted-positive ([`GridKind::Log`]). Exact: within an octave x − 2^k is exact (Sterbenz), and every width is a power of two, so j < s; only an x below [`OCTAVE_MIN`]'s octave gives j < 0, joining its bottom cell.
+    fn id(kind: GridKind, x: f64) -> i64 {
         match kind {
-            GridKind::Linear { x_lo, width } => Some(((x - x_lo) / width) as i64),
+            GridKind::Linear { x_lo, width } => ((x - x_lo) / width) as i64,
             GridKind::Log { m, shift } => {
                 let xe = if shift { x + 1.0 } else { x };
-                if !(xe > 0.0) {
-                    return None;
-                }
                 let k = octave(xe);
                 let s = 1i64 << m;
-                let j = (((xe - pow2(k)) / pow2(k - m)) as i64).clamp(0, s - 1);
-                Some(k as i64 * s + j)
+                let j = (((xe - pow2(k)) / pow2(k - m)) as i64).max(0);
+                k as i64 * s + j
             }
         }
     }
 
-    /// Instantiated index of the cell containing `x`; None = below the grid, raw by fiat. An `x` past the instantiated cells is a caller bug: debug builds assert, release builds clamp it into the edge cell.
-    fn index(&self, x: f64) -> Option<usize> {
-        Self::id(self.kind, x).map(|id| {
-            let offset = id - self.base;
-            debug_assert!(
-                (0..self.cells as i64).contains(&offset),
-                "point x={x} mapped outside its instantiated grid: id={id}, base={}, cells={}",
-                self.base,
-                self.cells
-            );
-            offset.clamp(0, self.cells as i64 - 1) as usize
-        })
+    /// Instantiated index of the cell containing `x`. An `x` outside the instantiated cells is a caller bug, which debug builds assert.
+    fn index(&self, x: f64) -> usize {
+        let id = Self::id(self.kind, x);
+        let offset = id - self.base;
+        debug_assert!(
+            (0..self.cells as i64).contains(&offset),
+            "point x={x} mapped outside its instantiated grid: id={id}, base={}, cells={}",
+            self.base,
+            self.cells
+        );
+        offset as usize
     }
 
     /// Bucket width of an instantiated cell — the step-axis point expectation (one point per integer).
@@ -1561,52 +1554,27 @@ pub struct GridSpec {
     pub shift_one: bool,
 }
 
-/// The log ladder's `p_lo` ([`make_grid_from`]): the smallest x a ladder cell can hold, from each run's first x above the shifted zero; infinite without one (and on linear grids, which ignore it).
-fn log_ladder_lo(xs: &[&[f64]], g_first: f64, spec: GridSpec) -> f64 {
-    if !spec.log_buckets {
-        return f64::INFINITY;
-    }
-    // log(x+1) only when the chart contains x = 0 — otherwise plain log(x).
-    let shift = if spec.shift_one && g_first == 0.0 {
-        1.0
-    } else {
-        0.0
-    };
-    let mut p_lo = f64::INFINITY;
-    for r in xs {
-        let i = r.partition_point(|&v| v + shift <= 0.0);
-        if let Some(&v) = r.get(i) {
-            p_lo = p_lo.min(v);
-        }
-    }
-    p_lo
-}
-
-/// The grid for a chart that decided to downsample. Linear: [`stable_grid`]. Log ladder: the largest subdivision s = 2^m whose cell count over the chart's positive span stays within target — ids are consecutive, so the count is closed-form, no data scanned; a sub-octave zoom therefore scales s up to match linear slot density. `p_lo` is [`log_ladder_lo`]'s (on step axes, whose x are integers, at least a step above the shifted zero). No positive x at all falls back to the linear grid: a bounded grid beats shipping every distinct nonpositive x raw.
-fn make_grid_from(p_lo: f64, g_first: f64, g_last: f64, spec: GridSpec) -> Grid {
+/// The grid for a chart that decided to downsample, its x spanning `g_first..=g_last`. Linear: [`stable_grid`]. Log ladder: the largest subdivision s = 2^m whose cell count over the span stays within target — ids are consecutive, so the count is closed-form, no data scanned; a sub-octave zoom therefore scales s up to match linear slot density.
+fn make_grid_from(g_first: f64, g_last: f64, spec: GridSpec) -> Grid {
     if spec.log_buckets {
-        let shift_one = spec.shift_one && g_first == 0.0;
-        if p_lo.is_finite() && p_lo <= g_last {
-            let cells_for = |m: i32| {
-                let k = GridKind::Log {
-                    m,
-                    shift: shift_one,
-                };
-                (Grid::id(k, g_last).unwrap() - Grid::id(k, p_lo).unwrap() + 1) as usize
-            };
-            // m caps at 40: far past any pixel target, and cell counts stay in i64. m = 0 can still exceed target (a span of more octaves than pixels) — the octave count bounds the excess at ~1500 cells.
-            let mut m = 0;
-            while m < 40 && cells_for(m + 1) <= spec.target {
-                m += 1;
-            }
-            let kind = GridKind::Log {
-                m,
-                shift: shift_one,
-            };
-            let base = Grid::id(kind, p_lo).unwrap();
-            let cells = (Grid::id(kind, g_last).unwrap() - base + 1) as usize;
-            return Grid { kind, base, cells };
+        let shift = spec.shift_one && g_first == 0.0;
+        // An x at or below the shifted zero would anchor the ladder at its magnitude, bucketing the whole chart wrong: it fails the build instead (no chart sends one, [`GridKind::Log`]).
+        assert!(
+            g_first > 0.0 || shift,
+            "log ladder from x = {g_first}, at or below its shifted zero"
+        );
+        let grid_for = |m: i32| {
+            let kind = GridKind::Log { m, shift };
+            let base = Grid::id(kind, g_first);
+            let cells = (Grid::id(kind, g_last) - base + 1) as usize;
+            Grid { kind, base, cells }
+        };
+        // m caps at 40: far past any pixel target, and cell counts stay in i64. m = 0 can still exceed target (a span of more octaves than pixels) — the octave count bounds the excess at ~1500 cells.
+        let mut m = 0;
+        while m < 40 && grid_for(m + 1).cells <= spec.target {
+            m += 1;
         }
+        return grid_for(m);
     }
     let (x_lo, width, buckets) = stable_grid(g_first, g_last, spec.target);
     Grid {
@@ -1863,10 +1831,9 @@ pub(crate) struct AxisPlan {
     grid: Grid,
     /// Per instantiated cell: does it downsample?
     env: Vec<bool>,
-    /// Envelope cells: (min, max) x of their points; (INF, -INF) = unoccupied.
+    /// Per cell, the (min, max) x of its points: an envelope cell's extent, and a raw non-step cell's, which held state's advance reads when appends flip it to an envelope. (INF, -INF) = unoccupied, or a raw step cell, which keeps none.
     ext: Vec<(f64, f64)>,
-    /// Every raw slot x: ascending and distinct. Log-ladder x <= 0 (below the
-    /// grid) leads the list.
+    /// Every raw slot x: ascending and distinct.
     raw_xs: Vec<f64>,
 }
 
@@ -1884,7 +1851,7 @@ impl AxisPlan {
 /// Classify every cell and collect extents + raw slots. Step axes: mode is
 /// width-pure (no data pass decides it); extents come from one per-run sweep,
 /// and only the raw region — log ladders below 2^(m+2), where widths drop under
-/// ENV_MIN_POINTS, plus x <= 0 — needs a distinct-merge, small by construction
+/// ENV_MIN_POINTS — needs a distinct-merge, small by construction
 /// (a linear step grid in this arm has width ≥ ENV_MIN_POINTS, so its raw
 /// region is empty). Non-step axes: one streamed distinct-merge visits every x
 /// in order; each cell's mode comes from its own distinct count.
@@ -1899,16 +1866,12 @@ fn plan_axis(xs: &[&[f64]], grid: Grid, spec: GridSpec) -> AxisPlan {
         let mut raw_slices: Vec<&[f64]> = Vec::with_capacity(xs.len());
         for r in xs {
             // Widths only grow with x, so a run's raw samples lead it.
-            let cut = r.partition_point(|&v| !grid.index(v).is_some_and(|c| env[c]));
-            if cut > 0 {
-                raw_slices.push(&r[..cut]);
-            }
+            let cut = r.partition_point(|&v| !env[grid.index(v)]);
+            raw_slices.push(&r[..cut]);
             for &x in &r[cut..] {
-                if let Some(c) = grid.index(x) {
-                    let e = &mut ext[c];
-                    e.0 = e.0.min(x);
-                    e.1 = e.1.max(x);
-                }
+                let e = &mut ext[grid.index(x)];
+                e.0 = e.0.min(x);
+                e.1 = e.1.max(x);
             }
         }
         merge_distinct(&raw_slices, |x| {
@@ -1916,32 +1879,21 @@ fn plan_axis(xs: &[&[f64]], grid: Grid, spec: GridSpec) -> AxisPlan {
             ControlFlow::Continue(())
         });
     } else {
-        // Distinct x ascend, so each cell's x arrive consecutively: count them on the fly, buffering the ≤ ENV_MIN_POINTS-1 x a still-raw cell may yet dump to the raw list (the ENV_MIN_POINTS-th distinct x settles it as envelope and drops the buffer; a cell that ends short ships it raw). Below-grid x (log ladder, x <= 0) streams straight to the raw list. ext accumulates for raw cells too: held state's advance (chart/incremental.rs) reads a raw cell's extent when appends flip it to an envelope, so it must cover every x the cell holds.
-        let mut cur: Option<usize> = None;
-        let mut cnt = 0usize;
+        // Distinct x ascend, so each cell's x arrive consecutively, its first (meeting the cell unoccupied) and last giving its extent, a raw cell's too ([`AxisPlan::ext`]). A still-raw cell buffers its ≤ ENV_MIN_POINTS-1 x, which it may yet dump to the raw list: the ENV_MIN_POINTS-th distinct x settles it as envelope and drops the buffer; a cell that ends short ships it raw.
         let mut buf: Vec<f64> = Vec::with_capacity(ENV_MIN_POINTS as usize - 1);
         merge_distinct(xs, |x| {
-            let cell = grid.index(x);
-            if cur != cell {
+            let c = grid.index(x);
+            if !ext[c].0.is_finite() {
                 raw_xs.append(&mut buf); // the previous cell ended short of ENV_MIN_POINTS
-                cnt = 0;
-                cur = cell;
+                ext[c].0 = x;
             }
-            match cell {
-                None => raw_xs.push(x),
-                Some(c) => {
-                    cnt += 1;
-                    if (cnt as f64) < ENV_MIN_POINTS {
-                        buf.push(x);
-                    } else {
-                        env[c] = true;
-                        buf.clear();
-                    }
-                    let e = &mut ext[c];
-                    e.0 = e.0.min(x);
-                    e.1 = e.1.max(x);
-                }
+            if !env[c] && ((buf.len() + 1) as f64) < ENV_MIN_POINTS {
+                buf.push(x);
+            } else {
+                env[c] = true;
+                buf.clear();
             }
+            ext[c].1 = x;
             ControlFlow::Continue(())
         });
         raw_xs.append(&mut buf);
@@ -1974,7 +1926,7 @@ pub(crate) fn anchor_slot(
     x_values: &[f64],
     x: f64,
 ) -> usize {
-    match plan.and_then(|plan| plan.grid.index(x).filter(|&c| plan.env[c])) {
+    match plan.and_then(|plan| Some(plan.grid.index(x)).filter(|&c| plan.env[c])) {
         Some(c) => slot_of_cell[c],
         None => x_values.partition_point(|&v| v < x),
     }
@@ -1984,10 +1936,6 @@ fn mixed_axis(plan: AxisPlan) -> MixedAxis {
     let mut x = Vec::with_capacity(plan.raw_xs.len() + plan.grid.cells);
     let mut slot_of_cell = vec![usize::MAX; plan.grid.cells];
     let mut rp = 0usize;
-    while rp < plan.raw_xs.len() && Grid::id(plan.grid.kind, plan.raw_xs[rp]).is_none() {
-        x.push(plan.raw_xs[rp]);
-        rp += 1;
-    }
     for (c, slot) in slot_of_cell.iter_mut().enumerate() {
         if plan.env[c] {
             if plan.ext[c].0.is_finite() {
@@ -1995,7 +1943,7 @@ fn mixed_axis(plan: AxisPlan) -> MixedAxis {
                 x.push((plan.ext[c].0 + plan.ext[c].1) * 0.5);
             }
         } else {
-            while rp < plan.raw_xs.len() && plan.grid.index(plan.raw_xs[rp]) == Some(c) {
+            while rp < plan.raw_xs.len() && plan.grid.index(plan.raw_xs[rp]) == c {
                 x.push(plan.raw_xs[rp]);
                 rp += 1;
             }
@@ -2047,11 +1995,10 @@ pub fn numeric_delta_from_col(
     let (held, held_x) = match AxisDecision::of(&old_refs, spec) {
         AxisDecision::Empty => return 0, // nothing held
         AxisDecision::Passthrough(held_x) => (incremental::HeldAxis::Passthrough, held_x),
-        AxisDecision::Downsample(grid, p_lo, g_first, g_last) => {
+        AxisDecision::Downsample(grid, g_first, g_last) => {
             let plan = plan_axis(&old_refs, grid, spec);
             let held = incremental::HeldAxis::Grid {
                 plan,
-                p_lo,
                 g_first,
                 g_last,
             };
@@ -2172,56 +2119,18 @@ fn mixed_from_col(
         .zip(continuing)
         .filter(|&(_, &cont)| cont)
         .fold(f64::INFINITY, |x, (&d, _)| x.min(d));
-    let cells = old_plan.grid.cells;
-    // UNclamped cell offset from the shared base (the layouts agree on kind and base — checked by the caller): None = below the grid (log ladder, x <= 0); offsets at or past `cells` are appended cells, whose slots all sit past the old prefix. Grid::index would clamp those into range and alias them onto real cells.
-    let kind = old_plan.grid.kind;
-    let base = old_plan.grid.base;
-    let cell_of = move |x: f64| Grid::id(kind, x).map(|id| id - base);
+    // The current grid holds every held and current x: the held grid's cells (kind and base agree, checked by the caller), then any appended cells, whose slots all sit past the old prefix.
+    let cell_of = |x| new_plan.grid.index(x);
 
     // A continuing series' first change ([`first_change`]): a NEW sample at an existing raw x is a duplicate or first-sample content change, an ANCHOR sample's marker anchor moves, and a raw slot from its series' slot rule's x on reads a changed sample. The walk stops at the raw slot at or past it, or the envelope cell whose x reach it.
-    let first_dirty = first_change(
-        xs,
-        age,
-        slot_dirty,
-        continuing,
-        |v| !matches!(cell_of(v), Some(off) if off < cells as i64 && new_plan.env[off as usize]),
-    );
+    let first_dirty = first_change(xs, age, slot_dirty, continuing, |v| {
+        !new_plan.env[cell_of(v)]
+    });
 
     let (old_raw, new_raw) = (&old_plan.raw_xs, &new_plan.raw_xs);
-    let (mut op, mut np) = (0usize, 0usize);
+    let mut r = 0usize; // raw slots walked, the same in both lists
     let mut from_col = 0usize;
-
-    // Pairwise walk of one cell's raw slots (`cell` None = the below-grid group that leads the list). Some(col) = divergence at that column.
-    let walk_raw = |cell: Option<i64>,
-                    op: &mut usize,
-                    np: &mut usize,
-                    from_col: &mut usize|
-     -> Option<usize> {
-        loop {
-            let o_here = *op < old_raw.len() && cell_of(old_raw[*op]) == cell;
-            let n_here = *np < new_raw.len() && cell_of(new_raw[*np]) == cell;
-            match (o_here, n_here) {
-                (false, false) => return None,
-                (true, true) => {
-                    if old_raw[*op].to_bits() != new_raw[*np].to_bits()
-                        || old_raw[*op] >= first_dirty
-                    {
-                        return Some(*from_col);
-                    }
-                    *op += 1;
-                    *np += 1;
-                    *from_col += 1;
-                }
-                // An inserted slot shifts every later column; a vanished one is impossible while samples only accumulate — refuse it the same way rather than trust it.
-                _ => return Some(*from_col),
-            }
-        }
-    };
-
-    if let Some(col) = walk_raw(None, &mut op, &mut np, &mut from_col) {
-        return col;
-    }
-    for c in 0..cells {
+    for c in 0..old_plan.grid.cells {
         if old_plan.env[c] != new_plan.env[c] {
             return from_col; // mode flip: the cell's slots restructure
         }
@@ -2237,8 +2146,18 @@ fn mixed_from_col(
             if lo.is_finite() {
                 from_col += 1;
             }
-        } else if let Some(col) = walk_raw(Some(c as i64), &mut op, &mut np, &mut from_col) {
-            return col;
+        } else {
+            // A raw cell: its held slots recur bit for bit at the same places, and no current slot follows them in the cell.
+            while let Some(&x) = old_raw.get(r).filter(|&&x| cell_of(x) == c) {
+                if x >= first_dirty || new_raw.get(r).is_none_or(|v| v.to_bits() != x.to_bits()) {
+                    return from_col;
+                }
+                r += 1;
+                from_col += 1;
+            }
+            if new_raw.get(r).is_some_and(|&v| cell_of(v) == c) {
+                return from_col;
+            }
         }
     }
     from_col
@@ -2407,6 +2326,35 @@ mod delta_planner_tests {
         assert_eq!(h.as_ref(), [1.0, 3.0]);
         assert_eq!(held_xs(&x, &[AGE_NEW; 4]).as_ref(), [0f64; 0]);
         assert!(matches!(held_xs(&x, &[AGE_OLD; 4]), Cow::Borrowed(s) if s == x));
+    }
+
+    /// A new series filling a cell the held plan left empty flips it from raw to envelope, which only `mixed_from_col`'s mode check sees (`first_change` reads continuing series, and the raw walk steps over an empty cell): the prefix stops before it. Cells of width 256 from 0: an envelope at 1..=4, a new one at 300..=303, raw x at 1000..=1002.
+    #[test]
+    fn a_new_series_filling_an_empty_cell_bounds_the_prefix() {
+        let a = vec![1.0, 2.0, 3.0, 4.0, 1000.0, 1001.0, 1002.0];
+        let b = vec![300.0, 301.0, 302.0, 303.0];
+        let ya: Vec<f64> = a.iter().map(|x| x * 2.0).collect();
+        let yb: Vec<f64> = b.iter().map(|x| x * 3.0).collect();
+        let spec = GridSpec {
+            is_step_axis: false,
+            ..spec(4)
+        };
+        assert_eq!(check(&[a, b], &[ya, yb], &[7, 0], 0, spec), 1);
+    }
+
+    /// A new series' x in a held raw cell, past its held raw slots, inserts a slot before every later column, which only the raw walk's insertion check sees (the envelope cell after it is unchanged): the prefix stops at it. Cells of width 256 from 0: raw x at 1 and 2, the new series' 3, an envelope at 300..=303, raw x at 1000..=1002.
+    #[test]
+    fn a_new_series_inserting_a_raw_slot_bounds_the_prefix() {
+        let a = vec![1.0, 2.0, 300.0, 301.0, 302.0, 303.0, 1000.0, 1001.0, 1002.0];
+        let ya: Vec<f64> = a.iter().map(|x| x * 2.0).collect();
+        let spec = GridSpec {
+            is_step_axis: false,
+            ..spec(4)
+        };
+        assert_eq!(
+            check(&[a, vec![3.0]], &[ya, vec![9.0]], &[9, 0], 0, spec),
+            2
+        );
     }
 
     #[test]
@@ -2668,7 +2616,7 @@ mod delta_planner_tests {
     }
 }
 
-/// Bucket every run onto one shared slot axis, by the chart's axis decision over `xs` (`decided`) and its geometry `spec`. Per run, `xs` and `kinds` are parallel (x ascending), as are `plot` and `raw` where not empty: `plot` holds the logged values (custom x's smoothed ones) and is empty for a run with a slot evaluator, `raw` holds the logged values when `is_smoothed`. `xnan` is each run's kind-4 anchors: the plottable x its unplottable samples (non-finite custom x, or negative x on a log axis) are carried to, or −∞ for a run with no plottable x (column 0). A run with a slot evaluator (`slot_evaluators`: smoothed step and time charts) takes every value from its smoother at the slot's x ([`SlotEvaluator`]); a smoothed run without one takes the samples in `plot` at raw slots and interpolates them at envelope slots. Labels and run ids are left for the caller to fill.
+/// Bucket every run onto one shared slot axis, by the chart's axis decision over `xs` (`decided`) and its geometry `spec`. Per run, `xs` and `kinds` are parallel (x ascending), as are `plot` and `raw` where not empty: `plot` holds the logged values (custom x's smoothed ones) and is empty for a run with a slot evaluator, `raw` holds the logged values when `is_smoothed`. `xnan` is each run's kind-4 anchors: the plottable x its unplottable samples (non-finite custom x, or on a log axis a negative x or a custom x of 0) are carried to, or −∞ for a run with no plottable x (column 0). A run with a slot evaluator (`slot_evaluators`: smoothed step and time charts) takes every value from its smoother at the slot's x ([`SlotEvaluator`]); a smoothed run without one takes the samples in `plot` at raw slots and interpolates them at envelope slots. Labels and run ids are left for the caller to fill.
 /// Also returns the axis layout, which the delta planner and held chart state read ([`incremental`]); `None` with no plottable point.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn shared_chart(
@@ -2705,7 +2653,7 @@ pub(crate) fn shared_chart(
             ),
             Some(incremental::HeldAxis::Passthrough),
         ),
-        AxisDecision::Downsample(grid, p_lo, g_first, g_last) => {
+        AxisDecision::Downsample(grid, g_first, g_last) => {
             let plan = plan_axis(xs, grid, spec);
             let (chart, plan) = if !plan.any_env_occupied() {
                 // Every cell came out raw (a log ladder over sparse-enough data): the distinct axis IS the chart, and the emission shape is passthrough's — band only under duplicate-x, exactly what the delta planner mirrors.
@@ -2748,7 +2696,6 @@ pub(crate) fn shared_chart(
             };
             let held = incremental::HeldAxis::Grid {
                 plan,
-                p_lo,
                 g_first,
                 g_last,
             };
@@ -2758,7 +2705,7 @@ pub(crate) fn shared_chart(
 }
 
 /// Merge "unplottable x" annotations (kind 4: non-finite custom-x, negative x
-/// on a log axis) into a run's markers, each on the slot holding its anchor
+/// on a log axis, or a custom x of 0 there) into a run's markers, each on the slot holding its anchor
 /// sample (`slot_of`). A y-kind already at that slot wins (it says strictly
 /// more). Also the single place markers are sorted and de-duplicated by slot.
 fn fold_xnan(a: &mut DenseSeries, xnan: &[f64], slot_of: impl Fn(f64) -> usize) {
@@ -2921,8 +2868,8 @@ fn bucket_run(
     let mut p = 0usize;
     for j in 0..m {
         let x = rx[j];
-        let env_cell = grid.index(x).filter(|&c| ma.plan.env[c]);
-        if let Some(c) = env_cell {
+        let c = grid.index(x);
+        if ma.plan.env[c] {
             if rk[j] != 0 {
                 if nfkind[c] == 0 {
                     nfkind[c] = rk[j];
@@ -3572,6 +3519,16 @@ mod shared_chart_tests {
             is_step_axis: true,
             log_buckets: true,
             shift_one: true,
+        }
+    }
+
+    /// A custom-x log chart's: its ladder never shifts.
+    fn log_custom_spec(target: usize) -> GridSpec {
+        GridSpec {
+            target,
+            is_step_axis: false,
+            log_buckets: true,
+            shift_one: false,
         }
     }
 
@@ -4252,7 +4209,7 @@ mod shared_chart_tests {
     #[test]
     fn log_ladder_matches_doc_example() {
         let kind = GridKind::Log { m: 2, shift: false };
-        let id = |x: f64| Grid::id(kind, x).unwrap();
+        let id = |x: f64| Grid::id(kind, x);
         assert_eq!(id(16.0), id(19.9));
         assert_eq!(id(20.0), id(16.0) + 1);
         assert_eq!(id(24.0), id(16.0) + 2);
@@ -4272,6 +4229,33 @@ mod shared_chart_tests {
         };
         assert_eq!(g.width(0), 4.0);
         assert_eq!(g.width(4), 8.0);
+    }
+
+    /// An x below [`OCTAVE_MIN`]'s octave joins that octave's bottom cell.
+    #[test]
+    fn log_ladder_merges_the_octaves_below_its_floor() {
+        let kind = GridKind::Log { m: 2, shift: false };
+        let bottom = Grid::id(kind, pow2(OCTAVE_MIN));
+        assert_eq!(Grid::id(kind, pow2(OCTAVE_MIN - 100)), bottom);
+        assert_eq!(Grid::id(kind, f64::MIN_POSITIVE / 2.0), bottom);
+    }
+
+    /// The ladder takes the finest subdivision whose cells over the span fit the target: 16..=256 spans octaves 4 to 8, 5 cells at m = 0 and 9 at m = 1.
+    #[test]
+    fn the_ladder_takes_the_finest_tier_within_target() {
+        let grid = |target| {
+            let g = make_grid_from(16.0, 256.0, log_custom_spec(target));
+            (g.kind, g.cells)
+        };
+        assert_eq!(grid(8), (GridKind::Log { m: 0, shift: false }, 5));
+        assert_eq!(grid(9), (GridKind::Log { m: 1, shift: false }, 9));
+    }
+
+    /// A ladder from an x at or below its shifted zero fails the build rather than anchor at that x's magnitude: here 0 on a custom-x ladder, which never shifts.
+    #[test]
+    #[should_panic(expected = "at or below its shifted zero")]
+    fn a_ladder_from_its_shifted_zero_fails() {
+        make_grid_from(0.0, 10.0, log_custom_spec(8));
     }
 
     /// A log step chart is a MIXTURE: exact raw slots where buckets would
@@ -4394,77 +4378,6 @@ mod shared_chart_tests {
         );
         assert!(sc.xr_min[2].is_nan(), "raw slots carry no x extent");
     }
-
-    /// Same defense-in-depth on the DOWNSAMPLE arm: nonpositive interior x on
-    /// a custom-x log grid sit below the ladder and must lead the axis as
-    /// exact raw slots — never bucketed, never dropped — while the positive
-    /// range buckets normally around them.
-    #[test]
-    fn log_below_grid_interior_x_leads_as_raw_slots() {
-        // -5, -4, -3 are all below-grid raw slots.
-        // 100..=119 spans one octave: at target 8 the ladder picks m = 4
-        // (width-4 cells), so every four-point cell is an envelope, including
-        // the final [116,120) cell.
-        let mut x = vec![-5.0, -4.0, -3.0];
-        x.extend((100..=119).map(|i| i as f64));
-        let ys: Vec<f64> = x.iter().map(|v| v * 2.0).collect();
-        let kinds = vec![vec![0u8; x.len()]];
-        let spec = GridSpec {
-            target: 8,
-            is_step_axis: false,
-            log_buckets: true,
-            shift_one: false,
-        };
-        let sc = run_spec(&[x], &[ys], &kinds, false, spec);
-        assert_eq!(
-            sc.x_values,
-            vec![-5.0, -4.0, -3.0, 101.5, 105.5, 109.5, 113.5, 117.5]
-        );
-        let s = &sc.series[0];
-        assert_eq!(
-            s.values[1], -8.0,
-            "below-grid raw slot keeps the exact sample"
-        );
-        assert_eq!(
-            (s.min_values[1], s.max_values[1]),
-            (-8.0, -8.0),
-            "band pinches to the line there"
-        );
-        assert_eq!(
-            (sc.xr_min[3], sc.xr_max[3]),
-            (100.0, 103.0),
-            "first envelope bucket extent"
-        );
-        assert_eq!(
-            (*sc.xr_min.last().unwrap(), *sc.xr_max.last().unwrap()),
-            (116.0, 119.0),
-            "last cell follows the same envelope rule"
-        );
-        assert!(sc.xr_min[1].is_nan(), "raw slots carry no x extent");
-    }
-
-    /// Negative x arrives pre-filtered into the xnan channel on log charts
-    /// (query.rs) and becomes a kind-4 exceptional marker — but if one ever
-    /// reaches the grid, it must land raw, never bucketed or dropped.
-    #[test]
-    fn log_stray_nonpositive_x_stays_raw() {
-        let xs = vec![vec![-5.0, 0.0, 1.0, 2.0, 3.0]];
-        let ys = vec![vec![1.0, 2.0, 3.0, 4.0, 5.0]];
-        let kinds = vec![vec![0u8; 5]];
-        // Custom-x log (no shift): -5 and 0 are below the ladder.
-        let spec = GridSpec {
-            target: 100,
-            is_step_axis: false,
-            log_buckets: true,
-            shift_one: false,
-        };
-        let sc = run_spec(&xs, &ys, &kinds, false, spec);
-        assert_eq!(
-            sc.x_values,
-            vec![-5.0, 0.0, 1.0, 2.0, 3.0],
-            "distinct ≤ target: passthrough keeps them all"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -4563,7 +4476,7 @@ mod slot_smoother_tests {
             let width = Floor::of(kind);
             let mut x = 1.0f64;
             while x < 1e6 {
-                let id = Grid::id(kind, x).unwrap();
+                let id = Grid::id(kind, x);
                 let bucket = pow2((id.div_euclid(1i64 << m)) as i32 - m);
                 let w = width.at(x);
                 assert!(
