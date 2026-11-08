@@ -1,6 +1,6 @@
 //! The dense chart model, its wire codec, and the delta slice/splice — shared by server and frontend.
 //!
-//! Lives next to kymo.proto because it IS wire contract: both crates include this file verbatim (`#[path]` module) and must agree across independent deploys. The MODEL ([`DenseChart`]) is what both sides compute over — axis-length columns, NaN = no data in that slot — and what the result hashes pin. The WIRE (proto ChartSeries/ChartResponse) carries no filler: occupancy ships as ranges of dense column indices with strictly finite f32 values ([`emit_series`]); the client re-inflates to the model at receipt ([`inflate_series`]/[`inflate_chart`]). The emit/inflate pair lives here so it cannot drift — each side only moves fields into/out of its generated types. Deciding what to ship is server-side frontier reconstruction (ChartCacheState, query.rs); this module only defines what delta columns mean: a continuation carries positions [from_col..) with markers and segment starts kept absolute ([`slice_series`]); the client keeps its first from_col columns and appends ([`splice_series`]).
+//! Lives next to kymo.proto because it IS wire contract: both crates include this file verbatim (`#[path]` module) and must agree across independent deploys. The MODEL ([`DenseChart`]) is what both sides compute over — axis-length columns, NaN = no data in that slot — and what the result hashes pin. The WIRE (proto ChartSeries/ChartResponse) carries no filler: occupancy ships as ranges of dense column indices with strictly finite f32 values ([`emit_series`]); the client re-inflates to the model at receipt ([`inflate_series`]/[`inflate_chart`]). The emit/inflate pair lives here so it cannot drift — each side only moves fields into/out of its generated types. Deciding what to ship is server-side frontier reconstruction (ChartCacheState, query.rs); this module only defines what delta columns mean: a continuation carries positions [from_col..) with markers and segment starts kept absolute ([`emit_series`]); the client keeps its first from_col columns and appends ([`splice_series`]).
 
 /// Private frontier-map wire ABI for exact semantic smoothing state. Version 2 deliberately supersedes the initial v1 two-word bandwidth tuple so any cached v1 response fails closed to a full answer.
 pub const SMOOTHING_STATE_VERSION_KEY: &str = "\0kymo:smoothing-version";
@@ -36,15 +36,22 @@ pub fn round_y(v: f64) -> f64 {
     (v.clamp(-f64::from(f32::MAX), f64::from(f32::MAX)) as f32) as f64
 }
 
-/// Occupancy of a dense column as (start, len) runs of finite entries — "ranges of dense column indices". NaN slots are simply not listed: the wire carries no filler.
-pub fn segment_spans(dense: &[f64]) -> (Vec<u32>, Vec<u32>) {
-    let mut starts = Vec::new();
-    let mut lens = Vec::new();
+/// Occupancy of a dense column as (start, len) runs of finite entries — "ranges of dense column indices", the column's first entry at index `offset` (a delta tail's starts are absolute). NaN slots are simply not listed: the wire carries no filler.
+fn segment_spans(dense: impl Iterator<Item = f64> + Clone, offset: usize) -> (Vec<u32>, Vec<u32>) {
+    // Sized exactly, counting the runs first: grown by doubling, a series whose samples alternate with gaps, a run per sample, would hold up to twice them.
+    let (mut runs, mut open) = (0usize, false);
+    for v in dense.clone() {
+        let finite = v.is_finite();
+        runs += usize::from(finite && !open);
+        open = finite;
+    }
+    let mut starts = Vec::with_capacity(runs);
+    let mut lens = Vec::with_capacity(runs);
     let mut run_open = false;
-    for (i, &v) in dense.iter().enumerate() {
+    for (i, v) in dense.enumerate() {
         if v.is_finite() {
             if !run_open {
-                starts.push(i as u32);
+                starts.push((offset + i) as u32);
                 lens.push(0u32);
                 run_open = true;
             }
@@ -56,19 +63,11 @@ pub fn segment_spans(dense: &[f64]) -> (Vec<u32>, Vec<u32>) {
     (starts, lens)
 }
 
-/// The finite entries of a dense column, in order, as wire f32 — parallel to [`segment_spans`]. The caller guarantees [`round_y`]-rounded input, so the cast is exact.
-pub fn finite_f32(dense: &[f64]) -> Vec<f32> {
-    dense
-        .iter()
-        .filter(|v| v.is_finite())
-        .map(|&v| v as f32)
-        .collect()
-}
-
-/// Occupancy-compress a dense column: [`segment_spans`] + [`finite_f32`] in one call.
-pub fn compress_segments(dense: &[f64]) -> (Vec<u32>, Vec<u32>, Vec<f32>) {
-    let (starts, lens) = segment_spans(dense);
-    (starts, lens, finite_f32(dense))
+/// The finite entries of a dense column, in order, as wire f32 — parallel to [`segment_spans`], whose run lengths sum to `len`: the vector is sized exactly, where one grown by doubling would hold up to twice its entries at a build's peak. The caller guarantees [`round_y`]-rounded input, so the cast is exact.
+fn finite_f32(dense: impl Iterator<Item = f64>, len: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(len);
+    out.extend(dense.filter(|v| v.is_finite()).map(|v| v as f32));
+    out
 }
 
 /// Inflate segments back to a dense column of length `n`, NaN elsewhere. `offset` shifts the absolute starts (a delta tail's columns are absolute; the tail vector is not) — any out-of-range or non-parallel shape is a protocol violation and returns None so the caller refuses instead of rendering a misaligned chart. Generic over the wire float width (f32 series values, f64 x extents).
@@ -205,6 +204,7 @@ pub struct WireSeriesOwned {
 
 impl WireSeriesOwned {
     /// Borrow as the inflater's view — the codec pair meets in this module's tests without either side's proto types.
+    #[cfg(test)]
     pub fn view(&self) -> WireSeries<'_> {
         WireSeries {
             label: &self.label,
@@ -226,56 +226,51 @@ impl WireSeriesOwned {
 
 /// Wire form of one dense series over columns [c..] (0 = the whole series, from_col for a continuation's tail): occupancy segments with ABSOLUTE column starts, strictly finite f32 values, markers absolute, band entries only where the envelope says more than the value — [`inflate_series`] re-derives min == max == value everywhere else. The inverse of that inflation, kept beside it so the codec pair cannot drift.
 pub fn emit_series(s: &DenseSeries, c: usize) -> WireSeriesOwned {
-    let t = slice_series(s, c);
-    let (mut seg_starts, seg_lens, values) = compress_segments(&t.values);
-    for st in &mut seg_starts {
-        *st += c as u32;
+    // Borrowed, not copied: a copy of the columns would sit beside the model while the reply is encoded, at a build's peak.
+    fn tail(v: &[f64], c: usize) -> &[f64] {
+        &v[c.min(v.len())..]
     }
+    let values = tail(&s.values, c);
+    let (seg_starts, seg_lens) = segment_spans(values.iter().copied(), c);
+    let finite = seg_lens.iter().sum::<u32>() as usize;
     // Raw rides parallel to the value occupancy (they exist at exactly the same slots: both are the run's finite samples).
-    let raw_values: Vec<f32> = if t.raw_values.is_empty() {
-        Vec::new()
-    } else {
-        t.values
+    let raw = tail(&s.raw_values, c);
+    let mut raw_values = Vec::with_capacity(finite.min(raw.len()));
+    raw_values.extend(
+        values
             .iter()
-            .zip(&t.raw_values)
+            .zip(raw)
             .filter(|(v, _)| v.is_finite())
-            .map(|(_, &r)| r as f32)
-            .collect()
-    };
-    let (band_seg_starts, band_seg_lens, band_min, band_max) = if t.min_values.is_empty() {
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new())
-    } else {
-        // Mask the derivable entries (band == value, bitwise on the rounded model): what remains is the real information — bucket spreads, duplicate-x spreads, and marker-slot bands (value NaN there, so they always differ).
-        let mut mn = vec![f64::NAN; t.values.len()];
-        let mut mx = vec![f64::NAN; t.values.len()];
-        for i in 0..t.values.len() {
-            let (lo, hi, v) = (t.min_values[i], t.max_values[i], t.values[i]);
+            .map(|(_, &r)| r as f32),
+    );
+    // Mask the derivable entries (band == value, bitwise on the rounded model): what remains is the real information — bucket spreads, duplicate-x spreads, and marker-slot bands (value NaN there, so they always differ). A band-less series zips to nothing.
+    let band = values
+        .iter()
+        .zip(tail(&s.min_values, c).iter().zip(tail(&s.max_values, c)))
+        .map(|(&v, (&lo, &hi))| {
             if !lo.is_nan() && (lo.to_bits() != v.to_bits() || hi.to_bits() != v.to_bits()) {
-                mn[i] = lo;
-                mx[i] = hi;
+                (lo, hi)
+            } else {
+                (f64::NAN, f64::NAN)
             }
-        }
-        let (mut bs, bl, bmn) = compress_segments(&mn);
-        let bmx = finite_f32(&mx);
-        for st in &mut bs {
-            *st += c as u32;
-        }
-        (bs, bl, bmn, bmx)
-    };
+        });
+    let (band_seg_starts, band_seg_lens) = segment_spans(band.clone().map(|(lo, _)| lo), c);
+    let banded = band_seg_lens.iter().sum::<u32>() as usize;
+    let (nan_indices, nan_kinds) = markers(s, c as u32, false);
     WireSeriesOwned {
-        label: t.label,
-        run_id: t.run_id,
+        label: s.label.clone(),
+        run_id: s.run_id.clone(),
         seg_starts,
         seg_lens,
-        values,
+        values: finite_f32(values.iter().copied(), finite),
         raw_values,
         band_seg_starts,
         band_seg_lens,
-        band_min,
-        band_max,
-        nan_indices: t.nan_indices,
-        nan_kinds: t.nan_kinds,
-        xnan_count: t.xnan_count,
+        band_min: finite_f32(band.clone().map(|(lo, _)| lo), banded),
+        band_max: finite_f32(band.map(|(_, hi)| hi), banded),
+        nan_indices,
+        nan_kinds,
+        xnan_count: s.xnan_count,
     }
 }
 
@@ -283,12 +278,15 @@ pub fn emit_series(s: &DenseSeries, c: usize) -> WireSeriesOwned {
 pub fn emit_xr(chart: &DenseChart, c: usize) -> (Vec<u32>, Vec<u32>, Vec<f64>, Vec<f64>) {
     let tail_min = &chart.xr_min[c.min(chart.xr_min.len())..];
     let tail_max = &chart.xr_max[c.min(chart.xr_max.len())..];
-    let (mut starts, lens) = segment_spans(tail_min);
-    for st in &mut starts {
-        *st += c as u32;
-    }
-    let xr_min: Vec<f64> = tail_min.iter().copied().filter(|v| v.is_finite()).collect();
-    let xr_max: Vec<f64> = tail_max.iter().copied().filter(|v| v.is_finite()).collect();
+    let (starts, lens) = segment_spans(tail_min.iter().copied(), c);
+    // Sized exactly, as [`finite_f32`]'s are.
+    let len = lens.iter().sum::<u32>() as usize;
+    let finite = |tail: &[f64]| {
+        let mut out = Vec::with_capacity(len);
+        out.extend(tail.iter().copied().filter(|v| v.is_finite()));
+        out
+    };
+    let (xr_min, xr_max) = (finite(tail_min), finite(tail_max));
     (starts, lens, xr_min, xr_max)
 }
 
@@ -324,32 +322,14 @@ pub fn inflate_chart<'a>(
     })
 }
 
-/// Columns `[c..]` of one series, markers kept absolute — what a delta response carries per continuing series. An absent vector stays absent: `[c.min(len)..]` of nothing is nothing.
-pub fn slice_series(s: &DenseSeries, c: usize) -> DenseSeries {
-    let tail = |v: &[f64]| v[c.min(v.len())..].to_vec();
-    let (nan_indices, nan_kinds) = markers(s, c as u32, false);
-    DenseSeries {
-        label: s.label.clone(),
-        run_id: s.run_id.clone(),
-        values: tail(&s.values),
-        raw_values: tail(&s.raw_values),
-        min_values: tail(&s.min_values),
-        max_values: tail(&s.max_values),
-        nan_indices,
-        nan_kinds,
-        xnan_count: s.xnan_count, // whole-series scalar: a tail carries the full count
-    }
-}
-
 /// Splice a delta series onto the cached one at column `c`: the cached prefix `[..c]`, then the delta's columns. Two absent vectors join to absent. A family ABSENT in the cache but present in the delta materializes as NaN over the kept prefix: envelope families are absent exactly while a series has no finite sample, so one springing into existence means its first finite samples arrived — new, at or past `c` by the dirty-column rule — and the prefix is provably all-NaN. The reverse (cached present, delta absent alongside a non-empty tail) is a protocol violation the caller refuses (chart_sync splice_response). Labels/run_ids adopt the delta's — they can legitimately change.
 pub fn splice_series(cached: &DenseSeries, delta: &DenseSeries, c: usize) -> DenseSeries {
     let join = |a: &[f64], b: &[f64]| {
-        if a.is_empty() && !b.is_empty() {
-            let mut v = vec![f64::NAN; c];
-            v.extend_from_slice(b);
-            return v;
-        }
-        let mut v = a[..c.min(a.len())].to_vec();
+        let mut v = if a.is_empty() && !b.is_empty() {
+            vec![f64::NAN; c]
+        } else {
+            a[..c.min(a.len())].to_vec()
+        };
         v.extend_from_slice(b);
         v
     };
@@ -372,12 +352,19 @@ pub fn splice_series(cached: &DenseSeries, delta: &DenseSeries, c: usize) -> Den
 
 /// A series' (index, kind) markers on one side of column `c`, kinds defaulted to 1 where absent (the client renderer's rule).
 fn markers(s: &DenseSeries, c: u32, below: bool) -> (Vec<u32>, Vec<u32>) {
-    s.nan_indices
+    let n = s
+        .nan_indices
         .iter()
-        .enumerate()
-        .filter(|(_, &idx)| (idx < c) == below)
-        .map(|(j, &idx)| (idx, s.nan_kinds.get(j).copied().unwrap_or(1)))
-        .unzip()
+        .filter(|&&idx| (idx < c) == below)
+        .count();
+    let (mut indices, mut kinds) = (Vec::with_capacity(n), Vec::with_capacity(n));
+    for (j, &idx) in s.nan_indices.iter().enumerate() {
+        if (idx < c) == below {
+            indices.push(idx);
+            kinds.push(s.nan_kinds.get(j).copied().unwrap_or(1));
+        }
+    }
+    (indices, kinds)
 }
 
 /// FNV-1a over 64-bit words. Not cryptographic — the result hashes guard against bugs, not adversaries; what matters is that any divergent bit, length, or family assignment moves the hash, deterministically and identically in both crates.
@@ -503,7 +490,8 @@ mod tests {
         ];
         for dense in cases {
             let rounded: Vec<f64> = dense.iter().map(|&v| round_y(v)).collect();
-            let (starts, lens, vals) = compress_segments(&rounded);
+            let (starts, lens) = segment_spans(rounded.iter().copied(), 0);
+            let vals = finite_f32(rounded.iter().copied(), lens.iter().sum::<u32>() as usize);
             assert!(
                 vals.iter().all(|v| v.is_finite()),
                 "wire values must be finite"
@@ -518,10 +506,11 @@ mod tests {
 
     #[test]
     fn segments_offset_and_violations() {
-        let dense = vec![f64::NAN, 1.0, 2.0, f64::NAN, 3.0];
-        let (starts, lens, vals) = compress_segments(&dense);
+        let dense = [f64::NAN, 1.0, 2.0, f64::NAN, 3.0];
+        let (starts, lens) = segment_spans(dense.iter().copied(), 0);
+        let vals = finite_f32(dense.iter().copied(), 3);
         // A delta tail: same segments, absolute starts, expanded into a shorter tail vector.
-        let shifted: Vec<u32> = starts.iter().map(|s| s + 10).collect();
+        let (shifted, _) = segment_spans(dense.iter().copied(), 10);
         let tail = expand_segments(&shifted, &lens, &vals, dense.len(), 10).unwrap();
         assert_eq!(
             tail.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
@@ -554,7 +543,7 @@ mod tests {
 
     #[test]
     fn emit_matches_inflate_bit_for_bit() {
-        // The codec pair at series level: emit's band masking (entries only where the envelope says more) must inflate back bit-for-bit under the dense-envelope derivation, for full series and delta tails alike.
+        // The codec pair at series level: emit's band masking (entries only where the envelope says more) must inflate back bit-for-bit under the dense-envelope derivation, for full series and delta tails alike — the inflated tail spliced onto the first `c` columns rebuilds the series.
         for (envelope, raw) in [(true, false), (false, true), (false, false), (true, true)] {
             let mut s = series(90, 13, envelope, raw);
             if envelope {
@@ -563,9 +552,29 @@ mod tests {
                     s.min_values[i] = s.values[i];
                     s.max_values[i] = s.values[i];
                 }
+                // Bands that say more on one side only: emit must keep them.
+                for i in 60..65 {
+                    s.min_values[i] = s.values[i];
+                }
+                for i in 65..70 {
+                    s.max_values[i] = s.values[i];
+                }
             }
-            for c in [0usize, 45] {
+            for c in [0usize, 1, 45, 89, 90] {
                 let w = emit_series(&s, c);
+                // Every wire vector is sized exactly: grown by doubling, one would hold up to twice its entries at a build's peak.
+                let words = [
+                    &w.seg_starts,
+                    &w.seg_lens,
+                    &w.band_seg_starts,
+                    &w.band_seg_lens,
+                    &w.nan_indices,
+                    &w.nan_kinds,
+                ];
+                let floats = [&w.values, &w.raw_values, &w.band_min, &w.band_max];
+                let exact = words.iter().all(|v| v.capacity() == v.len())
+                    && floats.iter().all(|v| v.capacity() == v.len());
+                assert!(exact, "envelope={envelope} raw={raw} c={c}: spare capacity");
                 assert!(
                     w.values.iter().all(|v| v.is_finite()),
                     "wire values must be finite"
@@ -579,7 +588,7 @@ mod tests {
                 let n = s.values.len() - c;
                 let tail = inflate_series(&w.view(), n, c, envelope, raw).unwrap();
                 assert!(
-                    cols_eq(&tail, &slice_series(&s, c)),
+                    cols_eq(&splice_series(&truncated(&s, c), &tail, c), &s),
                     "envelope={envelope} raw={raw} c={c}"
                 );
             }
@@ -599,26 +608,9 @@ mod tests {
     }
 
     #[test]
-    fn slice_then_splice_roundtrips() {
-        for (envelope, raw) in [(true, false), (false, true), (false, false), (true, true)] {
-            let new = series(90, 13, envelope, raw);
-            for c in [1usize, 45, 89, 90] {
-                let old = truncated(&new, c); // cached holds >= from_col columns
-                let sliced = slice_series(&new, c);
-                let rejoined = splice_series(&old, &sliced, c);
-                assert!(
-                    cols_eq(&rejoined, &new),
-                    "envelope={envelope} raw={raw} c={c}"
-                );
-            }
-        }
-    }
-
-    #[test]
     fn not_modified_is_an_empty_slice() {
-        let s = series(30, 2, true, false);
-        let sliced = slice_series(&s, 30);
-        assert!(sliced.values.is_empty() && sliced.nan_indices.is_empty());
+        let w = emit_series(&series(30, 2, true, false), 30);
+        assert!(w.values.is_empty() && w.nan_indices.is_empty());
     }
 
     #[test]
@@ -633,8 +625,8 @@ mod tests {
         let mut old = truncated(&new, 25);
         old.min_values.clear();
         old.max_values.clear();
-        let sliced = slice_series(&new, 25);
-        let rejoined = splice_series(&old, &sliced, 25);
+        let tail = inflate_series(&emit_series(&new, 25).view(), 15, 25, true, false).unwrap();
+        let rejoined = splice_series(&old, &tail, 25);
         assert!(cols_eq(&rejoined, &new));
     }
 
@@ -683,8 +675,8 @@ mod tests {
         // What the verification relies on: the client's accumulated splices hash identically to the response computed from scratch.
         let new = series(90, 13, true, false);
         let old = truncated(&new, 45);
-        let sliced = slice_series(&new, 45);
-        let rejoined = splice_series(&old, &sliced, 45);
+        let tail = inflate_series(&emit_series(&new, 45).view(), 45, 45, true, false).unwrap();
+        let rejoined = splice_series(&old, &tail, 45);
         assert_eq!(hash_series(&rejoined), hash_series(&new));
     }
 }

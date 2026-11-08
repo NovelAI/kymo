@@ -281,37 +281,11 @@ impl Tally {
     }
 }
 
-/// The work an advance may do, in row reads plus smoother outputs: per appended row, per series and per recomputed slot, each output priced at the smoother's per-output cost (an irregular Savitzky–Golay output fits its window), and the samples in the windows of the irregular Savitzky-Golay outputs it recomputed, which may hold held samples (clustered timestamps) and appended ones (a stalled clock), though never past twice what the full build of the same inputs costs (`full`, in [`Fallback::Dense`]'s unit). Nothing else scales with a series' held length but logarithmic searches.
-#[allow(clippy::too_many_arguments)]
-fn work_bound(
-    req: &proto::ChartRequest,
-    irregular: bool,
-    appended: usize,
-    series: usize,
-    slots: usize,
-    windows: usize,
-    full: usize,
-    n_max: usize,
-) -> usize {
-    let smoothing = req
-        .smoothing
-        .filter(|s| s.algorithm != Algorithm::None as i32);
-    let window =
-        smoothing.map_or(0, |s| s.window_size.clamp(3, chart::MAX_SMOOTHING_WINDOW)) as usize;
-    let per_output = match smoothing.map(|s| s.algorithm) {
-        None => 2,
-        Some(a) if a == Algorithm::SavitzkyGolay as i32 && irregular => 8 * (window + 2),
-        Some(a) if a == Algorithm::SavitzkyGolay as i32 => 16,
-        Some(_) => 4,
-    };
+/// The work an advance may do, in row reads plus causal samples folded: per appended row, per series (a checkpoint replay) and per recomputed slot, and the samples in the Savitzky-Golay windows of the slots it re-evaluates (`windows`), which may hold held samples (clustered timestamps) and appended ones (a stalled clock); the fuzz holds `windows` to the full build's. Nothing else scales with a series' held length but logarithmic searches.
+fn work_bound(appended: usize, series: usize, slots: usize, windows: usize, n_max: usize) -> usize {
     let log = (usize::BITS - n_max.leading_zeros()) as usize + 2;
-    let outputs =
-        appended + series * (2 * chart::CAUSAL_CHECKPOINT_STRIDE + 8 * window + 128) + slots * 64;
-    per_output * outputs
-        + 32 * appended
-        + series * (64 * log + 512)
-        + slots * (16 * log + 32)
-        + (4 * windows).min(2 * full)
+    let per_series = 4 * chart::CAUSAL_CHECKPOINT_STRIDE + 64 * log + 768;
+    34 * appended + series * per_series + slots * (16 * log + 160) + 4 * windows
 }
 
 fn stuck_value(rng: &mut Rng) -> f32 {
@@ -461,10 +435,10 @@ fn fuzz_case(seed: u64, polls: usize, tally: &mut Tally) {
     sparse_request(&mut rng, &mut base, &world);
     extend_request(&mut ext, &mut base, &world);
     tally.cases += 1;
-    // What the client holds: the last response it received.
-    let mut client: Option<proto::ChartResponse> = None;
+    // What the client holds: the last response it received and the model it inflated or spliced from it.
+    let mut client: Option<(proto::ChartResponse, DenseChart)> = None;
     for poll in 0..polls {
-        // Data: appends of varied size (crossing Savitzky–Golay block and checkpoint boundaries), sometimes late, rewritten, evicted, or in a new tag.
+        // Data: appends of varied size (crossing checkpoint boundaries), sometimes late, rewritten, evicted, or in a new tag.
         let mut increments: Vec<Vec<VersionedRawPoint>> = vec![Vec::new(); nruns];
         if poll > 0 {
             let late = rng.chance(4);
@@ -545,7 +519,7 @@ fn fuzz_case(seed: u64, polls: usize, tally: &mut Tally) {
             client = None;
         }
         let lose = rng.chance(6);
-        req.cache_state = client.as_ref().and_then(echo);
+        req.cache_state = client.as_ref().and_then(|(held, _)| echo(held));
         if canonicalize_chart_request(&mut req).is_err() {
             continue;
         }
@@ -559,6 +533,9 @@ fn fuzz_case(seed: u64, polls: usize, tally: &mut Tally) {
             .collect();
         tally.polls += 1;
 
+        // Samples the Savitzky-Golay slot fits read: an advance re-evaluates some of the full build's slots, each over the same window.
+        let windows = || chart::SAVGOL_READS.with(|reads| reads.replace(0));
+        windows();
         let truth = match build_chart(&req, &snapshots, None, false, None, &|_| {}, true) {
             Ok(truth) => truth,
             Err(status) => {
@@ -579,7 +556,7 @@ fn fuzz_case(seed: u64, polls: usize, tally: &mut Tally) {
         let cutoffs = lineages.verified().map(|verified| verified.cutoffs());
         let (entry, _) = store.take(&key, &snapshots, cutoffs);
         // The rows the entry has not seen: a client that lost responses advances an older entry across several polls' appends.
-        let unseen: usize = entry.as_ref().map_or(0, |entry| {
+        let appended: usize = entry.as_ref().map_or(0, |entry| {
             snapshots
                 .iter()
                 .zip(entry.maxima())
@@ -592,8 +569,13 @@ fn fuzz_case(seed: u64, polls: usize, tally: &mut Tally) {
                 })
                 .sum()
         });
+        let full_windows = windows();
+        let held_even = entry.as_ref().map_or(Vec::new(), |entry| entry.shape().1);
+        chart::FLOOR_GROWN.with(|grown| grown.set(0));
         let outcome =
             entry.and_then(|entry| held::advance(&entry, &req, &p, &snapshots, &lineages));
+        let advance_windows = windows();
+        let floor_grown = chart::FLOOR_GROWN.with(|grown| grown.get()) > 0;
         let context = || {
             format!(
                 "seed {seed} poll {poll}: req={:?} kind={:?}",
@@ -627,22 +609,17 @@ fn fuzz_case(seed: u64, polls: usize, tally: &mut Tally) {
                 if let Some(difference) = advanced.next.state_difference(captured) {
                     panic!("{}: held state differs: {difference}", context());
                 }
-                let appended: usize = unseen.max(increments.iter().map(Vec::len).sum());
                 let n_max = snapshots.iter().map(|s| s.len()).max().unwrap_or(0);
-                let irregular = advanced
-                    .next
-                    .shape()
-                    .1
-                    .iter()
-                    .any(|plan| matches!(plan, chart::SmoothingPlan::Median(_)));
+                assert!(
+                    advance_windows <= full_windows,
+                    "{}: slot fits read {advance_windows} samples, the full build's {full_windows}",
+                    context()
+                );
                 let bound = work_bound(
-                    &req,
-                    irregular,
                     appended,
                     advanced.next.model().series.len(),
                     advanced.work.rebuild.slots,
-                    advanced.work.windows,
-                    captured.full_build_cost(),
+                    advance_windows,
                     n_max,
                 );
                 assert!(
@@ -663,7 +640,7 @@ fn fuzz_case(seed: u64, polls: usize, tally: &mut Tally) {
                 }
                 let algorithm = req.smoothing.map_or(0, |s| s.algorithm as usize);
                 tally.algorithms_served[[0, 0, 1, 0, 2, 3][algorithm.min(5)]] += 1;
-                let (axis, plans) = advanced.next.shape();
+                let (axis, even) = advanced.next.shape();
                 let rebuild = advanced.work.rebuild;
                 tally.cover(axis, true);
                 tally.cover("time", req.use_timestamp_axis);
@@ -675,19 +652,15 @@ fn fuzz_case(seed: u64, polls: usize, tally: &mut Tally) {
                 tally.cover("inserted_slots", rebuild.inserted_slots > 0);
                 tally.cover("flipped_cells", rebuild.flipped_cells > 0);
                 tally.cover("moved_centers", rebuild.moved > 0);
-                tally.cover("relerped", rebuild.relerped > 0);
+                tally.cover("reached", rebuild.reached > 0);
                 tally.cover("folded_slots", rebuild.folded >= 64);
                 tally.cover("replays", advanced.work.replays > 0);
+                // A median plan kept across an append that broke its even spacing, which splices.
                 tally.cover(
-                    "uniform_plan",
-                    plans.contains(&chart::SmoothingPlan::Uniform),
+                    "broke_even_spacing",
+                    held_even.iter().zip(&even).any(|(&was, &is)| was && !is),
                 );
-                tally.cover(
-                    "median_plan",
-                    plans
-                        .iter()
-                        .any(|plan| matches!(plan, chart::SmoothingPlan::Median(_))),
-                );
+                tally.cover("floored_ladder", floor_grown);
                 tally.cover(
                     "kind4_markers",
                     advanced
@@ -711,7 +684,6 @@ fn fuzz_case(seed: u64, polls: usize, tally: &mut Tally) {
                     advanced.next.model().series.len() > req.y_series.len(),
                 );
                 tally.cover("first_paint", frontiers.is_none());
-                tally.cover("nonfinite_tail", advanced.next.longest_hole() >= 1_000);
                 store.insert(key, advanced.next);
             }
             Err(reason) => {
@@ -793,14 +765,20 @@ fn fuzz_case(seed: u64, polls: usize, tally: &mut Tally) {
             }
         }
         if !lose {
-            client = Some(truth.response.clone());
+            // The client splices a delta onto its model, checking the result hashes, so a planner unsoundness the advance shares with the full build fails here too.
+            let model = match &client {
+                Some((_, model)) if truth.response.delta => splice(model, &truth.response),
+                _ => inflate_full(&truth.response),
+            };
+            client = Some((truth.response.clone(), model));
         }
     }
 }
 
 fn fuzz(cases: u64, polls: usize, seed: u64) -> Tally {
     let mut tally = Tally::default();
-    let mut rng = Rng(seed | 1);
+    // Every seed its own stream but 0, which xorshift would never leave and so runs 1's (`| 1` would pair each even seed with the odd one after it).
+    let mut rng = Rng(seed.max(1));
     for _ in 0..cases {
         let case_seed = rng.next();
         fuzz_case(case_seed, polls, &mut tally);
@@ -856,16 +834,15 @@ fn held_state_advances_bit_identically_to_the_full_build() {
         "inserted_slots",
         "flipped_cells",
         "moved_centers",
-        "relerped",
+        "reached",
         "folded_slots",
         "replays",
-        "uniform_plan",
-        "median_plan",
+        "broke_even_spacing",
+        "floored_ladder",
         "kind4_markers",
         "y_markers",
         "tagged",
         "first_paint",
-        "nonfinite_tail",
         "shadow_match",
         "memo_hit",
         "second_tab",
@@ -942,12 +919,23 @@ fn held_state_work_does_not_scale_with_history() {
             }
             next_step += appended;
             let poll_req = continuation(&req, &client);
+            let windows = || chart::SAVGOL_READS.with(|reads| reads.replace(0));
+            windows();
             let advanced = advance_held(&state, &poll_req, &snapshots).unwrap_or_else(|reason| {
                 panic!("{algorithm:?} time={use_time} log={log} tail={tail:?}: {reason:?}")
             });
+            // Each re-evaluated Savitzky-Golay slot reads its window, which the floor widens to about 1.4-2.8 of its bucket's samples (up to twice that near a log ladder's octave end): a few buckets, not the history.
+            let windows = windows();
+            let columns = advanced.next.model().x_values.len();
+            let bucket = 2 * HISTORY as usize / columns + 1;
+            assert!(
+                windows <= advanced.work.rebuild.slots * (6 * bucket + 64),
+                "{algorithm:?} time={use_time} log={log} poll {poll}: windows read {windows} for {} slots over buckets of about {bucket}",
+                advanced.work.rebuild.slots
+            );
             let work = advanced.work.rows + advanced.work.smoothed;
-            // A constant per series (a checkpoint replay, the smoother's windows, searches) and per appended row; one pass over the history would read 4 × 40,000 rows.
-            let bound = runs.len() * 2_500 + 300 * appended as usize * runs.len();
+            // A constant per series (a checkpoint replay, searches), per appended row and per sample in the re-evaluated windows; one pass over the history would read 4 × 40,000 rows.
+            let bound = runs.len() * 2_500 + 300 * appended as usize * runs.len() + 4 * windows;
             assert!(
                 work <= bound,
                 "{algorithm:?} time={use_time} log={log} tail={tail:?} poll {poll}: work {:?} over {bound}",
@@ -1018,14 +1006,17 @@ fn held_state_work_does_not_scale_with_a_slots_samples() {
                 .map(|(held, rows)| held.refreshed_fixture(&rows))
                 .collect();
             let poll = continuation(&req, &held);
+            let windows = || chart::SAVGOL_READS.with(|reads| reads.replace(0));
+            windows();
             let advanced = advance_held(&state, &poll, &grown)
                 .unwrap_or_else(|reason| panic!("{shape} {algorithm:?}: {reason:?}"));
+            let windows = windows();
             let truth = build_chart(&poll, &grown, None, false, None, &|_| {}, false).unwrap();
             assert_eq!(advanced.response, truth.response, "{shape} {algorithm:?}");
             println!("HELD SLOT WORK {shape} {algorithm:?}: {:?}", advanced.work);
             let bound = if shape == "stalled" && algorithm == Algorithm::SavitzkyGolay {
-                // Every Savitzky–Golay output of run b fits all its samples, at one x, so the appended one changes them all: they share one fit, and the advance reads a few rows per sample of the stall.
-                assert_eq!(advanced.work.windows, n as usize + 1);
+                // Run b's samples all sit in one raw slot, at one x, so the appended one there re-evaluates its fit, which reads every one of them (beside run a's re-evaluated windows), and the advance reads a few rows per sample of the stall.
+                assert!(windows > n as usize, "{windows}");
                 10 * (n as usize + 1)
             } else {
                 5_000
@@ -1040,17 +1031,12 @@ fn held_state_work_does_not_scale_with_a_slots_samples() {
     }
 }
 
-/// An unchanged poll recomputes nothing: at a stalled clock's end, behind a short non-finite run, it does not walk back recomputing irregular Savitzky-Golay outputs whose windows hold the whole stall.
+/// An unchanged poll recomputes nothing: at a stalled clock's end, behind a short non-finite run, it re-evaluates no Savitzky-Golay slot, though the last slots' windows hold the whole stall.
 #[test]
 fn an_unchanged_poll_at_a_stalled_clock_reads_few_rows() {
     let mut request = req(&["a"], 300);
     request.use_timestamp_axis = true;
-    request.smoothing = Some(proto::SmoothingConfig {
-        algorithm: Algorithm::SavitzkyGolay as i32,
-        window_size: 21,
-        poly_order: 2,
-        ..Default::default()
-    });
+    request.smoothing = smoothing(Algorithm::SavitzkyGolay, 21, 0.0, 2);
     let rows = || {
         Arc::new(
             (0..3_000i64)
@@ -1097,12 +1083,7 @@ fn an_audit_failure_answers_in_full_and_turns_held_state_off() {
         })
         .collect();
     let mut req = req(&runs, 300);
-    req.smoothing = Some(proto::SmoothingConfig {
-        algorithm: Algorithm::Ema as i32,
-        window_size: 0,
-        time_constant: 12.0,
-        poly_order: 1,
-    });
+    req.smoothing = smoothing(Algorithm::Ema, 0, 12.0, 1);
     let store = HeldStore::new(HeldMode::On, usize::MAX);
     let mut client: Option<proto::ChartResponse> = None;
     for poll in 0..8 {
@@ -1296,6 +1277,23 @@ fn advance_held(
 ) -> Result<held::Advanced, Fallback> {
     let lineages = inspect_lineages(req, snapshots, echoed_frontiers(req));
     held::advance(state, req, &chart_params(req), snapshots, &lineages)
+}
+
+/// [`advance_held`], which must answer and hold what the full build of the poll does (`at` names the case).
+fn advance_as_full_build(
+    state: &held::HeldChart,
+    req: &proto::ChartRequest,
+    snapshots: &[Arc<SeriesSnapshot>],
+    at: &str,
+) -> held::Advanced {
+    let advanced =
+        advance_held(state, req, snapshots).unwrap_or_else(|reason| panic!("{at}: {reason:?}"));
+    let truth = build_chart(req, snapshots, None, false, None, &|_| {}, true).unwrap();
+    assert_eq!(advanced.response, truth.response, "{at}");
+    assert_eq!(advanced.kind, truth.kind, "{at}");
+    let captured = truth.held.unwrap().unwrap();
+    assert_eq!(advanced.next.state_difference(&captured), None, "{at}");
+    advanced
 }
 
 fn reason(outcome: &Result<held::Advanced, Fallback>) -> Option<Fallback> {
@@ -1565,7 +1563,7 @@ fn rare_fallbacks_answer_with_the_full_build() {
     );
     assert_eq!(reason(&outcome), Some(Fallback::Unplottable));
 
-    // envelope_flip: a sparse time chart shipping passthrough-shaped (every cell under four distinct x) gains four x in one cell.
+    // envelope_flip: a sparse time chart shipping passthrough-shaped (every cell under four distinct x) gains four x in one cell; the full planner answers in full too.
     let mut shaped = req(&["a"], 12);
     shaped.use_timestamp_axis = true;
     let ts = |i: i64| {
@@ -1575,18 +1573,19 @@ fn rare_fallbacks_answer_with_the_full_build() {
             1_000_000 + 2_000 * 19 + (i - 19)
         }
     };
-    let (outcome, _) = advance_between(
+    let (outcome, truth) = advance_between(
         &shaped,
         &[rows_shaped(20, |i| i, ts)],
         &[rows_shaped(24, |i| i, ts)],
     );
     assert_eq!(reason(&outcome), Some(Fallback::EnvelopeFlip));
+    assert!(!truth.delta, "the full planner refuses it");
 
-    // plan_shift: one held sample has the index-space plan; samples appended at its timestamp are no spacing, so the full build takes the x-aware one. Run b's occupied envelope cells keep the chart off the passthrough shape, whose repeated-x check would answer in full anyway.
+    // plan_shift: one held sample's spacing is 1; samples appended 7 ms apart move its median to 7. Run b's occupied envelope cells keep the chart off the passthrough shape.
     let mut sg = req(&["a", "b"], 300);
     sg.use_timestamp_axis = true;
     sg.smoothing = smoothing(Algorithm::SavitzkyGolay, 20, 1.0, 2);
-    let at = |_| 2_005_000;
+    let at = |i| 2_005_000 + 7 * i;
     let spread = rows_shaped(2_000, |i| i, |i| 2_000_000 + 10 * i);
     let (outcome, _) = advance_between(
         &sg,
@@ -1596,18 +1595,19 @@ fn rare_fallbacks_answer_with_the_full_build() {
     assert_eq!(reason(&outcome), Some(Fallback::PlanShift));
 }
 
-/// A relative time axis checks every tag of a ref for a row before its tag's latest (relative_offsets_stable), tags no series reads included: the advance refuses the delta exactly when the full build does.
+/// A relative time axis checks every tag of a ref for a row before its tag's latest (relative_offsets_stable), tags no series reads included: the advance refuses the delta exactly when the full build does. Capture checks time order only on the tags a series reads: a chart is still captured when a held tag no series reads is out of time order, and advances by the delta.
 #[test]
 fn a_relative_axis_checks_tags_no_series_reads() {
     let mut request = req(&["a"], 300);
     request.use_timestamp_axis = true;
     request.relative_time = true;
     request.y_series[0].tags = vec!["g1".into()];
-    let history = |n: i64, backwards: bool| {
+    // Tag g0, which no series reads, logs step `early` at step 0's timestamp.
+    let history = |n: i64, early: i64| {
         let mut rows = Vec::new();
         for tag in ["g0", "g1"] {
             for step in 0..n {
-                let ts = if backwards && tag == "g0" && step == n - 1 {
+                let ts = if tag == "g0" && step == early {
                     1_000_000
                 } else {
                     1_000_000 + 10 * step
@@ -1617,14 +1617,15 @@ fn a_relative_axis_checks_tags_no_series_reads() {
         }
         Arc::new(rows)
     };
-    // g0's new row precedes its latest: the full build answers in full.
-    let (outcome, truth) = advance_between(&request, &[history(50, false)], &[history(51, true)]);
-    assert!(!truth.delta);
-    assert_eq!(outcome.expect("advanced").response, truth);
-    // A row after it keeps the delta.
-    let (outcome, truth) = advance_between(&request, &[history(50, false)], &[history(51, false)]);
-    assert!(truth.delta);
-    assert_eq!(outcome.expect("advanced").response, truth);
+    // g0's new row precedes its latest: the full build answers in full. With g0's step 20 held out of order, rows after its latest keep the delta.
+    for (held, grown, delta) in [
+        (history(50, 0), history(51, 50), false),
+        (history(50, 20), history(51, 20), true),
+    ] {
+        let (outcome, truth) = advance_between(&request, &[held], &[grown]);
+        assert_eq!(truth.delta, delta);
+        assert_eq!(outcome.expect("captured and advanced").response, truth);
+    }
 }
 
 /// Rows `0..n` of each of `tags`, a step and 10 ms apart, stamped by step.
@@ -1760,11 +1761,7 @@ fn an_audit_failure_never_poisons_the_memo() {
     let memo = crate::query::memo::ChartMemo::new(true);
     let store = HeldStore::new(HeldMode::On, usize::MAX);
     let mut request = req(&["a"], 300);
-    request.smoothing = Some(proto::SmoothingConfig {
-        algorithm: Algorithm::Ema as i32,
-        time_constant: 5.0,
-        ..Default::default()
-    });
+    request.smoothing = smoothing(Algorithm::Ema, 0, 5.0, 0);
     let rows = vec![rows(2_000, 5)];
     let mut client: Option<FixtureResponse> = None;
     for poll in 0..4 {
@@ -2064,126 +2061,6 @@ fn a_shadow_divergence_serves_the_full_build_and_keeps_shadow_on() {
     assert_eq!(counted.get("shadow_match"), Some(&1), "{counted:?}");
 }
 
-/// An irregular Savitzky-Golay advance costing more than the full build answers in full, bit for bit the full build, and counts `dense`: one with 2,000 repeats of the appended row's timestamp, which every fit it recomputes holds, and one recomputing most of the outputs, a window wide against its series, unless a longer series beside it, which the append does not reach, carries most of the full build's cost.
-#[test]
-fn dense_irregular_savitzky_golay_history_answers_in_full() {
-    for (repeats, window, beside, dense) in [
-        (30usize, 20u32, 0i64, false),
-        (2_000, 20, 0, true),
-        (0, 60, 0, false),
-        (0, 100, 0, true),
-        (0, 100, 2_000, false),
-    ] {
-        // 201 timestamps about 10 ms apart, then `repeats` more rows at the last one; the appended row repeats it too, or follows it without repeats.
-        let rows: Vec<VersionedRawPoint> = (0..201 + repeats)
-            .map(|i| {
-                let t = i.min(200) as i64;
-                let value = 1.0 + (i % 13) as f32 / 37.0;
-                point("", i as i64, t * 10 + (t * 7) % 5, value, 1_000 + i as i64)
-            })
-            .collect();
-        let old = Arc::new(SeriesSnapshot::full(rows.clone()));
-        let mut after = rows;
-        let (step, ts) = (after.len() as i64, if repeats > 0 { 2_000 } else { 2_010 });
-        after.push(point("", step, ts, 2.0, 1_000 + step));
-        let new = old.refreshed_fixture(&after);
-        let longer = Arc::new(SeriesSnapshot::full(Arc::unwrap_or_clone(rows_shaped(
-            beside,
-            |i| i,
-            |i| i * 10 + (i * 7) % 5,
-        ))));
-        let (runs, old, new): (&[&str], Vec<_>, Vec<_>) = if beside > 0 {
-            (&["r", "s"], vec![old, longer.clone()], vec![new, longer])
-        } else {
-            (&["r"], vec![old], vec![new])
-        };
-        let mut r = req(runs, 6);
-        r.use_timestamp_axis = true;
-        r.smoothing = Some(proto::SmoothingConfig {
-            algorithm: Algorithm::SavitzkyGolay as i32,
-            window_size: window,
-            time_constant: 1.0,
-            poly_order: 2,
-        });
-        let (held, reply) = continuation_state(&r, &old);
-        r.cache_state = echo(&reply);
-        let snapshots = new;
-        let truth = build_chart(&r, &snapshots, None, false, None, &|_| {}, false).unwrap();
-        match advance_held(&held, &r, &snapshots) {
-            Ok(advanced) => {
-                assert!(!dense, "{repeats} repeats: advanced");
-                assert_eq!(advanced.response, truth.response);
-            }
-            Err(reason) => {
-                assert!(dense, "{repeats} repeats: {reason:?}");
-                assert_eq!(reason, Fallback::Dense);
-            }
-        }
-        // The service's build step answers the full build's reply either way.
-        let store = HeldStore::new(HeldMode::On, usize::MAX);
-        store.insert(held::request_key(&r), held);
-        held::take_outcomes();
-        let (built, rendered) =
-            crate::with_metrics(|| build_held(&store, &r, &snapshots, false, None).unwrap());
-        assert_eq!(built.response, truth.response);
-        assert_eq!(built.advanced, !dense);
-        let counted = held::take_outcomes();
-        assert_eq!(
-            counted.get("fallback").copied().unwrap_or(0),
-            usize::from(dense),
-            "{counted:?}"
-        );
-        assert_eq!(
-            rendered
-                .lines()
-                .any(|line| line == "mkdb2_chart_held_fallback_total{reason=\"dense\"} 1"),
-            dense,
-            "{rendered}"
-        );
-    }
-}
-
-/// An irregular Savitzky-Golay advance prices the windows of the fits it recomputes against the full build's, both one fit per distinct x, and answers in full only past it: a window as wide as its series, whose every recomputed output fits the whole series, falls back (its advance took 21 ms against the full build's 6.7 ms), while an appended stall, whose outputs share one fit, and a series whose every timestamp repeats ten times advance.
-#[test]
-fn an_irregular_savitzky_golay_advance_costing_more_than_the_full_build_answers_in_full() {
-    for (history, repeats, stall, window, dense) in [
-        (40_000usize, 1usize, 20usize, 20, false),
-        (40_000, 1, 2_000, 20, false),
-        (20_000, 10, 20, 200, false),
-        (2_000, 1, 1, 4_096, true),
-    ] {
-        let at = |i: usize| {
-            let t = i.min(history) / repeats;
-            1_000_000 + 10 * t as i64 + i64::from(t % 7 == 0)
-        };
-        let rows: Vec<VersionedRawPoint> = (0..history + stall)
-            .map(|i| {
-                let inserted = if i < history { 1_000 } else { 2_000 };
-                point("", i as i64, at(i), ((i * 7) % 101) as f32, inserted)
-            })
-            .collect();
-        let old = Arc::new(SeriesSnapshot::full(rows[..history].to_vec()));
-        let snapshots = [old.refreshed_fixture(&rows)];
-        let mut r = req(&["r"], 6);
-        r.use_timestamp_axis = true;
-        r.smoothing = smoothing(Algorithm::SavitzkyGolay, window, 1.0, 2);
-        let (held, reply) = continuation_state(&r, &[old]);
-        let r = continuation(&r, &reply);
-        let truth = build_chart(&r, &snapshots, None, false, None, &|_| {}, false).unwrap();
-        match advance_held(&held, &r, &snapshots) {
-            Ok(advanced) => {
-                assert!(!dense, "a stall of {stall}: advanced");
-                assert_eq!(advanced.response, truth.response);
-            }
-            Err(reason) => assert_eq!(
-                (dense, reason),
-                (true, Fallback::Dense),
-                "a stall of {stall}"
-            ),
-        }
-    }
-}
-
 /// A panic while capturing a full build's state serves the full build and turns held state off until restart, with or without an entry held, in shadow mode and under `on` mode's audit, where no advance follows it; later polls build in full.
 #[test]
 fn a_panicking_capture_serves_the_full_build() {
@@ -2286,32 +2163,56 @@ fn held_store_charges_cover_what_it_retains_under_eviction() {
     );
 }
 
-/// Stage 2 charges what the service's build step holds in every mode, within a small factor: a full build with its state captured, an advance served, and a full build with an advance beside it (shadow, audit), whose two models it charges. An irregular Savitzky-Golay advance reads every output's window, which allocates nothing per row read.
+/// A first paint and a continuation poll of `request` over `held_rows`, which leave its state in `store`, then its poll over `grown` through the service's build step, measured: what it built, the most bytes it held, and the model shapes it reported.
+fn measured_poll(
+    store: &HeldStore,
+    request: &proto::ChartRequest,
+    held_rows: &[Arc<Vec<VersionedRawPoint>>],
+    grown: &[Arc<Vec<VersionedRawPoint>>],
+    audit: bool,
+) -> (BuiltChart, u64, Vec<DenseShape>) {
+    let mut tab = Tab::default();
+    for _ in 0..2 {
+        tab.poll(request, held_rows, |r, snapshots| {
+            Ok(build_held(store, r, snapshots, false, None)?.response)
+        });
+    }
+    let mut next = request.clone();
+    next.cache_state = tab.0.as_ref().and_then(|held| echo(held));
+    let snapshots = fixture_snapshots(&next, grown);
+    let shapes = std::cell::RefCell::new(Vec::new());
+    let p = chart_params(&next);
+    let (built, peak, _) = super::super::alloc_probe::peak_and_live_bytes(|| {
+        held::build(
+            store,
+            &next,
+            &p,
+            Some(held::request_key(&next)),
+            &snapshots,
+            None,
+            audit,
+            None,
+            &|s| shapes.borrow_mut().push(s),
+            held::Advance::Try,
+        )
+        .unwrap()
+        .unwrap()
+    });
+    (built, peak, shapes.into_inner())
+}
+
+/// Stage 2 charges what the service's build step holds in every mode, within a small factor: a full build with its state captured, an advance served, and a full build with an advance beside it (shadow, audit), whose two models it charges. A Savitzky-Golay advance copies the windows of the slots it re-evaluates, charged at their capacity.
 #[test]
 fn held_build_charges_cover_measured_peaks() {
     let runs: Vec<String> = (0..16).map(|r| format!("run-{r}")).collect();
     let refs: Vec<&str> = runs.iter().map(String::as_str).collect();
     let mut request = req(&refs, 100);
-    request.smoothing = Some(proto::SmoothingConfig {
-        algorithm: Algorithm::Ema as i32,
-        time_constant: 4.0,
-        ..Default::default()
-    });
+    request.smoothing = smoothing(Algorithm::Ema, 0, 4.0, 0);
     let mut grid = req(&refs, 100);
-    grid.smoothing = Some(proto::SmoothingConfig {
-        algorithm: Algorithm::SavitzkyGolay as i32,
-        window_size: 5,
-        poly_order: 1,
-        ..Default::default()
-    });
+    grid.smoothing = smoothing(Algorithm::SavitzkyGolay, 5, 0.0, 1);
     let mut irregular = req(&["a", "b"], 1_000);
     irregular.use_timestamp_axis = true;
-    irregular.smoothing = Some(proto::SmoothingConfig {
-        algorithm: Algorithm::SavitzkyGolay as i32,
-        window_size: 200,
-        poly_order: 2,
-        ..Default::default()
-    });
+    irregular.smoothing = smoothing(Algorithm::SavitzkyGolay, 200, 0.0, 2);
     // Stage 2's probe chart, 16 runs of 64 tags of 4 rows (a dense model that dwarfs its rows), then a row more per tag.
     let tagged = |grown| -> Vec<Arc<Vec<VersionedRawPoint>>> {
         let (_, rows) = tagged_chart(16, 64, 4, grown);
@@ -2332,45 +2233,17 @@ fn held_build_charges_cover_measured_peaks() {
             (HeldMode::On, usize::MAX, true),
         ] {
             let store = HeldStore::new(mode, budget);
-            // A first paint and a continuation poll, which leaves the state held.
-            let mut tab = Tab::default();
-            for _ in 0..2 {
-                tab.poll(&request, &held_rows, |r, snapshots| {
-                    Ok(build_held(&store, r, snapshots, false, None)?.response)
-                });
-            }
             // The measured poll: rows appended to every tag.
-            let mut next = request.clone();
-            next.cache_state = tab.0.as_ref().and_then(|held| echo(held));
-            let snapshots = fixture_snapshots(&next, &grown);
-            let shapes = std::cell::RefCell::new(Vec::new());
-            let p = chart_params(&next);
-            let (built, peak, _) = super::super::alloc_probe::peak_and_live_bytes(|| {
-                held::build(
-                    &store,
-                    &next,
-                    &p,
-                    Some(held::request_key(&next)),
-                    &snapshots,
-                    None,
-                    audit,
-                    None,
-                    &|s| shapes.borrow_mut().push(s),
-                    held::Advance::Try,
-                )
-                .unwrap()
-                .unwrap()
-            });
+            let (built, peak, shapes) = measured_poll(&store, &request, &held_rows, &grown, audit);
             let (response, built_in_full) = (built.response, !built.advanced);
             let transients: u64 = if built_in_full {
-                snapshots
+                grown
                     .iter()
                     .map(|rows| rows.len() as u64 * budget::BUILD_BYTES_PER_ROW)
                     .sum()
             } else {
                 0
             };
-            let shapes = shapes.into_inner();
             let shape = *shapes.last().expect("every path reports its model");
             // An advance beside the full build has its model charged with the full build's, before it exists.
             assert_eq!(shapes[0].models, shape.models, "{mode:?} audit={audit}");
@@ -2516,42 +2389,294 @@ fn entries_at_one_maxima_on_two_lineages_advance_their_own() {
     assert_eq!(held::take_outcomes(), BTreeMap::from([("served", 1)]));
 }
 
-/// A series at one timestamp prices the full build at the one fit its sweep makes there, not one per sample, so beside a stall that grows at the same timestamp it lets the advance proceed only at the advance's own one fit; the counted fit reads match both prices.
+/// A causal slot ahead of its run's samples in the cell has no value, in an advance as in a full build: run a resumes at step 90 inside a cell b centers at 87, then b's appends move the center past 90 and a's slot gains its value, then a appends again.
 #[test]
-fn stalls_price_the_fits_their_sweeps_make() {
-    let at_zero = |n: i64, m: i64| -> Vec<_> {
-        (0..n)
-            .map(|s| point("", s, 0, (s % m) as f32, 1_000 + s))
-            .collect()
+fn a_causal_slot_gains_its_value_when_the_center_passes_its_first_sample() {
+    for algorithm in [Algorithm::Ema, Algorithm::Triangular] {
+        for use_time in [false, true] {
+            let row =
+                |step: i64, value: f32, stamp: i64| point("", step, step * 1_000, value, stamp);
+            let mut a: Vec<_> = (0..8).map(|s| row(s, (s * s) as f32, 1_000)).collect();
+            let mut b: Vec<_> = (0..111).map(|s| row(s, (s % 7) as f32, 1_000)).collect();
+            let mut r = req(&["a", "b"], 2);
+            r.use_timestamp_axis = use_time;
+            r.smoothing = smoothing(algorithm, 3, 2.0, 2);
+            let mut snapshots = vec![
+                Arc::new(SeriesSnapshot::full(a.clone())),
+                Arc::new(SeriesSnapshot::full(b.clone())),
+            ];
+            let (mut state, mut client) = continuation_state(&r, &snapshots);
+            for phase in 0..3 {
+                match phase {
+                    0 => a.push(row(90, 5.0, 2_000)),
+                    1 => b.extend((111..128).map(|s| row(s, (s % 7) as f32, 3_000))),
+                    _ => a.push(row(91, 5.5, 4_000)),
+                }
+                snapshots = snapshots
+                    .iter()
+                    .zip([&a, &b])
+                    .map(|(old, rows)| old.refreshed_fixture(rows))
+                    .collect();
+                let at = format!("{algorithm:?} time={use_time} phase={phase}");
+                let poll = continuation(&r, &client);
+                let advanced = advance_as_full_build(&state, &poll, &snapshots, &at);
+                let model = advanced.next.model();
+                assert_eq!(model.x_values.len(), 2, "{at}");
+                assert_eq!(model.series[0].values[1].is_finite(), phase > 0, "{at}");
+                client = advanced.response;
+                state = advanced.next;
+            }
+        }
+    }
+}
+
+/// A held raw slot exactly at the slot rule's x is re-evaluated: the appended 1,034 less window 4's half-width 2 is the slot at 1,032, whose window gains the appended sample at its zero-weight edge and turns symmetric (1,030 to 1,034), which fits as a dot product, and these values round to another f32 than the held direct fit over 1,030 to 1,033. Appended at 1,035 instead, the rule's x is the last held sample, 1,033, where the delta starts.
+#[test]
+fn a_raw_slot_at_the_slot_rules_x_is_reevaluated() {
+    let ys: [f32; 11] = [
+        531.407_65,
+        -706.696_2,
+        -287.198_12,
+        536.423_3,
+        -671.371_34,
+        862.773_5,
+        956.301_6,
+        20.532_593,
+        650.568_7,
+        -221.551_47,
+        996.490_3,
+    ];
+    let row = |i: i64, stamp: i64| {
+        let step = 1_024 + i;
+        point("", step, step * 1_000, ys[i as usize], stamp)
     };
-    // Its occupied envelope cells keep the chart held despite the stalls' repeated x; its spacing takes the uniform kernel.
-    let spread: Vec<_> = (0..20_000)
-        .map(|s| point("", s, 10_000_000 + 10 * s, (s % 13) as f32, 1_000 + s))
-        .collect();
-    let snapshots: Vec<_> = [at_zero(100_000, 11), at_zero(10_000, 7), spread.clone()]
+    let a: Vec<_> = (0..10).map(|i| row(i, 1_000)).collect();
+    let mut r = req(&["a"], 0);
+    r.smoothing = smoothing(Algorithm::SavitzkyGolay, 4, 1.0, 0);
+    let plan = chart::SmoothingPlan::Median(1f64.to_bits());
+    let rule = chart::SlotSmoother::new(Algorithm::SavitzkyGolay, 4, 1.0, 0, plan);
+    let held = vec![Arc::new(SeriesSnapshot::full(a.clone()))];
+    let (state, client) = continuation_state(&r, &held);
+    let poll = continuation(&r, &client);
+    for (step, rule_x) in [(1_034, 1_032.0), (1_035, 1_033.0)] {
+        assert_eq!(rule.dirty_from(Some(step as f64)), rule_x);
+        let mut a = a.clone();
+        a.push(point("", step, step * 1_000, ys[10], 2_000));
+        let snapshots = [held[0].refreshed_fixture(&a)];
+        let advanced = advance_as_full_build(&state, &poll, &snapshots, &format!("at {step}"));
+        assert_eq!(advanced.kind, Some("delta"));
+        assert_eq!(advanced.response.x_values[0], rule_x, "the delta's first x");
+        if step == 1_034 {
+            let at = |model: &DenseChart| {
+                let k = model.x_values.iter().position(|&x| x == rule_x).unwrap();
+                model.series[0].values[k].to_bits()
+            };
+            assert_ne!(
+                at(state.model()),
+                at(advanced.next.model()),
+                "the slot's value changes"
+            );
+        }
+    }
+}
+
+/// An envelope slot exactly at the slot rule's x is re-evaluated too: run a logs every third step from 1,020, so cell [1,032, 1,040)'s slot sits at its sample 1,035, the rule's x for the appended 1,041 less window 4's half-width 6 at spacing 3. The window gains 1,041 at its zero-weight edge and turns symmetric (1,029 to 1,041), which fits as a dot product: the held direct fit over 1,032 to 1,038 to rounding, which an f32 value rarely shows, so the test counts the re-evaluation.
+#[test]
+fn an_envelope_slot_at_the_slot_rules_x_is_reevaluated() {
+    let ys: [f32; 8] = [
+        -930.3273, -151.19495, -830.90076, 866.26685, -497.5519, -469.7627, -832.6223, 159.79578,
+    ];
+    let row = |i: usize, stamp: i64| {
+        let step = 1_020 + 3 * i as i64;
+        point("", step, step * 1_000, ys[i], stamp)
+    };
+    let mut a: Vec<_> = (0..7).map(|i| row(i, 1_000)).collect();
+    let mut r = req(&["a"], 4);
+    r.smoothing = smoothing(Algorithm::SavitzkyGolay, 4, 1.0, 0);
+    let held = vec![Arc::new(SeriesSnapshot::full(a.clone()))];
+    let (state, client) = continuation_state(&r, &held);
+    a.push(row(7, 2_000));
+    let snapshots = [held[0].refreshed_fixture(&a)];
+    let poll = continuation(&r, &client);
+    let advanced = advance_as_full_build(&state, &poll, &snapshots, "");
+    assert!(advanced.next.model().x_values.contains(&1_035.0));
+    assert_eq!(advanced.work.rebuild.reached, 1, "the slot at 1,035");
+}
+
+/// An advance's work follows its appended rows: a causal series appending k rows over s new envelope cells folds each appended sample once across its ascending slots, not once per slot (about s * k / 2 folds).
+#[test]
+fn causal_append_work_is_linear_in_the_appended_rows() {
+    let history = 100_000i64;
+    let rows = |n: i64| {
+        let stamp = |s| if s < history { 1_000 } else { 2_000 };
+        let rows = (0..n).map(|s| point("", s, 1_000_000 + s, ((s * 37) % 101) as f32, stamp(s)));
+        Arc::new(rows.collect::<Vec<_>>())
+    };
+    let mut r = req(&["a"], 2000);
+    r.smoothing = smoothing(Algorithm::Ema, 0, 20.0, 1);
+    let work: Vec<usize> = [1_024i64, 4_096, 16_384]
         .into_iter()
-        .map(|rows| Arc::new(SeriesSnapshot::full(rows)))
+        .map(|appended| {
+            let (outcome, truth) =
+                advance_between(&r, &[rows(history)], &[rows(history + appended)]);
+            let advanced = outcome.unwrap_or_else(|reason| panic!("{appended}: {reason:?}"));
+            assert_eq!(advanced.response, truth);
+            advanced.work.rows + advanced.work.smoothed
+        })
         .collect();
-    let mut req = req(&["a", "b", "c"], 300);
-    req.use_timestamp_axis = true;
-    req.smoothing = smoothing(Algorithm::SavitzkyGolay, 20, 10.0, 1);
-    let reads = || chart::SAVGOL_X_READS.with(|reads| reads.replace(0));
-    reads();
-    let (state, held) = continuation_state(&req, &snapshots);
-    // Two full builds, each fitting each stall once.
-    assert_eq!(reads(), 2 * 110_000);
-    assert_eq!(
-        state.full_build_cost(),
-        110_000 + held::FULL_BUILD_ROW_COST * 130_000
+    assert!(
+        work[2] <= 6 * work[1],
+        "work grew {}x for 4x the appended rows: {work:?}",
+        work[2] as f64 / work[1] as f64
     );
-    let grown: Vec<_> = snapshots
-        .iter()
-        .zip([at_zero(100_000, 11), at_zero(10_001, 7), spread])
-        .map(|(held, rows)| held.refreshed_fixture(&rows))
-        .collect();
-    let poll = continuation(&req, &held);
-    let advanced = advance_held(&state, &poll, &grown).unwrap();
-    assert_eq!((advanced.work.windows, reads()), (10_001, 10_001));
-    let truth = build_chart(&poll, &grown, None, false, None, &|_| {}, false).unwrap();
-    assert_eq!(advanced.response, truth.response);
+}
+
+/// Held state advances bit for bit on a log ladder whose smoothing floor grows with x ([`chart::Floor`]): the causal fold's time constant and the Savitzky-Golay half-width grow along the ladder, on step and timestamp axes alike.
+#[test]
+fn held_state_advances_bit_identically_on_a_growing_log_floor() {
+    for (algorithm, use_time) in [
+        (Algorithm::Ema, false),
+        (Algorithm::Ema, true),
+        (Algorithm::Triangular, true),
+        (Algorithm::SavitzkyGolay, false),
+        (Algorithm::SavitzkyGolay, true),
+    ] {
+        // Eight samples an octave over five octaves, against five ladder cells: one bucket an octave (m = 0), so the floor outgrows the time constant and the window early.
+        let row = |step: i64| {
+            let x = (1i64 << (step / 8)) * 8 + step % 8;
+            VersionedRawPoint {
+                timestamp_ms: if use_time { x * 1_000 } else { step },
+                ..point(
+                    "",
+                    if use_time { step } else { x },
+                    0,
+                    ((step * 7) % 31) as f32,
+                    1_000 + step,
+                )
+            }
+        };
+        let rows = |n: i64| Arc::new(SeriesSnapshot::full((0..n).map(row).collect::<Vec<_>>()));
+        let mut req = req(&["a", "b"], 5);
+        req.use_timestamp_axis = use_time;
+        req.log_buckets = true;
+        req.smoothing = smoothing(algorithm, 20, 4.0, 1);
+        let mut current = vec![rows(40), rows(40)];
+        let (mut state, mut client) = continuation_state(&req, &current);
+        for poll in 0..3 {
+            current = current
+                .iter()
+                .map(|held| {
+                    held.refreshed_fixture(&(0..43 + 3 * poll).map(row).collect::<Vec<_>>())
+                })
+                .collect();
+            let at = format!("{algorithm:?} time={use_time} poll {poll}");
+            let poll_req = continuation(&req, &client);
+            let advanced = advance_as_full_build(&state, &poll_req, &current, &at);
+            client = advanced.response;
+            state = advanced.next;
+        }
+    }
+}
+
+/// An advance's copied Savitzky-Golay windows stay within the charge stage 2 holds for it: 16 runs whose windows span every held sample, each copy growing to at most its rows.
+#[test]
+fn copied_savgol_windows_stay_within_their_charge() {
+    let runs: Vec<String> = (0..16).map(|r| format!("run-{r}")).collect();
+    let refs: Vec<&str> = runs.iter().map(String::as_str).collect();
+    for window in [1024, 4096] {
+        let mut request = req(&refs, 4);
+        request.smoothing = smoothing(Algorithm::SavitzkyGolay, window, 1.0, 0);
+        let rows_at = |n| {
+            refs.iter()
+                .map(|_| rows_shaped(n, |i| 3 * i, |i| 1_000_000 + i))
+                .collect::<Vec<_>>()
+        };
+        let held_rows = rows_at(i64::from(window));
+        let grown = rows_at(i64::from(window) + 1);
+        let store = HeldStore::new(HeldMode::On, usize::MAX);
+        let (built, peak, shapes) = measured_poll(&store, &request, &held_rows, &grown, false);
+        assert!(built.advanced, "window={window}: must measure an advance");
+        let shape = *shapes.last().expect("every advance reports its model");
+        let charged = ChartPlan::output_bytes(shape, false);
+        assert!(
+            peak <= charged,
+            "window={window}: held {peak} bytes, charged {charged}"
+        );
+    }
+}
+
+/// A window copy restarted apart from the last one restarts its cursor too: run a's appended 1,000 to 1,008, past an isolated NaN at 300, center a window at 1,004 on the held windows' gap of 2, and a cursor carried from the earlier copy's even run would index past the new copy.
+#[test]
+fn a_restarted_window_copy_restarts_its_cursor() {
+    for order in 0..=2u32 {
+        let row = |s: i64, v: f32, stamp: i64| point("", s, 1_000 + s, v, stamp);
+        let mut a: Vec<_> = (0..50)
+            .map(|i| row(2 * i, ((i * 37) % 101) as f32, 1_000))
+            .collect();
+        let mut r = req(&["a"], 0);
+        r.smoothing = smoothing(Algorithm::SavitzkyGolay, 4, 1.0, order);
+        let held = vec![Arc::new(SeriesSnapshot::full(a.clone()))];
+        let (state, client) = continuation_state(&r, &held);
+        a.extend([100, 102, 104, 106, 108].map(|s| row(s, ((s * 13) % 97) as f32, 2_000)));
+        a.push(row(300, f32::NAN, 2_000));
+        let resumed = [
+            (1_000, 5.0),
+            (1_001, -40.0),
+            (1_004, 17.0),
+            (1_007, 90.0),
+            (1_008, -3.0),
+        ];
+        a.extend(resumed.map(|(s, v)| row(s, v, 2_000)));
+        let snapshots = [held[0].refreshed_fixture(&a)];
+        let poll = continuation(&r, &client);
+        advance_as_full_build(&state, &poll, &snapshots, &format!("order {order}"));
+    }
+}
+
+/// An advance that re-evaluates one early slot copies that slot's window, not the rest of the history after it: run b's new sample moves the first cell's center, so that slot's window in each run, four rows here, is the advance's whole copy, however long run a grows.
+#[test]
+fn an_early_window_copies_no_more_than_its_rows() {
+    let mut peaks = Vec::new();
+    for n in [2_048i64, 131_072] {
+        let gap = n / 128;
+        let a: Vec<_> = (0..4)
+            .chain(gap..n)
+            .map(|x| point("", x, x, (x % 13) as f32, 1_000))
+            .collect();
+        let mut b: Vec<_> = (0..3)
+            .map(|x| point("", x, x, (x % 7) as f32, 1_000))
+            .collect();
+        let mut request = req(&["a", "b"], 128);
+        request.smoothing = smoothing(Algorithm::SavitzkyGolay, 3, 1.0, 0);
+        let before = vec![
+            Arc::new(SeriesSnapshot::full(a.clone())),
+            Arc::new(SeriesSnapshot::full(b.clone())),
+        ];
+        let (state, client) = continuation_state(&request, &before);
+        b.push(point("", gap / 2, gap / 2, 42.0, 2_000));
+        let current = vec![
+            before[0].refreshed_fixture(&a),
+            before[1].refreshed_fixture(&b),
+        ];
+        let poll = continuation(&request, &client);
+        let (_, peak, _) = super::super::alloc_probe::peak_and_live_bytes(|| {
+            advance_held(&state, &poll, &current).unwrap()
+        });
+        advance_as_full_build(&state, &poll, &current, &format!("{n} rows"));
+        peaks.push(peak);
+    }
+    // 33 KB at either length, where a copy to the history's end would hold 2.1 MB at 131,072 rows.
+    assert!(peaks[1] < 2 * peaks[0], "peaks {peaks:?}");
+}
+
+/// Held state answers a chart's first finite value in full, as the full build does: the client takes a flip of the banded bit only in a full answer.
+#[test]
+fn an_advance_gaining_the_first_finite_value_answers_full() {
+    let r = req(&["a"], 300);
+    let held = [rows_with(2_000, |_| f32::NAN)];
+    let grown = [rows_with(2_100, |s| if s < 2_000 { f32::NAN } else { 1.0 })];
+    let (outcome, truth) = advance_between(&r, &held, &grown);
+    let advanced = outcome.unwrap_or_else(|reason| panic!("fell back {reason:?}"));
+    assert!(truth.banded && !truth.delta);
+    assert_eq!(advanced.response, truth);
 }

@@ -1,6 +1,6 @@
 //! Stage 3b of docs/chart-request-latency.md: held chart state.
 //!
-//! After answering a continuation poll in full, the server keeps the chart's lean state: the dense model as emitted, its axis plan, each series' running aggregates for its last envelope cell, causal smoother checkpoints every [`chart::CAUSAL_CHECKPOINT_STRIDE`] samples and at the tail, the gap counts proving a median plan, and an index of long runs of non-finite plot values. The next poll whose client holds exactly that model, on the same lineages, advances it by the rows appended since: only their slots, the slots whose shared center moved, the interpolation and smoother dependencies the planner defines are recomputed, from the snapshot's rows with the same functions in the same order; everything else is copied. The response is then assembled exactly as [`super::build_chart`] assembles it, its `from_col` from the planner's own marking rules ([`chart::incremental::planner_from_col`]). Anything the advance does not cover answers with the full build, counted by reason ([`Fallback`]).
+//! After answering a continuation poll in full, the server keeps the chart's lean state: the dense model as emitted, its axis plan, each series' running aggregates for its last envelope cell, causal smoother checkpoints every [`chart::CAUSAL_CHECKPOINT_STRIDE`] samples and at the tail, and the gap counts proving a median plan. The next poll whose client holds exactly that model, on the same lineages, advances it by the rows appended since: only their slots, and the slots whose shared center moved or whose smoother reads an appended sample, are recomputed, from the snapshot's rows with the same functions in the same order; everything else is copied. The response is then assembled exactly as [`super::build_chart`] assembles it, its `from_col` from the planner's own marking rules ([`chart::axes_from_col`]). Anything the advance does not cover answers with the full build, counted by reason ([`Fallback`]).
 //!
 //! The state is keyed by the canonical request, holding at most [`ENTRIES_PER_KEY`] entries, each at its refs' lineages and maxima (tabs holding different responses; an entry on a lineage since rotated, which no poll takes, is released by its viewer's next answer); entries are shared, so viewers at the same maxima all advance from one. Within a lineage, rows stamped at or below a maximum are a step prefix of each tag (series_cache.rs), so a tag's rows past the held count are exactly the rows appended since.
 //!
@@ -20,10 +20,11 @@ use super::{
 };
 pub(super) use crate::chart::incremental::Fallback;
 use crate::chart::incremental::{self as inc, CellAgg, HeldAxis, Samples as _};
-use crate::chart::{self, CausalSmoother, CausalState, SmoothingPlan, CAUSAL_CHECKPOINT_STRIDE};
+use crate::chart::{
+    self, CausalState, MedianGaps, SlotSmoother, SmoothingPlan, CAUSAL_CHECKPOINT_STRIDE,
+};
 use crate::chart_delta::DenseChart;
 use crate::proto;
-use crate::proto::smoothing_config::Algorithm;
 use crate::series_cache::{
     buffer_bytes, hash_table_bytes, shrink_table, vec_bytes, CachedRow, SeriesSnapshot, TagRows,
     ARC_HEADER,
@@ -34,18 +35,12 @@ use tonic::Status;
 pub(super) const DEFAULT_HELD_BUDGET_MB: usize = 128;
 /// Models of one chart held at once, for tabs holding different responses.
 const ENTRIES_PER_KEY: usize = 4;
-/// Runs of at least this many non-finite plot values are indexed, so a walk to the nearest finite value skips them.
-const HOLE_MIN: usize = 64;
 /// Causal checkpoints per shared block: an advance copies at most one partial block.
 const CHECKPOINT_BLOCK: usize = 64;
 /// Integers at most this far from zero are exact in f64; the advance holds no chart whose x leaves that range (beyond it, distinct steps collide as f64 and appends need not keep a chart downsampled).
 const EXACT_X: u64 = 1 << 53;
 /// What one entry of the store's LRU order costs (a `BTreeMap` slot of tick and key, in nodes at least half full).
 const ORDER_ENTRY_BYTES: usize = 96;
-/// An irregular Savitzky-Golay advance's cost per sample in the windows of the fits it recomputes, in units of the full build's per sample in the windows it fits: the advance walks each window from its output through the snapshot, where the full build's sweep moves a window's ends over a slice. Past the full build's cost, it answers in full ([`Fallback::Dense`]).
-const ADVANCE_WINDOW_COST: usize = 3;
-/// The rest of a full build per fetched row (prepare, the axis, the reply), in the same unit.
-pub(super) const FULL_BUILD_ROW_COST: usize = 10;
 /// Shadow divergences remembered as logged ([`HeldStore::first_divergence`]).
 const LOGGED_MAX: usize = 1_024;
 
@@ -123,37 +118,7 @@ struct HeldTag {
     max_ts: i64,
 }
 
-/// What proves an append leaves a median plan in place: how many of the series' `total` positive gaps lie below its median `m` ([`chart::median_dx`]) and equal it.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-struct MedianGaps {
-    below: usize,
-    equal: usize,
-    total: usize,
-}
-
-impl MedianGaps {
-    /// These counts with the gaps between consecutive `keys` added, if `m` is still the median positive gap (1 with none).
-    fn extended(mut self, m: f64, keys: impl Iterator<Item = f64>) -> Result<Self, Fallback> {
-        let mut previous: Option<f64> = None;
-        for key in keys {
-            let gap = previous.map_or(0.0, |previous| key - previous);
-            if gap > 0.0 {
-                self.total += 1;
-                self.below += usize::from(gap < m);
-                self.equal += usize::from(gap == m);
-            }
-            previous = Some(key);
-        }
-        let holds = if self.total == 0 {
-            m == 1.0
-        } else {
-            self.below <= self.total / 2 && self.total / 2 < self.below + self.equal
-        };
-        holds.then_some(self).ok_or(Fallback::PlanShift)
-    }
-}
-
-/// A causal smoother's recorded states, without their indices: the k-th before sample k·stride, for every multiple of the stride below the series' count, in shared blocks of [`CHECKPOINT_BLOCK`] that later states reuse; and the tail, after its last sample.
+/// A causal smoother's recorded states: the k-th before sample k·stride, for every multiple of the stride below the series' count, in shared blocks of [`CHECKPOINT_BLOCK`] that later states reuse; and the tail, after its last sample.
 #[derive(Clone, Default)]
 struct Checkpoints {
     blocks: Vec<Arc<[CausalState]>>,
@@ -168,12 +133,11 @@ impl Checkpoints {
         (k * CAUSAL_CHECKPOINT_STRIDE, state)
     }
 
-    /// These checkpoints, extended by `states`: the stride checkpoints recorded past the tail, then a new tail (none extends nothing), as [`chart::smooth_run_with_plan`] records them; full blocks are shared.
-    fn extended(&self, states: &[(usize, CausalState)]) -> Self {
-        let Some((&(_, tail), mut fresh)) = states.split_last() else {
+    /// These checkpoints, extended by `states` as [`chart::CausalSmoother::fold_recording`] records them: the stride checkpoints past the tail, then a new tail (none extends nothing); full blocks are shared.
+    fn extended(&self, states: &[CausalState]) -> Self {
+        let Some((&tail, mut fresh)) = states.split_last() else {
             return self.clone();
         };
-        let state = |&(_, state): &(usize, CausalState)| state;
         let mut blocks = self.blocks.clone();
         // A partial last block is rebuilt only when a fresh state joins it; else it stays shared.
         if let Some(partial) =
@@ -185,17 +149,13 @@ impl Checkpoints {
                 partial
                     .iter()
                     .copied()
-                    .chain(head.iter().map(state))
+                    .chain(head.iter().copied())
                     .collect(),
             );
         }
         // Each state's list is cloned from the last, so growth slack buys nothing.
         blocks.reserve_exact(fresh.len().div_ceil(CHECKPOINT_BLOCK));
-        blocks.extend(
-            fresh
-                .chunks(CHECKPOINT_BLOCK)
-                .map(|block| block.iter().map(state).collect()),
-        );
+        blocks.extend(fresh.chunks(CHECKPOINT_BLOCK).map(Arc::from));
         Self {
             blocks,
             tail: Some(tail),
@@ -236,20 +196,14 @@ struct HeldSeries {
     /// Emitted samples: fetched indices [emit_from, emit_to).
     emit_from: usize,
     emit_to: usize,
-    /// Relative time: the series' first timestamp.
-    x_offset: i64,
     plan: SmoothingPlan,
     /// Median plans: the gaps proving the median.
     gaps: MedianGaps,
-    /// Irregular Savitzky-Golay: the samples in the windows of all its fetched outputs' fits, one per distinct x, which the full build reads ([`Fallback::Dense`]); 0 otherwise.
-    windows: usize,
     /// Causal smoothers' recorded states.
     checkpoints: Checkpoints,
     open: Option<CellAgg>,
-    /// Smoothed charts (a series without finite output too, so walks over it stay short): runs [start, end) of at least [`HOLE_MIN`] emitted samples whose plot values are all non-finite.
-    holes: Vec<(usize, usize)>,
-    /// Smoothed charts: the first emitted sample with a finite logged value (`flag_lerp_dependency`'s endpoint of last resort; a finite plot value implies one), `Some` exactly when prepare's `has_finite_output` holds.
-    first_endpoint: Option<usize>,
+    /// Smoothed charts: an emitted sample has a finite logged value (prepare's `has_finite_output`).
+    finite_output: bool,
 }
 
 impl HeldSeries {
@@ -265,14 +219,11 @@ impl HeldSeries {
                 "emitted",
                 (self.emit_from, self.emit_to) == (other.emit_from, other.emit_to),
             ),
-            ("offset", self.x_offset == other.x_offset),
             ("plan", self.plan == other.plan),
             ("gaps", self.gaps == other.gaps),
-            ("windows", self.windows == other.windows),
             ("checkpoints", self.checkpoints.same_as(&other.checkpoints)),
             ("open cell", open(self) == open(other)),
-            ("holes", self.holes == other.holes),
-            ("endpoint", self.first_endpoint == other.first_endpoint),
+            ("finite output", self.finite_output == other.finite_output),
         ]
         .into_iter()
         .find(|(_, same)| !same)
@@ -298,7 +249,7 @@ pub(super) struct HeldChart {
 }
 
 impl HeldChart {
-    /// Charge every allocation at its capacity and the allocator's rounding: the model's columns, markers and strings, the axis plan, the tags, each series' checkpoint blocks and hole index, and the state's own `Arc` allocation in the store.
+    /// Charge every allocation at its capacity and the allocator's rounding: the model's columns, markers and strings, the axis plan, the tags, each series' checkpoint blocks, and the state's own `Arc` allocation in the store.
     fn measure(&mut self) {
         let model = &self.model;
         let series_model: usize = model
@@ -336,7 +287,7 @@ impl HeldChart {
             + self
                 .series
                 .iter()
-                .map(|s| s.checkpoints.heap_bytes() + vec_bytes(&s.holes))
+                .map(|s| s.checkpoints.heap_bytes())
                 .sum::<usize>();
         self.model_bytes = model_bytes;
         self.bytes = buffer_bytes(ARC_HEADER + std::mem::size_of::<Self>())
@@ -361,18 +312,6 @@ impl HeldChart {
         self.bytes
     }
 
-    /// What a full build of this state's inputs costs, in the unit [`Fallback::Dense`] prices an advance in.
-    #[cfg(test)]
-    pub(super) fn full_build_cost(&self) -> usize {
-        self.series
-            .iter()
-            .map(|s| {
-                let tag = &self.refs[s.request_index][s.tag];
-                s.windows + FULL_BUILD_ROW_COST * (tag.r1 - tag.r0)
-            })
-            .sum()
-    }
-
     /// The per-ref maxima the state was built at.
     #[cfg(test)]
     pub(super) fn maxima(&self) -> &[Option<i64>] {
@@ -394,25 +333,19 @@ impl HeldChart {
         &self.model
     }
 
-    /// The axis shape and each series' plan, for the differential test's coverage.
+    /// The axis shape and, per series, whether its plan is a median over evenly spaced samples, for the differential test's coverage.
     #[cfg(test)]
-    pub(super) fn shape(&self) -> (&'static str, Vec<SmoothingPlan>) {
+    pub(super) fn shape(&self) -> (&'static str, Vec<bool>) {
         let axis = match &self.axis {
             HeldAxis::Passthrough => "passthrough",
             axis if axis.passthrough_shaped() => "shaped",
             _ => "mixed",
         };
-        (axis, self.series.iter().map(|s| s.plan).collect())
-    }
-
-    /// The longest non-finite plot run any series holds in its hole index, for the differential test's coverage.
-    #[cfg(test)]
-    pub(super) fn longest_hole(&self) -> usize {
-        self.series
-            .iter()
-            .flat_map(|s| s.holes.iter().map(|&(from, to)| to - from))
-            .max()
-            .unwrap_or(0)
+        let even = |s: &HeldSeries| {
+            let tag = &self.refs[s.request_index][s.tag];
+            matches!(s.plan, SmoothingPlan::Median(_)) && s.gaps.even(tag.r1 - tag.r0)
+        };
+        (axis, self.series.iter().map(even).collect())
     }
 
     /// Where this state differs from another of the same inputs (an advanced state against the one a full build captured), floats by bits.
@@ -466,7 +399,7 @@ impl<'a> TagView<'a> {
     }
 
     /// Rows [lo, hi), walking the chunks in order; an inverted range (`lo > hi`, as a zoomed fetch can ask for) is empty.
-    fn rows(&self, lo: usize, hi: usize) -> impl Iterator<Item = &'a CachedRow> + Clone + '_ {
+    fn rows(&self, lo: usize, hi: usize) -> impl Iterator<Item = &'a CachedRow> + '_ {
         let hi = hi.max(lo);
         let first = self.ends.partition_point(|&end| end <= lo);
         let mut start = if first == 0 { 0 } else { self.ends[first - 1] };
@@ -486,26 +419,7 @@ impl<'a> TagView<'a> {
     }
 }
 
-/// How a series' plot values are produced at the current state.
-enum Smoother<'a> {
-    /// The logged values (unsmoothed, or smoothed without a finite output).
-    Raw,
-    /// Values below `dense_from` (the held count) are replayed from `recorded`.
-    Causal {
-        smoother: CausalSmoother,
-        recorded: &'a Checkpoints,
-    },
-    SgUniform {
-        window: usize,
-        order: u32,
-    },
-    SgIrregular {
-        h_x: f64,
-        deg: usize,
-    },
-}
-
-/// One series' samples at the current state, read from the snapshot's rows, with exact plot values computed on demand and cached.
+/// One series' samples at the current state, read from the snapshot's rows.
 struct Source<'a> {
     tag: &'a TagView<'a>,
     /// First fetched row in the tag.
@@ -516,47 +430,46 @@ struct Source<'a> {
     a: usize,
     len: usize,
     use_time: bool,
+    /// Relative time: the series' first timestamp, its earliest (a held series' rows ascend in time), which prepare offsets its x by.
     offset: i64,
-    smoother: Smoother<'a>,
-    dense_from: usize,
-    dense: Vec<f64>,
-    sparse: HashMap<usize, f64>,
-    /// The held index of long non-finite runs (emitted indices), valid below `changed_from`.
-    holes: &'a [(usize, usize)],
-    /// The first emitted sample whose plot value may differ from the held one (the held emitted count when none does).
-    changed_from: usize,
+    /// Smoothed charts with a finite output: the smoother slots evaluate, at the chart's floor.
+    slot: Option<SlotSmoother>,
+    /// Causal slots: the held state's recorded states, and the held fetched count its tail is at.
+    recorded: Option<(&'a Checkpoints, usize)>,
+    /// Causal slots: the state before the fetched sample at this index, which the next slot (ascending) continues.
+    slot_cursor: (usize, CausalState),
     rows_read: std::cell::Cell<usize>,
     smoothed: usize,
     replays: usize,
+    /// A Savitzky-Golay series' window bounds and even-window weights, as the full build's evaluator keeps them, over `window_rows`.
+    savgol: chart::SavgolCursor,
+    /// Savitzky-Golay windows' fetched x and values from the index `.0` on, copied as ascending slots' windows first reach them: a fit reads its window's samples several times, from slices as the full build's do.
+    window_rows: (usize, Vec<f64>, Vec<f64>),
 }
 
 impl<'a> Source<'a> {
     /// `n` fetched rows from row `r0` of the tag; the emitted range (`a`, `len`) is set once known.
-    fn new(
-        tag: &'a TagView<'a>,
-        r0: usize,
-        n: usize,
-        use_time: bool,
-        offset: i64,
-        holes: &'a [(usize, usize)],
-    ) -> Self {
+    fn new(tag: &'a TagView<'a>, r0: usize, n: usize, p: &ChartParams) -> Self {
         Self {
             tag,
             r0,
             n,
             a: 0,
             len: 0,
-            use_time,
-            offset,
-            smoother: Smoother::Raw,
-            dense_from: n,
-            dense: Vec::new(),
-            sparse: HashMap::new(),
-            holes,
-            changed_from: 0,
+            use_time: p.use_time,
+            offset: if p.relative {
+                tag.row(r0).timestamp_ms
+            } else {
+                0
+            },
+            slot: None,
+            recorded: None,
+            slot_cursor: (0, CausalState::START),
             rows_read: std::cell::Cell::new(0),
             smoothed: 0,
             replays: 0,
+            savgol: chart::SavgolCursor::default(),
+            window_rows: (0, Vec::new(), Vec::new()),
         }
     }
 
@@ -585,221 +498,81 @@ impl<'a> Source<'a> {
     fn value(&self, i: usize) -> f64 {
         self.row(i).value as f64
     }
-
-    /// The smoothers' input: non-finite values as NaN.
-    fn y(&self, i: usize) -> f64 {
-        let v = self.value(i);
-        if v.is_finite() {
-            v
-        } else {
-            f64::NAN
-        }
-    }
-
-    /// smooth_run_with_plan's mask: outputs at non-finite inputs are holes (causal smoothers leave them NaN themselves).
-    fn masked(&self, i: usize, v: f64) -> f64 {
-        if self.value(i).is_finite() {
-            v
-        } else {
-            f64::NAN
-        }
-    }
-
-    /// Exact plot values for fetched [from, to), computed as the full build computes them.
-    fn compute(&mut self, from: usize, to: usize) -> Vec<f64> {
-        let n = self.n;
-        match self.smoother {
-            Smoother::Raw => (from..to).map(|i| self.value(i)).collect(),
-            Smoother::Causal { smoother, recorded } => {
-                debug_assert!(to <= self.dense_from, "the new tail is computed eagerly");
-                let (start, mut state) = recorded.at_or_before(from);
-                self.replays += 1;
-                let xs: Vec<f64> = (start..to).map(|i| self.xkey(i)).collect();
-                let y: Vec<f64> = (start..to).map(|i| self.y(i)).collect();
-                self.smoothed += to - start;
-                smoother
-                    .run(&xs, &y, &mut state, start, None)
-                    .split_off(from - start)
-            }
-            Smoother::SgUniform { window, order } => {
-                let (lo, hi) = chart::savgol_inputs(n, window, from, to);
-                let yw: Vec<f64> = (lo..hi).map(|i| self.y(i)).collect();
-                self.smoothed += to - from;
-                let out = chart::savitzky_golay_range(&yw, lo, n, from, to, window, order);
-                (from..to).map(|i| self.masked(i, out[i - from])).collect()
-            }
-            Smoother::SgIrregular { h_x, deg } => {
-                self.smoothed += to - from;
-                // Samples at one x share its fit, as in the full build's sweep ([`window_samples`] prices them so); each output is masked on its own.
-                let (mut fit_at, mut fit) = (f64::NAN, f64::NAN);
-                (from..to)
-                    .map(|i| {
-                        let x = self.xkey(i);
-                        if x != fit_at {
-                            fit = chart::savgol_x_at(
-                                &|j| self.xkey(j),
-                                &|j| self.y(j),
-                                n,
-                                i,
-                                h_x,
-                                deg,
-                            );
-                            fit_at = x;
-                        }
-                        self.masked(i, fit)
-                    })
-                    .collect()
-            }
-        }
-    }
-
-    fn plot_at(&mut self, i: usize) -> f64 {
-        if i >= self.dense_from && i < self.dense_from + self.dense.len() {
-            return self.dense[i - self.dense_from];
-        }
-        if let Some(&v) = self.sparse.get(&i) {
-            return v;
-        }
-        // A few neighbors at once: lookups cluster (interpolation scans walk outward from a slot).
-        let (from, to) = match self.smoother {
-            Smoother::Raw => return self.value(i),
-            Smoother::Causal { .. } => {
-                // Replayed from the checkpoint at or before i, whatever the range.
-                let start = i / CAUSAL_CHECKPOINT_STRIDE * CAUSAL_CHECKPOINT_STRIDE;
-                (start, (i + 8).min(self.dense_from).max(i + 1))
-            }
-            Smoother::SgUniform { .. } => (i.saturating_sub(8), (i + 8).min(self.n)),
-            Smoother::SgIrregular { .. } => (i.saturating_sub(1), (i + 2).min(self.n)),
-        };
-        let values = self.compute(from, to);
-        for (j, v) in (from..to).zip(values) {
-            self.sparse.insert(j, v);
-        }
-        self.sparse[&i]
-    }
-
-    /// The held hole holding emitted sample `e`, if it lies where held plot values still hold.
-    fn hole_at(&self, e: usize) -> Option<(usize, usize)> {
-        if e >= self.changed_from {
-            return None;
-        }
-        let at = self.holes.partition_point(|&(_, end)| end <= e);
-        self.holes
-            .get(at)
-            .filter(|&&(start, _)| start <= e)
-            .map(|&(start, end)| (start, end.min(self.changed_from)))
-    }
 }
 
 impl inc::Samples for Source<'_> {
     fn len(&self) -> usize {
         self.len
     }
-    fn x(&mut self, e: usize) -> f64 {
+    fn x(&self, e: usize) -> f64 {
         self.xkey(self.a + e)
     }
-    fn raw(&mut self, e: usize) -> f64 {
+    fn raw(&self, e: usize) -> f64 {
         self.value(self.a + e)
     }
-    fn plot(&mut self, e: usize) -> f64 {
-        self.plot_at(self.a + e)
-    }
-    fn hole_below(&mut self, e: usize) -> usize {
-        e.checked_sub(1)
-            .and_then(|below| self.hole_at(below))
-            .map_or(e, |(start, _)| start)
-    }
-    fn hole_from(&mut self, e: usize) -> usize {
-        self.hole_at(e).map_or(e, |(_, end)| end)
-    }
-}
-
-/// The emitted samples of a series' fetched rows: those in the step range and, on a log axis, at a nonnegative x (prepare's `is_output_position`). Fetched x ascend, so they are one range.
-fn emitted_range(source: &Source<'_>, p: &ChartParams) -> (usize, usize) {
-    let n = source.n;
-    let lo = inc::partition(0, n, |i| source.row(i).step < p.step_min);
-    let hi = inc::partition(0, n, |i| source.row(i).step <= p.step_max).max(lo);
-    let lo = if p.spec.log_buckets {
-        lo.max(inc::partition(0, n, |i| source.key(i) < 0)).min(hi)
-    } else {
-        lo
-    };
-    (lo, hi)
-}
-
-/// Irregular Savitzky-Golay window sizes over a series' ascending keys, priced as the sweeps fit them: one window per distinct x, which the samples at it share ([`chart::savgol_x`], and [`Source::compute`] from the first output it computes). `keys` are its keys from sample `lo` on. Returns two counts: the samples the fits of `outputs` hold; and what appending samples `new..` adds to the fits: each appended sample joins every fit within `h_x` below it, its own included, and one that starts its x also holds the older samples of its window. A window holds the samples within `h_x` of its output, itself included, as [`chart::savgol_x_at`] finds them.
-fn window_samples(
-    keys: impl Iterator<Item = f64> + Clone,
-    mut lo: usize,
-    outputs: std::ops::Range<usize>,
-    new: usize,
-    h_x: f64,
-) -> (usize, usize) {
-    let (mut windows, mut added) = (0, 0);
-    let mut lagging = keys.clone();
-    let Some(mut x_lo) = lagging.next() else {
-        return (0, 0);
-    };
-    // The distinct x among lo..=i (each one fit), and the fitted outputs among lo..i.
-    let (mut distinct, mut fitted) = (0, 0);
-    let mut previous = None;
-    let fits = |i: usize, starts_x: bool| outputs.contains(&i) && (i == outputs.start || starts_x);
-    let mut lo_starts_x = true;
-    for (i, x) in (lo..).zip(keys) {
-        let starts_x = previous != Some(x);
-        previous = Some(x);
-        distinct += usize::from(starts_x);
-        while x - x_lo > h_x {
-            if fits(lo, lo_starts_x) {
-                fitted -= 1;
-            }
-            let next = lagging.next().expect("each sample is within h_x of itself");
-            lo += 1;
-            // lo's x leaves the window once the next sample has another.
-            lo_starts_x = next != x_lo;
-            distinct -= usize::from(lo_starts_x);
-            x_lo = next;
+    /// Over every fetched sample, NaN where it does not show ([`SlotSmoother::shows`]). A causal state continues the previous slot's when that lies between `x` and the recorded state at or before it (the held tail for appended samples), else replays from that state, so ascending slots fold each sample once.
+    fn slot_value(&mut self, x: f64, first: f64) -> f64 {
+        let n = self.n;
+        let slot = self
+            .slot
+            .expect("a smoothed series with a finite output has a slot smoother");
+        if !slot.shows(x, first) {
+            return f64::NAN;
         }
-        // Samples lo..=i in i's fit if it makes one, and i in the fits made among lo..i.
-        let fit = fits(i, starts_x);
-        if fit {
-            windows += i + 1 - lo;
-        }
-        windows += fitted;
-        if i >= new {
-            added += distinct + if starts_x { i - lo } else { 0 };
-        }
-        if fit {
-            fitted += 1;
-        }
-    }
-    (windows, added)
-}
-
-/// Push onto `holes` the runs of at least [`HOLE_MIN`] non-finite plot values over samples `from..to`, the first continuing `run` (the start of a non-finite run reaching `from`).
-fn holes_in(
-    holes: &mut Vec<(usize, usize)>,
-    mut run: Option<usize>,
-    from: usize,
-    to: usize,
-    mut plot: impl FnMut(usize) -> f64,
-) {
-    for e in from..to {
-        if plot(e).is_finite() {
-            if let Some(start) = run.take() {
-                if e - start >= HOLE_MIN {
-                    holes.push((start, e));
+        match slot {
+            SlotSmoother::SavitzkyGolay { h_x, deg } => {
+                let h = h_x.at(x);
+                let lo = inc::partition(0, n, |i| x - self.xkey(i) > h);
+                let hi = inc::partition(lo, n, |i| self.xkey(i) - x <= h);
+                let (mut start, mut xs, mut ys) = std::mem::take(&mut self.window_rows);
+                // A window apart from the copied samples starts a new copy, its indices (and the cursor's) from its first sample. Windows' starts can move back: on a log ladder, a floor growing faster than x (R/s > 1).
+                if lo < start || lo > start + xs.len() {
+                    (start, self.savgol) = (lo, chart::SavgolCursor::default());
+                    xs.clear();
+                    ys.clear();
                 }
+                // Grown by doubling, as a vector grows, but never past the rows ascending windows can reach.
+                if xs.capacity() < hi - start {
+                    let capacity = (2 * xs.capacity()).max(hi - start).min(n - start);
+                    xs.reserve_exact(capacity - xs.len());
+                    ys.reserve_exact(capacity - ys.len());
+                }
+                for i in start + xs.len()..hi {
+                    let row = self.row(i);
+                    xs.push(self.key_of(row) as f64);
+                    ys.push(row.value as f64);
+                }
+                let cursor = &mut self.savgol;
+                let fit = chart::savgol_at(&|j| xs[j], &|j| ys[j], xs.len(), x, h_x, deg, cursor);
+                self.window_rows = (start, xs, ys);
+                fit
             }
-        } else {
-            run.get_or_insert(e);
+            SlotSmoother::Causal(smoother) => {
+                let (recorded, tail_at) = self.recorded.expect("a causal series' recorded states");
+                let to = inc::partition(0, n, |i| self.xkey(i) <= x);
+                let (mut from, mut state) = if to >= tail_at {
+                    let tail = recorded.tail.expect("a causal series' tail state");
+                    (tail_at, tail)
+                } else {
+                    recorded.at_or_before(to)
+                };
+                match self.slot_cursor {
+                    (at, cursor) if at > from && at <= to => (from, state) = (at, cursor),
+                    _ => self.replays += 1,
+                }
+                self.smoothed += to - from;
+                smoother.fold_range(&mut state, |i| self.xkey(i), |i| self.value(i), from, to);
+                self.slot_cursor = (to, state);
+                smoother.value_at(&state, x)
+            }
         }
     }
-    if let Some(start) = run {
-        if to - start >= HOLE_MIN {
-            holes.push((start, to));
-        }
-    }
+}
+
+/// The emitted samples of a series' fetched rows ([`super::emitted_range`]), whose log-axis search needs ascending x: held state's time axes ascend in time.
+fn emitted_range(source: &Source<'_>, p: &ChartParams) -> (usize, usize) {
+    let range = super::emitted_range(source.n, |i| source.row(i).step, |i| source.key(i), p);
+    (range.start, range.end)
 }
 
 /// Each ref's tags at these snapshots that `keep` names (by ref and tag), with views of their rows: row counts and fetched ranges, `max_ts` unset.
@@ -831,12 +604,13 @@ fn read_tags<'a>(
     (refs, views)
 }
 
-/// Capture a full build's held state ([`super::build_chart`]), taking its finished model.
+/// Capture a full build's held state ([`super::build_chart`]), taking its finished model and each series' causal checkpoints (`respond`'s).
 pub(super) fn capture(
     req: &proto::ChartRequest,
     p: &ChartParams,
     snapshots: &[Arc<SeriesSnapshot>],
-    prepared: &mut [PreparedSeries],
+    prepared: &[PreparedSeries],
+    checkpoints: Vec<Vec<CausalState>>,
     model: DenseChart,
     axis: Option<HeldAxis>,
 ) -> Result<HeldChart, Fallback> {
@@ -865,20 +639,7 @@ pub(super) fn capture(
     let (mut tags_of, views) = read_tags(snapshots, p, |index, tag| {
         p.relative || reads[index].binary_search(&tag).is_ok()
     });
-    // Which tag of which ref each series reads.
-    let positions = prepared
-        .iter()
-        .map(|ps| {
-            let request_index = ps.identity.request_index;
-            tags_of[request_index]
-                .iter()
-                .position(|t| *t.name == *ps.identity.tag)
-                .map(|tag| (request_index, tag))
-                .ok_or(Fallback::Lineage)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    // On time axes, one sequential pass over the fetched rows of each held tag: its latest timestamp, and whether its rows ascend in time.
-    let mut sorted: Vec<Vec<bool>> = tags_of.iter().map(|tags| vec![true; tags.len()]).collect();
+    // On time axes, one sequential pass over the fetched rows of each held tag: its latest timestamp, and for a tag a series reads, that its rows ascend in time.
     if p.use_time {
         for (ri, tags) in tags_of.iter_mut().enumerate() {
             for (t, tag) in tags.iter_mut().enumerate() {
@@ -888,50 +649,29 @@ pub(super) fn capture(
                     last = last.max(row.timestamp_ms);
                 }
                 tag.max_ts = last;
-                sorted[ri][t] = ascending;
+                if !ascending && reads[ri].binary_search(&&*tag.name).is_ok() {
+                    return Err(Fallback::TimeOrder);
+                }
             }
         }
     }
     let mut series = Vec::with_capacity(prepared.len());
-    for (ps, (request_index, tag)) in prepared.iter_mut().zip(positions) {
-        if !sorted[request_index][tag] {
-            return Err(Fallback::TimeOrder);
-        }
+    for (ps, states) in prepared.iter().zip(checkpoints) {
+        let request_index = ps.identity.request_index;
+        let tag = tags_of[request_index]
+            .iter()
+            .position(|t| *t.name == *ps.identity.tag)
+            .ok_or(Fallback::Lineage)?;
         let HeldTag { r0, r1, .. } = tags_of[request_index][tag];
         let view = &views[request_index][tag];
+        // At least one: a tag forms a series only with a row in the fetch range (prepare).
         let n = r1 - r0;
-        let x_offset = if p.relative && n > 0 {
-            view.row(r0).timestamp_ms
-        } else {
-            0
-        };
-        let source = Source::new(view, r0, n, p.use_time, x_offset, &[]);
-        if n > 0 && !exact_range(source.key(0), source.key(n - 1)) {
+        let source = Source::new(view, r0, n, p);
+        if !exact_range(source.key(0), source.key(n - 1)) {
             return Err(Fallback::InexactX);
         }
         let (emit_from, emit_to) = emitted_range(&source, p);
         if emit_to - emit_from != ps.xs.len() {
-            return Err(Fallback::Lineage);
-        }
-        let keys = || view.rows(r0, r1).map(|row| source.key_of(row) as f64);
-        let plan = ps.smoothing_plan;
-        let (gaps, windows) = match plan {
-            SmoothingPlan::Median(bits) => {
-                let gaps = MedianGaps::default().extended(f64::from_bits(bits), keys())?;
-                let windows = if p.algo == Algorithm::SavitzkyGolay {
-                    let h_x = chart::savgol_x_half_width(p.window_size as usize, bits);
-                    // What every sample adds from the first: the full build's fit samples.
-                    window_samples(keys(), 0, 0..0, 0, h_x).1
-                } else {
-                    0
-                };
-                (gaps, windows)
-            }
-            _ => (MedianGaps::default(), 0),
-        };
-        // Causal smoothers' recorded states (prepare records them for a causal series with a finite output), the tail at the fetched count.
-        let states = std::mem::take(&mut ps.checkpoints);
-        if states.last().is_some_and(|&(index, _)| index != n) {
             return Err(Fallback::Lineage);
         }
         let env_src = if p.is_smoothed { &ps.raw } else { &ps.plot };
@@ -940,24 +680,11 @@ pub(super) fn capture(
             tag,
             emit_from,
             emit_to,
-            x_offset,
-            plan,
-            gaps,
-            windows,
+            plan: ps.smoothing_plan,
+            gaps: ps.median_gaps,
             checkpoints: Checkpoints::default().extended(&states),
             open: axis.open_cell(&ps.xs, env_src, &ps.kinds),
-            holes: {
-                let mut holes = Vec::new();
-                if p.is_smoothed {
-                    holes_in(&mut holes, None, 0, ps.plot.len(), |e| ps.plot[e]);
-                }
-                holes
-            },
-            first_endpoint: if p.is_smoothed {
-                ps.kinds.iter().position(|&kind| kind == 0)
-            } else {
-                None
-            },
+            finite_output: ps.slot.is_some(),
         });
     }
     let mut held = HeldChart {
@@ -982,7 +709,7 @@ pub(super) struct Advanced {
     /// What it visited, which the differential test bounds.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) work: Work,
-    /// Its working copies' charge: the samples it computed (appended samples and plot values, checkpoint replays included) at the transient rate, and the most one series computed again, as a full build is charged over its rows and largest series, at most that full build's transients.
+    /// Its working copies at the transient rate: each series' appended samples and copied Savitzky-Golay windows' capacity (a causal slot folds the rows in place), summed, and again for the series with the most, as a full build is charged over its rows and its largest series; at most that full build's transients.
     transients: u64,
 }
 
@@ -998,14 +725,12 @@ impl Advanced {
 pub(super) struct Work {
     /// Row reads from the snapshots (binary-search probes included).
     pub(super) rows: usize,
-    /// Smoother outputs computed (checkpoint replays included).
+    /// Causal samples folded: the appended ones, once, to record the next state's checkpoints, and those each slot folds from a checkpoint or the previous slot's state.
     pub(super) smoothed: usize,
     /// What the axis and model steps did ([`inc::RebuildWork`]).
     pub(super) rebuild: inc::RebuildWork,
     /// Causal replays from a held checkpoint.
     pub(super) replays: usize,
-    /// Samples in the windows of the irregular Savitzky-Golay fits it recomputed, as [`Fallback::Dense`] priced them.
-    pub(super) windows: usize,
 }
 
 /// Per series, what the advance learned before rebuilding.
@@ -1015,8 +740,7 @@ struct Step {
     /// Fetched rows appended since the held state.
     appended: usize,
     gaps: MedianGaps,
-    windows: usize,
-    fresh_checkpoints: Vec<(usize, CausalState)>,
+    fresh_checkpoints: Vec<CausalState>,
 }
 
 /// [`advance`], with a panic caught rather than unwinding into the build: it answers [`Fallback::Panic`] and turns held state off until restart, in shadow mode as in `on`, since the same chart would panic again on its next poll.
@@ -1068,11 +792,13 @@ pub(super) fn advance(
                 .is_ok()
     });
     let mut relative_ok = req.step_min.is_none() && req.step_max.is_none();
+    // Time axes: whether each tag's appended rows continue its held fetched ones (captured ascending) in time order, which a series reading it needs.
+    let mut sorted: Vec<Vec<bool>> = refs.iter().map(|tags| vec![true; tags.len()]).collect();
     for (index, (tags, ref_views)) in refs.iter_mut().zip(&views).enumerate() {
         let maximum = held.maxima[index];
         // Held tags and the snapshot's both ascend by name, so one walk pairs them.
         let mut held_tags = held.refs[index].iter().peekable();
-        for (tag, view) in tags.iter_mut().zip(ref_views) {
+        for ((tag, view), sorted) in tags.iter_mut().zip(ref_views).zip(&mut sorted[index]) {
             while held_tags.next_if(|t| *t.name < *tag.name).is_some() {}
             let held_tag = held_tags.next_if(|t| *t.name == *tag.name);
             let held_len = held_tag.map_or(0, |t| t.len);
@@ -1091,6 +817,7 @@ pub(super) fn advance(
                 for row in view.rows(fresh_from, tag.r1) {
                     // relative_offsets_stable: a new row before the latest held one of its tag moves the offsets (a ref held without rows holds no tags).
                     relative_ok &= row.timestamp_ms >= held_max_ts;
+                    *sorted &= row.timestamp_ms >= tag.max_ts;
                     tag.max_ts = tag.max_ts.max(row.timestamp_ms);
                 }
                 work.rows += tag.r1.saturating_sub(fresh_from);
@@ -1132,16 +859,10 @@ pub(super) fn advance(
         return Err(Fallback::Tags);
     }
 
-    // Irregular Savitzky-Golay ([`Fallback::Dense`]): the full build's cost, the samples in the windows it fits (each series' held ones, then those its appended samples add) and its other work per fetched row, against the advance's, the samples in the windows of the fits it recomputes.
-    let mut full_cost: usize = held.series.iter().map(|hs| hs.windows).sum::<usize>()
-        + FULL_BUILD_ROW_COST
-            * identities
-                .iter()
-                .map(|&(ri, t)| refs[ri][t].r1 - refs[ri][t].r0)
-                .sum::<usize>();
-    let mut advance_cost = 0;
+    // The chart's floor, from its grid's tier, which the advance keeps (a re-tier falls back as `regrid`).
+    let floor = held.axis.floor();
 
-    // Per series: the appended rows, their emitted samples, the plan, and the plot values they change.
+    // Per series: the appended rows, their emitted samples, the plan, and the slot smoother.
     let mut sources: Vec<Source<'_>> = Vec::with_capacity(held.series.len());
     let mut steps: Vec<Step> = Vec::with_capacity(held.series.len());
     for (&(ri, t), hs) in identities.iter().zip(&held.series) {
@@ -1152,21 +873,13 @@ pub(super) fn advance(
             return Err(Fallback::Lineage);
         }
         let (held_n, n) = (held_tag.r1 - held_tag.r0, tag.r1 - tag.r0);
-        let mut source = Source::new(view, tag.r0, n, p.use_time, hs.x_offset, &hs.holes);
+        let mut source = Source::new(view, tag.r0, n, p);
         // Keys ascend (step order, and time order checked below), so the last bounds them all.
         if n > held_n && !exact_range(source.key(held_n), source.key(n - 1)) {
             return Err(Fallback::InexactX);
         }
-        if p.use_time && n > held_n {
-            // Held fetched rows ascend in time (captured so), the latest last; appended ones must continue them.
-            let mut last = held_tag.max_ts;
-            for i in held_n..n {
-                let ts = source.row(i).timestamp_ms;
-                if ts < last {
-                    return Err(Fallback::TimeOrder);
-                }
-                last = ts;
-            }
+        if !sorted[ri][t] {
+            return Err(Fallback::TimeOrder);
         }
         // Emitted samples: appended rows extend the held range only when it reached the held fetched end.
         let (emit_from, emit_to) = if n == held_n {
@@ -1183,7 +896,7 @@ pub(super) fn advance(
             (lo, hi)
         };
         // A new in-range sample with an unplottable x (log axes) would add a kind-4 marker.
-        if p.spec.log_buckets && n > held_n {
+        if p.spec.log_buckets {
             for i in held_n..n {
                 let step = source.row(i).step;
                 if step >= p.step_min && step <= p.step_max && source.key(i) < 0 {
@@ -1197,131 +910,70 @@ pub(super) fn advance(
         let first_new = hs.emit_to - hs.emit_from;
 
         // The plan, held while the appended gaps keep it; on smoothed charts a first finite logged value changes it.
-        let finite_output = hs.first_endpoint.is_some();
+        let finite_output = hs.finite_output;
         if p.is_smoothed
             && !finite_output
             && (emit_from + first_new..emit_to).any(|i| source.value(i).is_finite())
         {
             return Err(Fallback::PlanShift);
         }
-        let mut gaps = hs.gaps;
-        let mut windows = hs.windows;
-        if finite_output && n > held_n {
-            match hs.plan {
-                SmoothingPlan::NoState => {}
-                SmoothingPlan::Uniform => {
-                    // is_uniform's first gap, from the first held sample (a finite output means one is held) to the next, appended when that one was held alone.
-                    let d0 = source.xkey(1) - source.xkey(0);
-                    let gaps = (held_n.max(1)..n).map(|i| source.xkey(i) - source.xkey(i - 1));
-                    if !chart::same_gaps(d0, gaps) {
-                        return Err(Fallback::PlanShift);
-                    }
-                }
-                SmoothingPlan::Median(bits) => {
-                    let keys = (held_n.saturating_sub(1)..n).map(|i| source.xkey(i));
-                    gaps = gaps.extended(f64::from_bits(bits), keys)?;
-                }
+        let gaps = match hs.plan {
+            SmoothingPlan::Median(bits) if n > held_n => {
+                let keys = (held_n.saturating_sub(1)..n).map(|i| source.xkey(i));
+                let m = f64::from_bits(bits);
+                hs.gaps.extended(m, keys).ok_or(Fallback::PlanShift)?
             }
-        }
+            _ => hs.gaps,
+        };
 
-        // Plot values that change, from `reach_from` on, computed now; the rest on demand.
-        let mut reach_from = held_n;
+        // The slot smoother at the chart's floor; a causal one folds the appended rows from the held tail, recording the states the next state keeps.
         let mut fresh_checkpoints = Vec::new();
         if finite_output {
-            source.smoother = match (p.algo, hs.plan) {
-                (Algorithm::Ema | Algorithm::Triangular, plan) => Smoother::Causal {
-                    smoother: chart::causal_smoother(p.algo, p.time_constant, p.poly_order, plan),
-                    recorded: &hs.checkpoints,
-                },
-                (Algorithm::SavitzkyGolay, SmoothingPlan::Uniform) => Smoother::SgUniform {
-                    window: p.window_size as usize,
-                    order: p.poly_order,
-                },
-                (Algorithm::SavitzkyGolay, SmoothingPlan::Median(bits)) => Smoother::SgIrregular {
-                    h_x: chart::savgol_x_half_width(p.window_size as usize, bits),
-                    deg: p.poly_order.min(2) as usize,
-                },
-                _ => return Err(Fallback::PlanShift),
-            };
-            if n > held_n {
-                // prepare's flag_reach (OLD within the centered reach of the first NEW) and the dependency suffix (causal: from the first NEW; uniform SG: from its block origin).
-                if p.reach > 0 {
-                    reach_from = held_n.saturating_sub(p.reach);
-                    if let SmoothingPlan::Median(bits) = hs.plan {
-                        let span = f64::from_bits(bits) * p.reach as f64;
-                        let first = source.xkey(held_n);
-                        // Keys ascend to `first`, so the samples within its span are a suffix: searched for, however densely they sit.
-                        reach_from =
-                            inc::partition(0, reach_from, |i| first - source.xkey(i) > span);
-                    }
-                }
-                match source.smoother {
-                    Smoother::Causal { smoother, recorded } => {
-                        // Captured with every causal series' finite output, at its fetched count; a broken invariant panics into the advance's guard (answered in full, held state off).
-                        let mut state = recorded.tail.expect("a causal series' tail state");
-                        let xs: Vec<f64> = (held_n..n).map(|i| source.xkey(i)).collect();
-                        let y: Vec<f64> = (held_n..n).map(|i| source.y(i)).collect();
-                        source.smoothed += n - held_n;
-                        source.dense =
-                            smoother.run(&xs, &y, &mut state, held_n, Some(&mut fresh_checkpoints));
-                        source.dense_from = held_n;
-                    }
-                    Smoother::SgUniform { .. } | Smoother::SgIrregular { .. } => {
-                        // Uniform: also from the first prefix-sum block the new sample shifts.
-                        if let Smoother::SgUniform { window, .. } = source.smoother {
-                            reach_from =
-                                reach_from.min(chart::savgol_dependency_start(window, held_n));
-                        }
-                        // Only emitted outputs are read: those from `reach_from` on are computed up to the emitted end, not over a zoomed chart's fetch margins (each output's bits do not depend on the range computed).
-                        let start = reach_from.max(emit_from);
-                        let outputs = start..emit_to.max(start);
-                        // Irregular: answers in full once it would cost more than the full build ([`Fallback::Dense`]).
-                        if let Smoother::SgIrregular { h_x, .. } = source.smoother {
-                            let x0 = source.xkey(reach_from);
-                            let lo = inc::partition(0, reach_from, |i| x0 - source.xkey(i) > h_x);
-                            let (recomputed, added) = window_samples(
-                                (lo..n).map(|i| source.xkey(i)),
-                                lo,
-                                outputs.clone(),
-                                held_n,
-                                h_x,
-                            );
-                            windows += added;
-                            work.windows += recomputed;
-                            full_cost += added;
-                            advance_cost += ADVANCE_WINDOW_COST * recomputed;
-                            if advance_cost > full_cost {
-                                return Err(Fallback::Dense);
-                            }
-                        }
-                        source.dense = source.compute(outputs.start, outputs.end);
-                        source.dense_from = outputs.start;
-                    }
-                    Smoother::Raw => {}
+            source.slot = Some(
+                SlotSmoother::new(
+                    p.algo,
+                    p.window_size,
+                    p.time_constant,
+                    p.poly_order,
+                    hs.plan,
+                )
+                .floored(floor),
+            );
+            if let Some(SlotSmoother::Causal(smoother)) = source.slot {
+                source.recorded = Some((&hs.checkpoints, held_n));
+                if n > held_n {
+                    // Captured with every causal series' finite output, at its fetched count; a broken invariant panics into the advance's guard (answered in full, held state off).
+                    let mut state = hs.checkpoints.tail.expect("a causal series' tail state");
+                    let xs: Vec<f64> = (held_n..n).map(|i| source.xkey(i)).collect();
+                    let y: Vec<f64> = (held_n..n).map(|i| source.value(i)).collect();
+                    source.smoothed += n - held_n;
+                    smoother.fold_recording(
+                        &[(&xs, &y)],
+                        &mut state,
+                        held_n,
+                        Some(&mut fresh_checkpoints),
+                    );
+                    fresh_checkpoints.push(state);
                 }
             }
         }
-        // Plot values may differ from the held ones from `reach_from` on: held samples there are the planner's REACH, then the new ones follow.
-        source.changed_from = reach_from.clamp(emit_from, emit_to) - emit_from;
-        debug_assert!(source.changed_from <= first_new);
         sources.push(source);
         steps.push(Step {
             first_new,
-            appended: n.saturating_sub(held_n),
+            appended: n - held_n,
             gaps,
-            windows,
             fresh_checkpoints,
         });
     }
 
     // The axis, advanced by every series' new emitted x.
     let new_xs: Vec<Vec<f64>> = sources
-        .iter_mut()
+        .iter()
         .zip(&steps)
         .map(|(source, step)| (step.first_new..source.len).map(|e| source.x(e)).collect())
         .collect();
     if held.axis.passthrough_shaped() {
-        for (source, (step, xs)) in sources.iter_mut().zip(steps.iter().zip(&new_xs)) {
+        for (source, (step, xs)) in sources.iter().zip(steps.iter().zip(&new_xs)) {
             let previous = (step.first_new > 0).then(|| source.x(step.first_new - 1));
             if previous.zip(xs.first()).is_some_and(|(a, &b)| a == b)
                 || xs.windows(2).any(|w| w[0] == w[1])
@@ -1333,24 +985,28 @@ pub(super) fn advance(
     let new_refs: Vec<&[f64]> = new_xs.iter().map(Vec::as_slice).collect();
     let axis_step = inc::advance_axis(&held.axis, &held.model.x_values, &new_refs, p.spec)?;
 
-    // The model. Interpolation dependencies: envelope slots past the last finite point before the first change re-interpolate. Below the first change, plot values are the held ones, so the held hole index applies there.
+    // The model: slots that moved or whose smoother can read an appended sample re-evaluate.
+    let slot_dirty: Vec<f64> = sources
+        .iter()
+        .zip(&steps)
+        .map(|(source, step)| {
+            let first = source.n - step.appended;
+            source.slot.map_or(f64::INFINITY, |slot| {
+                slot.dirty_from((step.appended > 0).then(|| source.xkey(first)))
+            })
+        })
+        .collect();
     let (model, open) = {
         let mut series_steps: Vec<inc::SeriesStep<'_>> = Vec::with_capacity(sources.len());
-        for ((source, step), hs) in sources.iter_mut().zip(&steps).zip(&held.series) {
-            let changed_from = source.changed_from;
-            let mut lerp_after = f64::INFINITY;
-            if p.is_smoothed && changed_from < source.len {
-                let finite = inc::finite_below(source, changed_from);
-                lerp_after = if finite.len() == 2 {
-                    source.x(finite[0].0)
-                } else {
-                    f64::NEG_INFINITY
-                };
-            }
+        for (((source, step), hs), &slot_dirty_from) in sources
+            .iter_mut()
+            .zip(&steps)
+            .zip(&held.series)
+            .zip(&slot_dirty)
+        {
             series_steps.push(inc::SeriesStep {
                 first_new: step.first_new,
-                changed_from,
-                lerp_after,
+                slot_dirty_from,
                 open: hs.open,
                 samples: source,
             });
@@ -1368,67 +1024,39 @@ pub(super) fn advance(
     let mut kind = lineages.rejection().map(super::lineage::Rejection::label);
     let deltable = verified.is_some()
         && (!p.relative || relative_ok)
-        && super::continuing_series_match(req, p, plans(), held.series.len());
-    let from_col = deltable.then(|| planner_from_col(held, &axis_step, &mut sources, &steps, p));
+        && super::continuing_series_match(req, p, plans());
+    // The banded bit flips only in a full answer, as the full build answers it (`super::build_chart`).
+    let flips = super::is_banded(&model) && !super::is_banded(&held.model);
+    let from_col = deltable.then(|| match flips {
+        true => 0,
+        false => planner_from_col(held, &axis_step, &sources, &new_refs, &slot_dirty),
+    });
     // Every held series continues: no series appeared, and a series without held emitted samples gained none.
     let continues = std::iter::repeat_n(true, held.series.len());
     let mut response = super::reply(&model, req, from_col, continues, &mut kind);
     stamp_lineages(&mut response.frontiers, lineages);
     stamp_smoothing_state(&mut response.frontiers, p, plans());
 
-    // The next state's hole index: held below the first change, rescanned above it (over the samples the poll recomputed). Its endpoint is the held one: emitted samples keep their logged values, and a first finite one falls back (`plan_shift`).
+    // The next state: a first finite logged value fell back (`plan_shift`), so the held finite-output flag still holds.
     let mut series = Vec::with_capacity(held.series.len());
     for ((((hs, step), source), open), &(_, t)) in held
         .series
         .iter()
         .zip(&steps)
-        .zip(sources.iter_mut())
+        .zip(&sources)
         .zip(open)
         .zip(&identities)
     {
-        let holes = if p.is_smoothed {
-            let below = source.changed_from;
-            let len = source.len;
-            let mut holes: Vec<(usize, usize)> = hs
-                .holes
-                .iter()
-                .filter(|&&(_, end)| end < below)
-                .copied()
-                .collect();
-            // A hole reaching the first change runs on while the rescanned values stay non-finite; so does a shorter run of held values below it (under [`HOLE_MIN`] long, or the index would hold it), which only rescanned values can make a hole: without any, it is not looked for.
-            let run = hs
-                .holes
-                .iter()
-                .find(|&&(start, end)| start < below && end >= below)
-                .map(|&(start, _)| start)
-                .or_else(|| {
-                    if below >= len {
-                        return None;
-                    }
-                    let mut start = below;
-                    while start > 0 && !source.plot(start - 1).is_finite() {
-                        start -= 1;
-                    }
-                    (start < below).then_some(start)
-                });
-            holes_in(&mut holes, run, below, len, |e| source.plot(e));
-            holes
-        } else {
-            Vec::new()
-        };
         series.push(HeldSeries {
             request_index: hs.request_index,
             tag: t,
             emit_from: source.a,
             emit_to: source.a + source.len,
-            x_offset: hs.x_offset,
             plan: hs.plan,
             gaps: step.gaps,
-            windows: step.windows,
             checkpoints: hs.checkpoints.extended(&step.fresh_checkpoints),
             open,
-            holes,
-            first_endpoint: hs.first_endpoint,
+            finite_output: hs.finite_output,
         });
     }
 
@@ -1437,7 +1065,7 @@ pub(super) fn advance(
         work.rows += source.rows_read.get();
         work.smoothed += source.smoothed;
         work.replays += source.replays;
-        let samples = step.appended + source.smoothed;
+        let samples = step.appended + source.window_rows.1.capacity();
         (computed, most) = (computed + samples, most.max(samples));
         (fetched, longest) = (fetched + source.n, longest.max(source.n));
     }
@@ -1464,58 +1092,56 @@ pub(super) fn advance(
     })
 }
 
-/// [`super::plan_delta_from_col`] on the samples it can mark: each continuing series' REACH (prepare's centered reach and dependency suffix, then flag_lerp_dependency's one interpolation endpoint) and NEW samples.
+/// [`super::plan_delta_from_col`] on the samples it can mark: the NEW ones (`new_xs`), and the first raw slot from each series' `slot_dirty` x on where a held sample's smoothed value changes.
 fn planner_from_col(
     held: &HeldChart,
     axis_step: &inc::AxisStep,
-    sources: &mut [Source<'_>],
-    steps: &[Step],
-    p: &ChartParams,
+    sources: &[Source<'_>],
+    new_xs: &[&[f64]],
+    slot_dirty: &[f64],
 ) -> usize {
     let mut xs: Vec<Vec<f64>> = Vec::with_capacity(sources.len());
     let mut ages: Vec<Vec<u8>> = Vec::with_capacity(sources.len());
     let mut continuing = Vec::with_capacity(sources.len());
-    for ((source, step), hs) in sources.iter_mut().zip(steps).zip(&held.series) {
+    let shaped = axis_step.axis.passthrough_shaped();
+    let raw_slots = axis_step.raw_slots();
+    for ((source, &new), &dirty) in sources.iter().zip(new_xs).zip(slot_dirty) {
         // numeric_delta_from_col's continuing: some held emitted sample.
-        continuing.push(step.first_new > 0);
-        let hot = source.changed_from..source.len;
-        let mut samples = Vec::with_capacity(hot.len() + 1);
-        if p.is_smoothed {
-            // flag_lerp_dependency: the first changing sample, then the nearest preceding finite endpoint, or, with fewer than two, the first possible one (held below the first change, since every hot sample before `changing` is not one).
-            if let Some(changing) = hot.clone().find(|&e| source.raw(e).is_finite()) {
-                let finite = inc::finite_below(source, changing);
-                let dependency = if finite.len() == 2 {
-                    Some(finite[0].0)
-                } else {
-                    hs.first_endpoint
-                };
-                samples.extend(dependency.filter(|&d| d < hot.start));
+        let held_emitted = source.len - new.len();
+        continuing.push(held_emitted > 0);
+        let (mut x, mut age) = (Vec::new(), Vec::new());
+        // A held sample from the series' slot rule on changes its raw slot's smoothed value. The planner stops at the first such slot, which serves alone: passing through, the first held sample from `dirty` on; on a grid, the first of its raw slots from `dirty` on that holds one (emitted x ascend).
+        let x_at = |e: usize| source.x(e);
+        let last = held_emitted.checked_sub(1).map(x_at);
+        if let Some(last) = last.filter(|&last| last >= dirty) {
+            let first = if shaped {
+                Some(x_at(inc::partition(0, held_emitted, |e| x_at(e) < dirty)))
+            } else {
+                raw_slots[raw_slots.partition_point(|&v| v < dirty)..]
+                    .iter()
+                    .copied()
+                    .take_while(|&v| v <= last)
+                    .find(|&v| x_at(inc::partition(0, held_emitted, |e| x_at(e) < v)) == v)
+            };
+            if let Some(first) = first {
+                x.push(first);
+                age.push(chart::AGE_OLD);
             }
         }
-        samples.extend(hot);
-        // Ages: REACH from the first change (the endpoint too), NEW from the first new sample.
-        xs.push(samples.iter().map(|&e| source.x(e)).collect());
-        ages.push(
-            samples
-                .iter()
-                .map(|&e| {
-                    if e >= step.first_new {
-                        chart::AGE_NEW
-                    } else {
-                        chart::AGE_REACH
-                    }
-                })
-                .collect(),
-        );
+        x.extend_from_slice(new);
+        age.resize(x.len(), chart::AGE_NEW);
+        xs.push(x);
+        ages.push(age);
     }
     let xs_r: Vec<&[f64]> = xs.iter().map(Vec::as_slice).collect();
     let ages_r: Vec<&[u8]> = ages.iter().map(Vec::as_slice).collect();
-    inc::planner_from_col(
+    chart::axes_from_col(
         &held.axis,
         &held.model.x_values,
-        axis_step,
+        &axis_step.axis,
         &xs_r,
         &ages_r,
+        slot_dirty,
         &continuing,
     )
 }
@@ -1532,7 +1158,7 @@ pub(super) struct HeldStore {
 struct Held {
     /// Its place in the LRU order.
     tick: u64,
-    /// Answers stored at its maxima, less the polls since answered from them: the viewers that may still continue from it.
+    /// Answers stored at its maxima, less the polls since answered from them: the viewers that may still continue from it. A tab whose answer was never stored here is not counted, though its continuation releases one (stage 3b of chart-request-latency.md).
     viewers: usize,
     chart: Arc<HeldChart>,
 }
@@ -1586,11 +1212,10 @@ impl StoreInner {
         viewers
     }
 
-    /// Evict the entry, counting it if a viewer is on record (it may still continue from it, unless it closed its tab or changed its request).
+    /// Evict the entry and count it: a held entry has a viewer on record, who may still continue from it (unless it closed its tab or changed its request).
     fn evict(&mut self, key: &RequestKey, at: usize, cause: &'static str) {
-        if self.remove_at(key, at) > 0 {
-            metrics::counter!("mkdb2_chart_held_evicted_total", "cause" => cause).increment(1);
-        }
+        self.remove_at(key, at);
+        metrics::counter!("mkdb2_chart_held_evicted_total", "cause" => cause).increment(1);
     }
 
     fn publish(&mut self) {
@@ -1824,7 +1449,7 @@ impl HeldStore {
                 return;
             };
             let held = &mut list[at];
-            held.viewers = held.viewers.saturating_sub(1);
+            held.viewers -= 1;
             if held.viewers == 0 {
                 inner.remove_at(key, at);
                 shrink_table(&mut inner.map, &mut inner.map_capacity);
@@ -1950,7 +1575,7 @@ pub(super) fn build(
     if attempt == Advance::Only && (mode != HeldMode::On || audit) {
         return Ok(None);
     }
-    // No key: a custom-x chart, or held state was off when the poll was planned (so it is off now).
+    // Held state is off now (it never turns back on, so this includes a poll planned while it was off, which has no key), or a custom-x chart, which has no key.
     let Some(key) = request.filter(|_| mode != HeldMode::Off) else {
         if mode != HeldMode::Off {
             count("ineligible");
@@ -2155,62 +1780,4 @@ pub(super) fn build(
 /// A key's first bytes, for logs.
 fn short(key: &RequestKey) -> String {
     key[..6].iter().map(|b| format!("{b:02x}")).collect()
-}
-
-#[cfg(test)]
-mod window_samples_tests {
-    use super::*;
-
-    /// Samples within `h` of sample `i`, itself included: its fit's window.
-    fn window(keys: &[f64], i: usize, h: f64) -> usize {
-        keys.iter().filter(|&&x| (x - keys[i]).abs() <= h).count()
-    }
-
-    /// The full build's fit samples: one window per distinct x.
-    fn full(keys: &[f64], h: f64) -> usize {
-        (0..keys.len())
-            .filter(|&i| i == 0 || keys[i] != keys[i - 1])
-            .map(|i| window(keys, i, h))
-            .sum()
-    }
-
-    /// The pricing counts each fit's window as the sweeps fit: the full build's from the first sample, an advance's from the first output it computes, and what appended samples add to the full build's.
-    #[test]
-    fn window_samples_counts_the_windows_of_the_fits_made() {
-        let mut rng = crate::Rng(0x5eed_1234);
-        for _ in 0..300 {
-            let n = 1 + rng.below(40) as usize;
-            let mut x = 0.0;
-            let keys: Vec<f64> = (0..n)
-                .map(|_| {
-                    x += rng.pick(&[0.0, 0.0, 1.0, 2.0, 5.0]);
-                    x
-                })
-                .collect();
-            let h = rng.pick(&[0.5, 1.0, 3.0, 8.0, 100.0]);
-            assert_eq!(
-                window_samples(keys.iter().copied(), 0, 0..0, 0, h).1,
-                full(&keys, h),
-                "{keys:?} h={h}"
-            );
-            // As the advance calls it: held samples ..held_n, outputs from at least reach_from, the sweep from the first sample within h below it.
-            let held_n = 1 + rng.below(n as u64) as usize;
-            let reach_from = rng.below(held_n as u64) as usize;
-            let lo = (0..=reach_from)
-                .find(|&i| keys[reach_from] - keys[i] <= h)
-                .unwrap();
-            let start = reach_from + rng.below((n - reach_from + 1) as u64) as usize;
-            let end = start + rng.below((n - start + 1) as u64) as usize;
-            let (recomputed, added) =
-                window_samples(keys[lo..].iter().copied(), lo, start..end, held_n, h);
-            let fits = (start..end).filter(|&i| i == start || keys[i] != keys[i - 1]);
-            let case = format!("{keys:?} h={h} held {held_n} lo {lo} outputs {start}..{end}");
-            assert_eq!(
-                recomputed,
-                fits.map(|i| window(&keys, i, h)).sum::<usize>(),
-                "{case}"
-            );
-            assert_eq!(added, full(&keys, h) - full(&keys[..held_n], h), "{case}");
-        }
-    }
 }

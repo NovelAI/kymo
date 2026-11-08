@@ -2,24 +2,6 @@
 use super::*;
 use crate::query::memo::{memo_key, request_hash, ChartMemo};
 
-/// The audit's old-only reconstruction of a request the full build classified `unchanged` aligns with it, whether or not its smoothing needs the check, and the audited build classifies it `unchanged` too: an audited memo hit never meets the alignment gate, which would answer in full and disable the memo for a gate rather than a reply.
-fn assert_audit_aligns(req: &proto::ChartRequest, snapshots: &[Arc<SeriesSnapshot>]) {
-    let p = chart_params(req);
-    let lineages = inspect_lineages(req, snapshots, echoed_frontiers(req));
-    let held = lineages.verified();
-    let prepared = prepare(req, &p, snapshots, None, held, false, None, false).unwrap();
-    let plans: Vec<_> = prepared
-        .series
-        .iter()
-        .filter(|ps| ps.continues)
-        .map(|ps| (ps.identity.clone(), ps.smoothing_plan))
-        .collect();
-    let old = prepare(req, &p, snapshots, None, held, true, Some(&plans), false).unwrap();
-    assert!(old.audit_plans_aligned, "{req:?}");
-    let audited = build_chart(req, snapshots, None, true, None, &|_| {}, false).unwrap();
-    assert_eq!(audited.kind, Some("unchanged"), "{req:?}");
-}
-
 /// The service's stage-1 path after a poll's reads: probe, else build and settle (an `unchanged` build checked against the audit's alignment gate). Returns the reply and whether the memo served it.
 fn serve(
     memo: &ChartMemo,
@@ -33,8 +15,11 @@ fn serve(
         ControlFlow::Continue(held) => {
             let built =
                 build_chart(req, snapshots, None, audit, held.as_ref(), &|_| {}, false).unwrap();
+            // Audited, an `unchanged` build stays `unchanged`, so its old-only reconstruction aligns (a misaligned one is `gated`): an audited memo hit never meets the alignment gate, which would answer in full and disable the memo for a gate rather than a reply.
             if built.kind == Some("unchanged") {
-                assert_audit_aligns(req, snapshots);
+                let audited =
+                    build_chart(req, snapshots, None, true, None, &|_| {}, false).unwrap();
+                assert_eq!(audited.kind, Some("unchanged"), "{req:?}");
             }
             count_delta(built.kind);
             settle_memo(memo, key, snapshots, &built);

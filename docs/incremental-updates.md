@@ -19,16 +19,15 @@ Only output-determining global state is recorded:
 | Smoother | Axis/branch | Exact state | Derivation work per live output series |
 |---|---|---|---|
 | EMA / Triangular | step-sized | none | no uniform scan, no median sort |
-| EMA / Triangular | time | median bits | one median sort |
-| Savitzky–Golay | uniform | `Uniform` sentinel | one uniform scan |
-| Savitzky–Golay | irregular | median bits | one uniform scan and one median sort |
+| EMA / Triangular on time, Savitzky–Golay | evenly spaced | median bits (the gap) | one uniform scan |
+| EMA / Triangular on time, Savitzky–Golay | irregular | median bits | one uniform scan and one median sort |
 | Any | no finite rendered value (including no position after range/x filtering) | `NoState` sentinel | no plan derivation and no smoothing |
 
-Step EMA/Triangular still use each local x gap; “none” means only that they have no whole-series derived scalar which an append could use to rescale earlier output. Custom-x charts never use frontier deltas, so they compute only the plan needed to render the full response and neither stamp nor echo continuation state.
+Step EMA/Triangular still use each local x gap; “none” means only that they have no whole-series derived scalar which an append could use to rescale earlier output. The smoothing floor (`chart::Floor`) is not recorded: it follows the grid tier, which the planner already compares. Custom-x charts never use frontier deltas, so they compute only the plan needed to render the full response (and check even spacing again to pick Savitzky–Golay's index-space kernel) and neither stamp nor echo continuation state.
 
-The live preparation path derives this semantic plan once and reuses it for smoothing, Savitzky–Golay reach marking, exact state stamping, and comparison on the next request. The sampled old-only audit receives the already-proven current plans paired with stable request/tag identities. It reuses them positionally only after proving the complete old-only identity sequence matches; client-controlled count or membership mismatches answer in full before a plan can be consumed. The reconstruction therefore performs no local uniform scan or median sort. `NoState` remains an explicit sequence entry when all-marker and margin-only series interleave.
+The live preparation path derives this semantic plan once (a median plan with the gap counts held state keeps, `chart::MedianGaps`) and reuses it for smoothing, exact state stamping, and comparison on the next request. The sampled old-only audit receives the already-proven current plans paired with stable request/tag identities. It reuses them positionally only after proving the complete old-only identity sequence matches; client-controlled count or membership mismatches answer in full before a plan can be consumed. The reconstruction therefore performs no local uniform scan or median sort. `NoState` remains an explicit sequence entry when all-marker and margin-only series interleave.
 
-The opaque frontier map uses a version and response-series count plus one word per output series: `0 = NoState`, `1 = Uniform`, otherwise positive-finite median `f64` bits. Clients send the literal held-series count.
+Where the smoothing has such state (the median rows above), the opaque frontier map holds a version, the response's series count (stamped, not compared) and one word per output series: `0 = NoState`, otherwise the median's `f64` bits. The server checks the version and compares each continuing series' word with its current plan's, so any other word answers in full. Clients send the literal held-series count (`held_series`), which the server compares.
 
 A server rejects unsupported lineage state and seeds one full response. Frontend epoch changes suppress stale echoes after reconnect; the keyed stamp also invalidates pre-restart state.
 
@@ -54,7 +53,7 @@ The SQL visibility margin and overlap remain necessary. A row absent from every 
 | --- | --- |
 | `delta` | Reuses a prefix and sends replacement columns or complete newly requested series. |
 | `unchanged` | Reuses every axis/value column and every series continues; metadata may still change. |
-| `miss` | The planner found no reusable prefix (`from_col == 0`). |
+| `miss` | The planner found no reusable prefix, or the banded bit flips (`from_col == 0`). |
 | `gated` | Another eligibility, membership, relative-offset, smoothing, or audit-plan alignment gate refused continuation. |
 | `audit_failed` | A sampled check disagreed with the answer it checked, which then answers in full: the reconstruction with the proposed held prefix, or the full build with a memoized reply or with held state's advance. |
 | `state` | Echoed lineage state is malformed, unsupported, or structurally incompatible. |

@@ -81,7 +81,7 @@ fn newly_present_marker_right_of_last_envelope_resends_its_slot() {
     }
 }
 
-/// The same appearance on a passthrough chart: the anchor x=5 is an exact raw slot, and marking it REACH starts the delta there.
+/// The same appearance on a passthrough chart: the anchor x=5 is an exact raw slot, and marking it ANCHOR starts the delta there.
 #[test]
 fn newly_present_marker_on_a_passthrough_chart_resends_its_anchor_slot() {
     let b = timestamp_rows(&[1, 2, 3, 4]);
@@ -213,12 +213,7 @@ fn anchorless_marker_appearance_answers_full() {
         let mut request = absolute_log_request();
         request.target_resolution = 10_000;
         request.step_min = Some(100);
-        request.smoothing = Some(proto::SmoothingConfig {
-            algorithm: algorithm as i32,
-            window_size: 5,
-            time_constant: std::f64::consts::LOG2_E,
-            poly_order: 1,
-        });
+        request.smoothing = smoothing(algorithm, 5, std::f64::consts::LOG2_E, 1);
         let held = build(&request, &[held_a.clone(), axis.clone()]);
         let held_model = inflate_full(&held);
         assert_eq!(
@@ -369,12 +364,7 @@ fn smoothers_bound_new_negative_timestamps_with_an_unchanged_plan() {
             let other = rows_shaped(80, |i| i, |i| if i < 40 { i + 1 } else { i * 9_000 });
             let mut request = absolute_log_request();
             request.target_resolution = 30;
-            request.smoothing = Some(proto::SmoothingConfig {
-                algorithm: algorithm as i32,
-                window_size: 5,
-                time_constant: std::f64::consts::LOG2_E,
-                poly_order: 1,
-            });
+            request.smoothing = smoothing(algorithm, 5, std::f64::consts::LOG2_E, 1);
             let held = build(&request, &[samples(60), other.clone()]);
             let current = [samples(61), other];
             let continued = continuation(&request, &held);
@@ -389,9 +379,7 @@ fn smoothers_bound_new_negative_timestamps_with_an_unchanged_plan() {
                     .collect::<Vec<_>>(),
                 None,
                 Some(&verified),
-                false,
                 None,
-                false,
             )
             .unwrap()
             .series;
@@ -407,7 +395,6 @@ fn smoothers_bound_new_negative_timestamps_with_an_unchanged_plan() {
                         .iter()
                         .filter(|ps| ps.continues)
                         .map(|ps| ps.smoothing_plan),
-                    2,
                 ),
                 "{algorithm:?}: fixture must isolate the negative-input gate"
             );
@@ -432,26 +419,16 @@ fn smoothers_bound_new_negative_timestamps_with_an_unchanged_plan() {
     }
 }
 
+/// A row stamped before a uniform series' held ones, outside the zoom, is its first fetched sample, first in x: every slot lies past it less the half-width, so all are dirty (`SlotSmoother::dirty_from`) and the chart answers in full.
 #[test]
-fn uniform_savgol_insertion_before_zoom_reemits_numerically_changed_blocks() {
+fn a_row_stamped_before_a_uniform_series_answers_in_full() {
     for first_x in [0, 1_000] {
         let rows = |insert_earlier| {
-            let mut state = 10u64;
             let mut samples: Vec<_> = (0..180)
-                .map(|step| {
-                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-                    let value = ((state >> 32) % 10_000) as f32 / 97.0;
-                    VersionedRawPoint {
-                        timestamp_ms: first_x + step,
-                        ..scalar_row(step, value)
-                    }
-                })
+                .map(|step| timed_row(step, first_x + step, (step % 7) as f32))
                 .collect();
             if insert_earlier {
-                samples.push(VersionedRawPoint {
-                    timestamp_ms: first_x - 1,
-                    ..scalar_row(180, 3.0)
-                });
+                samples.push(timed_row(180, first_x - 1, 3.0));
             }
             Arc::new(samples)
         };
@@ -460,17 +437,12 @@ fn uniform_savgol_insertion_before_zoom_reemits_numerically_changed_blocks() {
         request.log_buckets = true;
         request.step_min = Some(32);
         request.step_max = Some(168);
-        request.smoothing = Some(proto::SmoothingConfig {
-            algorithm: Algorithm::SavitzkyGolay as i32,
-            window_size: 20,
-            poly_order: 2,
-            ..Default::default()
-        });
+        request.smoothing = smoothing(Algorithm::SavitzkyGolay, 20, 0.0, 2);
         let held = build(&request, &[rows(false)]);
         let current = [rows(true)];
         assert!(
             verified_inputs(&request, &current, &held.frontiers).is_some(),
-            "the cache proof must pass so this fixture exercises the SG dependency"
+            "the cache proof must pass so this fixture exercises the slot rule"
         );
         let current_full = build(&request, &current);
         assert_eq!(
@@ -478,16 +450,6 @@ fn uniform_savgol_insertion_before_zoom_reemits_numerically_changed_blocks() {
             current_full.frontiers[&smoothing_state_key(0)],
             "the global smoothing-plan gate must also pass"
         );
-        // The inserted row sorts first in TIME, outside the plotted steps and the planner's window-wide reach (steps 0-19 once sorted), yet it shifts every prefix-sum block under the plotted outputs. Compare f64 bits: the change rarely survives f32 rounding.
-        let smoothed = |rows: &[VersionedRawPoint]| {
-            let mut rows = rows.to_vec();
-            rows.sort_by_key(|row| row.timestamp_ms);
-            let xs: Vec<f64> = rows.iter().map(|row| row.timestamp_ms as f64).collect();
-            let ys: Vec<f64> = rows.iter().map(|row| f64::from(row.value)).collect();
-            chart::smooth_run(&xs, &ys, Algorithm::SavitzkyGolay, 20, 0.5, 2, false)
-        };
-        let (old, new) = (smoothed(&rows(false)), smoothed(&rows(true)));
-        assert!((32..=168).any(|step| old[step].to_bits() != new[step + 1].to_bits()));
         for out in assert_full_response(&request, &held, &current, None) {
             assert_eq!(
                 out.series[0].xnan_count, 0,
@@ -497,39 +459,21 @@ fn uniform_savgol_insertion_before_zoom_reemits_numerically_changed_blocks() {
     }
 }
 
+/// Slots evaluate the smoother at their x directly, so an append re-emits the slots whose windows reach it (window 20: from half a window before it).
 #[test]
-fn uniform_savgol_append_reemits_the_resized_final_block() {
-    let mut state = 234u64;
-    // Window 20's blocks cover twenty outputs each from step 10, so 195 samples leave steps 170-184 in a partial final block.
+fn savgol_append_reemits_the_slots_its_window_reaches() {
     let samples: Vec<_> = (0..195)
-        .map(|step| {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-            let value = (((state >> 32) % 20_001) as i64 - 10_000) as f32 / 97.0;
-            scalar_row(step, value)
-        })
+        .map(|step| scalar_row(step, (step % 7) as f32))
         .collect();
     let mut request = req(&["a"], 1_000);
-    request.smoothing = Some(proto::SmoothingConfig {
-        algorithm: Algorithm::SavitzkyGolay as i32,
-        window_size: 20,
-        poly_order: 2,
-        ..Default::default()
-    });
+    request.smoothing = smoothing(Algorithm::SavitzkyGolay, 20, 0.0, 2);
     let held = build(&request, &[Arc::new(samples.clone())]);
-    let mut grown = samples.clone();
+    let mut grown = samples;
     grown.extend([scalar_row(195, 3.0), scalar_row(196, 4.0)]);
-    // Appending resizes the final block and moves its origin, changing f64 outputs at steps 170-184 outside the new rows' ten-sample support.
-    let smoothed = |rows: &[VersionedRawPoint]| {
-        let xs: Vec<f64> = rows.iter().map(|row| row.step as f64).collect();
-        let ys: Vec<f64> = rows.iter().map(|row| f64::from(row.value)).collect();
-        chart::smooth_run(&xs, &ys, Algorithm::SavitzkyGolay, 20, 0.5, 2, true)
-    };
-    let (old, new) = (smoothed(&samples), smoothed(&grown));
-    assert!((170..185).any(|step| old[step].to_bits() != new[step].to_bits()));
     let current = [Arc::new(grown)];
     for audit in [false, true] {
         let out = checked_delta(&request, &held, &current, audit);
-        assert_eq!(out.from_col, 169, "retain the preceding complete blocks, then include the changed block's interpolation predecessor");
+        assert_eq!(out.from_col, 185, "the slots within the half-width");
     }
 }
 

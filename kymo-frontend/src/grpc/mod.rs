@@ -1,5 +1,5 @@
 pub mod client;
-// Wire contract shared verbatim with the server (lives next to kymo.proto; both crates include it by path). Each side exercises its half — the server slices, the client splices — so the other half is dead code by design.
+// Wire contract shared verbatim with the server (lives next to kymo.proto; both crates include it by path). Each side exercises its half — the server emits, the client splices — so the other half is dead code by design.
 #[path = "../../../proto/chart_delta.rs"]
 #[allow(dead_code)]
 pub mod chart_delta;

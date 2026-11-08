@@ -1,4 +1,4 @@
-//! Stage 3b of docs/chart-request-latency.md, the chart side: advance a model [`shared_chart`] emitted by samples appended to its series. The axis advances by the rules [`decide_axis`], [`make_grid`] and [`plan_axis`] apply, the slots the new samples can change are recomputed by [`bucket_run`]'s and [`shared_passthrough`]'s rules over the same inputs in the same order, and every other slot is copied from the held model. The caller (query/held.rs) supplies sample access and says which samples changed; the differential fuzz (query/frontier_delta_tests/held_tests.rs) holds the result to the full build bit for bit.
+//! Stage 3b of docs/chart-request-latency.md, the chart side: advance a model [`shared_chart`] emitted by samples appended to its series. The axis advances by the rules [`decide_axis`], [`make_grid_from`] and [`plan_axis`] apply, the slots the new samples can change are recomputed by [`bucket_run`]'s and [`shared_passthrough`]'s rules over the same inputs in the same order, and every other slot is copied from the held model. The caller (query/held.rs) supplies sample access and says which samples changed; the differential fuzz (query/frontier_delta_tests/held_tests.rs) holds the result to the full build bit for bit.
 
 use super::*;
 use crate::chart_delta::round_y;
@@ -20,7 +20,7 @@ pub(crate) enum Fallback {
     Membership,
     /// A new sample with an unplottable x (a kind-4 marker).
     Unplottable,
-    /// The smoothing plan changes: uniform spacing broken, the median moved, or a first finite output.
+    /// The smoothing plan changes: the median moved, or a first finite output.
     PlanShift,
     /// The grid's tier or anchor moved, or a passthrough chart started downsampling.
     Regrid,
@@ -30,8 +30,6 @@ pub(crate) enum Fallback {
     Duplicates,
     /// An x (step, or timestamp as the axis uses it) beyond the integers f64 holds exactly.
     InexactX,
-    /// Irregular Savitzky-Golay fits to recompute whose windows cost more than the full build's (clustered timestamps, a window wide against its series), which the full build computes faster.
-    Dense,
     /// No plottable point.
     Empty,
     /// The advance panicked.
@@ -53,7 +51,6 @@ impl Fallback {
             Self::EnvelopeFlip => "envelope_flip",
             Self::Duplicates => "duplicates",
             Self::InexactX => "inexact_x",
-            Self::Dense => "dense",
             Self::Empty => "empty",
             Self::Panic => "panic",
         }
@@ -65,7 +62,7 @@ impl Fallback {
 pub(crate) enum HeldAxis {
     /// The passthrough decision: the axis is the model's x values, every distinct x, so its ends are the chart's bounds.
     Passthrough,
-    /// The downsample decision's plan, and the floor its grid was made from ([`log_ladder_floor`]). With no occupied envelope cell the chart ships passthrough-shaped columns over `plan.raw_xs`.
+    /// The downsample decision's plan, and the log ladder's lowest x its grid was made from ([`log_ladder_lo`]). With no occupied envelope cell the chart ships passthrough-shaped columns over `plan.raw_xs`.
     Grid {
         plan: AxisPlan,
         p_lo: f64,
@@ -75,23 +72,30 @@ pub(crate) enum HeldAxis {
 }
 
 impl HeldAxis {
+    fn plan(&self) -> Option<&AxisPlan> {
+        match self {
+            Self::Grid { plan, .. } => Some(plan),
+            Self::Passthrough => None,
+        }
+    }
+
+    /// The chart's smoothing [`Floor`], from its grid's tier (none passing through).
+    pub(crate) fn floor(&self) -> Floor {
+        self.plan()
+            .map_or_else(Floor::default, |plan| Floor::of(plan.grid.kind))
+    }
+
     /// Whether the chart ships [`shared_passthrough`]'s columns: raw slots only, raw values when smoothed, bands only under a repeated x.
     pub(crate) fn passthrough_shaped(&self) -> bool {
-        match self {
-            Self::Passthrough => true,
-            Self::Grid { plan, .. } => !plan.any_env_occupied(),
-        }
+        self.plan().is_none_or(|plan| !plan.any_env_occupied())
     }
 
     /// Heap bytes held beyond the value itself: each buffer at its capacity and the allocator's rounding.
     pub(crate) fn heap_bytes(&self) -> usize {
         use crate::series_cache::vec_bytes;
-        match self {
-            Self::Passthrough => 0,
-            Self::Grid { plan, .. } => {
-                vec_bytes(&plan.env) + vec_bytes(&plan.ext) + vec_bytes(&plan.raw_xs)
-            }
-        }
+        self.plan().map_or(0, |plan| {
+            vec_bytes(&plan.env) + vec_bytes(&plan.ext) + vec_bytes(&plan.raw_xs)
+        })
     }
 
     /// The running aggregates [`bucket_run`] holds for a series' last occupied envelope cell (the one appends extend), from the series' emitted samples: `env_src` is the raw value when smoothing, else the plot value, as there.
@@ -104,7 +108,7 @@ impl HeldAxis {
         let first = xs.partition_point(|&x| plan.grid.index(x) != Some(cell));
         let mut agg = CellAgg::new(cell);
         for j in first..xs.len() {
-            agg.fold(env_src[j], kinds[j]);
+            agg.fold(xs[j], env_src[j], kinds[j]);
         }
         Some(agg)
     }
@@ -119,15 +123,22 @@ pub(crate) struct CellAgg {
     ymin: f64,
     ymax: f64,
     nfkind: u8,
+    /// The x of its first finite sample, which a causal slot must have read ([`SlotSmoother::shows`]).
+    first: f64,
 }
 
 impl CellAgg {
     /// The aggregates' bits, for exact comparison.
-    pub(crate) fn bits(&self) -> (usize, u32, [u64; 3], u8) {
+    pub(crate) fn bits(&self) -> (usize, u32, [u64; 4], u8) {
         (
             self.cell,
             self.cnt,
-            [self.sum.to_bits(), self.ymin.to_bits(), self.ymax.to_bits()],
+            [
+                self.sum.to_bits(),
+                self.ymin.to_bits(),
+                self.ymax.to_bits(),
+                self.first.to_bits(),
+            ],
             self.nfkind,
         )
     }
@@ -140,15 +151,19 @@ impl CellAgg {
             ymin: f64::INFINITY,
             ymax: f64::NEG_INFINITY,
             nfkind: 0,
+            first: f64::NAN,
         }
     }
 
-    fn fold(&mut self, v: f64, kind: u8) {
+    fn fold(&mut self, x: f64, v: f64, kind: u8) {
         if kind != 0 {
             if self.nfkind == 0 {
                 self.nfkind = kind;
             }
             return;
+        }
+        if self.cnt == 0 {
+            self.first = x;
         }
         self.cnt += 1;
         self.sum += v;
@@ -179,45 +194,29 @@ pub(crate) struct AxisStep {
 }
 
 impl AxisStep {
-    fn grid_plan(&self) -> Option<&AxisPlan> {
-        match &self.axis {
-            HeldAxis::Grid { plan, .. } => Some(plan),
-            HeldAxis::Passthrough => None,
-        }
-    }
-
-    /// Where a kind-4 marker anchored at `x` sits ([`MixedAxis::anchor_slot`], or the passthrough slot).
-    fn anchor_slot(&self, x: f64) -> usize {
-        match self
-            .grid_plan()
-            .and_then(|plan| plan.grid.index(x).filter(|&c| plan.env[c]))
-        {
-            Some(c) => self.slot_of_cell[c],
-            None => self.x_values.partition_point(|&v| v < x),
-        }
+    /// The advanced axis's raw slots, ascending: every column passing through, else its grid's raw cells' x.
+    pub(crate) fn raw_slots(&self) -> &[f64] {
+        self.axis.plan().map_or(&self.x_values, |plan| &plan.raw_xs)
     }
 }
 
-/// Merge `fresh` x values (any order, repeats and held x included) into the ascending distinct axis `old_x`: the merged axis and, per merged slot, its index in `old_x`.
-fn merge_raw(old_x: &[f64], mut fresh: Vec<f64>) -> (Vec<f64>, Vec<Option<usize>>) {
+/// Merge `fresh` x values (any order, repeats and held x included) into the ascending distinct axis `old_x`.
+fn merge_raw(old_x: &[f64], mut fresh: Vec<f64>) -> Vec<f64> {
     fresh.sort_by(f64::total_cmp);
     fresh.dedup();
     fresh.retain(|x| old_x.binary_search_by(|p| p.total_cmp(x)).is_err());
     let mut x = Vec::with_capacity(old_x.len() + fresh.len());
-    let mut old = Vec::with_capacity(old_x.len() + fresh.len());
     let (mut i, mut j) = (0, 0);
     while i < old_x.len() || j < fresh.len() {
         if j == fresh.len() || (i < old_x.len() && old_x[i] < fresh[j]) {
             x.push(old_x[i]);
-            old.push(Some(i));
             i += 1;
         } else {
             x.push(fresh[j]);
-            old.push(None);
             j += 1;
         }
     }
-    (x, old)
+    x
 }
 
 /// The identity of the slot at `x`, ordered as slots are: below-grid raw x first (cell −1), then cells ascending, an envelope cell's one slot (its center lies in the cell) or a raw cell's x ascending. Axis x are never NaN or −0 ([`HeldAxis`]), so `<` and `==` order keys totally.
@@ -252,14 +251,17 @@ pub(crate) fn advance_axis(
     match held {
         HeldAxis::Passthrough => {
             let fresh = new_xs.iter().flat_map(|xs| xs.iter().copied()).collect();
-            let (x_values, old) = merge_raw(old_x, fresh);
+            let x_values = merge_raw(old_x, fresh);
             // decide_axis passes through exactly while distinct ≤ cap (decision_cap).
-            if spec.target != 0
-                && g_last > g_first
-                && x_values.len() > decision_cap(g_first, g_last, spec)
-            {
+            if x_values.len() > decision_cap(g_first, g_last, spec) {
                 return Err(Fallback::Regrid);
             }
+            // Each slot's index in `old_x`, whose x the merge keeps in order.
+            let mut held = old_x.iter().enumerate().peekable();
+            let old = x_values
+                .iter()
+                .map(|x| held.next_if(|&(_, h)| h == x).map(|(i, _)| i))
+                .collect();
             let n = x_values.len();
             Ok(AxisStep {
                 axis: HeldAxis::Passthrough,
@@ -285,28 +287,13 @@ pub(crate) fn advance_axis(
                 env.push(spec.is_step_axis && grid.width(c) >= ENV_MIN_POINTS);
                 ext.push((f64::INFINITY, f64::NEG_INFINITY));
             }
-            let raw_hi = match grid.kind {
-                GridKind::Linear { x_lo, .. } => x_lo,
-                GridKind::Log { m, shift } => pow2(m + 2) - if shift { 1.0 } else { 0.0 },
-            };
             let mut raw_new: Vec<f64> = Vec::new();
             // Non-step raw cells receiving new x values.
             let mut sparse: Vec<(usize, f64)> = Vec::new();
             for &x in new_xs.iter().flat_map(|xs| xs.iter()) {
-                let cell = grid.index(x);
-                if spec.is_step_axis {
-                    if x < raw_hi {
-                        raw_new.push(x);
-                    } else if let Some(c) = cell {
-                        let e = &mut ext[c];
-                        e.0 = e.0.min(x);
-                        e.1 = e.1.max(x);
-                    }
-                    continue;
-                }
-                match cell {
-                    None => raw_new.push(x),
-                    Some(c) => {
+                match grid.index(x) {
+                    // A step axis's raw cells, narrower than ENV_MIN_POINTS steps, stay raw without extents, as plan_axis leaves them.
+                    Some(c) if env[c] || !spec.is_step_axis => {
                         let e = &mut ext[c];
                         e.0 = e.0.min(x);
                         e.1 = e.1.max(x);
@@ -314,6 +301,7 @@ pub(crate) fn advance_axis(
                             sparse.push((c, x));
                         }
                     }
+                    _ => raw_new.push(x),
                 }
             }
             let mut raw_xs = plan.raw_xs.clone();
@@ -338,7 +326,7 @@ pub(crate) fn advance_axis(
                     raw_xs.drain(lo..hi);
                 }
             }
-            let (raw_xs, _) = merge_raw(&raw_xs, raw_new);
+            let raw_xs = merge_raw(&raw_xs, raw_new);
             let new_plan = AxisPlan {
                 grid,
                 env,
@@ -389,49 +377,14 @@ pub(crate) fn advance_axis(
     }
 }
 
-/// [`numeric_delta_from_col`]'s arms, given the held and advanced axes it would derive and only the samples that can dirty a column (non-OLD ones). The caller has proved no series repeats an x, which passthrough arms would otherwise answer in full.
-pub(crate) fn planner_from_col(
-    held: &HeldAxis,
-    held_x: &[f64],
-    step: &AxisStep,
-    xs: &[&[f64]],
-    age: &[&[u8]],
-    continuing: &[bool],
-) -> usize {
-    // [`advance_axis`] refuses a change of decision, a re-grid and an envelope flip, the arms that answer in full: both axes are passthrough, both passthrough-shaped grids (whose columns are the held raw slots, `held_x`), or two grids of one tier and anchor with an occupied envelope.
-    match (held, &step.axis) {
-        (HeldAxis::Grid { plan: old, .. }, HeldAxis::Grid { plan: new, .. })
-            if old.any_env_occupied() =>
-        {
-            debug_assert!(
-                new.any_env_occupied()
-                    && new.grid.kind == old.grid.kind
-                    && new.grid.base == old.grid.base
-            );
-            mixed_from_col(old, new, xs, age, continuing)
-        }
-        _ => {
-            debug_assert!(match held {
-                HeldAxis::Grid { plan, .. } => plan.raw_xs == held_x,
-                HeldAxis::Passthrough => true,
-            });
-            passthrough_dirty_from_col(held_x, xs, age, continuing)
-        }
-    }
-}
-
 /// One series' emitted samples at the current state, in emitted (ascending-x) order.
 pub(crate) trait Samples {
     fn len(&self) -> usize;
-    fn x(&mut self, e: usize) -> f64;
+    fn x(&self, e: usize) -> f64;
     /// The logged value.
-    fn raw(&mut self, e: usize) -> f64;
-    /// The plotted value: exactly the smoothed one when smoothing, else the logged one.
-    fn plot(&mut self, e: usize) -> f64;
-    /// For a walk down from `e`: the start of a known run of non-finite plot values holding sample `e - 1`, else `e`. Lets a walk to the nearest finite values skip long holes.
-    fn hole_below(&mut self, e: usize) -> usize;
-    /// For a walk up from `e`: the end of a known run of non-finite plot values holding sample `e`, else `e`.
-    fn hole_from(&mut self, e: usize) -> usize;
+    fn raw(&self, e: usize) -> f64;
+    /// Smoothed charts: the smoother evaluated at `x`, as the full build's slots evaluate it ([`SlotEvaluator`]), `first` being the x of the series' first sample in the slot's cell; NaN where it does not show ([`SlotSmoother::shows`]).
+    fn slot_value(&mut self, x: f64, first: f64) -> f64;
 }
 
 /// First `e` in `lo..hi` where `pred` turns false (pred monotone true-then-false).
@@ -448,58 +401,13 @@ pub(crate) fn partition(lo: usize, hi: usize, mut pred: impl FnMut(usize) -> boo
     lo
 }
 
-/// The nearest finite plot values below sample `e`, nearest first, at most two, as (sample, value); walks skip known holes.
-pub(crate) fn finite_below(s: &mut dyn Samples, mut e: usize) -> Vec<(usize, f64)> {
-    let mut found = Vec::with_capacity(2);
-    while e > 0 && found.len() < 2 {
-        let below = s.hole_below(e);
-        if below < e {
-            e = below;
-            continue;
-        }
-        e -= 1;
-        let v = s.plot(e);
-        if v.is_finite() {
-            found.push((e, v));
-        }
-    }
-    found
-}
-
-/// The smoothed line at `xq` as [`bucket_run`] interpolates it ([`lerp_at`] over the series' finite plot points): from the two finite points either side of `xq`, which select the same segment and arithmetic as the whole list.
-fn lerp_value(s: &mut dyn Samples, xq: f64) -> f64 {
-    let n = s.len();
-    let p = partition(0, n, |e| s.x(e) < xq);
-    let mut fin: Vec<(f64, f64)> = Vec::with_capacity(4);
-    for (e, v) in finite_below(s, p).into_iter().rev() {
-        fin.push((s.x(e), v));
-    }
-    let before = fin.len();
-    let mut e = p;
-    while e < n && fin.len() < before + 2 {
-        let past = s.hole_from(e);
-        if past > e {
-            e = past;
-            continue;
-        }
-        let v = s.plot(e);
-        if v.is_finite() {
-            fin.push((s.x(e), v));
-        }
-        e += 1;
-    }
-    lerp_at(&fin, &mut 0, xq)
-}
-
 /// What the advance knows about one series.
 pub(crate) struct SeriesStep<'a> {
     pub(crate) samples: &'a mut dyn Samples,
-    /// First new emitted sample (the sample count when none is new).
+    /// First new emitted sample (the sample count when none is new): raw slots from its x on are recomputed.
     pub(crate) first_new: usize,
-    /// First emitted sample that is new or whose plot value may have changed: raw slots from its x on are recomputed.
-    pub(crate) changed_from: usize,
-    /// Smoothed charts: envelope slots whose x exceeds this re-interpolate (−∞ for every one, +∞ for none beyond moved or re-aggregated cells).
-    pub(crate) lerp_after: f64,
+    /// Smoothed charts: slots from this x on re-evaluate, their smoother reading a changed sample (+∞ where only new, moved or re-aggregated slots do).
+    pub(crate) slot_dirty_from: f64,
     /// The held aggregates of the series' last occupied envelope cell.
     pub(crate) open: Option<CellAgg>,
 }
@@ -515,10 +423,10 @@ pub(crate) struct RebuildWork {
     pub(crate) inserted_slots: usize,
     /// Cells that became envelopes.
     pub(crate) flipped_cells: usize,
-    /// (series, envelope slot) values re-interpolated because the shared center moved.
+    /// (series, envelope slot) values re-evaluated because the shared center moved.
     pub(crate) moved: usize,
-    /// (series, envelope slot) values re-interpolated for an interpolation dependency.
-    pub(crate) relerped: usize,
+    /// (series, slot) values re-evaluated because their smoother reads a changed sample.
+    pub(crate) reached: usize,
     /// Held samples of recomputed raw slots carried by their held columns rather than visited.
     pub(crate) folded: usize,
 }
@@ -555,6 +463,14 @@ pub(crate) fn rebuild(
     )
 }
 
+/// The first of the series' emitted samples at or past grid cell `c` (below-grid samples lead).
+fn cell_start(samples: &dyn Samples, step: &AxisStep, c: usize) -> usize {
+    let plan = step.axis.plan().expect("envelope cells lie on a grid");
+    partition(0, samples.len(), |e| {
+        plan.grid.index(samples.x(e)).is_none_or(|i| i < c)
+    })
+}
+
 fn rebuild_series(
     held_x: &[f64],
     old: &DenseSeries,
@@ -566,21 +482,23 @@ fn rebuild_series(
     let nax = step.x_values.len();
     let len = s.samples.len();
     let shaped = step.axis.passthrough_shaped();
-    let changed_x = if s.changed_from < len {
-        s.samples.x(s.changed_from)
+    let new_x = if s.first_new < len {
+        s.samples.x(s.first_new)
     } else {
         f64::INFINITY
     };
     let had_band = !old.min_values.is_empty();
     let had_raw = !old.raw_values.is_empty();
     let mut values = vec![f64::NAN; nax];
-    let mut raw_values = if shaped && is_smoothed {
+    let mut raw_values = if had_raw {
         vec![f64::NAN; nax]
     } else {
         Vec::new()
     };
-    let mut mins = vec![f64::NAN; nax];
-    let mut maxs = vec![f64::NAN; nax];
+    // Shaped advances cannot gain repeated x or envelopes, so they keep no band.
+    let band_len = if shaped { 0 } else { nax };
+    let mut mins = vec![f64::NAN; band_len];
+    let mut maxs = vec![f64::NAN; band_len];
     let mut any_band = had_band;
     let mut markers: Vec<(u32, u32)> = Vec::new();
     let old_marker = |k0: usize| -> Option<u32> {
@@ -589,26 +507,21 @@ fn rebuild_series(
     };
 
     // Envelope aggregates this step changes: cells that became envelopes (every sample there), then new samples in envelope cells, continuing the held open cell where they extend it.
-    let plan = step.grid_plan().filter(|_| !shaped);
+    let plan = step.axis.plan();
     let mut aggs: Vec<CellAgg> = Vec::new();
     if let Some(plan) = plan {
         for &c in &step.flipped {
-            let lo = partition(0, len, |e| {
-                plan.grid.index(s.samples.x(e)).is_none_or(|i| i < c)
-            });
-            let hi = partition(lo, len, |e| {
-                plan.grid.index(s.samples.x(e)).is_none_or(|i| i <= c)
-            });
+            let lo = cell_start(s.samples, step, c);
+            let hi = cell_start(s.samples, step, c + 1);
             if lo < hi {
                 let mut agg = CellAgg::new(c);
                 for e in lo..hi {
                     let v = s.samples.raw(e);
-                    agg.fold(v, nan_kind(v));
+                    agg.fold(s.samples.x(e), v, nan_kind(v));
                 }
                 aggs.push(agg);
             }
         }
-        let mut cur: Option<CellAgg> = None;
         for e in s.first_new..len {
             let x = s.samples.x(e);
             let Some(c) = plan.grid.index(x).filter(|&c| plan.env[c]) else {
@@ -617,17 +530,15 @@ fn rebuild_series(
             if step.flipped.binary_search(&c).is_ok() {
                 continue;
             }
-            if cur.is_none_or(|agg| agg.cell != c) {
-                aggs.extend(cur);
-                cur = Some(match s.open {
+            if aggs.last().is_none_or(|agg| agg.cell != c) {
+                aggs.push(match s.open {
                     Some(open) if open.cell == c => open,
                     _ => CellAgg::new(c),
                 });
             }
             let v = s.samples.raw(e);
-            cur.as_mut().unwrap().fold(v, nan_kind(v));
+            aggs.last_mut().unwrap().fold(x, v, nan_kind(v));
         }
-        aggs.extend(cur);
         aggs.sort_by_key(|agg| agg.cell);
     }
 
@@ -642,7 +553,7 @@ fn rebuild_series(
         let x = step.x_values[k];
         match step.slots[k] {
             SlotKind::Raw => match step.old[k] {
-                Some(k0) if x < changed_x => {
+                Some(k0) if x < new_x => {
                     values[k] = old.values[k0];
                     if had_band {
                         mins[k] = old.min_values[k0];
@@ -653,6 +564,12 @@ fn rebuild_series(
                     }
                     if let Some(kind) = old_marker(k0) {
                         markers.push((k as u32, kind));
+                    }
+                    // A smoothed slot has a value exactly when it holds a finite sample, which its smoother reads.
+                    if is_smoothed && x >= s.slot_dirty_from && old.values[k0].is_finite() {
+                        work.slots += 1;
+                        work.reached += 1;
+                        values[k] = round_y(s.samples.slot_value(x, x));
                     }
                 }
                 _ => {
@@ -673,10 +590,10 @@ fn rebuild_series(
                     }
                     let (mut v, mut lo_y, mut hi_y, mut raw) =
                         (f64::NAN, f64::NAN, f64::NAN, f64::NAN);
-                    // The slot's value is its last finite sample's plot value. A held slot's held samples keep their logged values, so its band, markers and last finite raw value continue from its held columns (the band's min and max fold on in sample order, as the full build's do), and its value is held unless a sample from `changed_from` replaces it: however many samples share its x, only the new ones and those whose plot values changed are visited.
+                    // The slot's value is its last finite sample's logged value, or on a smoothed chart the smoother at its x when it holds one. A held slot's held samples keep their logged values, so its band, markers, last finite raw value and value continue from its held columns (the band's min and max fold on in sample order, as the full build's do): however many samples share its x, only the new ones are visited.
                     let mut from = lo;
                     if let Some(k0) = step.old[k] {
-                        from = hi.min(s.first_new).max(lo);
+                        from = s.first_new.max(lo);
                         work.folded += from - lo;
                         if had_band {
                             lo_y = old.min_values[k0];
@@ -689,16 +606,7 @@ fn rebuild_series(
                             markers.push((k as u32, kind));
                         }
                         v = old.values[k0];
-                        let mut e = from;
-                        while e > lo.max(s.changed_from) {
-                            e -= 1;
-                            if nan_kind(s.samples.raw(e)) == 0 {
-                                v = s.samples.plot(e);
-                                break;
-                            }
-                        }
                     }
-                    let mut last = None;
                     for e in from..hi {
                         let r = s.samples.raw(e);
                         let kind = nan_kind(r);
@@ -706,20 +614,16 @@ fn rebuild_series(
                             markers.push((k as u32, kind as u32));
                             continue;
                         }
-                        last = Some(e);
-                        raw = r;
-                        lo_y = if lo_y.is_finite() { lo_y.min(r) } else { r };
-                        hi_y = if hi_y.is_finite() { hi_y.max(r) } else { r };
+                        (v, raw) = (r, r);
+                        (lo_y, hi_y) = (lo_y.min(r), hi_y.max(r));
                     }
-                    if let Some(e) = last {
-                        v = s.samples.plot(e);
+                    if is_smoothed && v.is_finite() {
+                        v = s.samples.slot_value(x, x);
                     }
                     values[k] = round_y(v);
-                    if shaped {
-                        if is_smoothed {
-                            raw_values[k] = round_y(raw);
-                        }
-                    } else if lo_y.is_finite() {
+                    if had_raw {
+                        raw_values[k] = round_y(raw);
+                    } else if !shaped && lo_y.is_finite() {
                         mins[k] = round_y(lo_y);
                         maxs[k] = round_y(hi_y);
                         any_band = true;
@@ -735,9 +639,9 @@ fn rebuild_series(
                     work.slots += 1;
                     if agg.nfkind != 0 {
                         markers.push((k as u32, agg.nfkind as u32));
-                    } else if agg.cnt >= 1 {
+                    } else {
                         values[k] = round_y(if is_smoothed {
-                            lerp_value(s.samples, x)
+                            s.samples.slot_value(x, agg.first)
                         } else {
                             agg.sum / agg.cnt as f64
                         });
@@ -756,16 +660,19 @@ fn rebuild_series(
                     if let Some(kind) = y_marker {
                         markers.push((k as u32, kind));
                     }
-                    let has_value = had_band && !old.min_values[k0].is_nan() && y_marker.is_none();
+                    // The cell holds samples, all finite: where its smoother shows, the slot has a value.
+                    let all_finite = had_band && !old.min_values[k0].is_nan() && y_marker.is_none();
                     let moved = x.to_bits() != held_x[k0].to_bits();
-                    values[k] = if is_smoothed && has_value && (moved || x > s.lerp_after) {
+                    values[k] = if is_smoothed && all_finite && (moved || x >= s.slot_dirty_from) {
                         work.slots += 1;
                         if moved {
                             work.moved += 1;
                         } else {
-                            work.relerped += 1;
+                            work.reached += 1;
                         }
-                        round_y(lerp_value(s.samples, x))
+                        // Its first sample, finite: the cell has no marker (bucket_run's `first_x` is its first finite one).
+                        let first = s.samples.x(cell_start(s.samples, step, c));
+                        round_y(s.samples.slot_value(x, first))
                     } else {
                         old.values[k0]
                     };
@@ -777,7 +684,12 @@ fn rebuild_series(
     // Unplottable samples carry one kind-4 marker to the first plottable x (column 0 without one); appends add none.
     if old.xnan_count > 0 {
         let slot = if len > 0 {
-            step.anchor_slot(s.samples.x(0))
+            super::anchor_slot(
+                step.axis.plan(),
+                &step.slot_of_cell,
+                &step.x_values,
+                s.samples.x(0),
+            )
         } else {
             0
         };
@@ -791,10 +703,6 @@ fn rebuild_series(
         mins = Vec::new();
         maxs = Vec::new();
     }
-    if !raw_values.iter().any(|v| v.is_finite()) {
-        raw_values = Vec::new();
-    }
-
     // The series' last occupied envelope cell, whose aggregates the next step continues: re-aggregated this step, or else the held open cell (a cell no new or flipped sample touched keeps its aggregates).
     let open = plan.and_then(|plan| {
         let last = len.checked_sub(1)?;
@@ -845,58 +753,18 @@ mod tests {
             .unzip()
     }
 
-    /// Any output range of the Savitzky–Golay sweep, from just the inputs [`savgol_inputs`] names, is bit-identical to the whole-series call.
-    #[test]
-    fn savgol_ranges_match_the_whole_series() {
-        for (n, window) in [
-            (1usize, 3usize),
-            (5, 9),
-            (40, 3),
-            (61, 10),
-            (300, 21),
-            (900, 130),
-            (2000, 64),
-        ] {
-            for holes in [false, true] {
-                let (_, y) = series(n, n as u64 * 31 + window as u64, holes);
-                for order in 0..=2 {
-                    let whole = savitzky_golay(&y, window, order);
-                    for (from, to) in [
-                        (0, n),
-                        (0, 1),
-                        (n / 3, n / 2 + 1),
-                        (n.saturating_sub(5), n),
-                        (n / 2, n),
-                    ] {
-                        let (lo, hi) = savgol_inputs(n, window, from, to);
-                        let part = savitzky_golay_range(&y[lo..hi], lo, n, from, to, window, order);
-                        let want: Vec<u64> = whole[from.min(n)..to.min(n)]
-                            .iter()
-                            .map(|v| v.to_bits())
-                            .collect();
-                        let got: Vec<u64> = part.iter().map(|v| v.to_bits()).collect();
-                        assert_eq!(
-                            got, want,
-                            "n={n} window={window} order={order} [{from}, {to})"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// A causal smoother resumed from any recorded checkpoint reproduces the uninterrupted run bit for bit.
+    /// A causal smoother resumed from any state its fold records reproduces the uninterrupted run bit for bit.
     #[test]
     fn causal_runs_resume_from_checkpoints_bit_for_bit() {
         let (x, y) = series(3_000, 7, true);
         for smoother in [
             CausalSmoother::Ema {
-                tau: 3.0,
+                tau: Width::fixed(3.0),
                 dx_ref: 1.0,
                 deg: 2,
             },
             CausalSmoother::Ema {
-                tau: 250.0,
+                tau: Width::fixed(250.0),
                 dx_ref: 2.5,
                 deg: 0,
             },
@@ -909,16 +777,20 @@ mod tests {
                 deg: 2,
             },
         ] {
-            let mut checkpoints = Vec::new();
-            let mut state = CausalState::START;
-            let whole = smoother.run(&x, &y, &mut state, 0, Some(&mut checkpoints));
+            let (mut checkpoints, mut state) = (Vec::new(), CausalState::START);
+            smoother.fold_recording(&[(&x, &y)], &mut state, 0, Some(&mut checkpoints));
+            checkpoints.push(state);
+            let mut uninterrupted = CausalState::START;
+            let whole = smoother.run(&x, &y, &mut uninterrupted);
+            assert_eq!(checkpoints.last().unwrap().bits(), uninterrupted.bits());
             assert_eq!(
                 checkpoints.len(),
                 3_000usize.div_ceil(CAUSAL_CHECKPOINT_STRIDE) + 1
             );
-            for &(index, recorded) in &checkpoints {
+            for (k, &recorded) in checkpoints.iter().enumerate() {
+                let index = (k * CAUSAL_CHECKPOINT_STRIDE).min(x.len());
                 let mut state = recorded;
-                let tail = smoother.run(&x[index..], &y[index..], &mut state, index, None);
+                let tail = smoother.run(&x[index..], &y[index..], &mut state);
                 for (i, v) in tail.iter().enumerate() {
                     assert_eq!(
                         v.to_bits(),
@@ -926,47 +798,6 @@ mod tests {
                         "{smoother:?} from {index}"
                     );
                 }
-            }
-        }
-    }
-
-    /// One irregular Savitzky–Golay output equals the whole-series sweep's.
-    #[test]
-    fn savgol_x_outputs_match_the_sweep() {
-        for holes in [false, true] {
-            let (x, y) = series(1_500, 11, holes);
-            for (h_x, deg) in [(1.5, 2), (6.0, 1), (40.0, 0), (130.0, 2)] {
-                let whole = savgol_x(&x, &y, h_x, deg);
-                for i in (0..x.len()).step_by(7) {
-                    let one = savgol_x_at(&|j| x[j], &|j| y[j], x.len(), i, h_x, deg);
-                    assert_eq!(one.to_bits(), whole[i].to_bits(), "h_x={h_x} i={i}");
-                }
-            }
-        }
-    }
-
-    /// The sweep reuses a fit across samples at one x; each output still equals that sample's own fit, holes among them included.
-    #[test]
-    fn savgol_x_outputs_at_repeated_x_match_their_own_fits() {
-        let mut rng = crate::Rng(7);
-        let mut x = 0.0;
-        let (x, y): (Vec<f64>, Vec<f64>) = (0..2_000)
-            .map(|_| {
-                let r = rng.next();
-                // Runs of about eight samples at each x, a fifth of them holes.
-                x += if r.is_multiple_of(8) { 3.0 } else { 0.0 };
-                let y = if r % 5 == 1 {
-                    f64::NAN
-                } else {
-                    ((r >> 16) % 1_000) as f64
-                };
-                (x, y)
-            })
-            .unzip();
-        for (h_x, deg) in [(1.5, 2), (6.0, 1), (40.0, 0)] {
-            for (i, swept) in savgol_x(&x, &y, h_x, deg).into_iter().enumerate() {
-                let one = savgol_x_at(&|j| x[j], &|j| y[j], x.len(), i, h_x, deg);
-                assert_eq!(one.to_bits(), swept.to_bits(), "h_x={h_x} i={i}");
             }
         }
     }

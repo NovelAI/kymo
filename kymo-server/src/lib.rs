@@ -4,7 +4,7 @@ mod cdn;
 mod cdn_gc;
 mod cdn_store;
 mod chart;
-// Wire contract shared verbatim with the frontend (lives next to kymo.proto; both crates include it by path). Each side exercises its half — the server slices, the client splices — so the other half is dead code by design.
+// Wire contract shared verbatim with the frontend (lives next to kymo.proto; both crates include it by path). Each side exercises its half — the server emits, the client splices — so the other half is dead code by design.
 #[path = "../../proto/chart_delta.rs"]
 #[allow(dead_code)]
 mod chart_delta;

@@ -8,7 +8,8 @@ use tracing::instrument;
 
 use crate::chart;
 use crate::chart_delta::{
-    self, SMOOTHING_STATE_SERIES_KEY, SMOOTHING_STATE_VERSION, SMOOTHING_STATE_VERSION_KEY,
+    self, DenseChart, DenseSeries, SMOOTHING_STATE_SERIES_KEY, SMOOTHING_STATE_VERSION,
+    SMOOTHING_STATE_VERSION_KEY,
 };
 #[cfg(test)]
 use crate::clickhouse::VersionedRawPoint;
@@ -499,8 +500,6 @@ impl ChartPlan {
         let span = u128::from(steps.1.abs_diff(steps.0)) + 1;
         let share = u128::from(hi.abs_diff(lo)) + 1;
         let kept = (rows as u128 * share).div_ceil(span);
-        // A record with rows in range has a group; an inconsistent one is priced wrong, not divided by zero in a poll.
-        let groups = groups.max(1);
         self.refs[index]
             .iter()
             .map(|&r| {
@@ -1191,8 +1190,6 @@ fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-use crate::chart_delta::{DenseChart, DenseSeries};
-
 /// Wire form of one dense series over columns [c..] — chart_delta::emit_series (the codec pair lives there), moved into the generated type.
 fn emit_series(s: &DenseSeries, c: usize) -> proto::ChartSeries {
     let w = chart_delta::emit_series(s, c);
@@ -1245,7 +1242,7 @@ fn audit_failed_full(
     }
 }
 
-/// Exact output-determining smoothing state rides inside the otherwise opaque frontier map so even an already-deployed frontend echoes it verbatim. Real identifiers cannot contain NUL (ingest::storable_ident), which reserves this namespace. Each output series is one word: 0 = no global state, 1 = uniform index-space branch, otherwise positive-finite median f64 bits.
+/// Exact output-determining smoothing state rides inside the otherwise opaque frontier map so even an already-deployed frontend echoes it verbatim. Real identifiers cannot contain NUL (ingest::storable_ident), which reserves this namespace. Each output series is one word: 0 = no global state, otherwise the median's f64 bits. The echoed words are only compared with the current plans' (`continuing_series_match`), so any other word answers in full.
 fn smoothing_state_key(index: usize) -> String {
     format!("\0kymo:s:{index}")
 }
@@ -1253,33 +1250,8 @@ fn smoothing_state_key(index: usize) -> String {
 fn encode_smoothing_plan(plan: chart::SmoothingPlan) -> i64 {
     match plan {
         chart::SmoothingPlan::NoState => 0,
-        chart::SmoothingPlan::Uniform => 1,
         chart::SmoothingPlan::Median(bits) => bits as i64,
     }
-}
-
-fn decode_smoothing_plan(word: i64) -> Option<chart::SmoothingPlan> {
-    match word {
-        0 => Some(chart::SmoothingPlan::NoState),
-        1 => Some(chart::SmoothingPlan::Uniform),
-        _ => {
-            let bits = word as u64;
-            let median = f64::from_bits(bits);
-            (median.is_finite() && median >= f64::MIN_POSITIVE)
-                .then_some(chart::SmoothingPlan::Median(bits))
-        }
-    }
-}
-
-fn read_smoothing_state(
-    frontiers: &std::collections::HashMap<String, i64>,
-    series: usize,
-) -> Option<Vec<chart::SmoothingPlan>> {
-    (frontiers.get(SMOOTHING_STATE_VERSION_KEY) == Some(&SMOOTHING_STATE_VERSION)).then_some(())?;
-    (usize::try_from(*frontiers.get(SMOOTHING_STATE_SERIES_KEY)?).ok()? == series).then_some(())?;
-    (0..series)
-        .map(|index| decode_smoothing_plan(*frontiers.get(&smoothing_state_key(index))?))
-        .collect()
 }
 
 /// Request-derived knobs shared by the live build, the delta planner, and the audit reconstruction.
@@ -1289,7 +1261,7 @@ struct ChartParams {
     filters: Option<Arc<[std::collections::HashSet<String>]>>,
     step_min: i64,
     step_max: i64,
-    // With smoothing + a zoom range, fetch a margin past both zoom edges so the smoothed curve keeps its unzoomed shape (clipping the fetch at the zoom edge made windows clip there like a data edge), then trim back to [step_min, step_max] after smoothing. Warmup bounds, not exactness guarantees: they're in steps while windows are in samples, so a sparser-than-4x logger's windows clip early — same artifact as a real data edge, vanishingly small under the biweight taper. EMA needs left history only; 8 time constants decay the truncated mass to e⁻⁸.
+    // With smoothing and a zoom range, fetch a margin past both zoom edges so the smoothed curve keeps its unzoomed shape (a fetch clipped at the zoom edge would clip windows there like a data edge); only [step_min, step_max] is emitted. Warmup bounds, not exactness guarantees: the user's widths are in samples and the margins in steps, so a Savitzky–Golay window clips early past a median gap of 8 steps where the floor's is no wider, its zoom's edge slots reading a one-sided window as at a real data edge (logging every 100 steps, window 10's last slot is about half the noise off). EMA needs left history only; 8 time constants decay the truncated mass to e⁻⁸ (the user's capped at 10⁶ steps: τ up to 125,000). A bounded step zoom's margins also cover its floor (`chart_params`); a step range on a timestamp axis (no client sends one smoothed) keeps the user's margins.
     fetch_min: i64,
     fetch_max: i64,
     use_time: bool,
@@ -1305,8 +1277,6 @@ struct ChartParams {
     all_same_run: bool,
     /// Axis geometry for the bucketing pipeline and the delta planner.
     spec: chart::GridSpec,
-    /// Conservative centered-smoother reach in samples; irregular plans also use the median-scaled x span. Causal influence and uniform SG block arithmetic are marked separately as suffixes before plotting filters.
-    reach: usize,
 }
 
 impl ChartParams {
@@ -1326,19 +1296,36 @@ fn chart_params(req: &proto::ChartRequest) -> ChartParams {
     // Keep fetch bounds and delta invalidation on the same window the
     // smoother executes. The wire value is untrusted and can span all u32.
     let window_size = smoothing.window_size.min(chart::MAX_SMOOTHING_WINDOW);
-    let (margin_l, margin_r): (i64, i64) = match algo {
+    let spec = chart::GridSpec {
+        target: req.target_resolution as usize,
+        is_step_axis: !req.use_timestamp_axis && req.x_series.is_none(),
+        log_buckets: req.log_buckets,
+        // Step/timestamp log ladders run in log(x+1) so step 0 renders; custom-x keeps plain log(x) (a +1 shift would crush sub-1 domains).
+        shift_one: req.log_buckets && req.x_series.is_none(),
+    };
+    // A step chart's floor widens its smoothers past the user's widths, at most to R·w(x) of the widest floor its zoom range allows (`chart::zoom_floor`), which the margins also cover: eight of an EMA's time constants at the zoom's first step (it only grows with x) and Savitzky-Golay's half-width wherever a slot's window reaches farthest. A range open at one end (which the frontend never sends smoothed) bounds no floor: it keeps the user's margins rather than fetch every sample.
+    let deg = smoothing.poly_order.min(2) as usize;
+    let bounded = req.step_min.is_some() && req.step_max.is_some();
+    let floor = (spec.is_step_axis && is_smoothed && bounded)
+        .then(|| chart::zoom_floor(step_min as f64, step_max as f64, spec));
+    let floored = |r: f64, x: i64| floor.map_or(0.0, |floor| r * floor.at(x as f64));
+    let (margin_l, margin_r): (u64, u64) = match algo {
         Algorithm::None => (0, 0),
         Algorithm::Ema => (
-            ((8.0 * smoothing.time_constant).ceil() as i64).clamp(1, 1_000_000),
+            ((8.0 * smoothing.time_constant).ceil() as u64)
+                .clamp(1, 1_000_000)
+                .max((8.0 * floored(chart::EMA_FLOOR_R[deg], step_min)).ceil() as u64),
             0,
         ),
         // Causal like EMA (nothing ahead), but its weights never decay, so a
-        // correct value needs the whole run behind it — an unbounded left
-        // extent that no finite margin expresses, pinned in fetch_min below.
-        Algorithm::Triangular => (0, 0),
+        // correct value needs the whole run behind it: a margin of i64's whole span.
+        Algorithm::Triangular => (u64::MAX, 0),
         _ => {
-            let w = window_size.max(3) as i64 * 4;
-            (w, w)
+            let w = window_size.max(3) as u64 * 4;
+            let h = |x: i64| floored(chart::SAVGOL_FLOOR_R[deg], x);
+            let span = step_max as f64 - step_min as f64;
+            let left = h(step_min).max(h(step_max) - span).ceil() as u64;
+            (w.max(left), w.max(h(step_max).ceil() as u64))
         }
     };
     ChartParams {
@@ -1350,23 +1337,9 @@ fn chart_params(req: &proto::ChartRequest) -> ChartParams {
         }),
         step_min,
         step_max,
-        fetch_min: if is_smoothed && req.step_min.is_some() {
-            // Triangular reaches back to the run's first step (any earlier
-            // step, negative included); the bounded smoothers extend left by
-            // their warmup margin.
-            if matches!(algo, Algorithm::Triangular) {
-                i64::MIN
-            } else {
-                step_min.saturating_sub(margin_l)
-            }
-        } else {
-            step_min
-        },
-        fetch_max: if is_smoothed && req.step_max.is_some() {
-            step_max.saturating_add(margin_r)
-        } else {
-            step_max
-        },
+        // An unsmoothed chart's margins are 0, and an open end is already i64's limit.
+        fetch_min: step_min.saturating_sub_unsigned(margin_l),
+        fetch_max: step_max.saturating_add_unsigned(margin_r),
         use_time: req.use_timestamp_axis,
         relative: req.use_timestamp_axis && req.relative_time,
         is_smoothed,
@@ -1388,17 +1361,7 @@ fn chart_params(req: &proto::ChartRequest) -> ChartParams {
             .y_series
             .iter()
             .all(|s| s.run_id == req.y_series[0].run_id),
-        spec: chart::GridSpec {
-            target: req.target_resolution as usize,
-            is_step_axis: !req.use_timestamp_axis && req.x_series.is_none(),
-            log_buckets: req.log_buckets,
-            // Step/timestamp log ladders run in log(x+1) so step 0 renders; custom-x keeps plain log(x) (a +1 shift would crush sub-1 domains).
-            shift_one: req.log_buckets && req.x_series.is_none(),
-        },
-        reach: match algo {
-            Algorithm::None | Algorithm::Ema | Algorithm::Triangular => 0,
-            _ => window_size.max(3) as usize,
-        },
+        spec,
     }
 }
 
@@ -1415,8 +1378,9 @@ struct PreparedSeries {
     label: String,
     run_id: String,
     xs: Vec<f64>,
-    plot: Vec<f64>, // smoothed when smoothing is on, else raw
-    raw: Vec<f64>,  // empty unless smoothing is on
+    /// The plotted value per sample: the logged one unsmoothed, the smoothed one on custom x; empty for a smoothed step or time series, whose values its slot smoother gives ([`Self::slot`]).
+    plot: Vec<f64>,
+    raw: Vec<f64>, // empty unless smoothing is on
     /// Per-sample [`chart::nan_kind`] of the LOGGED value (0 = finite).
     /// The single source of truth for non-finiteness: row eviction, marker
     /// emission, and the wire nan_kinds all derive from it.
@@ -1433,41 +1397,116 @@ struct PreparedSeries {
     xnan_count: u32,
     /// A verified-held unplottable log-x sample proves the held chart already carried this run's kind-4 marker (on column 0 when the run has no plottable x).
     xnan_held: bool,
-    /// Per-sample [`chart::AGE_OLD`]/REACH/NEW relative to verified cutoffs (all NEW when none apply), parallel to `xs`.
+    /// Per-sample [`chart::AGE_OLD`]/ANCHOR/NEW relative to verified cutoffs (all NEW when none apply), parallel to `xs`; empty on custom x, which has none.
     age: Vec<u8>,
     /// Whether a delta may CONTINUE this series (name the held one it extends) rather than ship it complete: some in-range plottable sample is verified-held, or no plottable sample is in range and some fetched row (smoothing warmup, unplottable x) is. The second case keeps such all-gap series from failing the held-count gate; their only possible change is a column-0 kind-4 marker appearing, which the planner answers in full. A series whose in-range plottable samples are ALL new ships complete even when held rows exist: its held columns were empty, and the held-count gate answers full for that one poll. The echoed held-series count still guards pairing after refs or tag groups change.
     continues: bool,
     /// The exact output-determining whole-series smoothing plan used for this response. `NoState` is explicit so margin-only series preserve positional alignment without computing or gating on discarded samples.
     smoothing_plan: chart::SmoothingPlan,
-    /// With [`prepare`]'s `checkpoints`: a causal smoother's recorded states (chart::smooth_run_with_plan), empty otherwise.
-    checkpoints: Vec<(usize, chart::CausalState)>,
+    /// A derived median plan's counts, which held state keeps ([`chart::MedianGaps`]); empty otherwise and under the audit's held plans, whose build is never captured.
+    median_gaps: chart::MedianGaps,
+    /// Smoothed step and time series with a finite output: what their slots evaluate.
+    slot: Option<SlotInputs>,
 }
 
-/// A plan override is safe to consume only when the old-only reconstruction expands to exactly the identities that supplied it. A mismatch is client-controlled cache state, so it is a normal full-answer gate rather than an error.
+impl PreparedSeries {
+    /// The series' [`chart::SlotEvaluator`], if smoothed, recording a causal smoother's checkpoints with `record`.
+    fn slot_evaluator(&self, record: bool) -> Option<chart::SlotEvaluator<'_>> {
+        let slot = self.slot.as_ref()?;
+        // The fetched samples in fetched order, as `slot` keeps them.
+        let (before, own, after) = (&slot.before, slot.own_len, &slot.after);
+        let parts = [
+            (&before.0[..], &before.1[..]),
+            (&self.xs[..own], &self.raw[..own]),
+            (&after.0[..], &after.1[..]),
+        ];
+        Some(chart::SlotEvaluator::new(slot.smoother, parts, record))
+    }
+}
+
+/// A series' slot smoother ([`chart::SlotEvaluator`]) and its fetched samples (x, logged value) in fetched order: its emitted ones ([`emitted_range`]) read in place from `xs` and `raw`, between copies of the others; under a step range on a timestamp axis (no client sends one smoothed), whose timestamps may run against its steps, a copy of every one. Stage 2 charges a build its fetched rows ([`budget::BUILD_BYTES_PER_ROW`]).
+struct SlotInputs {
+    smoother: chart::SlotSmoother,
+    before: (Vec<f64>, Vec<f64>),
+    /// How many of `xs` and `raw` are read in place: all of them, or none where every sample is copied.
+    own_len: usize,
+    after: (Vec<f64>, Vec<f64>),
+    /// The first new fetched sample's x, which the planners' slot rule starts from ([`chart::SlotSmoother::dirty_from`]).
+    first_new: Option<f64>,
+}
+
+impl SlotInputs {
+    /// Over the fetched samples `x` and `raw`, with their `steps` and x `keys`.
+    fn new(
+        smoother: chart::SlotSmoother,
+        first_new: Option<f64>,
+        (x, raw): (&[f64], &[f64]),
+        (steps, keys): (&[i64], &[i64]),
+        p: &ChartParams,
+    ) -> Self {
+        let run = if p.use_time && (p.step_min != i64::MIN || p.step_max != i64::MAX) {
+            0..0
+        } else {
+            emitted_range(x.len(), |i| steps[i], |i| keys[i], p)
+        };
+        Self {
+            smoother,
+            before: (x[..run.start].to_vec(), raw[..run.start].to_vec()),
+            own_len: run.len(),
+            after: (x[run.end..].to_vec(), raw[run.end..].to_vec()),
+            first_new,
+        }
+    }
+}
+
+/// The emitted samples among `n` fetched ones whose steps ascend (`step` and x `key` read them): those in the step range and, on a log axis, at a nonnegative x (prepare's `is_output_position`), one range.
+fn emitted_range(
+    n: usize,
+    step: impl Fn(usize) -> i64,
+    key: impl Fn(usize) -> i64,
+    p: &ChartParams,
+) -> std::ops::Range<usize> {
+    use chart::incremental::partition;
+    let lo = partition(0, n, |i| step(i) < p.step_min);
+    let hi = partition(0, n, |i| step(i) <= p.step_max).max(lo);
+    let lo = if p.spec.log_buckets {
+        lo.max(partition(0, n, |i| key(i) < 0)).min(hi)
+    } else {
+        lo
+    };
+    lo..hi
+}
+
+/// What [`prepare`] made of a chart's rows.
 struct Preparation {
     series: Vec<PreparedSeries>,
+    /// The chart's axis decision, made once for its smoothers' floor and its build ([`chart::AxisDecision`]).
+    axis: chart::AxisDecision,
+    /// False when the audit's held plans do not name exactly the groups the rows form: client cache state, so no series and a full answer rather than an error.
     audit_plans_aligned: bool,
     /// The rows collected, and those of the largest series: what stage 2 charges this build's transients over ([`DenseShape`]).
     rows: usize,
     largest: usize,
 }
 
-/// Whether the client holds exactly the `continuing` series. Verified lineages and shared-ref order prove that continuing groups were held; the client's echoed series count still detects removed refs/tag groups and held groups that no longer continue, such as a margin-only group gaining in-range samples, and positional splicing requires that every held series is paired. With exact smoothing state, their plans must also equal the ones stamped on the response the client holds (new complete series do not participate); missing state safely forces one full answer, which seeds plans for subsequent deltas.
+/// Whether the client holds exactly the continuing series, whose plans `continuing_plans` lists. Verified lineages and shared-ref order prove that continuing groups were held; the client's echoed series count still detects removed refs/tag groups and held groups that no longer continue, such as a margin-only group gaining in-range samples, and positional splicing requires that every held series is paired. With exact smoothing state, their plans must also equal the ones stamped on the response the client holds (new complete series do not participate); missing state safely forces one full answer, which seeds plans for subsequent deltas.
 fn continuing_series_match(
     req: &proto::ChartRequest,
     p: &ChartParams,
-    continuing_plans: impl Iterator<Item = chart::SmoothingPlan>,
-    continuing: usize,
+    continuing_plans: impl Iterator<Item = chart::SmoothingPlan> + Clone,
 ) -> bool {
     let Some(cache) = req.cache_state.as_ref() else {
         return false;
     };
+    let word = |key: &str| cache.frontiers.get(key).copied();
     cache
         .held_series
-        .is_some_and(|held| held as usize == continuing)
+        .is_some_and(|held| held as usize == continuing_plans.clone().count())
         && (!p.exact_smoothing_state
-            || read_smoothing_state(&cache.frontiers, continuing)
-                .is_some_and(|held| continuing_plans.eq(held)))
+            || (word(SMOOTHING_STATE_VERSION_KEY) == Some(SMOOTHING_STATE_VERSION)
+                && continuing_plans.enumerate().all(|(i, plan)| {
+                    word(&smoothing_state_key(i)) == Some(encode_smoothing_plan(plan))
+                })))
 }
 
 /// Stamp every output series' plan.
@@ -1489,84 +1528,16 @@ fn stamp_smoothing_state(
     }
 }
 
-/// Flag held samples whose smoothed value a new sample can reach, reusing the already-derived plan: uniform smoothers need index distance only; irregular smoothers also use their one median-scaled x span. Full/no-cache requests have no OLD samples and do no reach work.
-fn flag_reach(xs: &[f64], age: &mut [u8], reach: usize, plan: chart::SmoothingPlan) {
-    if reach == 0
-        || matches!(plan, chart::SmoothingPlan::NoState)
-        || !age.contains(&chart::AGE_NEW)
-        || !age.contains(&chart::AGE_OLD)
-    {
-        return;
-    }
-    let reach_x = match plan {
-        chart::SmoothingPlan::Median(bits) => Some(f64::from_bits(bits) * reach as f64),
-        chart::SmoothingPlan::Uniform => None,
-        chart::SmoothingPlan::NoState => unreachable!(),
-    };
-    let within = |i: usize, j: usize| {
-        i.abs_diff(j) <= reach || reach_x.is_some_and(|span| (xs[i] - xs[j]).abs() <= span)
-    };
-    let mut last_new: Option<usize> = None;
-    for (i, sample_age) in age.iter_mut().enumerate() {
-        match *sample_age {
-            chart::AGE_NEW => last_new = Some(i),
-            chart::AGE_OLD if last_new.is_some_and(|j| within(i, j)) => {
-                *sample_age = chart::AGE_REACH;
-            }
-            _ => {}
-        }
-    }
-    let mut next_new: Option<usize> = None;
-    for (i, sample_age) in age.iter_mut().enumerate().rev() {
-        match *sample_age {
-            chart::AGE_NEW => next_new = Some(i),
-            chart::AGE_OLD if next_new.is_some_and(|j| within(i, j)) => {
-                *sample_age = chart::AGE_REACH;
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Mark the earliest interpolation dependency for a suffix replacement.
-///
-/// Call once on the original smoothing-reach ages. A second call would treat the REACH flag written here as another changed endpoint. Only OLD becomes REACH, preserving held membership and marker provenance.
-///
-/// OLD smoother-only holes do not force a splice. Treating a NEW smoother-only hole as changing is deliberate conservatism for interpolation/extrapolation. REACH/NEW finite raw points can add, remove, or change endpoints even if their current smoothed output is non-finite. With two preceding finite endpoints, the earliest affected cell contains the nearer endpoint; with fewer, leading occupied holes also depend on the first segment. Later dependencies are already covered by the suffix. Logged non-finite samples own markers and cannot be endpoints.
-fn flag_lerp_dependency(plot: &[f64], kinds: &[u8], age: &mut [u8]) {
-    debug_assert_eq!(plot.len(), age.len());
-    debug_assert_eq!(kinds.len(), age.len());
-    let Some(changing) = (0..plot.len()).find(|&i| age[i] != chart::AGE_OLD && kinds[i] == 0)
-    else {
-        return;
-    };
-    let mut preceding = (0..changing).rev().filter(|&i| plot[i].is_finite());
-    let nearest = preceding.next();
-    let dependency = if preceding.next().is_some() {
-        nearest
-    } else {
-        // chart::lerp_at samples adjacent finite pairs for both interpolation and extrapolation. Its first pair supplies the slope for occupied smoother-only holes before either endpoint.
-        (0..changing).find(|&i| kinds[i] == 0)
-    };
-    if let Some(i) = dependency {
-        // Every possible endpoint before `changing` is OLD by construction. Preserve NEW: it records absence from the held snapshot.
-        debug_assert_eq!(age[i], chart::AGE_OLD);
-        age[i] = chart::AGE_REACH;
-    }
-}
-
-/// Prepare chart inputs, smoothing and provenance from fetched rows. The caller supplies verified cutoffs from the cache-lineage proof; those cutoffs drive ages (an absent ref is all NEW). old_only keeps precisely the verified held versions for the audit oracle. With `checkpoints`, also records each causal smoother's checkpoints (held chart state, query/held.rs).
-#[allow(clippy::too_many_arguments)]
+/// Prepare chart inputs, smoothing and provenance from fetched rows. The caller supplies verified cutoffs from the cache-lineage proof; those cutoffs drive ages (an absent ref is all NEW). With `held_plans`, the audit oracle's reconstruction keeps precisely the verified held versions, each group smoothed by the plan paired with its identity. A smoothed step or time series gets a slot smoother at the chart's floor over its fetched samples; a custom-x one its smoothed samples.
 fn prepare(
     req: &proto::ChartRequest,
     p: &ChartParams,
     all_rows: &[Arc<SeriesSnapshot>],
     x_maps: Option<&std::collections::HashMap<String, std::collections::HashMap<i64, f64>>>,
     held_rows: Option<&VerifiedLineages>,
-    old_only: bool,
-    smoothing_override: Option<&[(SeriesIdentity, chart::SmoothingPlan)]>,
-    checkpoints: bool,
+    held_plans: Option<&[(SeriesIdentity, chart::SmoothingPlan)]>,
 ) -> Result<Preparation, Status> {
+    let old_only = held_plans.is_some();
     // (step, x_key, value, age) — x_key is the plot key (the step, or
     // timestamp_ms in time mode). The step rides along so range trims and
     // x-metric lookups always work in step space, whatever the chart plots.
@@ -1661,8 +1632,8 @@ fn prepare(
         .map(|rs| rs.points.len())
         .max()
         .unwrap_or(0);
-    // `held_series` and smoothing-state counts are untrusted client bytes. Prove the whole positional override before smoothing: an extra old-only group could otherwise shift NoState onto Savitzky-Golay and panic, or overrun the plan slice and return a 500.
-    if smoothing_override.is_some_and(|plans| {
+    // `held_series` is untrusted client bytes. Prove the held plans' whole pairing before smoothing: an extra old-only group could otherwise shift the plans onto the wrong series and overrun the plan slice, a 500.
+    if held_plans.is_some_and(|plans| {
         !raw_series
             .iter()
             .map(|rs| &rs.identity)
@@ -1670,6 +1641,7 @@ fn prepare(
     }) {
         return Ok(Preparation {
             series: Vec::new(),
+            axis: chart::AxisDecision::Empty,
             audit_plans_aligned: false,
             rows,
             largest,
@@ -1699,14 +1671,17 @@ fn prepare(
     }
 
     let mut prepared: Vec<PreparedSeries> = Vec::with_capacity(raw_series.len());
-    for (series_index, mut rs) in raw_series.into_iter().enumerate() {
-        let mut series_checkpoints = Vec::new();
+    for (series_index, rs) in raw_series.into_iter().enumerate() {
         let steps_v: Vec<i64> = rs.points.iter().map(|&(s, ..)| s).collect();
         let xkeys_v: Vec<i64> = rs.points.iter().map(|&(_, x, ..)| x).collect();
         let raw_v: Vec<f64> = rs.points.iter().map(|&(_, _, v, ..)| v).collect();
-        let mut age_v: Vec<u8> = rs.points.iter().map(|&(_, _, _, a)| a).collect();
+        // Custom x has no verified history, so no ages.
+        let age_v: Vec<u8> = match x_maps {
+            Some(_) => Vec::new(),
+            None => rs.points.iter().map(|&(_, _, _, a)| a).collect(),
+        };
         // Nothing reads the points again: free them before this series' working copies are built.
-        drop(std::mem::take(&mut rs.points));
+        drop(rs.points);
         // Trim the smoothing warmup back to the requested STEP range whatever the plot key is. The precheck exactly matches the later axis filter, so a margin-only/unplottable series can skip plan derivation and smoothing entirely.
         let in_range = |i: usize| steps_v[i] >= p.step_min && steps_v[i] <= p.step_max;
         // Resolve this run's custom-x map once for both the output precheck and emission.
@@ -1720,50 +1695,19 @@ fn prepare(
             }
             None => in_range(i) && !(p.spec.log_buckets && xkeys_v[i] < 0),
         };
-        let (has_output_position, has_finite_output) = if p.is_smoothed {
-            let mut has_output_position = false;
-            let has_finite_output = (0..steps_v.len()).any(|i| {
-                let output_position = is_output_position(i);
-                has_output_position |= output_position;
-                output_position && raw_v[i].is_finite()
-            });
-            (has_output_position, has_finite_output)
-        } else {
-            ((0..steps_v.len()).any(is_output_position), false)
-        };
-        let override_plan = smoothing_override.map(|plans| plans[series_index].1);
-        let (plot_v, smoothing_plan) = if p.is_smoothed && has_finite_output {
-            // One f64 x vector and one semantic plan feed reach marking, smoothing, exact echo state, and audit. An audit override bypasses derivation completely.
+        let has_finite_output = p.is_smoothed
+            && (0..steps_v.len()).any(|i| is_output_position(i) && raw_v[i].is_finite());
+        let mut slot = None;
+        let (plot_v, smoothing_plan, median_gaps) = if has_finite_output {
+            // One f64 x vector and one semantic plan feed smoothing, exact echo state, held state and audit. The audit's held plans bypass derivation completely; its build is never captured, so it needs no counts.
             let x_keys: Vec<f64> = xkeys_v.iter().map(|&x| x as f64).collect();
-            let plan = override_plan
-                .unwrap_or_else(|| chart::smoothing_plan(&x_keys, p.algo, !p.use_time));
-            flag_reach(
-                &x_keys,
-                &mut age_v,
-                if req.x_series.is_none() { p.reach } else { 0 },
-                plan,
-            );
-            if held_rows.is_some() && !old_only {
-                if let Some(first_new) = age_v.iter().position(|&age| age == chart::AGE_NEW) {
-                    let from = match p.algo {
-                        Algorithm::Ema | Algorithm::Triangular => Some(first_new),
-                        Algorithm::SavitzkyGolay if plan == chart::SmoothingPlan::Uniform => Some(
-                            chart::savgol_dependency_start(p.window_size as usize, first_new),
-                        ),
-                        _ => None,
-                    };
-                    // Verified lineages preserve held positions. Causal influence and SG block arithmetic can change the whole suffix, even if the new input itself is later trimmed/unplottable. Preserve NEW membership.
-                    if let Some(from) = from {
-                        for age in &mut age_v[from..] {
-                            if *age == chart::AGE_OLD {
-                                *age = chart::AGE_REACH;
-                            }
-                        }
-                    }
-                }
-            }
-            (
-                chart::smooth_run_with_plan(
+            let (plan, gaps) = match held_plans {
+                Some(plans) => (plans[series_index].1, chart::MedianGaps::default()),
+                None => chart::smoothing_plan(&x_keys, p.algo, !p.use_time),
+            };
+            if req.x_series.is_some() {
+                // Custom x smooths in step order, each sample plotted at its own x.
+                let plot = chart::smooth_run_with_plan(
                     &x_keys,
                     &raw_v,
                     p.algo,
@@ -1771,24 +1715,47 @@ fn prepare(
                     p.time_constant,
                     p.poly_order,
                     plan,
-                    checkpoints.then_some(&mut series_checkpoints),
-                ),
-                plan,
-            )
-        } else if has_output_position {
-            (raw_v.clone(), chart::SmoothingPlan::NoState)
+                );
+                (Some(plot), plan, gaps)
+            } else {
+                // Step and time charts evaluate the smoother at their slots, at the chart's floor once every series' axis is known (below).
+                let smoother = chart::SlotSmoother::new(
+                    p.algo,
+                    p.window_size,
+                    p.time_constant,
+                    p.poly_order,
+                    plan,
+                );
+                let first_new = age_v
+                    .iter()
+                    .position(|&a| a == chart::AGE_NEW)
+                    .map(|i| x_keys[i]);
+                slot = Some(SlotInputs::new(
+                    smoother,
+                    first_new,
+                    (&x_keys, &raw_v),
+                    (&steps_v, &xkeys_v),
+                    p,
+                ));
+                (None, plan, gaps)
+            }
         } else {
-            (Vec::new(), chart::SmoothingPlan::NoState)
+            (
+                None,
+                chart::SmoothingPlan::NoState,
+                chart::MedianGaps::default(),
+            )
         };
 
-        // The output columns, allocated once at their length: the fetched rows' on step and time axes, the plottable points' on custom x.
+        // The output columns, allocated once at their length: on step and time axes the output positions (all fetched rows unsmoothed, whose fetch is the zoom), the plottable points on custom x.
+        let per_sample_plot = !p.is_smoothed || req.x_series.is_some();
         let columns = |n: usize| {
             (
                 Vec::with_capacity(n),
-                Vec::with_capacity(n),
+                Vec::with_capacity(if per_sample_plot { n } else { 0 }),
                 Vec::with_capacity(if p.is_smoothed { n } else { 0 }),
                 Vec::with_capacity(n),
-                Vec::with_capacity(n),
+                Vec::with_capacity(if x_map.is_none() { n } else { 0 }),
             )
         };
         let (mut xs, mut plot, mut raw, mut kinds, mut age);
@@ -1802,12 +1769,12 @@ fn prepare(
                 // hidden; a step whose x metric was LOGGED non-finite has
                 // no position but is real data — carry it to the last
                 // plottable x seen in step order (leading ones attach to
-                // the first), as a kind-4 annotation. Custom-x charts never
-                // take the delta path, so ages need not survive this arm.
+                // the first), as a kind-4 annotation.
                 // Beyond its prepared rows, a series holds at most these points and their sort's buffer, which stage 2 charges as any series' working copies: the key copy is freed before they are collected (at most one per row in range), the other copies before the sort.
                 drop(xkeys_v);
                 let mut pts: Vec<(f64, f64, f64, u8)> =
                     Vec::with_capacity((0..steps_v.len()).filter(|&i| in_range(i)).count());
+                let plot_values = plot_v.as_deref().unwrap_or(&raw_v);
                 let mut leading_gap = false;
                 for i in (0..steps_v.len()).filter(|&i| in_range(i)) {
                     let Some(&x) = xm.and_then(|m| m.get(&steps_v[i])) else {
@@ -1816,7 +1783,7 @@ fn prepare(
                     // A non-finite x never plots; on a log axis a nonpositive x can't either — both become exceptional kind-4 markers carried to the run's last plottable x (docs/log-scale-buckets.md).
                     let plottable = x.is_finite() && !(p.spec.log_buckets && x <= 0.0);
                     if plottable {
-                        pts.push((x, plot_v[i], raw_v[i], chart::nan_kind(raw_v[i])));
+                        pts.push((x, plot_values[i], raw_v[i], chart::nan_kind(raw_v[i])));
                     } else {
                         xnan_count += 1;
                         match pts.last() {
@@ -1834,10 +1801,6 @@ fn prepare(
                 xnan_xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 xnan_xs.dedup();
                 drop((steps_v, raw_v, plot_v));
-                if !pts.is_empty() {
-                    // `continues` reads the fetched ages only when no point plots.
-                    age_v = Vec::new();
-                }
                 // uPlot needs ascending x; an x metric need not be monotonic
                 pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
                 (xs, plot, raw, kinds, age) = columns(pts.len());
@@ -1848,11 +1811,17 @@ fn prepare(
                         raw.push(rv);
                     }
                     kinds.push(k);
-                    age.push(chart::AGE_NEW);
                 }
             }
             None => {
-                (xs, plot, raw, kinds, age) = columns(steps_v.len());
+                let outputs = if p.is_smoothed {
+                    (0..steps_v.len())
+                        .filter(|&i| is_output_position(i))
+                        .count()
+                } else {
+                    steps_v.len()
+                };
+                (xs, plot, raw, kinds, age) = columns(outputs);
                 // On a log axis (ladder in log(x+1) here) a negative x can't render: it becomes an exceptional kind-4 marker, like a non-finite custom-x (docs/log-scale-buckets.md). Negatives lead the ascending keys, so they all carry to the first plottable x.
                 for i in 0..steps_v.len() {
                     if !in_range(i) {
@@ -1865,7 +1834,9 @@ fn prepare(
                         continue;
                     }
                     xs.push(xk);
-                    plot.push(plot_v[i]);
+                    if per_sample_plot {
+                        plot.push(raw_v[i]);
+                    }
                     if p.is_smoothed {
                         raw.push(raw_v[i]);
                     }
@@ -1894,11 +1865,20 @@ fn prepare(
             age,
             continues,
             smoothing_plan,
-            checkpoints: series_checkpoints,
+            median_gaps,
+            slot,
         });
+    }
+    // The axis every series' emitted x decide, which `respond` builds on; step and time charts' slot smoothers widen to its floor ([`chart::Floor`]).
+    let xs: Vec<&[f64]> = prepared.iter().map(|ps| ps.xs.as_slice()).collect();
+    let axis = chart::AxisDecision::of(&xs, p.spec);
+    let floor = axis.floor();
+    for slot in prepared.iter_mut().filter_map(|ps| ps.slot.as_mut()) {
+        slot.smoother = slot.smoother.floored(floor);
     }
     Ok(Preparation {
         series: prepared,
+        axis,
         audit_plans_aligned: true,
         rows,
         largest,
@@ -1907,17 +1887,26 @@ fn prepare(
 
 /// The FULL dense model for a prepared set — every chart, delta or not, is computed through here (the audit oracle reconstructs the held one). Every chart — step, timestamp, AND custom-x — is bucketed on ONE slot grid shared by all runs (docs/chart-shared-axis.md); `shared_chart` owns the grid, slot mixture, envelopes, and the marker channel. Y columns are rounded to wire precision HERE (chart_delta::round_y), so the model, the result hashes, and the client's inflated copy are bit-identical — and a smoother's non-finite overshoot is clamped back into the finite range the wire carries.
 ///
-/// With `capture`, also returns the axis layout (held chart state, query/held.rs).
+/// Also returns the axis layout (`None` with no plottable point) and, with `capture`, each series' causal checkpoints (held chart state, query/held.rs).
 fn respond(
     prepared: &[PreparedSeries],
+    axis: chart::AxisDecision,
     p: &ChartParams,
     capture: bool,
-) -> (DenseChart, Option<chart::incremental::HeldAxis>) {
+) -> (
+    DenseChart,
+    Option<chart::incremental::HeldAxis>,
+    Vec<Vec<chart::CausalState>>,
+) {
     let xs_s: Vec<&[f64]> = prepared.iter().map(|q| q.xs.as_slice()).collect();
     let plot_s: Vec<&[f64]> = prepared.iter().map(|q| q.plot.as_slice()).collect();
     let raw_s: Vec<&[f64]> = prepared.iter().map(|q| q.raw.as_slice()).collect();
     let kinds_s: Vec<&[u8]> = prepared.iter().map(|q| q.kinds.as_slice()).collect();
     let xnan_s: Vec<&[f64]> = prepared.iter().map(|q| q.xnan_xs.as_slice()).collect();
+    let mut slot_evaluators: Vec<_> = prepared
+        .iter()
+        .map(|ps| ps.slot_evaluator(capture))
+        .collect();
     let (mut chart, axis) = chart::shared_chart(
         &xs_s,
         &plot_s,
@@ -1925,8 +1914,9 @@ fn respond(
         &kinds_s,
         &xnan_s,
         p.is_smoothed,
+        &mut slot_evaluators,
         p.spec,
-        capture,
+        axis,
     );
     for (s, ps) in chart.series.iter_mut().zip(prepared) {
         s.label = ps.label.clone();
@@ -1943,7 +1933,11 @@ fn respond(
             }
         }
     }
-    (chart, axis)
+    let checkpoints = slot_evaluators
+        .into_iter()
+        .map(|evaluator| evaluator.map_or_else(Vec::new, chart::SlotEvaluator::finish))
+        .collect();
+    (chart, axis, checkpoints)
 }
 
 /// Relative-time offsets require an untrimmed request and timestamps monotone across the held boundary.
@@ -2068,14 +2062,15 @@ fn to_delta(
     }
 }
 
-/// Flag interpolation and kind-4 appearance dependencies for verified input history, then prove the numeric prefix.
+/// Flag kind-4 appearance dependencies for verified input history, then prove the numeric prefix. Standard axes only: custom x has no verified history, and no ages.
 ///
-/// Flags turn OLD ages into REACH in place, without changing continuation facts. Initial full builds and audit reconstruction skip this step.
-fn plan_delta_from_col(prepared: &mut [PreparedSeries], p: &ChartParams) -> usize {
+/// Flags turn OLD ages into ANCHOR in place, without changing continuation facts. Initial full builds and audit reconstruction skip this step.
+fn plan_delta_from_col(
+    prepared: &mut [PreparedSeries],
+    p: &ChartParams,
+    axis: &chart::incremental::HeldAxis,
+) -> usize {
     for ps in prepared.iter_mut() {
-        if p.is_smoothed {
-            flag_lerp_dependency(&ps.plot, &ps.kinds, &mut ps.age);
-        }
         // A kind-4 marker's appearance (the held rows had no unplottable sample) is the one change no numeric column shows. A run with no plottable x has its marker on column 0, so no prefix survives. Otherwise the marker sits on its anchor sample's slot, the run's first plottable x, and moves only with that sample's cell: dirty the anchor.
         if ps.xnan_count == 0 || ps.xnan_held {
             continue;
@@ -2085,14 +2080,23 @@ fn plan_delta_from_col(prepared: &mut [PreparedSeries], p: &ChartParams) -> usiz
                 return 0;
             }
         } else if ps.age[0] == chart::AGE_OLD {
-            // Held rows exist only on standard axes, where every unplottable sample is carried to the first plottable x; custom-x ages are all NEW.
+            // On standard axes every unplottable sample is carried to the first plottable x.
             debug_assert_eq!(ps.xnan_xs.as_slice(), &ps.xs[..1]);
-            ps.age[0] = chart::AGE_REACH;
+            ps.age[0] = chart::AGE_ANCHOR;
         }
     }
     let xs: Vec<&[f64]> = prepared.iter().map(|ps| ps.xs.as_slice()).collect();
     let ages: Vec<&[u8]> = prepared.iter().map(|ps| ps.age.as_slice()).collect();
-    chart::numeric_delta_from_col(&xs, &ages, p.spec)
+    // The planners' slot rule per series ([`chart::SlotSmoother::dirty_from`]); none without a slot smoother.
+    let slot_dirty: Vec<f64> = prepared
+        .iter()
+        .map(|ps| {
+            ps.slot.as_ref().map_or(f64::INFINITY, |slot| {
+                slot.smoother.dirty_from(slot.first_new)
+            })
+        })
+        .collect();
+    chart::numeric_delta_from_col(&xs, &ages, &slot_dirty, p.spec, axis)
 }
 
 #[cfg(test)]
@@ -2204,10 +2208,10 @@ fn build_chart(
 ) -> Result<BuiltChart, Status> {
     let lineages = inspect_lineages(req, snapshots, echoed_frontiers(req));
     let held_rows = lineages.verified();
-    let preparation = prepare(req, p, snapshots, x_maps, held_rows, false, None, capture)?;
+    let preparation = prepare(req, p, snapshots, x_maps, held_rows, None)?;
     let mut prepared = preparation.series;
     let mut kind = lineages.rejection().map(lineage::Rejection::label);
-    let (full, axis) = respond(&prepared, p, capture);
+    let (full, mut axis, checkpoints) = respond(&prepared, preparation.axis, p, capture);
     on_dense(DenseShape {
         series: full.series.len(),
         columns: full.x_values.len(),
@@ -2220,7 +2224,6 @@ fn build_chart(
         // No plottable point anywhere: series ship their unplottable counts over an empty axis, so the panel can say why it has nothing to draw, and nothing is stamped to continue from.
         emit_full(&full)
     } else {
-        let continuing = prepared.iter().filter(|ps| ps.continues).count();
         // Appends can change a global smoothing plan even with verified held inputs; the audit reuses the exact matched plan.
         let deltable = held_rows
             .is_some_and(|f| !p.relative || relative_offsets_stable(req, p, snapshots, f))
@@ -2231,43 +2234,54 @@ fn build_chart(
                     .iter()
                     .filter(|ps| ps.continues)
                     .map(|ps| ps.smoothing_plan),
-                continuing,
             );
-        let mut from_col = deltable.then(|| plan_delta_from_col(&mut prepared, p));
-        let mut audit_bad = false;
+        let mut from_col = deltable.then(|| {
+            // A chart with a column has an axis.
+            axis.as_ref()
+                .map_or(0, |axis| plan_delta_from_col(&mut prepared, p, axis))
+        });
+        // The banded bit flips only in a full answer (chart_sync `splice_response`), and a chart that held no finite value held no envelope.
+        let held_finite = |ps: &PreparedSeries| {
+            ps.age
+                .iter()
+                .zip(&ps.kinds)
+                .any(|(&age, &kind)| age != chart::AGE_NEW && kind == 0)
+        };
+        if is_banded(&full) && !prepared.iter().any(held_finite) {
+            from_col = from_col.map(|_| 0);
+        }
+        // Only a capture reads the axis from here on: without one it goes before the reply is encoded, at the build's peak.
+        if !capture {
+            axis = None;
+        }
         if let Some(col) = from_col.filter(|&col| audit && col > 0 && col <= full.x_values.len()) {
-            // The verified held reconstruction must not derive spacing because the exact gate proved the held/current plans equal. Pair each override with stable request/tag identity: `held_series` is client-controlled, so its count alone cannot prove that old-only and continuing groups align.
+            // The verified held reconstruction takes the current plans, which the exact gate proved equal to the held ones (without exact state every plan is NoState), rather than derive spacing. Pair each with stable request/tag identity: `held_series` is client-controlled, so its count alone cannot prove that old-only and continuing groups align.
             let audit_plans: Vec<(SeriesIdentity, chart::SmoothingPlan)> = prepared
                 .iter()
                 .filter(|ps| ps.continues)
                 .map(|ps| (ps.identity.clone(), ps.smoothing_plan))
                 .collect();
-            let old = prepare(
-                req,
-                p,
-                snapshots,
-                x_maps,
-                held_rows,
-                true,
-                p.exact_smoothing_state.then_some(audit_plans.as_slice()),
-                false,
-            )?;
+            let old = prepare(req, p, snapshots, x_maps, held_rows, Some(&audit_plans))?;
             if !old.audit_plans_aligned {
                 kind = Some("gated");
                 from_col = None;
-            } else if !prefix_matches(&respond(&old.series, p, false).0, &full, col, &prepared) {
+            } else if !prefix_matches(
+                &respond(&old.series, old.axis, p, false).0,
+                &full,
+                col,
+                &prepared,
+            ) {
                 tracing::error!(
                     from_col = col,
                     "chart delta audit failed; answering in full"
                 );
                 kind = Some("audit_failed");
-                audit_bad = true;
                 from_col = None;
             }
         }
         let continues = prepared.iter().map(|ps| ps.continues);
         let mut resp = reply(&full, req, from_col, continues, &mut kind);
-        resp.audit_failed = audit_bad;
+        resp.audit_failed = kind == Some("audit_failed");
         stamp_lineages(&mut resp.frontiers, &lineages);
         stamp_smoothing_state(
             &mut resp.frontiers,
@@ -2288,7 +2302,8 @@ fn build_chart(
         kind = Some("audit_failed");
         resp = audit_failed_full(&full, std::mem::take(&mut resp.frontiers));
     }
-    let held = capture.then(|| held::capture(req, p, snapshots, &mut prepared, full, axis));
+    let held =
+        capture.then(|| held::capture(req, p, snapshots, &prepared, checkpoints, full, axis));
     Ok(BuiltChart {
         response: resp,
         kind,
@@ -2660,7 +2675,6 @@ mod frontier_delta_tests {
     mod lineage_tests;
     mod marker_delta_tests;
     mod memo_tests;
-    mod smoother_hole_tests;
 
     const ALGORITHMS: [Algorithm; 4] = [
         Algorithm::None,
@@ -2701,6 +2715,14 @@ mod frontier_delta_tests {
             value,
             is_value: 1,
             inserted_ms: step * 10_000_000,
+        }
+    }
+
+    /// A [`scalar_row`] logged at `timestamp_ms`.
+    fn timed_row(step: i64, timestamp_ms: i64, value: f32) -> VersionedRawPoint {
+        VersionedRawPoint {
+            timestamp_ms,
+            ..scalar_row(step, value)
         }
     }
 
@@ -2804,7 +2826,7 @@ mod frontier_delta_tests {
         }
     }
 
-    /// A tag forms a group only when it keeps a row: under `old_only`, a tag holding only new rows forms none, so the scalar rows its group suppresses in the full build are the held reconstruction's series.
+    /// A tag forms a group only when it keeps a row: in the held reconstruction, a tag holding only new rows forms none, so the scalar rows its group suppresses in the full build are the held reconstruction's series.
     #[test]
     fn old_only_groups_form_from_held_rows_alone() {
         let request = req(&["a"], 300);
@@ -2819,25 +2841,23 @@ mod frontier_delta_tests {
         let verified = verified_inputs(&continued, grown, &held.frontiers).expect("held rows");
         let p = chart_params(&continued);
         let snapshots = fixture_snapshots(&continued, grown);
-        let groups = |old_only| -> Vec<String> {
-            prepare(
-                &continued,
-                &p,
-                &snapshots,
-                None,
-                Some(&verified),
-                old_only,
-                None,
-                false,
-            )
-            .unwrap()
-            .series
-            .into_iter()
-            .map(|ps| ps.identity.tag)
-            .collect()
+        let held_plans = [(
+            SeriesIdentity {
+                request_index: 0,
+                tag: String::new(),
+            },
+            chart::SmoothingPlan::NoState,
+        )];
+        let groups = |plans| -> Vec<String> {
+            prepare(&continued, &p, &snapshots, None, Some(&verified), plans)
+                .unwrap()
+                .series
+                .into_iter()
+                .map(|ps| ps.identity.tag)
+                .collect()
         };
-        assert_eq!(groups(false), ["t"]);
-        assert_eq!(groups(true), [""]);
+        assert_eq!(groups(None), ["t"]);
+        assert_eq!(groups(Some(&held_plans)), [""]);
     }
 
     #[test]
@@ -2846,11 +2866,7 @@ mod frontier_delta_tests {
         request.use_timestamp_axis = true;
         request.relative_time = true;
         request.log_buckets = true;
-        request.smoothing = Some(proto::SmoothingConfig {
-            algorithm: Algorithm::SavitzkyGolay as i32,
-            window_size: 20,
-            ..Default::default()
-        });
+        request.smoothing = smoothing(Algorithm::SavitzkyGolay, 20, 0.0, 0);
         let custom_x = proto::SeriesRef {
             metric_name: "train/epoch".into(),
             ..Default::default()
@@ -2881,11 +2897,7 @@ mod frontier_delta_tests {
     fn ema_rejects_a_time_constant_that_is_not_finite_and_positive() {
         let ema = |time_constant: f64| {
             let mut request = req(&["a"], 300);
-            request.smoothing = Some(proto::SmoothingConfig {
-                algorithm: Algorithm::Ema as i32,
-                time_constant,
-                ..Default::default()
-            });
+            request.smoothing = smoothing(Algorithm::Ema, 0, time_constant, 0);
             canonicalize_chart_request(&mut request)
         };
         assert!(ema(7.0).is_ok());
@@ -2918,29 +2930,13 @@ mod frontier_delta_tests {
         let mut request = req(&["a"], 300);
         request.step_min = Some(100_000);
         request.step_max = Some(200_000);
-        request.smoothing = Some(proto::SmoothingConfig {
-            algorithm: Algorithm::SavitzkyGolay as i32,
-            window_size: u32::MAX,
-            ..Default::default()
-        });
+        request.smoothing = smoothing(Algorithm::SavitzkyGolay, u32::MAX, 0.0, 0);
 
         let params = chart_params(&request);
         assert_eq!(params.window_size, chart::MAX_SMOOTHING_WINDOW);
-        assert_eq!(params.reach, chart::MAX_SMOOTHING_WINDOW as usize);
         let margin = i64::from(chart::MAX_SMOOTHING_WINDOW) * 4;
         assert_eq!(params.fetch_min, 100_000 - margin);
         assert_eq!(params.fetch_max, 200_000 + margin);
-
-        let mut ages = vec![chart::AGE_OLD; chart::MAX_SMOOTHING_WINDOW as usize + 2];
-        *ages.last_mut().unwrap() = chart::AGE_NEW;
-        let xs = (0..ages.len())
-            .map(|index| index as f64)
-            .collect::<Vec<_>>();
-        flag_reach(&xs, &mut ages, params.reach, chart::SmoothingPlan::Uniform);
-        assert_eq!(ages[0], chart::AGE_OLD);
-        assert!(ages[1..ages.len() - 1]
-            .iter()
-            .all(|age| *age == chart::AGE_REACH));
     }
 
     /// `request` continued from `held`, as the client polls it next.
@@ -2969,6 +2965,11 @@ mod frontier_delta_tests {
         let c = delta.from_col as usize;
         assert!(delta.delta && c > 0 && c <= held.x_values.len());
         assert_eq!(delta.splice_from_cached.len(), delta.series.len());
+        let held_banded = held.series.iter().any(|s| !s.min_values.is_empty());
+        assert_eq!(
+            delta.banded, held_banded,
+            "the banded bit flips only in a full answer"
+        );
         let tail_len = delta.x_values.len();
         let new_len = c + tail_len;
         let mut x_values = held.x_values[..c].to_vec();
@@ -3313,11 +3314,7 @@ mod frontier_delta_tests {
     #[test]
     fn smoothed_appends_still_splice_exactly() {
         let mut r = req(&["a"], 250);
-        r.smoothing = Some(proto::SmoothingConfig {
-            algorithm: proto::smoothing_config::Algorithm::SavitzkyGolay as i32,
-            window_size: 20,
-            ..Default::default()
-        });
+        r.smoothing = smoothing(Algorithm::SavitzkyGolay, 20, 0.0, 0);
         let held = build(&r, &[rows(3000, 5)]);
         let grown = [rows(3080, 5)];
         let r2 = continuation(&r, &held);
@@ -3329,25 +3326,16 @@ mod frontier_delta_tests {
         ));
     }
 
-    /// Smoothed envelope values are evaluated at the shared bucket center. A
-    /// gappy finite append supplies a new interpolation endpoint and can
-    /// therefore change the preceding occupied bucket even when intervening
-    /// samples are non-finite. The delta must begin at that finite
-    /// predecessor, not merely at the append/marker buckets.
+    /// Smoothed envelope values are the smoother evaluated at the shared bucket center, and a causal smoother there reads only samples at or before it. A gappy finite append therefore changes the buckets from its own on, however many non-finite samples precede it: the earlier buckets stay in the prefix.
     #[test]
-    fn gappy_causal_append_invalidates_preceding_interpolation_bucket() {
+    fn gappy_causal_append_keeps_the_preceding_buckets() {
         let held_a = rows_at(&[(8, 1.0), (9, 4.0), (16, f32::NAN)]);
         let grown_a = rows_at(&[(8, 1.0), (9, 4.0), (16, f32::NAN), (24, 20.0)]);
         let b = rows(32, 7); // fixes four width-8 shared envelope cells
 
         for algorithm in [Algorithm::Ema, Algorithm::Triangular] {
             let mut r = req(&["a", "b"], 4);
-            r.smoothing = Some(proto::SmoothingConfig {
-                algorithm: algorithm as i32,
-                window_size: 10,
-                time_constant: std::f64::consts::LOG2_E,
-                poly_order: 1,
-            });
+            r.smoothing = smoothing(algorithm, 10, std::f64::consts::LOG2_E, 1);
             let held = build(&r, &[held_a.clone(), b.clone()]);
             assert_eq!(inflate_full(&held).x_values, vec![3.5, 11.5, 19.5, 27.5]);
 
@@ -3355,19 +3343,19 @@ mod frontier_delta_tests {
             let out = build(&continued, &[grown_a.clone(), b.clone()]);
             assert!(!out.audit_failed, "{algorithm:?}: planner lost a prefix");
             assert!(out.delta, "{algorithm:?}: stable grid should still delta");
-            assert_eq!(out.from_col, 1, "{algorithm:?}: predecessor bucket");
+            assert_eq!(
+                out.from_col, 3,
+                "{algorithm:?}: the appended sample's bucket"
+            );
 
             let truth = inflate_full(&build(&r, &[grown_a.clone(), b.clone()]));
             assert!(eq(&splice(&inflate_full(&held), &out), &truth));
         }
     }
 
-    /// A centered smoother can change an already-held finite endpoint near a
-    /// NEW sample. If non-finite samples separate it from the preceding finite
-    /// endpoint, interpolation moves an earlier bucket beyond the smoother's
-    /// ordinary index reach; that preceding finite bucket must join the tail.
+    /// A centered smoother evaluated at a bucket center reads the samples within its half-width there, whatever lies between: non-finite samples separating a finite held sample from an append move no earlier bucket. The tail starts at the first bucket centered within the half-width before the append: the floor's, 805/572 of the width-8 cells at order 2 (the user's window 10 reaches only the last cell).
     #[test]
-    fn changed_smoothing_endpoint_invalidates_preceding_finite_bucket() {
+    fn gappy_centered_append_keeps_the_buckets_its_window_misses() {
         let mut held_points = vec![(9, 1.0)];
         held_points.extend((16..32).map(|step| (step, f32::NAN)));
         held_points.extend([(32, 4.0), (33, f32::NAN)]);
@@ -3375,33 +3363,395 @@ mod frontier_delta_tests {
         grown_points.push((34, 20.0));
         let held_a = rows_at(&held_points);
         let grown_a = rows_at(&grown_points);
-        // Keep five width-8 shared cells while making the anchor's smoother use the irregular, direct-fit path. Its prefix-sum block rounding is a separate dependency covered by the block regressions.
+        // Keep five width-8 shared cells.
         let b = rows_at(
             &(0..40)
-                .filter(|&step| step != 17)
                 .map(|step| (step, ((step * 7) % 97) as f32))
                 .collect::<Vec<_>>(),
         );
 
         let mut r = req(&["a", "b"], 5);
-        r.smoothing = Some(proto::SmoothingConfig {
-            algorithm: Algorithm::SavitzkyGolay as i32,
-            window_size: 10,
-            poly_order: 1,
-            ..Default::default()
-        });
+        r.smoothing = smoothing(Algorithm::SavitzkyGolay, 10, 0.0, 2);
         let held = build(&r, &[held_a.clone(), b.clone()]);
         let continued = continuation(&r, &held);
         let out = build(&continued, &[grown_a.clone(), b.clone()]);
         assert!(!out.audit_failed, "planner lost a prefix");
         assert!(out.delta, "stable grid should still delta");
-        assert_eq!(out.from_col, 1, "finite predecessor");
+        assert_eq!(out.from_col, 3, "the bucket the floored window reaches");
 
         let truth = inflate_full(&build(&r, &[grown_a.clone(), b.clone()]));
         assert!(eq(&splice(&inflate_full(&held), &out), &truth));
     }
 
-    /// A verified new negative timestamp can reuse earlier shared columns: causal influence is marked before filtering, and the new kind-4 marker dirties its anchor's cell. Here the centered smoothers answer in full because the timestamp changes their exact plan from Uniform to Median.
+    /// A Savitzky-Golay series' spacing is its plan's median gap: a row stamped between its two held ones halves it, narrowing every slot's window, slots below the new row's reach included, so the plan gate answers in full. The slot at 7.5, which run b centers, drops sample 34 from its window and goes from 3.7 to 5.
+    #[test]
+    fn a_second_timestamp_rescales_every_slot_window() {
+        let held_a = Arc::new(vec![timed_row(0, 14, 5.0), timed_row(1, 34, 9.0)]);
+        let grown_a = Arc::new(vec![
+            timed_row(0, 14, 5.0),
+            timed_row(1, 34, 9.0),
+            timed_row(2, 24, 7.0),
+        ]);
+        let b: Vec<_> = (0..48).map(|s| timed_row(s, s, (s % 7) as f32)).collect();
+        let b = Arc::new(b);
+        let mut r = req(&["a", "b"], 3);
+        r.use_timestamp_axis = true;
+        r.smoothing = smoothing(Algorithm::SavitzkyGolay, 3, 1.0, 1);
+        let held = build(&r, &[held_a, b.clone()]);
+        let current = [grown_a, b];
+        let truth = inflate_full(&build(&r, &current));
+        let old = inflate_full(&held);
+        assert_eq!((old.x_values[0], truth.x_values[0]), (7.5, 7.5));
+        let first = |model: &DenseChart| model.series[0].values[0] as f32;
+        assert_eq!((first(&old), first(&truth)), (3.7, 5.0));
+        let out = build(&continuation(&r, &held), &current);
+        assert!(!out.audit_failed);
+        assert!(!out.delta, "the first column changes");
+        assert!(eq(&inflate_full(&out), &truth));
+    }
+
+    /// A Savitzky-Golay window over two timestamps fits a line, not a quadratic, whatever the degree asked: run a logs 2 at timestamp 0 and 3.25 at 1, run b's 1023 puts the one slot at 511.5, and a quadratic's pivot of rounding noise would draw 3.4 million there.
+    #[test]
+    fn a_window_over_two_timestamps_fits_a_line() {
+        let a = Arc::new(
+            (0..49)
+                .map(|step| VersionedRawPoint {
+                    timestamp_ms: i64::from(step >= 16),
+                    ..scalar_row(step, if step < 16 { 2.0 } else { 3.25 })
+                })
+                .collect(),
+        );
+        let b = Arc::new(vec![timed_row(0, 2, 0.0), timed_row(1, 1023, 0.0)]);
+        let mut r = req(&["a", "b"], 1);
+        r.use_timestamp_axis = true;
+        r.smoothing = smoothing(Algorithm::SavitzkyGolay, 3, 1.0, 2);
+        let model = inflate_full(&build(&r, &[a, b]));
+        assert_eq!(model.x_values, [511.5]);
+        assert_eq!(model.series[0].values, [641.375]);
+    }
+
+    /// A timestamp axis whose timestamps run against its steps, under a step range, reads its emitted samples among the fetched ones (`SlotInputs` copies every one): every slot is the floored smoother over exactly the fetched rows in time order.
+    #[test]
+    fn slots_against_steps_read_the_fetched_rows_in_time_order() {
+        let half = 3_000;
+        // Even steps' timestamps interleave odd steps': halves of the run logged alternately.
+        let rows: Vec<VersionedRawPoint> = (0..2 * half)
+            .map(|step| VersionedRawPoint {
+                timestamp_ms: (step % half) * 2 + step / half,
+                ..scalar_row(step, ((step * 7_919) % 101) as f32)
+            })
+            .collect();
+        for algorithm in [Algorithm::SavitzkyGolay, Algorithm::Ema] {
+            let mut r = req(&["a"], 16);
+            r.use_timestamp_axis = true;
+            r.step_min = Some(half / 2);
+            r.step_max = Some(half + half / 2);
+            r.smoothing = smoothing(algorithm, 9, 4.0, 1);
+            let p = chart_params(&r);
+            let mut fetched: Vec<_> = rows
+                .iter()
+                .filter(|row| (p.fetch_min..=p.fetch_max).contains(&row.step))
+                .collect();
+            fetched.sort_by_key(|row| row.timestamp_ms);
+            let xs: Vec<f64> = fetched.iter().map(|row| row.timestamp_ms as f64).collect();
+            let ys: Vec<f64> = fetched.iter().map(|row| f64::from(row.value)).collect();
+            let emitted: Vec<f64> = fetched
+                .iter()
+                .filter(|row| (p.step_min..=p.step_max).contains(&row.step))
+                .map(|row| row.timestamp_ms as f64)
+                .collect();
+            let floor = chart::AxisDecision::of(&[&emitted], p.spec).floor();
+            let plan = chart::smoothing_plan(&xs, algorithm, false).0;
+            let smoother = chart::SlotSmoother::new(algorithm, 9, 4.0, 1, plan).floored(floor);
+            let mut truth = chart::SlotEvaluator::over(smoother, &xs, &ys);
+            let model = inflate_full(&build(&r, &[Arc::new(rows.clone())]));
+            let mut compared = 0;
+            for (&x, &got) in model.x_values.iter().zip(&model.series[0].values) {
+                let want = chart_delta::round_y(truth.at(x));
+                // A causal slot ahead of its run's first sample in the cell has no value.
+                if got.is_finite() || algorithm == Algorithm::SavitzkyGolay {
+                    assert_eq!(got.to_bits(), want.to_bits(), "{algorithm:?} at {x}");
+                    compared += 1;
+                }
+            }
+            assert!(compared >= 10, "{algorithm:?}: {compared} slots");
+        }
+    }
+
+    /// A timestamp axis with a step range smooths over fetch-margin samples it does not emit, and timestamps need not follow steps: an appended step past the range can sit inside a cell another run stretches, read by that cell's window although the series has no sample near it to mark. The slot rule dirties it, so the delta still splices to the full model.
+    #[test]
+    fn time_margin_append_dirties_the_slot_its_window_reads() {
+        let mut a_rows = vec![timed_row(0, 0, 2.0)];
+        a_rows.extend((4..30).map(|step| timed_row(step, (599 + step).min(607), 1.0)));
+        let held_a = Arc::new(a_rows.clone());
+        a_rows.push(timed_row(30, 608, 100.0));
+        let grown_a = Arc::new(a_rows);
+        let b = Arc::new(
+            [0, 400, 800, 1200]
+                .iter()
+                .enumerate()
+                .map(|(step, &timestamp)| timed_row(step as i64, timestamp, 1.0))
+                .collect::<Vec<_>>(),
+        );
+        let mut r = req(&["a", "b"], 1);
+        r.use_timestamp_axis = true;
+        r.step_max = Some(3);
+        r.smoothing = smoothing(Algorithm::SavitzkyGolay, 18, 0.0, 0);
+        let held = build(&r, &[held_a, b.clone()]);
+        assert_eq!(inflate_full(&held).x_values, [600.0]);
+        let continued = continuation(&r, &held);
+        let truth = inflate_full(&build(&r, &[grown_a.clone(), b.clone()]));
+        assert_ne!(
+            inflate_full(&held).series[0].values[0].to_bits(),
+            truth.series[0].values[0].to_bits(),
+            "the appended margin sample moves the slot"
+        );
+        for audit in [false, true] {
+            let out =
+                build_response(&continued, &[grown_a.clone(), b.clone()], None, audit).unwrap();
+            assert!(!out.audit_failed);
+            let rebuilt = if out.delta {
+                splice(&inflate_full(&held), &out)
+            } else {
+                inflate_full(&out)
+            };
+            assert!(eq(&rebuilt, &truth), "audit={audit}");
+        }
+    }
+
+    /// A slot centered far past a run's samples reads its fit there without losing digits: samples on a polynomial of the fit's degree continue it exactly, causal states read at their offset and Savitzky-Golay windows fitted about their samples.
+    #[test]
+    fn slot_values_far_past_their_samples_keep_their_digits() {
+        let close = |got: f64, want: f64, what: &str| {
+            assert!(
+                (got - want).abs() <= 1e-6 * want.abs(),
+                "{what}: {got} vs {want}"
+            );
+        };
+        for algorithm in [Algorithm::Ema, Algorithm::Triangular] {
+            for (degree, end) in [(1u32, 200_000_000i64), (2, 20_000)] {
+                let mut r = req(&["lagging", "stretch"], 1);
+                r.smoothing = smoothing(algorithm, 0, 4.0, degree);
+                let last = if degree == 2 { 4.0 } else { 2.0 };
+                let lagging = rows_at(&[(0, 0.0), (1, 1.0), (2, last)]);
+                let stretch = rows_at(&[(0, 3.0), (end, 3.0)]);
+                let model = inflate_full(&build(&r, &[lagging, stretch]));
+                let x = model.x_values[0];
+                close(
+                    model.series[0].values[0],
+                    x.powi(degree as i32),
+                    &format!("{algorithm:?} order {degree} at {x}"),
+                );
+            }
+        }
+        let mut r = req(&["lagging", "stretch"], 1);
+        r.smoothing = smoothing(Algorithm::SavitzkyGolay, 4096, 0.0, 2);
+        let lagging = rows_at(&[(0, 0.0), (1, 1.0), (2, 4.0), (3, 9.0)]);
+        let stretch = rows_at(&[(0, 3.0), (4000, 3.0)]);
+        let model = inflate_full(&build(&r, &[lagging, stretch]));
+        assert_eq!(model.x_values, [2000.0]);
+        close(
+            model.series[0].values[0],
+            4e6,
+            "Savitzky-Golay order 2 at 2000",
+        );
+    }
+
+    /// Where a run resumes after a gap, or starts after the others, the bucket's center can precede all its samples there: a causal smoother at the center has read none of them, so the slot has no value, and the next bucket has one. A Savitzky-Golay window narrower than the bucket's half (window 100, half-width 50 against 64.5 from the center to the samples) is widened by the floor to reach them.
+    #[test]
+    fn slots_ahead_of_a_buckets_samples_wait_for_causal_smoothers_and_reach_them_floored() {
+        let noise = |s: i64| ((s * 37) % 11) as f32 / 20.0;
+        let mut resumed: Vec<(i64, f32)> = (0..=1_000).map(|s| (s, s as f32 / 1_000.0)).collect();
+        resumed.extend((11_200..=12_000).map(|s| (s, 5.0 + noise(s))));
+        let late: Vec<(i64, f32)> = (11_200..=12_000).map(|s| (s, 5.0 + noise(s))).collect();
+        let stretch: Vec<(i64, f32)> = (0..=12_000).map(|s| (s, noise(s))).collect();
+        for (algorithm, order) in [
+            (Algorithm::Ema, 0u32),
+            (Algorithm::Ema, 2),
+            (Algorithm::Triangular, 1),
+            (Algorithm::SavitzkyGolay, 1),
+        ] {
+            let mut r = req(&["resumed", "stretch", "late"], 47);
+            r.smoothing = smoothing(algorithm, 100, 50.0, order);
+            let model = inflate_full(&build(
+                &r,
+                &[rows_at(&resumed), rows_at(&stretch), rows_at(&late)],
+            ));
+            // The bucket [11008, 11264), centered by the stretching run before the others' first sample at 11200.
+            let slot = model.x_values.iter().position(|&x| x == 11_135.5).unwrap();
+            for run in [0, 2] {
+                let series = &model.series[run];
+                assert!(
+                    series.min_values[slot].is_finite(),
+                    "run {run} has samples there"
+                );
+                let causal = algorithm != Algorithm::SavitzkyGolay;
+                assert_eq!(
+                    series.values[slot].is_nan(),
+                    causal,
+                    "{algorithm:?} {order}: run {run}'s value ahead of its samples"
+                );
+                assert!(
+                    series.values[slot + 1].is_finite(),
+                    "{algorithm:?}: the next bucket"
+                );
+            }
+        }
+    }
+
+    /// A passthrough chart's slots take each run's smoother at their x, with no floor: on a timestamp axis whose clock stalls, a slot reads every sample at its timestamp; over steps far apart, a window keeps the user's width (a floor, a 1,000-step bucket's here, would widen the first three samples' windows over all of them).
+    #[test]
+    fn passthrough_slots_take_the_smoother_at_their_x() {
+        // Steps 10-14 share one timestamp.
+        let timestamp = |step: i64| 1_000 * step.min(10) + 1_000 * (step - 14).max(0);
+        let stalled: Vec<_> = (0..40)
+            .map(|step| timed_row(step, timestamp(step), ((step * 37) % 11) as f32))
+            .collect();
+        let sparse = [(0, 0.0), (1, 1.0), (2, 4.0), (1_000_000, 0.0)]
+            .map(|(step, value)| scalar_row(step, value));
+        for (rows, use_timestamp_axis, algorithm, window, order) in [
+            (&stalled[..], true, Algorithm::Ema, 0u32, 1u32),
+            (&stalled, true, Algorithm::Triangular, 0, 2),
+            (&stalled, true, Algorithm::SavitzkyGolay, 7, 2),
+            (&sparse, false, Algorithm::SavitzkyGolay, 3, 0),
+        ] {
+            let x: Vec<f64> = rows
+                .iter()
+                .map(|row| match use_timestamp_axis {
+                    true => row.timestamp_ms as f64,
+                    false => row.step as f64,
+                })
+                .collect();
+            let y: Vec<f64> = rows.iter().map(|row| f64::from(row.value)).collect();
+            let mut r = req(&["a"], 1_000);
+            r.use_timestamp_axis = use_timestamp_axis;
+            r.smoothing = smoothing(algorithm, window, 3.0, order);
+            let model = inflate_full(&build(&r, &[Arc::new(rows.to_vec())]));
+            let plan = chart::smoothing_plan(&x, algorithm, !use_timestamp_axis).0;
+            let smoother = chart::SlotSmoother::new(algorithm, window, 3.0, order, plan);
+            let mut evaluator = chart::SlotEvaluator::over(smoother, &x, &y);
+            let mut distinct = x.clone();
+            distinct.dedup();
+            assert_eq!(model.x_values, distinct, "one slot per distinct x");
+            for (slot, &at) in model.x_values.iter().enumerate() {
+                assert_eq!(
+                    model.series[0].values[slot].to_bits(),
+                    chart_delta::round_y(evaluator.at(at)).to_bits(),
+                    "{algorithm:?} at {at}"
+                );
+            }
+        }
+    }
+
+    /// The floor makes a slot about as smooth as its bucket's mean: over white noise, with the user's widths far below it (window 3, time constant 1), each smoother's slots vary as the bucket means do, within the discreteness of ∫K² (R's per smoother, w's per grid).
+    #[test]
+    fn floored_slots_vary_as_their_bucket_means_do() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let all: Vec<(i64, f32)> = (0..=200_000)
+            .map(|s| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let uniform = (state >> 11) as f64 / (1u64 << 53) as f64;
+                (s, (uniform * 2.0 - 1.0) as f32)
+            })
+            .collect();
+        // The edges' slots, past which no bucket lies, are left out.
+        let variance = |v: &[f64]| {
+            let v = &v[10..v.len() - 2];
+            let mean = v.iter().sum::<f64>() / v.len() as f64;
+            v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (v.len() - 1) as f64
+        };
+        let mut r = req(&["a"], 500);
+        let means = inflate_full(&build(&r, &[rows_at(&all)]));
+        let base = variance(&means.series[0].values);
+        for (algorithm, window, tc, order) in [
+            (Algorithm::SavitzkyGolay, 3, 1.0, 0),
+            (Algorithm::SavitzkyGolay, 3, 1.0, 1),
+            (Algorithm::SavitzkyGolay, 3, 1.0, 2),
+            (Algorithm::Ema, 0, 1.0, 0),
+            (Algorithm::Ema, 0, 1.0, 1),
+            (Algorithm::Ema, 0, 1.0, 2),
+        ] {
+            r.smoothing = smoothing(algorithm, window, tc, order);
+            let model = inflate_full(&build(&r, &[rows_at(&all)]));
+            assert_eq!(model.x_values, means.x_values);
+            let ratio = variance(&model.series[0].values) / base;
+            assert!(
+                (0.95..1.05).contains(&ratio),
+                "{algorithm:?} order {order}: {ratio}"
+            );
+        }
+    }
+
+    /// Target 0 never downsamples, so its zoom keeps the user's margins: no floor's (a log ladder at target 0 would have one bucket per octave).
+    #[test]
+    fn an_unlimited_zoom_has_no_floor_margin() {
+        let mut r = req(&["a"], 0);
+        r.step_min = Some(40_000);
+        r.step_max = Some(80_000);
+        r.log_buckets = true;
+        r.smoothing = smoothing(Algorithm::Ema, 0, 5.0, 2);
+        assert_eq!(chart_params(&r).fetch_min, 40_000 - 40);
+    }
+
+    /// A range open at one end (no client sends one smoothed) bounds no floor: its zoom keeps the user's margins, four windows of steps.
+    #[test]
+    fn an_open_ended_zoom_keeps_the_users_margins() {
+        let mut r = req(&["a"], 500);
+        r.step_min = Some(40_000);
+        r.smoothing = smoothing(Algorithm::SavitzkyGolay, 10, 1.0, 2);
+        assert_eq!(chart_params(&r).fetch_min, 40_000 - 40);
+    }
+    /// A zoom's fetch margins cover the floor its smoothers widen to, past the user's widths (window 10, time constant 5): every slot is the floored smoother over all samples, Savitzky-Golay's bit for bit and EMA's within its e⁻⁸ warmup, on a linear grid and the log ladder. At 4 pixels over 7 octaves the ladder has one bucket per octave, whose half-width outgrows x: the last slot's window reaches farthest back, into negative steps.
+    #[test]
+    fn zoom_margins_cover_the_floor() {
+        let noise = |s: i64| (((s * 7919) % 1009) as f32 / 1009.0 - 0.5) * 2.0;
+        let all: Vec<(i64, f32)> = (-40_000..=120_000).map(|s| (s, noise(s))).collect();
+        let xs: Vec<f64> = all.iter().map(|&(s, _)| s as f64).collect();
+        let ys: Vec<f64> = all.iter().map(|&(_, v)| f64::from(v)).collect();
+        for (algorithm, window, tc, order, (lo, hi), target) in [
+            (Algorithm::SavitzkyGolay, 10, 1.0, 0, (40_000, 80_000), 500),
+            (Algorithm::SavitzkyGolay, 10, 1.0, 1, (40_000, 80_000), 500),
+            (Algorithm::SavitzkyGolay, 10, 1.0, 2, (40_000, 80_000), 500),
+            (Algorithm::SavitzkyGolay, 10, 1.0, 2, (512, 65_536), 4),
+            (Algorithm::SavitzkyGolay, 10, 1.0, 2, (-5, 65_536), 500),
+            (Algorithm::Ema, 0, 5.0, 0, (40_000, 80_000), 500),
+            (Algorithm::Ema, 0, 5.0, 1, (40_000, 80_000), 500),
+            (Algorithm::Ema, 0, 5.0, 2, (40_000, 80_000), 500),
+            (Algorithm::Ema, 0, 5.0, 2, (512, 65_536), 4),
+        ] {
+            for log in [false, true] {
+                // A log axis plots no negative step.
+                let from = if log { lo.max(0) } else { lo };
+                let emitted: Vec<f64> = (from..=hi).map(|s| s as f64).collect();
+                let at = format!("{algorithm:?} order {order} {lo}..{hi} log={log}");
+                let mut r = req(&["a"], target);
+                r.step_min = Some(lo);
+                r.step_max = Some(hi);
+                r.log_buckets = log;
+                r.smoothing = smoothing(algorithm, window, tc, order);
+                let model = inflate_full(&build(&r, &[rows_at(&all)]));
+                let floor = chart::AxisDecision::of(&[&emitted], chart_params(&r).spec).floor();
+                let plan = chart::smoothing_plan(&xs, algorithm, true).0;
+                let smoother =
+                    chart::SlotSmoother::new(algorithm, window, tc, order, plan).floored(floor);
+                let mut truth = chart::SlotEvaluator::over(smoother, &xs, &ys);
+                for (&x, &got) in model.x_values.iter().zip(&model.series[0].values) {
+                    let want = chart_delta::round_y(truth.at(x));
+                    if algorithm == Algorithm::SavitzkyGolay {
+                        assert_eq!(got.to_bits(), want.to_bits(), "{at}: slot {x}");
+                    } else {
+                        assert!(
+                            (got - want).abs() < (-8f64).exp(),
+                            "{at}: slot {x}: {got} for {want}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    /// A verified new negative timestamp can reuse earlier shared columns: the slot rule starts from its x though it does not plot, and the new kind-4 marker dirties its anchor's cell. The new timestamp leaves every plan's median in place, so all smoothers splice.
     #[test]
     fn verified_new_unplottable_timestamp_bounds_causal_influence_and_dirties_its_anchor() {
         let held_a = rows_shaped(10, |i| i, |i| 64 + 10 * i);
@@ -3420,24 +3770,12 @@ mod frontier_delta_tests {
             let continued = continuation(&r, &held);
             let out = build(&continued, &[grown_a.clone(), b.clone()]);
             let truth = inflate_full(&build(&r, &[grown_a.clone(), b.clone()]));
-            assert_eq!(
-                out.delta,
-                matches!(
-                    algorithm,
-                    Algorithm::None | Algorithm::Ema | Algorithm::Triangular
-                ),
-                "{algorithm:?}"
-            );
+            assert!(out.delta, "{algorithm:?}");
             assert!(
                 !out.audit_failed,
                 "{algorithm:?}: a gate is not an audit failure"
             );
-            let rebuilt = if out.delta {
-                splice(&held_model, &out)
-            } else {
-                inflate_full(&out)
-            };
-            assert!(eq(&rebuilt, &truth));
+            assert!(eq(&splice(&held_model, &out), &truth));
             assert_eq!(truth.series[0].nan_kinds, vec![4]);
             assert_eq!(
                 truth.series[0].nan_indices,
@@ -3619,8 +3957,8 @@ mod frontier_delta_tests {
             (Algorithm::None, false, true, (0, 0)),
             (Algorithm::Ema, false, true, (0, 0)),
             (Algorithm::Triangular, false, true, (0, 0)),
-            (Algorithm::Ema, true, false, (0, 1)),
-            (Algorithm::Triangular, true, false, (0, 1)),
+            (Algorithm::Ema, true, false, (1, 1)),
+            (Algorithm::Triangular, true, false, (1, 1)),
             (Algorithm::SavitzkyGolay, true, true, (1, 0)),
             (Algorithm::SavitzkyGolay, true, false, (1, 1)),
         ];
@@ -3645,12 +3983,7 @@ mod frontier_delta_tests {
     fn irrelevant_spacing_state_does_not_gate_causal_smoothers() {
         for algorithm in [Algorithm::Ema, Algorithm::Triangular] {
             let mut step_req = req(&["a"], 100);
-            step_req.smoothing = Some(proto::SmoothingConfig {
-                algorithm: algorithm as i32,
-                time_constant: std::f64::consts::LOG2_E,
-                poly_order: 1,
-                ..Default::default()
-            });
+            step_req.smoothing = smoothing(algorithm, 0, std::f64::consts::LOG2_E, 1);
             let step_shape = |n: i64| {
                 rows_shaped(
                     n,
@@ -3675,7 +4008,7 @@ mod frontier_delta_tests {
                 &inflate_full(&build(&step_req, &grown))
             ));
 
-            // Time EMA/Triangular do need the median, but not the uniformity branch. Appending 12ms then 8ms gaps flips uniformity while keeping the upper median exactly 10ms.
+            // Time EMA/Triangular do need the median. Appending 12ms then 8ms gaps breaks even spacing while keeping the upper median exactly 10ms.
             let mut time_req = step_req.clone();
             time_req.use_timestamp_axis = true;
             let time_shape = |n: i64| {
@@ -3692,7 +4025,7 @@ mod frontier_delta_tests {
             let held = build(&time_req, &[time_shape(20)]);
             let grown = [time_shape(22)];
             let continued = continuation(&time_req, &held);
-            let out = counted((0, 1), || build(&continued, &grown));
+            let out = counted((1, 1), || build(&continued, &grown));
             assert!(
                 out.delta,
                 "{algorithm:?}: stable median must ignore uniformity flip"
@@ -3706,36 +4039,27 @@ mod frontier_delta_tests {
 
     fn savgol_req(runs: &[&str], target: u32) -> proto::ChartRequest {
         let mut r = req(runs, target);
-        r.smoothing = Some(proto::SmoothingConfig {
-            algorithm: proto::smoothing_config::Algorithm::SavitzkyGolay as i32,
-            window_size: 20,
-            ..Default::default()
-        });
+        r.smoothing = smoothing(Algorithm::SavitzkyGolay, 20, 0.0, 0);
         r
     }
 
     /// A zoomed triangular request must fetch from the run's very start — its
     /// weights never decay, so any earlier step (a positive step_min above a
     /// negative-stepped history included) still affects the in-range fit. It
-    /// stays causal: nothing is fetched past step_max, and its delta reach is 0.
+    /// stays causal: nothing is fetched past step_max.
     #[test]
     fn triangular_fetch_spans_whole_run() {
         let mut r = req(&["a"], 100);
         r.step_min = Some(5_000);
         r.step_max = Some(6_000);
-        r.smoothing = Some(proto::SmoothingConfig {
-            algorithm: proto::smoothing_config::Algorithm::Triangular as i32,
-            poly_order: 1,
-            ..Default::default()
-        });
+        r.smoothing = smoothing(Algorithm::Triangular, 0, 0.0, 1);
         let p = chart_params(&r);
         assert_eq!(
             p.fetch_min,
             i64::MIN,
-            "must reach back to the first step, not step_min − margin"
+            "must reach back to the first step, not a warmup margin before step_min"
         );
         assert_eq!(p.fetch_max, 6_000, "causal: no look-ahead past step_max");
-        assert_eq!(p.reach, 0);
     }
 
     #[test]
@@ -3758,17 +4082,38 @@ mod frontier_delta_tests {
             ));
         }
 
-        // Step axis, Savitzky–Golay: held logged every step (uniform spacing), the
-        // appends log every 3rd step — smooth_run switches from the
-        // index-space smoother to the x-aware one, moving every output.
+        // Step axis: 100 steps logged every step, then 120 every 3rd. The median gap moves from 1 to 3, tripling every Savitzky–Golay window, while the slot rule dirties only from about 30 steps below the first new one; the passthrough-sized target keeps the grid and its floor out of it, so only the plan gate answers in full.
+        let r = savgol_req(&["a"], 1000);
+        let held = build(&r, &[rows_shaped(100, |i| i, |i| 1_000_000 + i)]);
+        let stride = |i: i64| i.min(100) + 3 * (i - 100).max(0);
+        let grown = [rows_shaped(220, stride, |i| 1_000_000 + i)];
+        assert_ne!(
+            held.frontiers[&smoothing_state_key(0)],
+            build(&r, &grown).frontiers[&smoothing_state_key(0)],
+            "the median moves from 1 to 3"
+        );
+        let r2 = continuation(&r, &held);
+        for audit in [false, true] {
+            let out = build_response(&r2, &grown, None, audit).unwrap();
+            assert!(!out.delta && !out.audit_failed, "audit={audit}");
+            assert!(eq(&inflate_full(&out), &inflate_full(&build(&r, &grown))));
+        }
+    }
+
+    /// Held logged every step, the appends every 3rd step: the median gap stays 1, so every Savitzky–Golay window keeps its half-width and the append splices.
+    #[test]
+    fn a_kept_median_splices_across_a_spacing_change() {
         let r = savgol_req(&["a"], 300);
         let held = build(&r, &[rows_shaped(2000, |i| i, |i| 1_000_000 + i)]);
         let stride = |i: i64| i.min(2000) + 3 * (i - 2000).max(0);
         let grown = [rows_shaped(2060, stride, |i| 1_000_000 + i)];
         let r2 = continuation(&r, &held);
         let out = build(&r2, &grown);
-        assert!(!out.delta, "a uniform-spacing flip must gate to full");
-        assert!(eq(&inflate_full(&out), &inflate_full(&build(&r, &grown))));
+        assert!(out.delta && !out.audit_failed, "a kept median splices");
+        assert!(eq(
+            &splice(&inflate_full(&held), &out),
+            &inflate_full(&build(&r, &grown))
+        ));
     }
 
     /// Historical jitter fixture: median spacing can change globally after an append even though every held row is still present. Lineage verification proves the rows, but the exact smoothing-plan gate must still reject a changed median.
@@ -3805,12 +4150,7 @@ mod frontier_delta_tests {
             r.y_series[1].metric_name = "system/disk_write_mbps".into();
             r.use_timestamp_axis = true;
             r.relative_time = true;
-            r.smoothing = Some(proto::SmoothingConfig {
-                algorithm: algorithm as i32,
-                window_size: 3,
-                time_constant: 100.0,
-                poly_order: 1,
-            });
+            r.smoothing = smoothing(algorithm, 3, 100.0, 1);
             let held_rows = [
                 shaped(
                     &[0, 1, 2, 3, 5, 7, 9],
@@ -3889,12 +4229,16 @@ mod frontier_delta_tests {
             legacy_req.cache_state = Some(legacy_state);
             assert!(!build(&legacy_req, &grown).delta);
 
-            // Every v2 position is required and must decode to NoState, Uniform, or a median that median_dx can produce.
-            let mut malformed_state = echo(&held).unwrap();
-            malformed_state.frontiers.insert(smoothing_state_key(0), 2);
-            let mut malformed_req = r.clone();
-            malformed_req.cache_state = Some(malformed_state);
-            assert!(!build(&malformed_req, &grown).delta);
+            // Every v2 position is required and must be the current plan's word: the retired uniform word 1 and any other answer in full.
+            for word in [1, 2] {
+                let mut malformed_state = echo(&held).unwrap();
+                malformed_state
+                    .frontiers
+                    .insert(smoothing_state_key(0), word);
+                let mut malformed_req = r.clone();
+                malformed_req.cache_state = Some(malformed_state);
+                assert!(!build(&malformed_req, &grown).delta);
+            }
         }
     }
 
@@ -3926,12 +4270,7 @@ mod frontier_delta_tests {
             let mut r = req(&["a"], 100);
             r.use_timestamp_axis = true;
             r.relative_time = true;
-            r.smoothing = Some(proto::SmoothingConfig {
-                algorithm: algorithm as i32,
-                window_size: 3,
-                time_constant: std::f64::consts::LOG2_E,
-                poly_order: 1,
-            });
+            r.smoothing = smoothing(algorithm, 3, std::f64::consts::LOG2_E, 1);
             let held_rows = [shaped(
                 &[0, 2, 4, 6, 7, 8, 9, 10],
                 &[0, 1000, 2000, 3000, 4000, 4500, 4750, 5000],
@@ -3946,12 +4285,7 @@ mod frontier_delta_tests {
             let continued = continuation(&r, &held);
             let truth = inflate_full(&build(&r, &grown));
             for audit in [false, true] {
-                let expected = if matches!(algorithm, Algorithm::Ema | Algorithm::Triangular) {
-                    (0, 1)
-                } else {
-                    (1, 1)
-                };
-                let out = counted(expected, || {
+                let out = counted((1, 1), || {
                     build_response(&continued, &grown, None, audit).unwrap()
                 });
                 assert!(
@@ -4044,7 +4378,10 @@ mod frontier_delta_tests {
             .values
             .iter()
             .all(|v| v.is_nan()));
-        assert_eq!(held.frontiers.get(&smoothing_state_key(0)), Some(&1));
+        assert_eq!(
+            held.frontiers.get(&smoothing_state_key(0)),
+            Some(&(1.0f64.to_bits() as i64))
+        );
         assert_eq!(held.frontiers.get(&smoothing_state_key(1)), Some(&0));
 
         let grown = [rows(950, 3), b(60)];
@@ -4157,15 +4494,30 @@ mod frontier_delta_tests {
         assert!(eq(&splice(&inflate_full(&held), &out), &truth));
     }
 
+    /// A smoothed time chart with a repeated timestamp bands its raw spread there, a non-finite sample at it left out (its marker carries it).
+    #[test]
+    fn a_smoothed_repeated_timestamp_bands_its_finite_raw_spread() {
+        let mut r = req(&["a"], 300);
+        r.use_timestamp_axis = true;
+        r.smoothing = smoothing(Algorithm::Ema, 0, 4.0, 0);
+        let rows = Arc::new(vec![
+            timed_row(0, 0, 1.0),
+            timed_row(1, 10, 5.0),
+            timed_row(2, 10, f32::INFINITY),
+            timed_row(3, 10, 2.0),
+            timed_row(4, 20, 3.0),
+        ]);
+        let model = inflate_full(&build(&r, &[rows]));
+        let (s, c) = (&model.series[0], 1);
+        assert_eq!(model.x_values[c], 10.0);
+        assert_eq!((s.min_values[c], s.max_values[c]), (2.0, 5.0));
+    }
+
     /// A smoothed run with output positions but no finite value has an all-NaN curve regardless of spacing. It must derive no plan, preserve every marker kind without leaking clamped infinities into value families, and keep delta-splicing when its cadence changes from uniform to irregular.
     #[test]
     fn all_marker_smoothed_series_deltas_without_a_plan() {
         let mut r = req(&["a", "b"], 500);
-        r.smoothing = Some(proto::SmoothingConfig {
-            algorithm: proto::smoothing_config::Algorithm::SavitzkyGolay as i32,
-            window_size: 10,
-            ..Default::default()
-        });
+        r.smoothing = smoothing(Algorithm::SavitzkyGolay, 10, 0.0, 0);
         let finite = |n: i64| rows_with(n, |s| ((s * 7) % 89) as f32);
         let markers = |n: i64, irregular_tail: bool| -> Arc<Vec<VersionedRawPoint>> {
             Arc::new(
@@ -4197,8 +4549,8 @@ mod frontier_delta_tests {
         let held = counted((1, 0), || build(&r, &[finite(300), markers(200, false)]));
         assert_eq!(
             held.frontiers.get(&smoothing_state_key(0)),
-            Some(&1),
-            "the finite uniform run stamps Uniform"
+            Some(&(1.0f64.to_bits() as i64)),
+            "the finite uniform run stamps its spacing"
         );
         assert_eq!(
             held.frontiers.get(&smoothing_state_key(1)),
@@ -4247,7 +4599,7 @@ mod frontier_delta_tests {
         assert!(truth_markers.min_values.is_empty());
     }
 
-    /// A forged/corrupt exact-smoothing cache state — one that UNDERCOUNTS held_series so it slips past the count gate while the old-only audit reconstruction still contains the extra group — must answer in full, never panic (a `NoState` plan shifted onto an active Savitzky–Golay series) or 500 (a plan-slice overrun). The audit keys plans by request/tag identity and gates to full on any mismatch, because `held_series` is client-controlled and its count alone cannot prove old-only and continuing groups align.
+    /// A forged/corrupt cache state — one that UNDERCOUNTS held_series so it slips past the count gate while the old-only audit reconstruction still contains the extra group — must answer in full, never smooth a series under another's plan, 500 (a plan-slice overrun) or fail the audit, for every smoother (a step axis's causal ones have no plan words to forge, only the count). The audit keys plans by request/tag identity and gates to full on any mismatch, because `held_series` is client-controlled and its count alone cannot prove old-only and continuing groups align.
     #[test]
     fn forged_smoothing_state_answers_full_not_panic() {
         // A: dense across the zoom (continuing). B: OLD rows only in the warmup margin, NEW rows in-range (provably-held yet NON-continuing). M: margin-only (continuing, NoState).
@@ -4263,29 +4615,31 @@ mod frontier_delta_tests {
         let mut b: Vec<i64> = (60..=99).collect();
         b.extend(150..=200);
         let m: Vec<i64> = (60..=99).collect();
-        // [A,B] overruns the plan slice (a 500); [B,A,M] shifts NoState onto the active Savitzky–Golay series (a panic). The identity gate turns BOTH into a clean full answer.
+        // [A,B] overruns the plan slice at B; [B,A,M] shifts NoState onto the active Savitzky–Golay series A and overruns at M (each a 500). The identity gate turns BOTH into a clean full answer.
         type ForgedCase = (
             Vec<&'static str>,
             Vec<Arc<Vec<VersionedRawPoint>>>,
-            i64,
+            u32,
             Vec<(usize, i64)>,
         );
+        // Run A's spacing, 1: its plan's word.
+        let one = 1f64.to_bits() as i64;
         let cases: [ForgedCase; 2] = [
-            (vec!["A", "B"], vec![at(&a), at(&b)], 1, vec![(0, 1)]),
+            (vec!["A", "B"], vec![at(&a), at(&b)], 1, vec![(0, one)]),
             (
                 vec!["B", "A", "M"],
                 vec![at(&b), at(&a), at(&m)],
                 2,
-                vec![(0, 1), (1, 0)],
+                vec![(0, one), (1, 0)],
             ),
         ];
-        for (runs, rows, series_key, plans) in cases {
+        for (algorithm, (runs, rows, held_series, plans)) in ALGORITHMS[1..]
+            .iter()
+            .flat_map(|&algorithm| cases.clone().map(|case| (algorithm, case)))
+        {
             let mut r = req(&runs, 100);
-            r.smoothing = Some(proto::SmoothingConfig {
-                algorithm: proto::smoothing_config::Algorithm::SavitzkyGolay as i32,
-                window_size: 10,
-                ..Default::default()
-            });
+            // Each margin (EMA's 8 time constants, Savitzky-Golay's 4 windows, Triangular's whole run) holds B's and M's rows.
+            r.smoothing = smoothing(algorithm, 10, 10.0, 0);
             r.step_min = Some(100);
             r.step_max = Some(200);
             let held_rows: Vec<Arc<Vec<VersionedRawPoint>>> = runs
@@ -4304,24 +4658,22 @@ mod frontier_delta_tests {
             let held = build(&r, &held_rows);
             let mut frontiers = held.frontiers.clone();
             assert!(verified_inputs(&r, &rows, &frontiers).is_some());
-            frontiers.insert(
-                SMOOTHING_STATE_VERSION_KEY.to_string(),
-                SMOOTHING_STATE_VERSION,
-            );
-            frontiers.insert(SMOOTHING_STATE_SERIES_KEY.to_string(), series_key);
             for (index, plan) in plans {
                 frontiers.insert(smoothing_state_key(index), plan);
             }
             r.cache_state = Some(proto::ChartCacheState {
                 frontiers,
-                held_series: Some(series_key as u32),
+                held_series: Some(held_series),
             });
             // audit forced on (build_response ..., true, ...): the audit is where the misalignment struck.
             let out = build_response(&r, &rows, None, true).unwrap();
-            assert!(!out.delta, "{runs:?}: a forged undercount must answer full");
+            assert!(
+                !out.delta,
+                "{algorithm:?} {runs:?}: a forged undercount must answer full"
+            );
             assert!(
                 !out.audit_failed,
-                "{runs:?}: the identity gate fires before the audit, so it is not an audit failure"
+                "{algorithm:?} {runs:?}: the identity gate fires before the audit, so it is not an audit failure"
             );
         }
     }
@@ -4331,9 +4683,9 @@ mod frontier_delta_tests {
     fn randomized_growth_splices_bitexactly() {
         let mut rng = Rng(0x9E3779B97F4A7C15);
         let algorithms = [
-            proto::smoothing_config::Algorithm::Ema as i32,
-            proto::smoothing_config::Algorithm::Triangular as i32,
-            proto::smoothing_config::Algorithm::SavitzkyGolay as i32,
+            Algorithm::Ema,
+            Algorithm::Triangular,
+            Algorithm::SavitzkyGolay,
         ];
         let mut covered = [[[false; 2]; 2]; 3];
         let mut deltas = 0;
@@ -4409,12 +4761,7 @@ mod frontier_delta_tests {
                 // Mixed-radix dimensions: every 36 cases cover smoothing on/off and step/time × linear/log axes; among smoothed cases every algorithm sees every axis pair.
                 let algorithm_index = ((case / 12) % 3) as usize;
                 covered[algorithm_index][use_time as usize][log as usize] = true;
-                r.smoothing = Some(proto::SmoothingConfig {
-                    algorithm: algorithms[algorithm_index],
-                    window_size: 10,
-                    time_constant: 100.0,
-                    poly_order: 1,
-                });
+                r.smoothing = smoothing(algorithms[algorithm_index], 10, 100.0, 1);
             }
             let held = build(&r, &held_rows);
             let r2 = continuation(&r, &held);
@@ -6267,6 +6614,115 @@ mod chart_admission_tests {
         (built.response, peak, charged, reserved, shape)
     }
 
+    /// Zoomed smoothed charts, whose slot smoothers read fetched samples beyond the emitted columns, stay within stage 2's charge: every fetched sample is held once, emitted or kept (on a timestamp axis, whose jittered timestamps here run against the steps at the zoom's edges, too), and a narrow zoom's columns are its emitted samples' (Triangular fetches every earlier one).
+    #[test]
+    fn zoomed_smoothed_builds_stay_within_their_charge() {
+        let short: Vec<Vec<VersionedRawPoint>> = (0..8)
+            .map(|r| {
+                (0..20_000)
+                    .map(|step| VersionedRawPoint {
+                        timestamp_ms: step * 1_000 + (step * 7_919) % 13 * 400,
+                        ..point("", step, ((step * (r + 3)) % 97) as f32, 1 + step)
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut over = Vec::new();
+        let wide = Some((4_000, 16_000));
+        for (name, runs, algorithm, window, zoom) in [
+            (
+                "1x20k SG500 unzoomed",
+                1,
+                Algorithm::SavitzkyGolay,
+                500u32,
+                None,
+            ),
+            ("1x20k zoomed SG500", 1, Algorithm::SavitzkyGolay, 500, wide),
+            (
+                "8x20k SG500 unzoomed",
+                8,
+                Algorithm::SavitzkyGolay,
+                500,
+                None,
+            ),
+            ("8x20k zoomed SG500", 8, Algorithm::SavitzkyGolay, 500, wide),
+            ("8x20k zoomed SG100", 8, Algorithm::SavitzkyGolay, 100, wide),
+            ("8x20k zoomed SG20", 8, Algorithm::SavitzkyGolay, 20, wide),
+            ("1x20k zoomed EMA", 1, Algorithm::Ema, 0, wide),
+            ("8x20k zoomed EMA", 8, Algorithm::Ema, 0, wide),
+            ("1x20k zoomed Triangular", 1, Algorithm::Triangular, 0, wide),
+            ("8x20k zoomed Triangular", 8, Algorithm::Triangular, 0, wide),
+            (
+                "64x20k narrow-zoomed Triangular",
+                64,
+                Algorithm::Triangular,
+                0,
+                Some((19_950, 19_999)),
+            ),
+        ] {
+            for use_timestamp_axis in [false, true] {
+                let request = proto::ChartRequest {
+                    y_series: (0..runs).map(|r| series(&format!("run-{r}"))).collect(),
+                    target_resolution: 1000,
+                    use_timestamp_axis,
+                    step_min: zoom.map(|z| z.0),
+                    step_max: zoom.map(|z| z.1),
+                    smoothing: Some(proto::SmoothingConfig {
+                        algorithm: algorithm as i32,
+                        window_size: window,
+                        time_constant: 100.0,
+                        poly_order: 1,
+                    }),
+                    ..Default::default()
+                };
+                let snapshots: Vec<Arc<SeriesSnapshot>> = (0..runs)
+                    .map(|r| Arc::new(SeriesSnapshot::full(short[r % short.len()].clone())))
+                    .collect();
+                let (_, peak, charged, reserved, shape) =
+                    measured_build(&request, &snapshots, None, false);
+                let name = format!("{name}{}", if use_timestamp_axis { " time" } else { "" });
+                eprintln!(
+                    "ZOOMED CHARGE {name}: rows={} largest={} columns={} peak={peak} charged={charged} reserved={reserved} peak/charged={:.3}",
+                    shape.prepared_rows, shape.largest_series, shape.columns, peak as f64 / charged as f64
+                );
+                if peak > charged || peak > reserved {
+                    over.push(name);
+                }
+            }
+        }
+        // Timestamps against steps throughout the zoom (halves of the run logged alternately): every fetched sample is copied.
+        let half = 4_097;
+        let interleaved: Vec<_> = (0..2 * half)
+            .map(|step| VersionedRawPoint {
+                timestamp_ms: (step % half) * 2 + step / half,
+                ..point("", step, (step % 97) as f32, step + 1)
+            })
+            .collect();
+        let request = proto::ChartRequest {
+            y_series: (0..32).map(|r| series(&format!("run-{r}"))).collect(),
+            target_resolution: 8,
+            use_timestamp_axis: true,
+            step_min: Some(half),
+            step_max: Some(2 * half - 1),
+            smoothing: Some(proto::SmoothingConfig {
+                algorithm: Algorithm::Ema as i32,
+                time_constant: 20_000.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let snapshot = Arc::new(SeriesSnapshot::full(interleaved));
+        let (_, peak, charged, reserved, _) =
+            measured_build(&request, &vec![snapshot; 32], None, false);
+        if peak > charged || peak > reserved {
+            over.push("32x8k interleaved EMA time".into());
+        }
+        assert!(
+            over.is_empty(),
+            "past their charge or reservation: {over:?}"
+        );
+    }
+
     #[test]
     fn build_charges_cover_measured_peaks() {
         let snapshots = |rows: &[Vec<VersionedRawPoint>]| -> Vec<Arc<SeriesSnapshot>> {
@@ -6383,6 +6839,62 @@ mod chart_admission_tests {
             };
             cases.push((name, request, snapshots(&short[..runs]), false));
         }
+        // A build that captures nothing drops its axis plan before it encodes its reply (`build_chart`): 2 runs of 3,000 rows logged every second up to 4 s out of order interleave on a 4,000-pixel time axis (5,925 columns), smoothed, at 0.92 of their charge, 1.01 with the plan kept.
+        let interleaved: Vec<Vec<VersionedRawPoint>> = (0..2)
+            .map(|r| {
+                (0..3_000)
+                    .map(|step| VersionedRawPoint {
+                        timestamp_ms: step * 1_000 + (step * 7_919 + r) % 13 * 333,
+                        ..point("", step, ((step * (r + 3)) % 97) as f32, 1 + step)
+                    })
+                    .collect()
+            })
+            .collect();
+        let request = proto::ChartRequest {
+            y_series: (0..2).map(|r| series(&format!("run-{r}"))).collect(),
+            target_resolution: 4_000,
+            use_timestamp_axis: true,
+            smoothing: Some(proto::SmoothingConfig {
+                algorithm: Algorithm::Ema as i32,
+                time_constant: 4.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        cases.push((
+            "2x3k interleaved time smoothed",
+            request,
+            snapshots(&interleaved),
+            false,
+        ));
+        // A segment per sample: 2 smoothed runs at alternate milliseconds, one timestamp repeated, pass through a banded time axis (8,195 columns), each run's occupancy alternating, at 0.996 of their charge (1.10 with the wire's segment vectors grown by doubling, chart_delta.rs `segment_spans`).
+        let alternating: Vec<Vec<VersionedRawPoint>> = (0..2i64)
+            .map(|r| {
+                (0..4_098i64)
+                    .map(|i| VersionedRawPoint {
+                        timestamp_ms: if r == 0 && i == 1 { 0 } else { 2 * i + r },
+                        ..point("", i, ((i * 7_919 + r * 31) % 97) as f32 * 0.37, 1 + i)
+                    })
+                    .collect()
+            })
+            .collect();
+        let request = proto::ChartRequest {
+            y_series: (0..2).map(|r| series(&format!("run-{r}"))).collect(),
+            target_resolution: 8_296,
+            use_timestamp_axis: true,
+            smoothing: Some(proto::SmoothingConfig {
+                algorithm: Algorithm::Ema as i32,
+                time_constant: 4.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        cases.push((
+            "2x4k alternating banded time smoothed",
+            request,
+            snapshots(&alternating),
+            false,
+        ));
         // Unequal series: one long run's working copies beside short ones, first or last.
         let unequal = proto::ChartRequest {
             y_series: (0..8).map(|r| series(&format!("run-{r}"))).collect(),
@@ -6481,16 +6993,22 @@ mod chart_admission_tests {
                 .collect::<std::collections::HashMap<_, _>>()
         };
         let mut custom_cases = Vec::new();
-        for (name, runs, smoothing, shuffled) in [
-            ("1x20k custom x", 1, false, false),
-            ("1x20k custom x shuffled", 1, false, true),
-            ("1x20k custom x smoothed shuffled", 1, true, true),
-            ("4x20k custom x shuffled", 4, false, true),
+        // Just past a power of two in rows, where a vector grown by doubling moves.
+        for (name, runs, rows, smoothing, shuffled) in [
+            ("1x20k custom x", 1, 20_000, false, false),
+            ("1x20k custom x shuffled", 1, 20_000, false, true),
+            ("1x20k custom x smoothed shuffled", 1, 20_000, true, true),
+            ("1x16,385 custom x smoothed", 1, 16_385, true, false),
+            ("4x20k custom x shuffled", 4, 20_000, false, true),
         ] {
+            let rows: Vec<_> = short[..runs]
+                .iter()
+                .map(|run| run[..rows].to_vec())
+                .collect();
             custom_cases.push((
                 name,
                 custom(runs, smoothing, true),
-                snapshots(&short[..runs]),
+                snapshots(&rows),
                 Some(x_maps(runs, shuffled)),
             ));
         }
@@ -6672,8 +7190,7 @@ mod chart_admission_tests {
                 })
                 .fold(Kept::NONE, Kept::join);
             let p = chart_params(&request);
-            let prepared =
-                prepare(&request, &p, &snapshots, None, None, false, None, false).unwrap();
+            let prepared = prepare(&request, &p, &snapshots, None, None, None).unwrap();
             let kept: usize = prepared.series.iter().map(|ps| ps.xs.len()).sum();
             assert_eq!(charged, kept, "{request:?}");
             assert_eq!(series, prepared.series.len(), "{request:?}");
@@ -6718,16 +7235,7 @@ mod chart_admission_tests {
             let mut plan = plan_off(&request);
             let kept = plan.prepared_rows(0, &rows);
             let estimate = plan.estimate(&[CachedSize::Cached(rows.clone())]);
-            let prepared = prepare(
-                &request,
-                &p,
-                std::slice::from_ref(&rows),
-                None,
-                None,
-                false,
-                None,
-                false,
-            );
+            let prepared = prepare(&request, &p, std::slice::from_ref(&rows), None, None, None);
             if tags > MAX_TAG_GROUPS {
                 assert_eq!(prepared.err().unwrap().code(), tonic::Code::InvalidArgument);
                 assert_eq!(kept, Kept::NONE);
@@ -8767,7 +9275,7 @@ mod emit_inflate_roundtrip {
                 ..Default::default()
             };
             let p = chart_params(&req);
-            let prepared = prepare(
+            let preparation = prepare(
                 &req,
                 &p,
                 &rows
@@ -8776,13 +9284,10 @@ mod emit_inflate_roundtrip {
                     .collect::<Vec<_>>(),
                 None,
                 None,
-                false,
                 None,
-                false,
             )
-            .unwrap()
-            .series;
-            let model = respond(&prepared, &p, false).0;
+            .unwrap();
+            let model = respond(&preparation.series, preparation.axis, &p, false).0;
             let wire = emit_full(&model);
             // No filler on the wire: every value entry is finite.
             for s in &wire.series {

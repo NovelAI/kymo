@@ -199,22 +199,10 @@ fn lineage_rejections_are_counted_once_even_when_no_chart_points_remain() {
 #[test]
 fn held_timestamp_rewrites_are_detected_for_every_smoother() {
     let a = Arc::new(vec![
-        VersionedRawPoint {
-            timestamp_ms: 64,
-            ..scalar_row(0, 1.0)
-        },
-        VersionedRawPoint {
-            timestamp_ms: 74,
-            ..scalar_row(1, 2.0)
-        },
-        VersionedRawPoint {
-            timestamp_ms: 84,
-            ..scalar_row(2, 3.0)
-        },
-        VersionedRawPoint {
-            timestamp_ms: 1,
-            ..scalar_row(3, 42.0)
-        },
+        timed_row(0, 64, 1.0),
+        timed_row(1, 74, 2.0),
+        timed_row(2, 84, 3.0),
+        timed_row(3, 1, 42.0),
     ]);
     let b = rows_shaped(
         100,
@@ -274,26 +262,15 @@ fn same_millisecond_value_rewrites_are_not_mistaken_for_identical_versions() {
 #[test]
 fn rewritten_warmup_positions_cannot_hide_a_changed_curve() {
     let mut original: Vec<_> = (0..50)
-        .map(|step| VersionedRawPoint {
-            timestamp_ms: step + if step == 10 { 4 } else { 0 },
-            ..scalar_row(step, step as f32)
-        })
+        .map(|step| timed_row(step, step + if step == 10 { 4 } else { 0 }, step as f32))
         .collect();
-    original.push(VersionedRawPoint {
-        timestamp_ms: 30,
-        ..scalar_row(50, 1_000.0)
-    });
+    original.push(timed_row(50, 30, 1_000.0));
     let mut request = req(&["a"], 1_000);
     request.use_timestamp_axis = true;
     request.log_buckets = true;
     request.step_min = Some(20);
     request.step_max = Some(40);
-    request.smoothing = Some(proto::SmoothingConfig {
-        algorithm: Algorithm::SavitzkyGolay as i32,
-        window_size: 3,
-        poly_order: 1,
-        ..Default::default()
-    });
+    request.smoothing = smoothing(Algorithm::SavitzkyGolay, 3, 0.0, 1);
     let held = build(&request, &[Arc::new(original.clone())]);
     for timestamp in [-1, 60] {
         let mut changed = original.clone();
@@ -523,11 +500,7 @@ fn cache_lineage_covers_warmup_and_conservatively_rejects_outside_rewrites() {
     let mut request = req(&["a"], 1_000);
     request.step_min = Some(100);
     request.step_max = Some(200);
-    request.smoothing = Some(proto::SmoothingConfig {
-        algorithm: Algorithm::Ema as i32,
-        time_constant: std::f64::consts::LOG2_E,
-        ..Default::default()
-    });
+    request.smoothing = smoothing(Algorithm::Ema, 0, std::f64::consts::LOG2_E, 0);
     let p = chart_params(&request);
     assert!(p.fetch_min > 0 && p.fetch_min < 100);
     let original = rows(250, 3);
@@ -562,11 +535,7 @@ fn changed_render_parameters_cannot_reuse_an_old_lineage() {
     changed.log_buckets = true;
     assert_full_response(&changed, &held, &rows, None);
     changed = request.clone();
-    changed.smoothing = Some(proto::SmoothingConfig {
-        algorithm: Algorithm::Ema as i32,
-        time_constant: std::f64::consts::LOG2_E,
-        ..Default::default()
-    });
+    changed.smoothing = smoothing(Algorithm::Ema, 0, std::f64::consts::LOG2_E, 0);
     assert_full_response(&changed, &held, &rows, None);
 }
 
