@@ -18,11 +18,8 @@ use crate::util::{
 /// Greedy row-pack: each rect consumes its `column_span` units of the current
 /// row; overflow wraps to the next row; `rows_per_page` rows = one page.
 /// Returns the global rect indices grouped per page (always at least one page).
+/// `max_columns` is at least 1 (the caller clamps it).
 fn pack_into_pages(rects: &[RectConfig], max_columns: u32, rows_per_page: u32) -> Vec<Vec<usize>> {
-    if rects.is_empty() {
-        return vec![Vec::new()];
-    }
-    let max_columns = max_columns.max(1);
     let mut pages: Vec<Vec<usize>> = vec![Vec::new()];
     let mut units_in_row: u32 = 0;
     let mut rows_in_page: u32 = 0;
@@ -93,20 +90,19 @@ pub fn Section(
     let sections_visible = use_context::<UserConfigState>().sections_visible();
     let collapsed = config.is_collapsed(sections_visible);
 
-    let pages = pack_into_pages(&display_rects, config.max_columns, config.rows_per_page);
+    let max_columns = config.max_columns.max(1);
+    let pages = pack_into_pages(&display_rects, max_columns, config.rows_per_page);
+    let total_pages = pages.len();
     // Clamp the page signal so config changes (rows_per_page, max_columns,
     // rect deletions) can't leave us pointing past the end.
-    let page = (*current_page.read()).min(pages.len().saturating_sub(1));
-    let total_pages = pages.len();
-    let show_pagination = config.rows_per_page > 0 && total_pages > 1;
-    let visible_indices: Vec<usize> = pages[page].clone();
+    let page = (*current_page.read()).min(total_pages - 1);
+    let show_pagination = total_pages > 1;
     let page_input_style = format!("width: calc({}ch + 6px);", total_pages.to_string().len());
 
     // Every panel's content sizes itself by the section's chart height (kymo.css), so a height change changes no panel props.
     let grid_style = format!(
         "grid-template-columns: repeat({}, 1fr); --kymo-chart-height: {}px;",
-        config.max_columns.max(1),
-        config.chart_height
+        max_columns, config.chart_height
     );
 
     // Add panel: the header's + and an empty section's + Add panel.
@@ -277,7 +273,10 @@ pub fn Section(
                         aria_expanded: !collapsed,
                         // A collapsed section renders no body, so there is nothing to point at then.
                         aria_controls: (!collapsed).then(|| body_id.clone()),
-                        span { class: "section-name", "{section_label}" }
+                        // On an inner span, not the button: there the mask would fade the focus ring, and the title would repeat the name as an accessible description.
+                        span { class: "fade-overflow", title: "{section_label}",
+                            span { class: "section-name", "{section_label}" }
+                        }
                         span { class: "section-count", "{display_rects.len()}" }
                     }
                 }
@@ -358,13 +357,8 @@ pub fn Section(
                                 // signal is set to itself, so an empty/invalid
                                 // edit reliably restores the committed page.
                                 onchange: move |e: Event<FormData>| {
-                                    match page_index_from_input(&e.value(), total_pages) {
-                                        Some(target) => current_page.set(target),
-                                        None => {
-                                            let committed = *current_page.peek();
-                                            current_page.set(committed);
-                                        }
-                                    }
+                                    let target = page_index_from_input(&e.value(), total_pages).unwrap_or_else(|| *current_page.peek());
+                                    current_page.set(target);
                                 },
                             }
                             span { aria_hidden: "true", "/{total_pages}" }
@@ -396,10 +390,10 @@ pub fn Section(
                             }
                         }
                     }
-                    for i in visible_indices.iter().copied() {
+                    for i in pages[page].iter().copied() {
                         {
-                            let rect = display_rects[i].clone();
-                            let span = rect.options.column_span.clamp(1, config.max_columns.max(1));
+                            let rect = &display_rects[i];
+                            let span = rect.options.column_span.clamp(1, max_columns);
                             let span_style = format!("grid-column: span {};", span);
                             rsx! {
                                 div {

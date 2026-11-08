@@ -488,7 +488,7 @@ message ChartRequest {
   bool use_timestamp_axis = 7;  // false = step (default), true = timestamp_ms
   bool relative_time = 8;       // if true + use_timestamp_axis, offset each series to start from 0
   optional ChartCacheState cache_state = 9;  // what the client already holds; unset = answer in full
-  // The panel renders a log x axis: buckets come from the log ladder (octave [2^k, 2^(k+1)) split into 2^m power-of-two buckets — chart.rs make_grid) instead of the uniform linear grid, so on-screen slot density stays even across the decades.
+  // The panel renders a log x axis: buckets come from the log ladder (octave [2^k, 2^(k+1)) split into 2^m power-of-two buckets — chart.rs make_grid_from) instead of the uniform linear grid, so on-screen slot density stays even across the decades.
   bool log_buckets = 10;
 }
 

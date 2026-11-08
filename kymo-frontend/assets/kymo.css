@@ -95,7 +95,6 @@ input[type="range"] {
     background: var(--bg0);
     height: 10px;
     outline: none;
-    padding: 0;
     width: 100%;
     border: 2px solid transparent;
     border-radius: 3px;
@@ -147,13 +146,21 @@ input[type="range"]:focus::-moz-range-thumb {
     background: var(--bg3);
     opacity: 1;
 }
+/* Focus rings: outside the control, or inset where the control fills its row or tab. */
+.section-toggle:focus-visible, .editor-section-toggle:focus-visible, .page-action:focus-visible, .project-sort:focus-visible, input[type="checkbox"]:focus-visible {
+    outline: 2px solid var(--text-headings);
+    outline-offset: 2px;
+}
+.project-row:focus-visible, .copy-text:focus-visible, .text-stream-tab:focus-visible {
+    outline: 2px solid var(--text-headings);
+    outline-offset: -2px;
+}
 
 /* Inline text buttons; color per-site. */
 .btn-link, .binding-remove {
     background: none;
     border: none;
     font-size: var(--font-size-14);
-    padding: 0;
     cursor: pointer;
 }
 
@@ -184,10 +191,6 @@ input[type="checkbox"] {
     position: relative;
 }
 input[type="checkbox"]:checked { background: var(--text-headings); }
-input[type="checkbox"]:focus-visible {
-    outline: 2px solid var(--text-headings);
-    outline-offset: 2px;
-}
 input[type="checkbox"]:checked::before {
     content: '';
     position: absolute;
@@ -201,6 +204,7 @@ input[type="checkbox"]:checked::before {
 
 /* === Overflow Fade === */
 /* Overflowing text fades over its last 16px. util/overflow_fade.js sets data-overflow only while the content reaches past the box's right edge, so text that fits is never faded. Keep the text in an inline-block child, so an edit or font change resizes an observed element even when the box keeps its size; WebKit can also leave a box holding bare text at a stale width (seen in the Trash table's baseline-aligned grid when the web font swaps in). The chart tooltip's name cells (.kymo-tip-name) are the exception: their rows are rebuilt wholesale, so a name never changes in place, and a child per row would add 1-3 ms per rebuild at 200 runs. The mask also fades the box's own paint (background, focus ring) and clips descendants shown outside it, fixed ones included: use an unpainted box and turn the mask off for hover reveals. */
+/* Limits: the box cuts glyph ink past the text's ends (a leading j's tail, a trailing f's hook) even when the text fits, and WebKit's find-in-page scrolls the box to a match in its hidden tail and leaves it scrolled; overflow: clip stops that but moves the scroll to the nearest ancestor that can scroll sideways (a gallery panel, the options panel body). */
 .fade-overflow {
     display: block;
     overflow: hidden;
@@ -481,7 +485,6 @@ input[type="checkbox"]:checked::before {
 .run-details > .run-name-host {
     justify-self: stretch;
     align-self: stretch;
-    min-width: 0;
 }
 .run-details-link:hover .run-name-host { color: var(--text-headings); }
 
@@ -615,7 +618,6 @@ input[type="checkbox"]:checked::before {
 .project-list-header { padding-block: var(--spacing-xs); }
 .project-sort {
     justify-self: start;
-    padding: 0;
     font-size: var(--font-size-13);
     line-height: inherit;
 }
@@ -624,17 +626,9 @@ input[type="checkbox"]:checked::before {
     color: var(--text-headings);
     font-weight: 600;
 }
-.project-sort:focus-visible {
-    outline: 2px solid var(--text-headings);
-    outline-offset: 2px;
-}
 .project-list > * + * { border-top: 1px solid var(--bg3); }
 .project-row { transition: background var(--transition); }
 .project-row:hover { background: var(--bg2); }
-.project-row:focus-visible {
-    outline: 2px solid var(--text-headings);
-    outline-offset: -2px;
-}
 .project-row-name {
     font-weight: 600;
     color: var(--text-main);
@@ -945,7 +939,7 @@ input[type="checkbox"]:checked::before {
 .section-header:hover .section-action,
 .section-header:has(:focus-visible) .section-action { opacity: 1; }
 
-.section-name {
+.section-name, .section-name-input {
     font-family: var(--font-heading);
     font-size: var(--font-size-15);
     font-weight: 600;
@@ -956,10 +950,6 @@ input[type="checkbox"]:checked::before {
 .section-name-input {
     min-width: 0;
     width: 20ch;
-    font-family: var(--font-heading);
-    font-size: var(--font-size-15);
-    font-weight: 600;
-    color: var(--text-headings);
     background: var(--bg1);
     border: 1px solid var(--text-headings);
     border-radius: 3px;
@@ -972,12 +962,13 @@ input[type="checkbox"]:checked::before {
 
 .section-count { font-size: var(--font-size-11); color: var(--text-disabled); margin-left: var(--spacing-xs); }
 
+/* A grid, so the name's track gives way, down to nothing, while the count's track keeps the toggle from narrowing past the count (a flex toggle at min-width: 0 slides the count under + Add panel in a narrow header). */
 .section-toggle {
-    display: flex;
+    display: grid;
+    grid-template-columns: minmax(0, max-content) max-content;
     align-items: center;
     gap: var(--spacing-sm);
     font: inherit;
-    cursor: pointer;
 }
 
 .section-action {
@@ -1288,9 +1279,7 @@ input[type="checkbox"]:checked::before {
     right: calc(100% + var(--spacing-lg));
     top: 50%;
     z-index: 61;
-    box-sizing: border-box;
     width: min(380px, calc(100vw - 100% - 2 * var(--spacing-lg)));
-    margin: 0;
     padding: var(--spacing-md);
     background: var(--bg1);
     border: 1px solid var(--bg3);
@@ -1439,7 +1428,6 @@ input[type="checkbox"]:checked::before {
     background: var(--bg1);
     border: 1px solid var(--bg3);
 }
-.binding-run-list .fade-overflow { min-width: 0; }
 .binding-run-empty { font-size: var(--font-size-13); color: var(--text-placeholder); }
 
 /* === uPlot Chart === */
@@ -1647,7 +1635,6 @@ input[type="checkbox"]:checked::before {
 }
 
 .copy-text:hover { box-shadow: inset 0 0 0 1px var(--text-disabled); }
-.copy-text:focus-visible { outline: 2px solid var(--text-headings); outline-offset: -2px; }
 
 .cdn-caption {
     font-size: var(--font-size-12);
@@ -1739,7 +1726,6 @@ input[type="checkbox"]:checked::before {
     height: auto;
     max-width: none;
     max-height: none;
-    margin: 0;
     border: 0;
     overflow: hidden;
     background: rgba(0, 0, 0, 0.85);
@@ -2052,7 +2038,6 @@ input[type="checkbox"]:checked::before {
     height: 20px;
     border: 2px solid transparent;
     cursor: pointer;
-    padding: 0;
 }
 .color-swatch:hover { border-color: var(--text-main); }
 .color-swatch-active { border-color: var(--text-headings); }
@@ -2076,7 +2061,6 @@ input[type="checkbox"]:checked::before {
     border: 1px solid var(--bg3);
     background: none;
     cursor: pointer;
-    padding: 0;
 }
 
 
@@ -2112,28 +2096,20 @@ input[type="checkbox"]:checked::before {
 }
 .options-panel-body > .editor-section-label ~ .editor-section-label { margin-top: var(--spacing-md); }
 .editor-section-toggle {
-    cursor: pointer;
     user-select: none;
     display: flex;
     align-items: center;
     gap: 4px;
-}
-button.editor-section-toggle {
     width: 100%;
     text-align: left;
 }
-button.editor-section-toggle,
+.editor-section-toggle,
 .section-toggle {
-    padding: 0;
     border: 0;
     background: none;
+    cursor: pointer;
 }
 .editor-section-toggle:hover { color: var(--text-main); }
-button.editor-section-toggle:focus-visible,
-.section-toggle:focus-visible {
-    outline: 2px solid var(--text-headings);
-    outline-offset: 2px;
-}
 .editor-section-arrow { font-size: var(--font-size-11); width: 1em; }
 
 .editor-options {
@@ -2206,10 +2182,6 @@ button.editor-section-toggle:focus-visible,
     border-color: var(--text-headings);
     background: var(--bg2);
     color: var(--text-headings);
-}
-.page-action:focus-visible {
-    outline: 2px solid var(--text-headings);
-    outline-offset: 2px;
 }
 
 /* === Navbar Panel Filter ===
@@ -2361,11 +2333,6 @@ button.editor-section-toggle:focus-visible,
     border-bottom-color: var(--run-color);
 }
 
-.text-stream-tab:focus-visible {
-    outline: 2px solid var(--text-headings);
-    outline-offset: -2px;
-}
-
 .text-stream-log {
     flex: 1;
     min-height: 0;
@@ -2469,7 +2436,6 @@ button.editor-section-toggle:focus-visible,
 /* Fills the cell so the whole key is the toggle's hit target. */
 .metadata-branch-toggle {
     width: 100%;
-    padding: 0;
     border: 0;
     background: none;
     color: inherit;

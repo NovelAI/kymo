@@ -860,6 +860,24 @@ def checks(page, url):
     expect(page.locator(".text-stream-line").first).to_be_visible(timeout=20_000)
     rename_reveal(page)
     chart_press_while_naming(page, fixture)
+
+    print(
+        "naming: a long name fades on one line, with the whole name as its title",
+        flush=True,
+    )
+    add_section.click()
+    faded = named_section(page, name)
+    header = faded.locator(".section-header")
+    naming_height = header.evaluate("e => e.getBoundingClientRect().height")
+    label = ", ".join(["A name too long for its bar"] * 12)
+    name.fill(label)
+    name.press("Enter")
+    fade = faded.locator(".section-toggle > .fade-overflow")
+    expect(fade).to_have_css("mask-image", re.compile("linear-gradient"))
+    expect(fade).to_have_attribute("title", label)
+    expect(faded.locator(".section-name")).to_have_text(label)
+    height = header.evaluate("e => e.getBoundingClientRect().height")
+    assert abs(height - naming_height) < 0.01, (naming_height, height)
     assert not fixture.errors, f"unexpected fixture RPCs: {fixture.errors}"
 
 
