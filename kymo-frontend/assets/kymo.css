@@ -505,23 +505,27 @@ input[type="checkbox"]:checked::before {
     position: absolute;
     inset: 0 var(--spacing-xs) 0 auto;
     margin: auto 0;
-    z-index: 61;
+    z-index: 60;
     width: 1.6rem;
     height: 1.6rem;
     background: var(--row-bg, var(--bg1));
     font-size: var(--font-size-16);
     opacity: 0;
-    /* Keep the invisible hit target active: the control reveals only when
-       the pointer reaches the area that can actually be clicked. */
+    /* The expanded name paints above the button but lets the pointer through,
+       so reaching the button's hit area can bring it above the text. */
     pointer-events: auto;
 }
-.run-overflow-trigger:hover,
+.sidebar-run:hover .run-overflow-trigger,
 .run-overflow-trigger:focus-visible {
     opacity: 1;
 }
+.run-overflow-trigger:hover,
+.run-overflow-trigger:focus-visible {
+    z-index: 62;
+}
 .run-overflow-trigger:hover { color: var(--text-main); }
 @media (hover: none) {
-    .run-overflow-trigger { opacity: 1; }
+    .run-overflow-trigger { opacity: 1; z-index: 62; }
 }
 
 /* Native label semantics: any click on the label toggles visibility, so its
