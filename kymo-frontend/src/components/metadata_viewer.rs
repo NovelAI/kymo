@@ -258,7 +258,7 @@ fn render_rows(
                                     {value_cell(column, tint, cell)}
                                 }
                             } else {
-                                // No `{}` on this row: plain cells, which skip value_cell's style edit and placeholder.
+                                // No `{}` on this row: plain cells, which skip value_cell's style edit and placeholder node.
                                 for _ in columns {
                                     td { class: "metadata-val-cell" }
                                 }

@@ -2219,10 +2219,7 @@ class SpoolDurabilityTests(unittest.TestCase):
             writer.close()
 
     def test_seal_leaves_the_durability_barrier_to_the_replay_thread(self):
-        """seal() runs on the worker's only queue-consumer thread, so its fsync
-        moved to sync() — a stalled mount must not stop the queue draining. The
-        owner's later close() of an already-synced segment must not re-fsync
-        there either, or the barrier is back on that thread."""
+        """seal() runs on the worker's only queue-consumer thread, which a stalled fsync must not stop, so it leaves the fsync to sync(). The owner's later close() of an already-synced segment must not re-fsync on that thread either."""
         with tempfile.TemporaryDirectory() as spool_dir:
             path = os.path.join(spool_dir, "worker.mkspool")
             writer = SpoolWriter(path, spool_header())

@@ -353,7 +353,7 @@ class SpoolWriter:
     """Append-only spool writer. Opens the file (and writes the header) lazily
     on the first record or at open(), so no file appears on runs that flush cleanly.
 
-    A failed write or flush cuts the file back to its last whole record, since a reader rejects a file whose last record is torn. ``count`` is the records written, less any a cut removed; those still buffered reach the file at the next flush."""
+    A failed write or flush cuts the file back to its last whole record if it can, since a reader rejects a file whose last record is torn. ``count`` is the records written, less any a cut removed; those still buffered reach the file at the next flush."""
 
     def __init__(self, path: str, header: dict, until=None):
         self._path = path
@@ -520,7 +520,7 @@ class SpoolWriter:
         ``*.mkspool`` path available for ordinary recovery.
 
         Deliberately no fsync: this runs on the worker's only queue-consumer
-        thread, and a stalled spool mount must not stop the queue draining.
+        thread, and a stalled fsync must not stop the queue draining.
         ``sync()`` performs the durability barrier from the replay helper.
         """
         # A torn writer has already dropped its buffer: sealing it hands the file to replay, which quarantines the torn tail, instead of failing every attempt.
@@ -532,10 +532,7 @@ class SpoolWriter:
         """Make the written records durable. Safe to call from the thread that
         replays a sealed segment; the owner performs no concurrent writes.
 
-        A no-op once everything written has been synced, so the owner's own
-        ``close()`` of a segment its replay helper already synced costs no second
-        fsync — on a stalled mount that fsync would block the queue-consumer
-        thread this barrier was moved off.
+        A no-op once everything written has been synced, so the owner's own ``close()`` of a segment its replay helper already synced costs no second fsync on the queue-consumer thread, which a stalled fsync would block.
         """
         if self._fh is None or not self._unsynced:
             return
@@ -552,11 +549,7 @@ class SpoolWriter:
     def release(self) -> None:
         """Drop the descriptor without a durability barrier.
 
-        For a segment whose records the server has accepted — or that is being
-        retired — persistence is moot, and a barrier that already failed must not
-        be retried by the worker's queue-consumer thread: that retry is exactly
-        the stall this split was made to remove. Sealing already emptied the
-        userspace buffer, so nothing is dropped here.
+        For a segment whose records the server has accepted, or that is being retired, persistence is moot, and the worker's queue-consumer thread must not retry a barrier that already failed, which could stall it. Sealing already emptied the userspace buffer, so nothing is dropped here.
         """
         if self._fh is None:
             return

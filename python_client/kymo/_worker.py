@@ -791,9 +791,7 @@ def _upload_worker(
     def close_spool(writer: SpoolWriter) -> Optional[str]:
         """Release a spool's descriptor, including its durability barrier.
 
-        A broken mount must not kill the worker here. Report the path as pending
-        instead: whatever records reached the file are still replayable, and the
-        owner's own spool scan will find them.
+        A broken mount must not kill the worker here. Report the path as pending instead: the owner's spool scan will find it, and its whole records replay unless a torn tail quarantines the file.
         """
         try:
             return writer.close()
