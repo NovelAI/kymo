@@ -139,16 +139,16 @@ from kymo._cdn import (
 from kymo._generated import kymo_pb2, kymo_pb2_grpc
 from kymo._local_runtime import ensure_local_endpoint, grpc_channel, http_client
 from kymo._wire import (
+    _CDN_ENVELOPE_BYTES,
+    _CDN_EXTENSIONS,
     _F32_OVERFLOW,
     _MAX_POINTS_PER_MSG,
     _chunk_tuples,
-    _is_permanent_upload_error,
     _normalize_numeric_value,
     _upload_to_cdn,
 )
 from kymo.client import (
     _MAX_RUN_NAME_BYTES,
-    _CDN_EXTENSIONS,
     _BidiStream,
     _strip_url_userinfo,
 )
@@ -172,8 +172,6 @@ IMAGE_EXTS = {"png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "ico", "tiff"}
 # <metric>/<field> numeric points instead of being dropped.
 STATS_FIELDS = {"-Inf", "Inf", "Nan", "Count", "Max", "Min", "Sum"}
 STATS_RENAME = {"-Inf": "neg_inf", "Inf": "inf", "Nan": "nan"}
-# kymo-server's upload body limit (cdn.rs ENVELOPE_BYTES).
-CDN_UPLOAD_MAX_BYTES = 256 * 1024 * 1024
 POINT_KINDS = ("numeric_ts", "numeric_tagged_ts", "text_ts", "cdn_ts")
 
 
@@ -567,8 +565,6 @@ class Sender:
                 code = getattr(e, "code", lambda: None)()
                 if code is not None and code.name in self._NO_RETRY_CODES:
                     raise
-                if _is_permanent_upload_error(e):
-                    raise
                 if i == attempts - 1:
                     raise
                 log.warning("retrying %s after: %r", what, e)
@@ -629,7 +625,7 @@ class Sender:
         for rel, caption, path, ext in files:
             try:
                 size = path.stat().st_size
-                if size > CDN_UPLOAD_MAX_BYTES:
+                if size > _CDN_ENVELOPE_BYTES:
                     # It can never import: a counted skip like unknown media, since run damage would replay the run on every rerun.
                     c["media_too_large"] += 1
                     continue

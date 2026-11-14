@@ -851,7 +851,7 @@ def scenario_hung_server(spool_dir):
     spooled_imgs = 0
     for f in files:
         for rec in read_spool_records(f):
-            if rec[0] == "cdn_batch_encoded_mutation_reserved":
+            if rec[0] == "cdn_batch_encoded_mutation":
                 spooled_imgs += 1
                 assert rec[3][0]["data"][:8] == b"\x89PNG\r\n\x1a\n", (
                     "spooled image is not a PNG"

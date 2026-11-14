@@ -41,6 +41,7 @@ import time
 import uuid
 
 import grpc
+import httpx
 
 from kymo._cdn import (
     content_id,
@@ -61,7 +62,7 @@ from kymo._wire import (
     _RichMutationDataLoss,
     _chunk_tuples,
     _estimate_tuple_bytes,
-    _is_permanent_upload_error,
+    _cdn_refusal,
     _is_terminal_run_error,
     _publish_rich_mutation,
     _terminal_run_error,
@@ -321,7 +322,6 @@ def _replay_cdn_record(
     run_id,
     record,
     replayed_keys: dict[tuple, str],
-    reduced_galleries: list[tuple[str, int]] | None = None,
 ) -> bool:
     kind, name, step = record[0], record[1], record[2]
     versioned = kind in _VERSIONED_RICH_KINDS
@@ -344,15 +344,11 @@ def _replay_cdn_record(
         if metadata:
             prospective_bytes = metadata_manifest(record[3])
         else:
-            expected_resources = [
-                (entry, content_id(entry["data"], entry["ext"])) for entry in record[3]
+            prospective_items = [
+                encoded_gallery_item(entry, content_id(entry["data"], entry["ext"]))
+                for entry in record[3]
             ]
-            prospective_bytes = gallery_manifest(
-                [
-                    encoded_gallery_item(entry, expected_id)
-                    for entry, expected_id in expected_resources
-                ]
-            )
+            prospective_bytes = gallery_manifest(prospective_items)
         prospective_id = content_id(prospective_bytes, "json")
         # A legacy record has no logical version, so the server wins: a step that already holds another key keeps it, even an older one, unless that key is a `pending:` placeholder or one this sync already replayed there; this is checked here and again just before the point write. A versioned record leaves it to the server's version check.
         if not versioned:
@@ -373,31 +369,33 @@ def _replay_cdn_record(
                 )
                 return True
 
-        manifest_changed = False
         if not metadata:
             items = []
-            for entry, expected_id in expected_resources:
+            for entry, item in zip(record[3], prospective_items):
                 try:
-                    resource_id = _upload_to_cdn(
+                    _upload_to_cdn(
                         http_client,
                         cdn_url,
                         entry["data"],
                         entry["ext"],
-                        expected_id=expected_id,
+                        expected_id=item["resource"],
                     )
-                except Exception as e:
-                    # A permanent rejection (4xx but 408, 425 and 429) will recur on every future replay too — dropping the item is the only way the rest of the record (and file) can ever finish.
-                    if _is_permanent_upload_error(e):
-                        _log.warning(
-                            "CDN rejected spooled item (%s step %s) — dropping it: %s",
-                            name,
-                            step,
-                            e,
-                        )
-                        manifest_changed = True
-                        continue
-                    raise
-                items.append(encoded_gallery_item(entry, resource_id))
+                except httpx.HTTPStatusError as e:
+                    # An older client could spool an item kymo-server refuses on every replay: drop it only on a 4xx this client's copy of the rules confirms, since a newer client's item may be one a newer server stores, and a 4xx for an item the rules accept comes from a proxy or an older server.
+                    refusal = _cdn_refusal(entry["data"], entry["ext"])
+                    status = e.response.status_code
+                    if refusal is None or not 400 <= status < 500:
+                        raise
+                    _log.warning(
+                        "dropping spooled CDN item (%s step %s) on HTTP %d: %s",
+                        name,
+                        step,
+                        status,
+                        refusal,
+                    )
+                    continue
+                items.append(item)
+        manifest_changed = not metadata and len(items) < len(prospective_items)
         if manifest_changed:
             # Even with zero usable items, log an EMPTY manifest: it is a real mutation of the step, and an older client's run may have left a pending:* placeholder there that only a real manifest clears.
             encoded_manifest = gallery_manifest(items)
@@ -416,7 +414,7 @@ def _replay_cdn_record(
         if versioned:
             timestamp_ms, mutation_version = record[4], record[5]
             if manifest_changed:
-                # A gallery that lost an item publishes under the successor its writer reserved, which only the reserved kind records.
+                # A gallery that lost an item publishes under the successor an older client reserved, which only the reserved kind records; any other version names the whole manifest.
                 if kind != "cdn_batch_encoded_mutation_reserved":
                     raise _RichMutationDataLoss(
                         "reduced gallery has no causally reserved mutation identity"
@@ -432,8 +430,6 @@ def _replay_cdn_record(
                 timestamp_ms,
                 mutation_version,
             )
-            if manifest_changed and reduced_galleries is not None:
-                reduced_galleries.append((name, step))
             return True
 
         current = _current_cdn_key(stub, project_id, run_id, name, step)
@@ -511,7 +507,6 @@ def _validate_spool_record(record, known_kinds: set[str]) -> str:
                 reduced_mutation_version = record[6]
                 if (
                     type(reduced_mutation_version) is not int
-                    or not (0 < reduced_mutation_version < 1 << 64)
                     or reduced_mutation_version != mutation_version + 1
                     or reduced_mutation_version >> 32 != mutation_version >> 32
                 ):
@@ -608,13 +603,9 @@ def _replay_file(
     terminal_runs: set[tuple[str, str, str]] | None = None,
     quarantined_files: set[str] | None = None,
     *,
-    reduced_galleries: list[tuple[str, int]] | None = None,
     _local_endpoint=None,
 ) -> bool:
-    """replay_file's replay, under its claim.
-
-    ``reduced_galleries`` collects the (name, step) of each versioned gallery it published without items the CDN rejected, once per gallery, two at one step included; the worker, which alone passes it, spools no unversioned record.
-    """
+    """replay_file's replay, under its claim."""
     if quarantined_files is None:
         quarantined_files = set()
     size_before = os.stat(path).st_size
@@ -811,8 +802,6 @@ def _replay_file(
                     break
                 if kind != "cdn_key_mutation" and http_client is None:
                     if local_endpoint is None:
-                        import httpx
-
                         http_client = httpx.Client(timeout=60.0)
                     else:
                         from kymo._local_runtime import http_client as local_http
@@ -826,7 +815,6 @@ def _replay_file(
                     run_id,
                     record,
                     replayed_keys,
-                    reduced_galleries,
                 ):
                     sent += 1
                 else:

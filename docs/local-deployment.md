@@ -148,7 +148,7 @@ PostgreSQL stores run metadata and monotonic rich-mutation heads. ClickHouse sto
 1. Quarantines the affected spool as `.rejected`, matching installation-mismatch quarantine naming.
 2. Logs the exact reason and file, and reports a distinct DATA_LOSS delivery failure to the owning process.
 3. Removes that whole segment from automatic replay and advances to later segments for the run. Records after the rejected mutation in the same segment remain quarantined; later segment files remain eligible.
-4. Uses a distinct mutation sequence reserved before enqueue if dropping an invalid gallery child requires publishing a reduced manifest; replay never reuses the rejected publication's version or allocates a new writer epoch.
+4. Never reuses the rejected publication's version or allocates a new writer epoch. A replay that must drop a gallery child publishes the reduced manifest under the successor version an older client reserved before enqueue; a versioned record without one quarantines the segment.
 
 Spool creation, retirement, and quarantine sync the affected directory entries, so on filesystems that support directory sync a power loss can neither drop a spooled segment nor resurrect a delivered one.
 

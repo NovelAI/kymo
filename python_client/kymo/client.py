@@ -57,6 +57,7 @@ from kymo._control_rpc import BOOTSTRAP as _CONTROL_BOOTSTRAP, _ended
 from kymo._log import logger as _log
 from kymo.api import _check_fork_safe
 from kymo._wire import (
+    _CDN_EXTENSIONS,
     _F32_OVERFLOW,
     _MAX_ID_BYTES,
     _MAX_METRIC_NAME_BYTES,
@@ -64,9 +65,8 @@ from kymo._wire import (
     _MAX_RICH_RESOURCE_ID_BYTES,
     _SEND_CALL_TIMEOUT,
     _SEND_MAX_DELAY,
-    _is_permanent_upload_error,
+    _cdn_refusal,
     _normalize_numeric_value,
-    _publish_rich_mutation,
     _upload_to_cdn,
     _validate_ident,
     _validate_project_id,
@@ -86,31 +86,6 @@ from kymo.types import Image, Metadata, Resource
 from kymo._worker import _worker_process
 
 _MAX_RUN_NAME_BYTES = 2048
-# Client-side mirror of ALLOWED_EXTENSIONS in kymo-server/src/cdn.rs (keep in sync): the server 400s any other extension, which would drop the item as a permanent upload error.
-_CDN_EXTENSIONS = frozenset(
-    {
-        "png",
-        "jpg",
-        "jpeg",
-        "gif",
-        "webp",
-        "bmp",
-        "svg",
-        "ico",
-        "tiff",
-        "json",
-        "txt",
-        "csv",
-        "wav",
-        "mp3",
-        "mp4",
-        "webm",
-        "ogg",
-        "pdf",
-        "gz",
-        "bin",
-    }
-)
 # Unicode White_Space code points used by Rust str::trim; Python str.strip() additionally removes U+001C..U+001F.
 _RUN_NAME_TRIM_CHARS = "\t\n\v\f\r \u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000"
 
@@ -397,23 +372,19 @@ _unproven_lock = threading.RLock()
 _PENDING_MAX_BYTES = 256 << 20
 
 
-def _reserve_versions(count: int) -> tuple[int, ...]:
-    """The reservation for _rich_queue_tuple, a held section (_HELD_SECTIONS): the allocator's lock is reentrant, so a handler kymo chains to that logs a gallery from inside it would reserve the same versions, and the server would reject one gallery as DATA_LOSS."""
+def _reserve_version() -> int:
+    """The reservation for _rich_queue_tuple, a held section (_HELD_SECTIONS): the allocator's lock is reentrant, so a handler kymo chains to that logs a gallery from inside it would reserve the same version, which the server rejects as DATA_LOSS for two mutations of one metric at one step with different content."""
     lock = _rich_mutation_seq.get_lock()
     if not lock.acquire(timeout=_STATUS_LOCK_TIMEOUT):
         raise RuntimeError("kymo rich mutation allocator lock is unavailable")
     try:
         raw_seq = _rich_mutation_seq.get_obj()
-        if raw_seq.value > (1 << 32) - 1 - count:
+        if raw_seq.value >= (1 << 32) - 1:
             raise RuntimeError(
                 "kymo rich mutation sequence exhausted for this run writer"
             )
-        first = raw_seq.value + 1
-        raw_seq.value += count
-        return tuple(
-            (_rich_writer_epoch << 32) | sequence
-            for sequence in range(first, first + count)
-        )
+        raw_seq.value += 1
+        return (_rich_writer_epoch << 32) | raw_seq.value
     finally:
         lock.release()
 
@@ -1212,13 +1183,12 @@ class _GalleryQueueItem(tuple):
 def _rich_queue_tuple(
     kind: str, name: str, step: int, payload, timestamp_ms: int
 ) -> tuple:
-    # A gallery also reserves its successor, before any later logical mutation: a replay may have to omit a child that the CDN now rejects permanently, and the reduced rebuild must stay in this writer's causal order.
     try:
-        versions = _reserve_versions(2 if kind == "cdn_batch_mutation" else 1)
+        version = _reserve_version()
     finally:
         if _deferred_signals:
             _run_deferred_signals()
-    return (kind, name, step, payload, timestamp_ms, *versions)
+    return (kind, name, step, payload, timestamp_ms, version)
 
 
 def _queue_item_size(item) -> int:
@@ -1370,7 +1340,7 @@ def _upload_failure_message(failure: int) -> str:
     if failure == _WORKER_GALLERY_CUT_SHORT:
         return (
             "kymo upload worker published or spooled a gallery without items "
-            "that could not be encoded or that the CDN rejected (see its log)"
+            "that could not be encoded or that kymo-server would refuse (see its log)"
         )
     if failure == _WORKER_EXIT_DATA_LOSS:
         return (
@@ -3112,13 +3082,13 @@ def _release_shutdown(shutdown: "_Shutdown", arrived=()) -> None:
         shutdown.done.set()
 
 
-# Held sections: kymo's handler defers its shutdown signals while one runs on the main thread (_signal_handler), where it would act before a shutdown set the run's code, its flush could deadlock or time out on the section's locks or lose captured text or a pending call, a chained handler's gallery log() could reserve the same rich versions, and a Ctrl-C as the upload worker starts would raise before the run is active (_start_run).
+# Held sections: kymo's handler defers its shutdown signals while one runs on the main thread (_signal_handler), where it would act before a shutdown set the run's code, its flush could deadlock or time out on the section's locks or lose captured text or a pending call, a chained handler's gallery log() could reserve the same rich version, and a Ctrl-C as the upload worker starts would raise before the run is active (_start_run).
 # Handling the deferred signals is one, so a later signal waits rather than nests (but see _call_chained), and so is the stack walk, whose caller handles a signal interrupting it. Frames on the stack, not a count: a raising handler can skip a count's restore, even one first in a `finally` on Python 3.10, which runs pending handlers as an exception handler starts. A shutdown's waits hold nothing: the handler never flushes then (_signal_during_shutdown).
 _HELD_SECTIONS = frozenset(
     # Their code objects' ids, which the functions keep alive (_held_sections).
     id(function.__code__)
     for function in (
-        _reserve_versions,
+        _reserve_version,
         _start_run,
         _publish_held,
         _read_delivery_status,
@@ -3901,7 +3871,7 @@ class _EncodedItems:
 
     def __init__(self, entries: list[dict], dropped: bool):
         self.entries = entries
-        # An item failed to encode, so the manifest must publish under the reduced mutation version.
+        # An item could not be encoded, or kymo-server would refuse it, so delivery reads incomplete.
         self.dropped = dropped
         # Captions and filenames keep lone surrogates until display, so a strict encode would raise.
         self.nbytes = sum(
@@ -3915,7 +3885,7 @@ class _EncodedItems:
 
 
 def _encode_cdn_items(name: str, step: int, items: list) -> _EncodedItems:
-    """Encode a gallery's items in place into spool entries, replacing each one that cannot be encoded with None and a warning, since a retry can never fix it.
+    """Encode a gallery's items in place into spool entries, replacing each one that cannot be encoded, or that kymo-server would refuse (_cdn_refusal), with None and a warning, since a retry can never fix it.
 
     Replacing each item as it is encoded releases its arrays at once, so a gallery is never held both whole and encoded, and a retry after a MemoryError resumes at the item that raised. Callers pass a decoded snapshot, never a list given to log().
     """
@@ -3941,12 +3911,15 @@ def _encode_cdn_items(name: str, step: int, items: list) -> _EncodedItems:
             else:
                 # Encoded or dropped by an earlier attempt.
                 continue
+            refusal = _cdn_refusal(data, ext)
+            if refusal:
+                raise ValueError(refusal)
         except MemoryError:
             raise
         except Exception as e:
             entry = None
             _log.warning(
-                "failed to encode CDN item (%s step %d) — dropping it: %s",
+                "dropping CDN item (%s step %d) that could not be encoded or that kymo-server would refuse: %s",
                 name,
                 step,
                 e,
@@ -3956,83 +3929,23 @@ def _encode_cdn_items(name: str, step: int, items: list) -> _EncodedItems:
     return _EncodedItems(entries, dropped=len(entries) < len(items))
 
 
-def _process_cdn_batch(
-    stub,
-    http_client,
-    cdn_url: str,
-    project_id: str,
-    run_id: str,
-    metric_name: str,
-    step: int,
-    items: _EncodedItems,
-    *,
-    deadline_fn,
-    timestamp_ms: int,
-    mutation_version: int,
-    reduced_mutation_version: int,
-) -> bool | int:
-    """Upload encoded items and publish their gallery's manifest.
+def _upload_gallery(
+    http_client, cdn_url: str, items: _EncodedItems, *, deadline_fn
+) -> Optional[str]:
+    """Upload encoded items and their gallery's manifest, an empty one too, returning the manifest's key for process_cdn_entry to publish. Any failure raises, leaving the batch queued for the owner loop to retry or spool, since a manifest missing an item would silently thin the gallery. Running this again is safe: re-uploads dedup by content hash.
 
-    Return True for a complete gallery and _WORKER_GALLERY_CUT_SHORT once the manifest went out without items its encode dropped or the CDN rejected; any other failure raises, leaving the batch queued for process_cdn_entry's owner loop to retry or spool. Running this again is safe: re-uploads dedup by content hash, and publishing the same version and manifest again is idempotent.
-
-    Check deadline_fn before each item's upload and return False once it has fired: past the deadline the owner spools the batch without waiting for this helper, so its remaining uploads would be wasted.
+    Check deadline_fn before each item's upload and return None once it has fired: past the deadline the owner spools the batch without waiting for this helper, so its remaining uploads would be wasted.
     """
-    # 1. Upload the encoded items. A CDN rejection drops its item, like an encode failure; any other upload failure is transient and fails the whole batch for retry — committing a manifest missing the failed items would silently thin the gallery.
     manifest_items = []
-    manifest_changed = items.dropped
     for entry in items.entries:
         if deadline_fn():
-            return False
-        try:
-            resource_id = _upload_to_cdn(
-                http_client, cdn_url, entry["data"], entry["ext"]
-            )
-        except Exception as e:
-            if _is_permanent_upload_error(e):
-                manifest_changed = True
-                _log.warning(
-                    "CDN rejected item (%s step %d) — dropping it: %s",
-                    metric_name,
-                    step,
-                    e,
-                )
-                continue
-            raise
+            return None
+        resource_id = _upload_to_cdn(http_client, cdn_url, entry["data"], entry["ext"])
         manifest_items.append(encoded_gallery_item(entry, resource_id))
-
-    if not manifest_items:
-        # Publish an EMPTY manifest rather than returning early: an empty gallery is still a real mutation of its step.
-        _log.error(
-            "no encodable/accepted items in CDN batch %s step %d — logging an empty gallery",
-            metric_name,
-            step,
-        )
-
-    # 2. Build and upload manifest
-    encoded_manifest = gallery_manifest(manifest_items)
-    manifest_id = _upload_to_cdn(http_client, cdn_url, encoded_manifest, "json")
-
-    # 3. Publish the immutable manifest. The server compares the parent-issued logical version before inserting, so a delayed retry cannot overwrite a newer same-step value.
-    if manifest_changed:
-        mutation_version = reduced_mutation_version
-    _publish_rich_mutation(
-        stub,
-        project_id,
-        run_id,
-        metric_name,
-        step,
-        manifest_id,
-        timestamp_ms,
-        mutation_version,
+    # An empty gallery is still a real mutation of its step.
+    return _upload_to_cdn(
+        http_client, cdn_url, gallery_manifest(manifest_items), "json"
     )
-    _log.info(
-        "CDN %s step=%d → %s (%d items)",
-        metric_name,
-        step,
-        manifest_id,
-        len(manifest_items),
-    )
-    return _WORKER_GALLERY_CUT_SHORT if manifest_changed else True
 
 
 _CONNECT_INITIAL_DELAY = 0.5
@@ -4042,7 +3955,7 @@ _CONNECT_POLL_TIMEOUT = 0.25
 # workers that observed the same restart from hammering the replacement pod in
 # lockstep. Ordinary in-memory stream retries retain the low-latency 5s cap.
 _RECOVERY_MAX_DELAY = 60.0
-# Attempts on one rich-lane entry before the lane fails over to the spool, retry delays growing from 2 s to 60 s; a gallery item the CDN rejects permanently is dropped instead.
+# Attempts on one rich-lane entry before the lane fails over to the spool, retry delays growing from 2 s to 60 s.
 _CDN_MAX_ATTEMPTS = 8
 # Worker exit code: some points reached neither the server nor the spool (a spool write failed, e.g. disk full, a gallery could not be encoded for the spool, a queued snapshot would not unpickle in the worker, its spill end passed before it spilled them, or it never read them and no salvage follows). finish() must not report success.
 _WORKER_EXIT_SPOOL_FAILED = 2
@@ -4054,7 +3967,7 @@ _WORKER_EXIT_DRAIN_INCOMPLETE = 3
 _WORKER_EXIT_RUN_DELETED = 4
 # A spool segment was quarantined as *.rejected (the server answered DATA_LOSS for a rich mutation in it, or it held records that can never be delivered), and later data kept flowing.
 _WORKER_EXIT_DATA_LOSS = 5
-# Not an exit code, and what _process_cdn_batch returns for it: the worker published a gallery without items its encode dropped or the CDN rejected, so delivery is incomplete, as for a value dropped after its log() returned.
+# Not an exit code, and what process_cdn_entry returns for it: the worker published or spooled a gallery without items its encode dropped, so delivery is incomplete, as for a value dropped after its log() returned.
 _WORKER_GALLERY_CUT_SHORT = 6
 # Loss evidence outranks other failures, and an outright spool failure outranks a quarantine; any failure outranks a gallery cut short.
 _FAILURE_RANK = {
@@ -4265,32 +4178,18 @@ def _spool_record(point_tuple: tuple) -> tuple:
         )
     if kind != "cdn_batch_mutation":
         return point_tuple
-    _, name, step, items, timestamp_ms, mutation_version, reduced_mutation_version = (
-        point_tuple
-    )
+    _, name, step, items, timestamp_ms, mutation_version = point_tuple
     # The worker's encoder may already have encoded this gallery.
     if not isinstance(items, _EncodedItems):
         items = _encode_cdn_items(name, step, items)
-    # Recorded even when every item failed to encode: an empty gallery is still a real mutation.
-    if items.dropped:
-        # Under the version reserved for the reduced gallery, which leaves none in reserve.
-        return (
-            "cdn_batch_encoded_mutation",
-            name,
-            step,
-            items.entries,
-            timestamp_ms,
-            reduced_mutation_version,
-        )
-    # A distinct kind makes the extra field forward-safe: older replay tools preserve unknown records instead of rejecting a valid newer tuple as malformed.
+    # Recorded even when the encode dropped every item: an empty gallery is still a real mutation.
     return (
-        "cdn_batch_encoded_mutation_reserved",
+        "cdn_batch_encoded_mutation",
         name,
         step,
         items.entries,
         timestamp_ms,
         mutation_version,
-        reduced_mutation_version,
     )
 
 

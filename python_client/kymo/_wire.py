@@ -25,6 +25,32 @@ _CDN_RPC_TIMEOUT = 30.0
 _MAX_POINTS_PER_MSG = 5_000
 _MAX_BYTES_PER_MSG = 2 * 1024 * 1024
 _MAX_POINT_BYTES = 4 * 1024 * 1024 - 64 * 1024
+# Mirrors of hosted kymo-server's only per-item CDN rejections (cdn.rs ALLOWED_EXTENSIONS and ENVELOPE_BYTES; test_spool_replay checks them against that file). The encoder drops an item they refuse, so a live upload retries every HTTP error, since a 4xx from a proxy or an older server is no reason to drop data; kymo.sync uses them to confirm a 4xx before dropping an older client's spooled item.
+_CDN_EXTENSIONS = frozenset(
+    {
+        "png",
+        "jpg",
+        "jpeg",
+        "gif",
+        "webp",
+        "bmp",
+        "svg",
+        "ico",
+        "tiff",
+        "json",
+        "txt",
+        "csv",
+        "wav",
+        "mp3",
+        "mp4",
+        "webm",
+        "ogg",
+        "pdf",
+        "gz",
+        "bin",
+    }
+)
+_CDN_ENVELOPE_BYTES = 256 * 1024 * 1024
 
 
 class _PermanentPointError(ValueError):
@@ -155,6 +181,23 @@ def _upload_to_cdn(
         content=data,
         headers={"X-Extension": ext, "Content-Type": "application/octet-stream"},
     )
+    if (
+        400 <= response.status_code < 500
+        and "authorization" not in response.request.headers
+        and _cdn_refusal(data, ext) is None
+    ):
+        import httpx
+
+        # Hosted kymo-server answers no 4xx for a body it can store, so name the likely cause in the error every retry logs; only a local server gets a bearer, and it answers a stale one with 401.
+        raise httpx.HTTPStatusError(
+            f"{response.status_code} {response.reason_phrase} from {response.request.url} "
+            f"(Server: {response.headers.get('server', 'none')}) for a body kymo-server "
+            "would store: most likely a proxy in the upload path (one this machine uses, "
+            "such as HTTP_PROXY, HTTPS_PROXY or ALL_PROXY, or one in front of the server), "
+            "else a kymo-server older than this client or a wrong CDN address",
+            request=response.request,
+            response=response,
+        )
     response.raise_for_status()
     resource_id = response.json()["resource_id"]
     if expected_id is None:
@@ -164,10 +207,13 @@ def _upload_to_cdn(
     return resource_id
 
 
-def _is_permanent_upload_error(error: Exception) -> bool:
-    """Return whether a CDN validation rejection is permanently unretryable."""
-    status = getattr(getattr(error, "response", None), "status_code", None)
-    return status is not None and 400 <= status < 500 and status not in (408, 425, 429)
+def _cdn_refusal(data: bytes, ext: str) -> Optional[str]:
+    """Why kymo-server would refuse to store this item, or None."""
+    if ext.lower() not in _CDN_EXTENSIONS:
+        return f"kymo-server stores no {ext!r} files"
+    if len(data) > _CDN_ENVELOPE_BYTES:
+        return f"{len(data)} bytes is over kymo-server's {_CDN_ENVELOPE_BYTES}-byte upload limit"
+    return None
 
 
 # Finite doubles at or beyond this magnitude round to float32 infinity (halfway from FLT_MAX to 2**128).

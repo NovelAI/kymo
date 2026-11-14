@@ -305,13 +305,12 @@ def _upload_worker(
         _equal_jitter_delay,
         _merged_worker_failure,
         _next_connect_retry_delay,
-        _process_cdn_batch,
-        _publish_rich_mutation,
         _queue_item_size,
         _recovery_retry_delay,
         _retire_rejected_worker_spools,
         _spill_tuple,
         _spool_header,
+        _upload_gallery,
         _upload_to_cdn,
         _validated_ack_delta,
         SpoolWriter,
@@ -327,6 +326,7 @@ def _upload_worker(
         _chunk_tuples,
         _estimate_tuple_bytes,
         _is_terminal_run_error,
+        _publish_rich_mutation,
         _terminal_run_error,
     )
 
@@ -492,7 +492,7 @@ def _upload_worker(
     cut = 0  # points left unspilled once the spill end passed (spill_end())
     undecodable = 0  # queued points dropped because their snapshot would not unpickle; kept out of spool_failed, which also stops spill() from writing
     unencodable = 0  # points dropped because their spool record could not be built (a gallery too large to encode); the spool itself is still sound
-    # Galleries published without items their encode dropped or the CDN rejected.
+    # Galleries published or spooled without items their encode dropped.
     cut_short = 0
     drain_incomplete = False
     terminal_rejected = False
@@ -704,7 +704,7 @@ def _upload_worker(
         raw_galleries = sum(map(counted_raw, tuples)) - (
             encoding is not None and counted_raw(encoding)
         )
-        spooled_now = cut_now = reduced = 0
+        spooled_now = cut_now = cut_short_now = 0
         if spool_failed:
             spool_failed += len(tuples)
         else:
@@ -748,7 +748,7 @@ def _upload_worker(
                     if not _spill_tuple(spool, t):
                         unwritten += 1
                     elif gallery and spooled_cut_short(t):
-                        reduced += 1
+                        cut_short_now += 1
                 except SpoolWriteCut:
                     # The spill end passed as it wrote this record, which the writer cut off.
                     cut_now = len(tuples) - index
@@ -768,7 +768,7 @@ def _upload_worker(
             spooled_now = spool.count - held
             unencodable += unwritten
             cut += cut_now
-            cut_short += reduced
+            cut_short += cut_short_now
             lost = len(tuples) - cut_now - spooled_now - unwritten
             if lost:
                 _log.warning("failed to spool %d point(s): %s", lost, error)
@@ -780,7 +780,7 @@ def _upload_worker(
             failure=_WORKER_EXIT_SPOOL_FAILED
             if spool_failed or unencodable
             else _WORKER_GALLERY_CUT_SHORT
-            if reduced
+            if cut_short_now
             else 0,
         )
         release_raw_galleries(raw_galleries)
@@ -841,7 +841,7 @@ def _upload_worker(
                 return False
         segment = replay_segment
 
-        def replay() -> tuple[bool, int]:
+        def replay() -> None:
             # Lazy import avoids client <-> sync module initialization recursion.
             from kymo.sync import replay_file
 
@@ -856,7 +856,6 @@ def _upload_worker(
                 )
             terminal_runs: set[tuple[str, str, str]] = set()
             quarantined_files: set[str] = set()
-            reduced_galleries: list[tuple[str, int]] = []
             try:
                 # Delete consumed segments: their records were delivered or superseded.
                 delivered = replay_file(
@@ -864,7 +863,6 @@ def _upload_worker(
                     delete=True,
                     terminal_runs=terminal_runs,
                     quarantined_files=quarantined_files,
-                    reduced_galleries=reduced_galleries,
                     _writer_lock_held=True,
                     _local_endpoint=local_endpoint,
                 )
@@ -879,15 +877,14 @@ def _upload_worker(
                     raise _SegmentGone(segment.path) from None
                 else:
                     raise
-            if delivered or terminal_runs or quarantined_files:
-                # Done with a segment whose path is gone or renamed: release it without a barrier, since persisting it buys nothing, and here, since closing a deleted file frees its blocks (milliseconds per GiB) and the queue-consumer thread should not pay that.
-                segment.release()
+            if not (delivered or terminal_runs or quarantined_files):
+                raise RuntimeError("spool replay did not complete")
+            # Done with a segment whose path is gone or renamed: release it without a barrier, since persisting it buys nothing, and here, since closing a deleted file frees its blocks (milliseconds per GiB) and the queue-consumer thread should not pay that.
+            segment.release()
             if terminal_runs:
                 raise _TerminalRunError("run is no longer writable during spool replay")
             if quarantined_files:
                 raise _ReplayQuarantined(next(iter(quarantined_files)))
-            # Whether it delivered the segment, and how many galleries it published without items the CDN rejected.
-            return delivered, len(reduced_galleries)
 
         replay_attempt = _ThreadAttempt(segment, replay, name="kymo-spool-replay")
         replay_can_prove = True
@@ -1062,29 +1059,22 @@ def _upload_worker(
             spill(pending_spill)
 
     def process_cdn_entry(entry: tuple) -> bool | int:
-        """Complete one CDN head entry; the owner loop applies its result (_process_cdn_batch's for a gallery) and handles what it raises: a terminal answer, DATA_LOSS, or a failure it logs before retrying or spooling the entry."""
-        kind, name, step, payload, timestamp_ms, mutation_version = entry[:6]
+        """Complete one CDN head entry: upload what it names, then publish its key under its version, which is idempotent for the same version and key. The owner loop applies its result (False past the deadline, _WORKER_GALLERY_CUT_SHORT for a gallery its encode cut short) and handles what it raises: a terminal answer, DATA_LOSS, or a failure it logs before retrying or spooling the entry."""
+        kind, name, step, payload, timestamp_ms, mutation_version = entry
         if kind == "cdn_batch_mutation":
-            return _process_cdn_batch(
-                cdn_stub,
-                http_client,
-                cdn_url,
-                project_id,
-                run_id,
-                name,
-                step,
-                payload,
-                deadline_fn=past_deadline,
-                timestamp_ms=timestamp_ms,
-                mutation_version=mutation_version,
-                reduced_mutation_version=entry[6],
+            key = _upload_gallery(
+                http_client, cdn_url, payload, deadline_fn=past_deadline
             )
-        key = payload
-        if kind == "metadata_batch_mutation":
+            if key is None:
+                return False
+        elif kind == "metadata_batch_mutation":
             key = _upload_to_cdn(
                 http_client, cdn_url, metadata_manifest(payload.data), "json"
             )
             _log.info("metadata %s step=%d uploaded as %s", name, step, key)
+        else:
+            key = payload
+        # The server compares the parent-issued logical version before inserting, so a delayed retry cannot overwrite a newer same-step value.
         _publish_rich_mutation(
             cdn_stub,
             project_id,
@@ -1095,7 +1085,12 @@ def _upload_worker(
             timestamp_ms,
             mutation_version,
         )
-        return True
+        if kind != "cdn_batch_mutation":
+            return True
+        _log.info(
+            "CDN %s step=%d → %s (%d items)", name, step, key, len(payload.entries)
+        )
+        return _WORKER_GALLERY_CUT_SHORT if payload.dropped else True
 
     def reject_deleted_run(error: BaseException) -> None:
         """Stop every transport and fail queued work without creating a spool."""
@@ -1455,19 +1450,7 @@ def _upload_worker(
             else:
                 completed_segment = replay_attempt.item
                 replay_attempt = None
-                error = None
-                if not replay_succeeded:
-                    error = replay_result
-                else:
-                    delivered, reduced = replay_result
-                    if reduced:
-                        # Recorded before an empty disk prefix clears the spooled flag below, so delivery never reads complete without it.
-                        resolve_points(0, failure=_WORKER_GALLERY_CUT_SHORT)
-                    if delivered:
-                        # Counted by the replay that delivers the segment: one that fails is retried, and cuts the same galleries again.
-                        cut_short += reduced
-                    else:
-                        error = RuntimeError("spool replay did not complete")
+                error = None if replay_succeeded else replay_result
                 # The helper has released a segment it finished with; only a failed replay keeps it for the retry.
                 if isinstance(error, _TerminalRunError):
                     replay_segment = None
@@ -1956,7 +1939,7 @@ def _upload_worker(
     if cut_short:
         _log.error(
             "%d gallery(ies) were published or spooled without items that could "
-            "not be encoded or that the CDN rejected",
+            "not be encoded or that kymo-server would refuse",
             cut_short,
         )
     if spool_failed or undecodable or unencodable or cut or unread_lost:

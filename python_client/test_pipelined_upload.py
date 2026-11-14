@@ -3314,94 +3314,64 @@ class AccountingTests(unittest.TestCase):
         self.assertEqual(first[:3], ("metadata_batch_mutation", "info/run_info", 0))
         self.assertEqual(first[4:], (100, (7 << 32) | 1))
         self.assertEqual(second[:3], ("cdn_batch_mutation", "gallery", 1))
-        self.assertEqual(second[4:], (101, (7 << 32) | 2, (7 << 32) | 3))
+        self.assertEqual(second[4:], (101, (7 << 32) | 2))
 
-    def test_gallery_primary_and_fallback_are_one_atomic_reservation(self):
-        start_contender = threading.Event()
-        contender_attempted = threading.Event()
-        contender_done = threading.Event()
-
-        class InterleavingLock:
+    def test_a_reservation_reads_and_writes_under_its_one_lock_acquisition(self):
+        class Sequence:
             def __init__(self):
-                self._lock = threading.Lock()
-                self.gallery_acquires = 0
-
-            def acquire(self, timeout):
-                if threading.current_thread().name == "contender":
-                    contender_attempted.set()
-                elif threading.current_thread().name == "gallery":
-                    self.gallery_acquires += 1
-                    if self.gallery_acquires > 1:
-                        contender_done.wait(1)
-                return self._lock.acquire(timeout=timeout)
-
-            def release(self):
-                self._lock.release()
-
-        class InterleavingSequence:
-            def __init__(self):
-                self._value = 0
-                self._lock = InterleavingLock()
-                self._signaled = False
+                self.lock = threading.Lock()
+                self.acquires = 0
+                self.raw = 0
 
             def get_lock(self):
-                return self._lock
+                return self
 
             def get_obj(self):
                 return self
 
+            def acquire(self, timeout):
+                self.acquires += 1
+                return self.lock.acquire(timeout=timeout)
+
+            def release(self):
+                self.lock.release()
+
+            def _check_locked(self):
+                if not self.lock.locked():
+                    raise AssertionError(
+                        "the sequence was touched outside the allocator lock"
+                    )
+
             @property
             def value(self):
-                if threading.current_thread().name == "gallery" and not self._signaled:
-                    self._signaled = True
-                    start_contender.set()
-                    self.assert_contender_attempted()
-                return self._value
+                self._check_locked()
+                return self.raw
 
             @value.setter
             def value(self, value):
-                self._value = value
+                self._check_locked()
+                self.raw = value
 
-            @staticmethod
-            def assert_contender_attempted():
-                if not contender_attempted.wait(1):
-                    raise AssertionError(
-                        "concurrent mutation never attempted allocation"
-                    )
-
-        sequence = InterleavingSequence()
-        gallery = []
-        contender = []
-
-        def reserve_gallery():
-            gallery.append(
-                client_module._rich_queue_tuple(
-                    "cdn_batch_mutation", "gallery", 1, [], 101
-                )
-            )
-
-        def reserve_contender():
-            start_contender.wait(1)
-            contender.extend(client_module._reserve_versions(1))
-            contender_done.set()
-
+        sequence = Sequence()
         with (
             mock.patch.object(client_module, "_rich_writer_epoch", 7),
             mock.patch.object(client_module, "_rich_mutation_seq", sequence),
         ):
-            threads = [
-                threading.Thread(target=reserve_gallery, name="gallery"),
-                threading.Thread(target=reserve_contender, name="contender"),
-            ]
-            for thread in reversed(threads):
-                thread.start()
-            for thread in threads:
-                thread.join(2)
-                self.assertFalse(thread.is_alive())
+            self.assertEqual(client_module._reserve_version(), (7 << 32) | 1)
+        self.assertEqual((sequence.acquires, sequence.raw), (1, 1))
 
-        self.assertEqual(gallery[0][4:], (101, (7 << 32) | 1, (7 << 32) | 2))
-        self.assertEqual(contender, [(7 << 32) | 3])
-        self.assertEqual(sequence._lock.gallery_acquires, 1)
+    def test_the_last_rich_version_is_reserved_once(self):
+        with (
+            mock.patch.object(client_module, "_rich_writer_epoch", 7),
+            mock.patch.object(
+                client_module,
+                "_rich_mutation_seq",
+                multiprocessing.Value("I", (1 << 32) - 2),
+            ),
+        ):
+            self.assertEqual(client_module._reserve_version(), (7 << 32) | 0xFFFFFFFF)
+            with self.assertRaisesRegex(RuntimeError, "exhausted"):
+                client_module._reserve_version()
 
     def test_rich_mutation_allocator_fails_instead_of_waiting_on_a_dead_owner(self):
         sequence = mock.Mock()
@@ -3410,16 +3380,16 @@ class AccountingTests(unittest.TestCase):
             mock.patch.object(client_module, "_rich_mutation_seq", sequence),
             self.assertRaisesRegex(RuntimeError, "allocator lock is unavailable"),
         ):
-            client_module._reserve_versions(1)
+            client_module._reserve_version()
         sequence.get_lock.return_value.acquire.assert_called_once_with(
             timeout=client_module._STATUS_LOCK_TIMEOUT
         )
         sequence.get_lock.return_value.release.assert_not_called()
 
-    def test_a_handler_kymo_chains_to_never_takes_a_reservations_versions(self):
-        # A handler kymo chains to logs a gallery at each opcode of a reservation. The allocator's lock is reentrant, so inside it the handler would read the sequence the reservation had read and take the same versions, one gallery's of which the server rejects as DATA_LOSS: the reservation defers it, and every version is reserved once.
+    def test_a_chained_handler_never_reuses_a_rich_version(self):
+        # A handler kymo chains to logs a gallery at each opcode of a reservation; the reservation defers it (_reserve_version), so every version is reserved once.
         reservation = client_module._rich_queue_tuple
-        traced = {reservation.__code__, client_module._reserve_versions.__code__}
+        traced = {reservation.__code__, client_module._reserve_version.__code__}
         for k in itertools.count():
             nested = []
 
@@ -3443,9 +3413,9 @@ class AccountingTests(unittest.TestCase):
             if not fired:
                 break
             state = f"signal at opcode {k}"
-            self.assertEqual(len(nested), 2, state)
+            self.assertEqual(len(nested), 1, state)
             self.assertFalse(set(outer) & set(nested), state)
-            self.assertEqual(reserved, 4, state)
+            self.assertEqual(reserved, 2, state)
         self.assertGreater(k, 10)
 
     def test_run_metadata_uses_one_immutable_ordered_worker_record(self):
@@ -10142,7 +10112,7 @@ class ShutdownProofTests(unittest.TestCase):
         self.assertFalse(self._run_shutdown(backlog=1, poller_quiesced=True))
 
     def test_finish_fails_after_a_gallery_went_out_cut_short(self):
-        # The worker exits cleanly after publishing a gallery without items its encode dropped or the CDN rejected, but delivery is incomplete.
+        # The worker exits cleanly after publishing a gallery without items its encode dropped, but delivery is incomplete.
         cut_short = _QueueStatus(client_module._WORKER_GALLERY_CUT_SHORT)
         with mock.patch.object(client_module, "_upload_failure", cut_short):
             self.assertFalse(self._run_shutdown())
@@ -11811,9 +11781,8 @@ def _kymo_handles(originals: dict):
 
 
 def _gallery(step: int, items: list, name: str = "samples") -> tuple:
-    """A gallery's tuple as log() builds it: timestamp step, versions (1 << 32) | (2 * step - 1) and its reserved successor."""
-    version = (1 << 32) | (2 * step - 1)
-    return ("cdn_batch_mutation", name, step, items, step, version, version + 1)
+    """A gallery's tuple in log()'s shape: timestamp step, version (1 << 32) | step."""
+    return ("cdn_batch_mutation", name, step, items, step, (1 << 32) | step)
 
 
 def _queued_gallery(step: int, gallery: list) -> tuple:
@@ -12176,7 +12145,7 @@ class WorkerResponsivenessTests(unittest.TestCase):
                     kinds,
                     [
                         ["numeric_ts", "numeric_ts"],
-                        ["cdn_batch_encoded_mutation_reserved"],
+                        ["cdn_batch_encoded_mutation"],
                     ],
                 )
 
@@ -12926,7 +12895,7 @@ class WorkerResponsivenessTests(unittest.TestCase):
         stack = contextlib.ExitStack()
         for patch in (
             mock.patch.object(client_module, "_upload_to_cdn", side_effect=upload),
-            mock.patch.object(client_module, "_publish_rich_mutation"),
+            mock.patch.object(wire_module, "_publish_rich_mutation"),
             mock.patch.object(client_module, "_cdn_retry_delay", return_value=0.0),
             mock.patch("kymo._local_runtime.grpc_channel", return_value=_Channel()),
             mock.patch.object(
@@ -14199,22 +14168,13 @@ class WorkerResponsivenessTests(unittest.TestCase):
         second_numeric_fed = threading.Event()
         cdn_calls = []
 
-        def process_cdn(
-            _stub,
-            _http_client,
-            _cdn_url,
-            _project_id,
-            _run_id,
-            name,
-            _step,
-            _items,
-            **_kwargs,
-        ):
-            cdn_calls.append(name)
-            if name == "demo/first":
+        def upload_gallery(_http_client, _cdn_url, items, **_kwargs):
+            data = items.entries[0]["data"]
+            cdn_calls.append(data)
+            if data == b"one":
                 first_cdn_started.set()
                 release_first_cdn.wait(timeout=3)
-            return True
+            return "manifest.json"
 
         def on_feed(batch):
             if any(point.step == 2 for point in batch.points):
@@ -14239,8 +14199,11 @@ class WorkerResponsivenessTests(unittest.TestCase):
                 )
                 stack.enter_context(
                     mock.patch.object(
-                        client_module, "_process_cdn_batch", side_effect=process_cdn
+                        client_module, "_upload_gallery", side_effect=upload_gallery
                     )
+                )
+                stack.enter_context(
+                    mock.patch.object(wire_module, "_publish_rich_mutation")
                 )
                 worker = _worker_thread(
                     self,
@@ -14266,7 +14229,7 @@ class WorkerResponsivenessTests(unittest.TestCase):
 
         self.assertTrue(numeric_progressed)
         self.assertFalse(worker.is_alive())
-        self.assertEqual(cdn_calls, ["demo/first", "demo/second"])
+        self.assertEqual(cdn_calls, [b"one", b"two"])
         self.assertEqual(status.value, 0)
 
     def test_outage_retries_cdn_and_metadata_until_their_publications_commit(self):
@@ -14274,14 +14237,14 @@ class WorkerResponsivenessTests(unittest.TestCase):
         source.put(
             [
                 _gallery(1, [Resource(b"image", "bin")], "demo/gallery"),
-                ("cdn_key_mutation", "demo/key", 2, "direct-key", 1, (1 << 32) | 3),
+                ("cdn_key_mutation", "demo/key", 2, "direct-key", 1, (1 << 32) | 2),
                 (
                     "metadata_batch_mutation",
                     "info/run_info",
                     0,
                     Metadata({"model": "test"}),
                     1,
-                    (1 << 32) | 4,
+                    (1 << 32) | 3,
                 ),
             ]
         )
@@ -14317,7 +14280,7 @@ class WorkerResponsivenessTests(unittest.TestCase):
                     side_effect=upload_results,
                 ) as upload,
                 mock.patch.object(
-                    client_module,
+                    wire_module,
                     "_publish_rich_mutation",
                     side_effect=publish_results,
                 ) as publish,
@@ -14348,8 +14311,8 @@ class WorkerResponsivenessTests(unittest.TestCase):
         self.assertEqual(
             [call.args[3:] for call in publish.call_args_list],
             [("demo/gallery", 1, "manifest.json", 1, (1 << 32) | 1)] * 2
-            + [("demo/key", 2, "direct-key", 1, (1 << 32) | 3)]
-            + [("info/run_info", 0, "metadata.json", 1, (1 << 32) | 4)] * 2,
+            + [("demo/key", 2, "direct-key", 1, (1 << 32) | 2)]
+            + [("info/run_info", 0, "metadata.json", 1, (1 << 32) | 3)] * 2,
         )
         self.assertEqual(status.value, 0)
 

@@ -17,6 +17,8 @@ Record kinds:
     ("metadata_json_mutation", name, step, dict, timestamp_ms, mutation_version)
     ("cdn_batch_encoded_mutation", name, step, entries, timestamp_ms,
      mutation_version)
+
+Replayed only (clients that reserved a successor version for each gallery wrote it):
     ("cdn_batch_encoded_mutation_reserved", name, step, entries, timestamp_ms,
      mutation_version, reduced_mutation_version)
 

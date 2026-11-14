@@ -17,7 +17,7 @@ pub struct CdnState {
     pub(crate) collector_status: Arc<crate::cdn_gc::Status>,
 }
 
-/// The CDN upload envelope: the routes' `DefaultBodyLimit`.
+/// The CDN upload envelope: the routes' `DefaultBodyLimit`. The Python client's `_cdn_refusal` (python_client/kymo/_wire.py) mirrors it and `ALLOWED_EXTENSIONS`, which test_spool_replay.py checks, and retries any upload the mirror accepts, so add a new per-item rejection to the mirror before deploying it here.
 pub(crate) const ENVELOPE_BYTES: usize = 256 * 1024 * 1024;
 
 /// Allowed extensions (prevent path traversal / weird filenames). Local raw-ID v1 persists these names, so the set is append-only.
