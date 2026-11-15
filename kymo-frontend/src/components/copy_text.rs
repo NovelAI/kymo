@@ -28,7 +28,14 @@ fn press_hits_selection(x: f64, y: f64) -> bool {
 }
 
 #[component]
-pub(crate) fn CopyText(text: String, class: &'static str, display: Option<String>) -> Element {
+pub(crate) fn CopyText(
+    text: String,
+    class: &'static str,
+    display: Option<String>,
+    /// The text's explanation for the ? button (util/help.js): gallery captions carry one; a metadata table says it once itself.
+    #[props(default)]
+    help: Option<&'static str>,
+) -> Element {
     let display = display.as_deref().unwrap_or(&text);
     let mut pressed_on_selection = use_signal(|| false);
     let keyboard_text = text.clone();
@@ -38,6 +45,7 @@ pub(crate) fn CopyText(text: String, class: &'static str, display: Option<String
             tabindex: 0,
             class: "copy-text {class}",
             title: "{display}",
+            "data-help": help,
             aria_label: text.trim().is_empty().then_some("Copy empty text"),
             onmousedown: move |event: Event<MouseData>| {
                 // Shift-clicks and multi-clicks adjust the selection rather than dismiss it.

@@ -1,5 +1,6 @@
 mod components;
 mod grpc;
+mod help;
 mod pages;
 mod route;
 mod runtime;
@@ -49,6 +50,8 @@ const CHART_HIGHLIGHT_JS: &str = include_str!("components/uplot_chart/highlight.
 const CHART_HOVER_JS: &str = include_str!("components/uplot_chart/hover_points.js");
 const OVERFLOW_FADE_JS: &str = include_str!("util/overflow_fade.js");
 const WIDTH_DRAG_JS: &str = include_str!("util/width_drag.js");
+const HELP_JS: &str = include_str!("util/help.js");
+const CHART_HELP_JS: &str = include_str!("components/uplot_chart/help.js");
 const PANEL_PRESSES_JS: &str = include_str!("util/panel_presses.js");
 const PRESS_TARGET_JS: &str = include_str!("util/press_target.js");
 
@@ -153,6 +156,12 @@ fn main() {
     js_sys::eval(CHART_HOVER_JS).expect("failed to install chart hover lookup");
     js_sys::eval(OVERFLOW_FADE_JS).expect("failed to install the overflow fade observer");
     js_sys::eval(WIDTH_DRAG_JS).expect("failed to install the width drags");
+    js_sys::eval(&HELP_JS.replace(
+        "__TOP_LAYER_SELECTOR__",
+        &util::js_bridge::js_string(util::TOP_LAYER_SELECTOR),
+    ))
+    .expect("failed to install contextual help");
+    js_sys::eval(CHART_HELP_JS).expect("failed to install chart help");
     js_sys::eval(PANEL_PRESSES_JS).expect("failed to install the panel press guard");
     js_sys::eval(PRESS_TARGET_JS).expect("failed to install the press target record");
     js_sys::eval(util::js_bridge::LIFECYCLE_JS)

@@ -98,6 +98,7 @@ pub fn SectionEditor(return_focus_id: String, config: SectionConfig) -> Element 
     rsx! {
         OptionsPanel {
             title: "Configure section",
+            help: format!("{}\n{}", crate::help::LIVE_EDITING, crate::help::LAYOUT_SAVED),
             // The catch-all section of unprefixed metrics has no name to show.
             target: Some(config.display_name()).filter(|name| !name.is_empty()).map(str::to_string),
             return_focus_ids: vec![return_focus_id],
@@ -169,7 +170,7 @@ pub fn SectionEditor(return_focus_id: String, config: SectionConfig) -> Element 
                     }
                 }
 
-                div { class: "binding-field",
+                div { class: "binding-field", "data-help": crate::help::ROWS_PER_PAGE,
                     label { r#for: "{OPTIONS_ID_PREFIX}-rows-per-page", "Rows / page" }
                     input {
                         id: "{OPTIONS_ID_PREFIX}-rows-per-page",
@@ -186,6 +187,7 @@ pub fn SectionEditor(return_focus_id: String, config: SectionConfig) -> Element 
 
                 EditorSection {
                     title: "Chart defaults",
+                    help: crate::help::DEFAULTS,
 
                     ChartOptionsForm {
                         draft: draft_chart_opts,

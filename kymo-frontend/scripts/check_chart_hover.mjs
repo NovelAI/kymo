@@ -340,6 +340,10 @@ test("borrowed raw and envelope values come from the selected sample", () => {
   assert.equal(tooltipCell(f.tip, 1, "val").text, "5.000");
   assert.equal(tooltipCell(f.tip, 1, "raw").text, "3.000–6.000");
   assert.equal(tooltipCell(f.tip, 1, "x").text, "@ 0");
+  // Contextual help labels the gray column by its first populated cell (kymo.css).
+  assert.deepEqual(tooltipRows(f.tip).map(row => row.cells.find(cell => cell.role === "raw").text), ["80.00–110.0", "3.000–6.000"]);
+  assert.equal(f.tip.innerHTML.split('class="kymo-tip-raw kymo-tip-range"').length, 2, "one cell is classed, the first that holds a range");
+  assert.ok(f.tip.innerHTML.indexOf("kymo-tip-range") < f.tip.innerHTML.indexOf("3.000"), "the first row's");
   f.chart.data = f.chart.data.map(column => column.slice());
   f.chart.data[5][0] = f.chart.data[6][0] = 4;
   f.run();
@@ -358,6 +362,7 @@ test("borrowed smoothing evidence uses collapsed envelopes and raw-only columns"
   assert.equal(tooltipCell(f.tip, 1, "val").text, "5.000");
   assert.equal(tooltipCell(f.tip, 1, "raw").text, "4.000");
   assert.equal(tooltipCell(f.tip, 1, "x").text, "@ 0");
+  assert.equal(f.tip.innerHTML.split('class="kymo-tip-raw kymo-tip-rawval"').length, 2, "the gray column's first cell holds a raw value");
 
   const raw = fixture({ hasRaw: true, isSmoothed: true, rawStride: 1, lineBase: 3 });
   raw.enable();

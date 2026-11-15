@@ -7,42 +7,43 @@ use dioxus::core::{current_scope_id, Runtime};
 fn RunStatusIcon(status: RunStatus) -> Element {
     const DOT: &str = "M5 1.5a3.5 3.5 0 1 1 0 7 3.5 3.5 0 1 1 0-7z";
     let (state, title, path, stroked) = match status {
-        RunStatus::Running => ("running", "running", DOT, false),
+        RunStatus::Running => ("running", crate::help::STATUS_RUNNING, DOT, false),
         RunStatus::Stuck => (
             "stuck",
-            "stuck (main metrics stalled)",
+            crate::help::STATUS_STUCK,
             "M1.8 1.2h2.3v7.6H1.8zM5.9 1.2h2.3v7.6H5.9z",
             false,
         ),
         // Warning triangle with the "!" knocked out (evenodd).
         RunStatus::Unresponsive => (
             "unresponsive",
-            "unresponsive (>10s silent)",
+            crate::help::STATUS_UNRESPONSIVE,
             "M5 .6 9.7 9.2H.3zM4.35 3.4h1.3v3.1h-1.3zM4.35 7.1h1.3v1.2h-1.3z",
             false,
         ),
         RunStatus::PresumedDead => (
             "presumed-dead",
-            "presumed dead (>10min silent)",
+            crate::help::STATUS_PRESUMED_DEAD,
             "M5 1.3a3.7 3.7 0 1 1 0 7.4 3.7 3.7 0 1 1 0-7.4zM2.4 7.6l5.2-5.2",
             true,
         ),
         RunStatus::Crashed => (
             "crashed",
-            "crashed (non-zero exit)",
+            crate::help::STATUS_CRASHED,
             "M2 2l6 6M8 2 2 8",
             true,
         ),
         RunStatus::Finished => (
             "finished",
-            "finished (clean exit)",
+            crate::help::STATUS_FINISHED,
             "M1.5 5.4 4 7.8l4.6-5.4",
             true,
         ),
-        RunStatus::Unknown => ("unknown", "unknown", DOT, false),
+        RunStatus::Unknown => ("unknown", crate::help::STATUS_UNKNOWN, DOT, false),
     };
     rsx! {
-        span { class: "run-status {state}", role: "img", aria_label: title, title,
+        // One text names the state three ways: the accessible name, the title, and the note contextual help shows (one per state on screen).
+        span { class: "run-status {state}", role: "img", aria_label: title, title, "data-help": title,
             svg {
                 view_box: "0 0 10 10",
                 fill: "currentColor",
@@ -179,12 +180,7 @@ pub fn Sidebar() -> Element {
             .runs
             .read()
             .iter()
-            .filter(|r| {
-                filter_text.is_empty()
-                    || r.run_name.to_lowercase().contains(&filter_text)
-                    || r.run_id.to_lowercase().contains(&filter_text)
-                    || r.ordinal.to_string().contains(&filter_text)
-            })
+            .filter(|r| super::run_matches_filter(r, &filter_text))
             .map(|run| Rc::new(run.clone()))
             .collect();
         let run_ids = runs.iter().map(|run| run.run_id.clone()).collect();
@@ -292,6 +288,7 @@ pub fn Sidebar() -> Element {
                 div { class: "sidebar-actions-end",
                     span {
                         class: "sidebar-meta",
+                        "data-help": if in_trash_mode { crate::help::COUNTER_TRASH } else { crate::help::COUNTER_SHOWN },
                         aria_live: "polite",
                         aria_atomic: "true",
                         "{active_selected_count}/{runs.len()}"
@@ -313,8 +310,10 @@ pub fn Sidebar() -> Element {
                         button {
                             id: "sidebar-trash-trigger",
                             class: "sidebar-trash-trigger icon-button",
-                            title: "Select runs to move to Trash",
+                            title: crate::help::TRASH_SELECT,
+                            // It starts the selection; nothing is deleted until the footer's button.
                             aria_label: "Select runs to move to Trash",
+                            "data-help": crate::help::TRASH_SELECT,
                             disabled: *trash_busy.read(),
                             onmousedown: primary(move |_| {
                                 if *trash_busy.peek() {
@@ -333,6 +332,8 @@ pub fn Sidebar() -> Element {
             div { class: "sidebar-filter-row",
                 input {
                     class: "sidebar-filter",
+                    "data-help": crate::help::RUN_FILTER,
+                    "data-help-within": ":focus",
                     placeholder: "Filter runs...",
                     disabled: in_trash_mode && *trash_busy.read(),
                     value: "{filter}",
@@ -415,7 +416,7 @@ pub fn Sidebar() -> Element {
             }
 
             // Dragged by util/width_drag.js, which sizes its parent: it must stay a direct child of `.sidebar`.
-            div { class: "sidebar-resize" }
+            div { class: "sidebar-resize", "data-help": crate::help::RESIZE }
         }
 
         if let Some(ColorPickerTarget { run_id, run_label, ordinal, opened }) = color_picker_target {
@@ -562,11 +563,8 @@ fn RunRow(
     let color = run_color(&run.run_id, ordinal);
     let hover_name = run.run_name.clone();
     let display_name = sidebar_run_label(&run, show_run_ordinals);
-    let visibility_title = if is_selected {
-        format!("Hide {display_name} from charts")
-    } else {
-        format!("Show {display_name} on charts")
-    };
+    // The row names the run; the accessible names below carry it.
+    let visibility_title = if is_selected { "Hide run" } else { "Show run" };
     let visibility_label = format!("{display_name} visible on charts");
     let status = run.status();
     let row_class = if in_trash_mode && is_pending_trash {
@@ -659,6 +657,7 @@ fn RunRow(
             if in_trash_mode {
                 span { class: "run-marker-toggle",
                     "aria-hidden": "true",
+                    "data-help": crate::help::TRASH_MARKING,
                     span {
                         // Keep chart visibility visible in Trash mode; the selected row class adds deletion fill and its warning halo without a second state check.
                         class: if is_selected {
@@ -674,6 +673,7 @@ fn RunRow(
                 // The label owns the full-height hit target and the row's left padding.
                 label {
                     class: "run-marker-toggle",
+                    "data-help": crate::help::VISIBILITY_DRAG,
                     onmousedown: primary(move |e: Event<MouseData>| {
                         // Paint visibility without taking keyboard focus from another control.
                         e.prevent_default();
@@ -695,7 +695,7 @@ fn RunRow(
                         class: "run-marker run-marker-input",
                         checked: is_selected,
                         style: "--run-color: {color};",
-                        title: "{visibility_title}",
+                        title: visibility_title,
                         aria_label: "{visibility_label}",
                         onchange: move |_| {
                             toggle_membership(&mut state.selected_runs.write(), &run_id_toggle);
@@ -706,7 +706,7 @@ fn RunRow(
             if in_trash_mode {
                 span { class: "run-details",
                     RunStatusIcon { status }
-                    span { class: "run-name-host fade-overflow",
+                    span { class: "run-name-host fade-overflow", "data-help": show_run_ordinals.then_some(crate::help::RUN_NUMBER),
                         span { class: "run-name", "{display_name}" }
                     }
                 }
@@ -740,7 +740,7 @@ fn RunRow(
                     RunLink { project_id: run.project_id.clone(), run_id: run.run_id.clone(),
                         RunStatusIcon { status }
                         // The shared host stays in flow while its pointer-transparent name pops out on hover.
-                        span { class: "run-name-host fade-overflow",
+                        span { class: "run-name-host fade-overflow", "data-help": show_run_ordinals.then_some(crate::help::RUN_NUMBER),
                             span { class: "run-name", "{display_name}" }
                         }
                     }
@@ -749,7 +749,9 @@ fn RunRow(
                     id: "run-overflow-trigger-{ordinal}",
                     class: "run-overflow-trigger icon-button",
                     style: "anchor-name: --run-overflow-{ordinal};",
-                    title: "More actions for {display_name}",
+                    title: crate::help::MORE_ACTIONS,
+                    // Hard to find: shown on every row while help's notes show (kymo.css).
+                    "data-help": crate::help::MORE_ACTIONS,
                     aria_label: "More actions for {display_name}",
                     aria_haspopup: "dialog",
                     aria_controls: "{menu_id}",
@@ -820,6 +822,7 @@ fn RunRow(
                     }
                     div { class: "run-overflow-divider" }
                     button {
+                        "data-help": crate::help::TRASH_RUN,
                         onmousedown: primary({
                             let project_id = run.project_id.clone();
                             let run_id = run.run_id.clone();
@@ -829,7 +832,11 @@ fn RunRow(
                             }
                         }),
                         TrashIcon {}
-                        "Trash"
+                        "Delete"
+                        // The bulk footer warns of this for a selection; a single Delete has no other step to say it in.
+                        if crate::state::app_state::is_live(&run) {
+                            span { class: "run-menu-warning", "Still logging; new points will be dropped" }
+                        }
                     }
                 }
             }

@@ -214,6 +214,9 @@ pub fn UPlotChart(
     smoothed: bool,
     /// The number of the server answer behind `chart` (ChartCacheEntry::reply), so an answer that kept the held model, and so changes no other prop, still reaches the liveness check below.
     reply: u64,
+    /// For contextual help only (uplot_chart/help.js), so neither is among the effect's inputs: a run on the chart may still log, and the step answer shown is a zoomed one.
+    live: bool,
+    step_zoomed: bool,
 ) -> Element {
     let user_config = use_context::<UserConfigState>();
     let chart_id = use_hook(next_chart_id);
@@ -441,7 +444,16 @@ pub fn UPlotChart(
 
     rsx! {
         // Sized by CSS (`--kymo-chart-height`, set by the section or the maximize overlay); create.js and its ResizeObserver follow the box.
-        div { id: "{chart_id}", class: "chart-container" }
+        div {
+            id: "{chart_id}",
+            class: "chart-container",
+            "data-help": crate::help::ZOOM_DRAG,
+            "data-help-fn": "chart",
+            "data-live": live.then_some("true"),
+            "data-smoothed": smoothed.then_some("true"),
+            "data-step-zoomed": step_zoomed.then_some("true"),
+            "data-xnan": chart.0.series.iter().any(|s| s.xnan_count > 1).then_some("true"),
+        }
     }
 }
 

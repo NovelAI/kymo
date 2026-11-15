@@ -17,15 +17,21 @@ use crate::util::{primary, use_live_apply};
 /// Field-id prefix for every options editor; one panel is open at a time.
 pub const OPTIONS_ID_PREFIX: &str = "kymo-options";
 
-/// A field's row, marked when `overridden`, with a dot that resets it to its inherited value.
+/// A field's row, marked when `overridden`, with a dot that resets it to its inherited value. `help` is the row's explanation for the ? button (see util/help.js).
 #[component]
-fn Field(overridden: bool, onreset: EventHandler<()>, children: Element) -> Element {
+fn Field(
+    overridden: bool,
+    onreset: EventHandler<()>,
+    #[props(default)] help: Option<&'static str>,
+    children: Element,
+) -> Element {
     rsx! {
-        div { class: if overridden { "binding-field field-overridden" } else { "binding-field" },
+        div { class: if overridden { "binding-field field-overridden" } else { "binding-field" }, "data-help": help,
             if overridden {
                 button {
                     class: "field-reset-dot",
-                    title: "Reset to inherited value",
+                    title: crate::help::RESET_INHERITED,
+                    "data-help": crate::help::RESET_INHERITED,
                     onmousedown: primary(move |_| onreset.call(())),
                     "●"
                 }
@@ -227,11 +233,14 @@ fn override_chips(
                         OverrideTarget::Rect(_) => ("", "Chart"),
                     };
                     let text = format!("{prefix}{} = {}", o.label, pretty_option_value(field, &o.value));
-                    let title = format!("{kind} \"{}\" overrides this field — click to clear so it re-inherits", o.label);
+                    // The chip's own text names what overrides; its accessible name says the rest.
+                    let name = format!("{kind} \"{}\" overrides this field — click to clear so it re-inherits", o.label);
                     rsx! {
                         button {
                             class: "override-chip",
-                            title: "{title}",
+                            title: crate::help::CLEAR_OVERRIDE,
+                            aria_label: "{name}",
+                            "data-help": crate::help::CLEAR_OVERRIDE,
                             onmousedown: primary(move |_| {
                                 state.clear_option_pin(&o);
                                 cleared.write().push(o.clone());
@@ -266,6 +275,7 @@ pub fn ProjectDefaultsEditor(return_focus_id: String) -> Element {
     rsx! {
         OptionsPanel {
             title: "Project settings",
+            help: format!("{}\n{}\n{}", crate::help::LIVE_EDITING, crate::help::DEFAULTS, crate::help::LAYOUT_SAVED),
             return_focus_ids: vec![return_focus_id],
             revert_disabled: unchanged,
             on_revert: {
@@ -284,15 +294,20 @@ pub fn ProjectDefaultsEditor(return_focus_id: String) -> Element {
     }
 }
 
-/// Collapsible editor content, open until the user collapses it.
+/// Collapsible editor content, open until the user collapses it. `help` is its explanation for the ? button (see util/help.js), shown while it is open.
 #[component]
-pub fn EditorSection(title: String, children: Element) -> Element {
+pub fn EditorSection(
+    title: String,
+    #[props(default)] help: Option<&'static str>,
+    children: Element,
+) -> Element {
     let mut open = use_signal(|| true);
     rsx! {
         button {
             r#type: "button",
             class: "editor-section-label editor-section-toggle",
             aria_expanded: *open.read(),
+            "data-help": help.filter(|_| *open.read()),
             onmousedown: primary(move |_| open.toggle()),
             span { class: "editor-section-arrow",
                 aria_hidden: "true",
@@ -371,14 +386,14 @@ pub fn SmoothingFields(
             {chips_for("smoothing_poly_order")}
         }
         if o.smoothing == SmoothingAlgorithm::BiweightPolyfit {
-            Field { overridden: o.smoothing_window != anchor.smoothing_window, onreset: move |_| draft.write().smoothing_window = anchor.smoothing_window,
+            Field { overridden: o.smoothing_window != anchor.smoothing_window, help: crate::help::WINDOW, onreset: move |_| draft.write().smoothing_window = anchor.smoothing_window,
                 {window_slider.inputs("window", "Window", f64::from(o.smoothing_window), write_window)}
             }
             {chips_for("smoothing_window")}
         }
         if o.smoothing == SmoothingAlgorithm::EmaPolyfit {
-            Field { overridden: o.smoothing_alpha != anchor.smoothing_alpha, onreset: move |_| draft.write().smoothing_alpha = anchor.smoothing_alpha,
-                {tc_slider.inputs("time-constant", "Time constant (steps)", ema_time_constant(o.smoothing_alpha), write_time_constant)}
+            Field { overridden: o.smoothing_alpha != anchor.smoothing_alpha, help: crate::help::TIME_CONSTANT, onreset: move |_| draft.write().smoothing_alpha = anchor.smoothing_alpha,
+                {tc_slider.inputs("time-constant", "Decay length", ema_time_constant(o.smoothing_alpha), write_time_constant)}
             }
             {chips_for("smoothing_alpha")}
         }
@@ -420,7 +435,7 @@ pub fn AxisFields(
         {chips_for("log_x")}
         {log_field("Y", o.log_y, anchor.log_y, |options, value| options.log_y = value)}
         {chips_for("log_y")}
-        Field { overridden: o.max_runs != anchor.max_runs, onreset: move |_| draft.write().max_runs = anchor.max_runs,
+        Field { overridden: o.max_runs != anchor.max_runs, help: crate::help::MAX_RUNS, onreset: move |_| draft.write().max_runs = anchor.max_runs,
             label { r#for: "{OPTIONS_ID_PREFIX}-max-runs", "Max runs" }
             input {
                 id: "{OPTIONS_ID_PREFIX}-max-runs",

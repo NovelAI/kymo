@@ -69,6 +69,8 @@ function updateHover(u){
     // Columns are name/value/[raw]/[x] on the source, value/[x] on peers. Borrowed x metadata gets its own column so numeric values stay aligned.
     let hasPointX=order.some(i=>idxs[i]!==idx);
     let rows='';
+    // The gray column's first populated cell is classed for what it holds, a raw value or a range, so contextual help can label it (kymo.css).
+    let gray=false;
     for(let oi=0;oi<order.length;oi++){
       let i=order[oi];
       let pi=idxs[i];
@@ -86,14 +88,16 @@ function updateHover(u){
           // Equal envelope bounds need one raw value, which smoothing may still need beside the plotted value.
           let mb=1+i*rawStride+(hasRaw?1:0);
           let lo=hasRange?u.data[mb][pi]:null,hi=hasRange?u.data[mb+1][pi]:null;
-          let rs;
+          let rs,range=false;
           if(lo==null||hi==null||lo==hi){
             let rv=hasRaw?u.data[1+i*rawStride][pi]:(isSmoothed?lo:null);
             rs=rv==null?'':rv.toPrecision(4);
           }else{
-            rs=lo.toPrecision(4)+'\u2013'+hi.toPrecision(4);
+            rs=lo.toPrecision(4)+'\u2013'+hi.toPrecision(4);range=true;
           }
-          row+='<span class="kymo-tip-raw">'+rs+'</span>';
+          let first=!gray&&rs?(range?' kymo-tip-range':' kymo-tip-rawval'):'';
+          if(first)gray=true;
+          row+='<span class="kymo-tip-raw'+first+'">'+rs+'</span>';
         }
         rows+=row+pointX+'</div>';
       }else{

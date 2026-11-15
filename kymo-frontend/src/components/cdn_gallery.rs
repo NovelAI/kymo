@@ -160,7 +160,7 @@ fn gallery_image(
             img { src: "{url}", loading: "lazy", alt: "" }
         }
         if let Some(caption) = &item.caption {
-            CopyText { text: caption.clone(), class: "cdn-caption" }
+            CopyText { text: caption.clone(), class: "cdn-caption", help: crate::help::CLICK_TO_COPY }
         }
     }
 }
@@ -826,8 +826,11 @@ pub fn CdnGallery(
     let mut shown: Vec<RunManifest> = Vec::new();
     let mut sources: Vec<ManifestSource> = Vec::new();
     let (mut pending_live, mut pending_ended) = (Vec::new(), Vec::new());
+    // A source with nothing logged at the shown step is left out of the grid, which contextual help says.
+    let mut absent = false;
     for run in &runs {
         let Some((_, key)) = run.keys.iter().find(|(s, _)| Some(*s) == step) else {
+            absent = true;
             continue;
         };
         if key.starts_with("pending:") {
@@ -974,7 +977,12 @@ pub fn CdnGallery(
             // Step slider — pointless with a single step (e.g. info/run_info metadata, always step 0)
             if total_steps > 1 {
                 // MAXIMIZE_KEYS_JS (dashboard_layout.rs) presses the step buttons by aria-label for ↑/↓ in a maximized panel.
-                div { class: "cdn-step-nav",
+                div { class: "cdn-step-nav", "data-help": match (runs.iter().any(|run| !run.ended), absent) {
+                    (true, true) => Some(format!("{}\n{}", crate::help::GALLERY_STEP_HOLD, crate::help::GALLERY_STEP_RUNS)),
+                    (true, false) => Some(crate::help::GALLERY_STEP_HOLD.to_string()),
+                    (false, true) => Some(crate::help::GALLERY_STEP_RUNS.to_string()),
+                    (false, false) => None,
+                },
                     button {
                         class: "cdn-nav-btn icon-button",
                         title: "Previous step",
@@ -1013,7 +1021,13 @@ pub fn CdnGallery(
                         }),
                         CaretRightIcon {}
                     }
-                    span { class: "cdn-step-label", "step {step} ({current_step}/{total_steps})" }
+                    span {
+                        class: "cdn-step-label",
+                        // The keys work only on a maximized panel (MAXIMIZE_KEYS_JS).
+                        "data-help": crate::help::GALLERY_STEP_KEYS,
+                        "data-help-within": ".maximize-content",
+                        "step {step} ({current_step}/{total_steps})"
+                    }
                 }
             }
 
@@ -1436,6 +1450,7 @@ fn SelectIndexView(
                 r#type: "range",
                 class: "cdn-step-slider",
                 aria_label: "Image index",
+                "data-help": crate::help::SAME_IMAGE_POSITION,
                 aria_valuetext: "Image {current} of {max_items}",
                 min: "0",
                 max: "{max_items - 1}",

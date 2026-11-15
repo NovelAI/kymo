@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use dioxus::prelude::*;
 
-use crate::grpc::proto::{RunInfo, RunRecord};
+use crate::grpc::proto::{RunInfo, RunRecord, RunStatus};
 use crate::grpc::GrpcClient;
 use crate::route::Route;
 use crate::state::layout_config::{
@@ -971,6 +971,11 @@ pub fn use_version_bridge(
 /// Find a RunInfo by run_id (UUID).
 pub fn find_run<'a>(runs: &'a [RunInfo], run_id: &str) -> Option<&'a RunInfo> {
     runs.iter().find(|r| r.run_id == run_id)
+}
+
+/// Whether a run may still log: running, or stuck (alive, though its main metrics stalled).
+pub fn is_live(run: &RunInfo) -> bool {
+    matches!(run.status(), RunStatus::Running | RunStatus::Stuck)
 }
 
 /// Rewrite a ChartSeries label from the server by replacing its owning run's run_id with the run's name.

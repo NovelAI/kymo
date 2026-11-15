@@ -109,7 +109,7 @@ pub fn MetadataViewer(
     }
 
     rsx! {
-        div { class: "metadata-viewer",
+        div { class: "metadata-viewer", "data-help": if diff_only && columns.len() > 1 { format!("{}\n{}", crate::help::METADATA_COPY, crate::help::METADATA_DIFF_ONLY) } else { crate::help::METADATA_COPY.to_string() },
             table { class: "metadata-table",
                 thead {
                     tr {
@@ -280,9 +280,19 @@ fn value_cell(column: &MetadataColumn, tint: bool, value: Option<&Value>) -> Ele
         let display = format_value(value);
         (copy_payload(value, &display).to_owned(), display)
     });
+    let help = match (tint, cell.is_none()) {
+        (true, true) => Some(format!(
+            "{}\n{}",
+            crate::help::METADATA_TINT,
+            crate::help::METADATA_BLANK
+        )),
+        (true, false) => Some(crate::help::METADATA_TINT.to_string()),
+        (false, true) => Some(crate::help::METADATA_BLANK.to_string()),
+        (false, false) => None,
+    };
     rsx! {
         // An untinted cell has no style: Dioxus keeps the old background when it sets `style: ""`.
-        td { class: "metadata-val-cell", style: tint.then(|| format!("background: {}22;", column.color)),
+        td { class: "metadata-val-cell", style: tint.then(|| format!("background: {}22;", column.color)), "data-help": help,
             if let Some((text, display)) = cell {
                 CopyText { text, display, class: "metadata-copy-value" }
             }

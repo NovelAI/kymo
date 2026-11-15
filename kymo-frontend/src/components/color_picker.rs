@@ -20,6 +20,8 @@ pub fn ColorPicker(
     rsx! {
         div {
             class: "color-picker",
+            // On the dialog itself, so the note falls below it and covers no swatch.
+            "data-help": crate::help::COLOR_SAVED,
             style: "position-anchor: --run-overflow-{anchor_ordinal};",
             popover: "auto",
             role: "dialog",

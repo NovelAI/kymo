@@ -227,7 +227,7 @@ def rename_reveal(page):
     configured = named_section(page, name)
     before = main.evaluate(scroll_top)
     name.fill("Z configured while named")
-    configured.locator('.section-header button[title="Configure"]').click()
+    configured.locator('.section-header button[title="Configure section"]').click()
     settings = options_panel(page, "Configure section")
     expect(configured.locator(".section-header")).to_be_in_viewport(ratio=0.99)
     assert main.evaluate(scroll_top) > before + 2000
@@ -249,7 +249,7 @@ def rename_reveal(page):
     )
     render_turn(page)
     before = main.evaluate(scroll_top)
-    tail.locator('.section-header button[title="Configure"]').click()
+    tail.locator('.section-header button[title="Configure section"]').click()
     settings = options_panel(page, "Configure section")
     expect(other.locator(".section-name")).to_have_text("B named while another opens")
     render_turn(page)
@@ -261,7 +261,7 @@ def rename_reveal(page):
         "rename: the settings Name moves the page once the edit settles, not while typing",
         flush=True,
     )
-    section.locator('.section-header button[title="Configure"]').click()
+    section.locator('.section-header button[title="Configure section"]').click()
     settings = options_panel(page, "Configure section")
     editor_name = settings.get_by_role("textbox", name="Name", exact=True)
     # The panel body's mount focus repeats a task later; let it land before taking the field.
@@ -296,7 +296,7 @@ def rename_reveal(page):
     assert main.evaluate(scroll_top) == 0
 
     print("rename: Revert follows a rename still being typed back", flush=True)
-    section.locator('.section-header button[title="Configure"]').click()
+    section.locator('.section-header button[title="Configure section"]').click()
     settings = options_panel(page, "Configure section")
     editor_name = settings.get_by_role("textbox", name="Name", exact=True)
     render_turn(page)
@@ -339,7 +339,7 @@ def rename_reveal(page):
     added = named_section(page, name)
     name.fill("Z panel added while named")
     empty_add_panel(added).click()
-    chart_settings = options_panel(page, "Configure Metric")
+    chart_settings = options_panel(page, "Chart settings")
     picker = chart_settings.get_by_role("combobox", name="Source 1 metric", exact=True)
     expect(picker).to_be_focused()
     picker.select_option(PRIMARY)
@@ -349,7 +349,7 @@ def rename_reveal(page):
     print("rename: renaming a tall section in place leaves the page still", flush=True)
     main.evaluate("e => e.scrollTop = 0")
     logs = page.locator('.section[data-section-id="logs"]')
-    logs.locator('.section-header button[title="Configure"]').click()
+    logs.locator('.section-header button[title="Configure section"]').click()
     settings = options_panel(page, "Configure section")
     editor_name = settings.get_by_role("textbox", name="Name", exact=True)
     render_turn(page)
@@ -429,7 +429,7 @@ def rename_reveal(page):
     )
     # Not A one: the drag above anchored A two to it, so A two would move with its rename.
     main.evaluate("e => e.scrollTop = 0")
-    other.locator('.section-header button[title="Configure"]').click()
+    other.locator('.section-header button[title="Configure section"]').click()
     settings = options_panel(page, "Configure section")
     editor_name = settings.get_by_role("textbox", name="Name", exact=True)
     render_turn(page)
@@ -539,7 +539,7 @@ def checks(page, url):
     }}""")
     add_section = page.get_by_title("Add a section", exact=True)
     name = page.get_by_role("textbox", name="Section name", exact=True)
-    panel = options_panel(page, "Configure Metric")
+    panel = options_panel(page, "Chart settings")
     picker = panel.get_by_role("combobox", name="Source 1 metric", exact=True)
     filter_input = page.get_by_placeholder("Filter panels", exact=True)
     main = page.locator("main.main-content")
@@ -638,7 +638,7 @@ def checks(page, url):
     new = named_section(page, name)
     name.fill("Deleted while named")
     page.once("dialog", lambda dialog: dialog.accept())
-    new.get_by_title("Delete section", exact=True).click()
+    new.get_by_role("button", name="Delete section", exact=True).click()
     expect(new).to_have_count(0)
     add_section.click()
     expect(name).to_be_focused()
@@ -648,7 +648,7 @@ def checks(page, url):
     print("section settings opens with the completed inline name", flush=True)
     add_section.click()
     name.fill("Name before settings")
-    section_of(name).get_by_title("Configure", exact=True).click()
+    section_of(name).get_by_title("Configure section", exact=True).click()
     settings = options_panel(page, "Configure section")
     expect(settings.get_by_role("textbox", name="Name", exact=True)).to_have_value(
         "Name before settings"
@@ -716,7 +716,7 @@ def checks(page, url):
     expect(section.locator(".metric-rect")).to_have_count(2)
 
     print("header add: returns to the last page of a paginated section", flush=True)
-    section.locator('.section-header button[title="Configure"]').click()
+    section.locator('.section-header button[title="Configure section"]').click()
     settings = options_panel(page, "Configure section")
     settings.get_by_role("spinbutton", name="Columns", exact=True).fill("1")
     settings.get_by_role("spinbutton", name="Rows / page", exact=True).fill("1")
@@ -734,7 +734,7 @@ def checks(page, url):
     # Off-screen panels render placeholders, so bring one back first.
     chart = page.locator('.section[data-section-id="logs"] .metric-rect').first
     chart.scroll_into_view_if_needed()
-    chart.get_by_title("Configure", exact=True).click()
+    chart.get_by_role("button", name="Chart settings", exact=True).click()
     expect(panel_body(panel)).to_be_focused()
     pointer_open(page, add_section, name)
     expect(page.locator(".maximize-overlay")).to_have_count(0)

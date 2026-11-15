@@ -141,7 +141,7 @@ input[type="range"]:focus::-moz-range-thumb {
 .navbar-action:hover, .section-action:hover, .rect-action:hover, .navbar-search-clear:hover, .options-panel-close:hover { color: var(--text-headings); }
 .delete-action:hover { color: var(--warning); }
 /* A panel trigger whose panel is open shows pressed, and closes it. */
-.navbar-action[aria-expanded="true"], .section-action[aria-expanded="true"] {
+.navbar-action[aria-expanded="true"], .section-action[aria-expanded="true"], .navbar-help[aria-pressed="true"] {
     color: var(--text-headings);
     background: var(--bg3);
     opacity: 1;
@@ -527,6 +527,8 @@ input[type="checkbox"]:checked::before {
 @media (hover: none) {
     .run-overflow-trigger { opacity: 1; z-index: 62; }
 }
+/* While contextual help's notes show, so its note has dots to point at. */
+:root[data-kymo-help] .run-overflow-trigger { opacity: 1; z-index: 62; }
 
 /* Native label semantics: any click on the label toggles visibility, so its
    padding and stretched height ARE the enlarged hitbox. Split the original
@@ -1082,10 +1084,11 @@ input[type="checkbox"]:checked::before {
 }
 
 .rect-title-text { min-width: 0; }
+/* Over the title's grown hover target, so the text itself takes the hit: contextual help's note goes beside the text, not at the far end of the header. */
+.rect-title-pop { position: relative; z-index: 2; }
 /* Hover reveals the full title. The text stays in flow — position:fixed (the sidebar idiom) detaches from a scrolling chart — so the clips above it open instead: the fade box here and the card in the :has below. Background+z-index sit on the inner span, whose box spans the full text even while the outer clips it. */
 .rect-title:hover .rect-title-text { overflow: visible; mask-image: none; }
 .rect-title:hover .rect-title-pop {
-    position: relative;
     background: var(--bg1);
     /* above the actions row (55), below the chart tips (70) */
     z-index: 60;
@@ -1443,7 +1446,71 @@ input[type="checkbox"]:checked::before {
     user-select: none;
 }
 
-/* === uPlot Tooltip === */
+/* === Contextual Help === */
+/* util/help.js places one note beside each explained control while the navbar's ? is hovered, focused or pinned; a note for a control inside a popover is that popover's child, so it paints above it. Notes take no pointer events and sit above everything in the page but the top layer and the hovered chart's readout. */
+.navbar-help { min-width: 1lh; font-weight: 600; }
+.kymo-help-note {
+    position: fixed;
+    left: 0;
+    top: 0;
+    width: max-content;
+    max-width: min(22rem, calc(100vw - 8px));
+    pointer-events: none;
+    z-index: 95;
+    white-space: pre-line;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+}
+/* A note and a chart readout's label (below) look the same. */
+.kymo-help-note, :root[data-kymo-help] .kymo-tip-src :is(.kymo-tip-row:first-child > .kymo-tip-val, .kymo-tip-rawval, .kymo-tip-range)::after {
+    padding: 1px 6px;
+    border-radius: 3px;
+    background: var(--text-headings);
+    color: var(--bg0);
+    font: 600 var(--font-size-12)/1.4 var(--font-ui);
+}
+/* A tick on the edge that faces the target, aimed at it (--tick, help.js); a note in its target's corner has no side and no tick. */
+.kymo-help-note[data-side]::before {
+    content: "";
+    position: absolute;
+    left: var(--tick);
+    border: 4px solid transparent;
+}
+.kymo-help-note[data-side="below"]::before { bottom: 100%; border-bottom-color: var(--text-headings); }
+.kymo-help-note[data-side="above"]::before { top: 100%; border-top-color: var(--text-headings); }
+.kymo-help-note[data-side="beside"]::before { left: auto; right: 100%; top: var(--tick); border-right-color: var(--text-headings); }
+.kymo-help-note[data-side="before"]::before { left: 100%; top: var(--tick); border-left-color: var(--text-headings); }
+/* A note with no room against its control sits further off, with a line (--reach long, set by help.js) back to the control in place of the tick. The line passes under the notes in between, which is why such a note paints beneath the others. */
+.kymo-help-note[data-far] { z-index: 94; }
+.kymo-help-note[data-far]::before { border: 0; background: var(--text-headings); width: 2px; height: var(--reach); margin-left: 3px; }
+.kymo-help-note[data-far]:is([data-side="beside"], [data-side="before"])::before { width: var(--reach); height: 2px; margin: 3px 0 0; }
+
+/* A chart readout's own labels (left on it as custom properties by uplot_chart/help.js), each just over a value of the hovered chart's readout with a tick down at it, while help's notes show: one on the first row's colored value, one on the gray column's first populated cell, saying what it holds, a raw value or a range (hover.js classes that cell). They lie over what is above them (the readout's header line), out of flow, so the readout keeps the size hover.js measured; the gray one can reach past the readout's right edge, and so past the window's when the readout is against it. */
+/* The readout under the pointer goes over the page's notes (z-index 95), which would otherwise hide what is being read. */
+:root[data-kymo-help] .kymo-tip-src { z-index: 96; }
+:root[data-kymo-help] .kymo-tip-src :is(.kymo-tip-row:first-child > .kymo-tip-val, .kymo-tip-rawval, .kymo-tip-range) { position: relative; }
+:root[data-kymo-help] .kymo-tip-src :is(.kymo-tip-row:first-child > .kymo-tip-val, .kymo-tip-rawval, .kymo-tip-range)::after { position: absolute; bottom: calc(100% + 5px); }
+:root[data-kymo-help] .kymo-tip-src .kymo-tip-row:first-child > .kymo-tip-val::after { content: var(--help-colored, none); right: 0; }
+:root[data-kymo-help] .kymo-tip-src .kymo-tip-rawval::after { content: var(--help-raw, none); left: 0; }
+:root[data-kymo-help] .kymo-tip-src .kymo-tip-range::after { content: var(--help-range, none); left: 0; }
+/* The tick, drawn where its label is (the same property gives both their content, and none of either where it is unset): at the value's middle, but no further from the label's own end than the shortest label reaches (a range is wider than "Range"). */
+:root[data-kymo-help] .kymo-tip-src :is(.kymo-tip-row:first-child > .kymo-tip-val, .kymo-tip-rawval, .kymo-tip-range)::before {
+    position: absolute;
+    bottom: 100%;
+    left: max(3px, min(50% - 5px, 1.5 * var(--font-size-12)));
+    width: 0;
+    height: 0;
+    overflow: hidden;
+    border: 5px solid transparent;
+    border-bottom: 0;
+    border-top-color: var(--text-headings);
+}
+:root[data-kymo-help] .kymo-tip-src .kymo-tip-rawval::before { content: var(--help-raw, none); }
+:root[data-kymo-help] .kymo-tip-src .kymo-tip-range::before { content: var(--help-range, none); }
+:root[data-kymo-help] .kymo-tip-src .kymo-tip-row:first-child > .kymo-tip-val::before { content: var(--help-colored, none); left: auto; right: max(3px, min(50% - 5px, 1.5 * var(--font-size-12))); }
+/* Not while a mouse button is held (data-kymo-held, which matches nothing but these): the labels go with the notes. Listed after the rules above and no less specific. */
+:root[data-kymo-help][data-kymo-held] .kymo-tip-src .kymo-tip-grid .kymo-tip-row > :is(.kymo-tip-val, .kymo-tip-raw)::before,
+:root[data-kymo-help][data-kymo-held] .kymo-tip-src .kymo-tip-grid .kymo-tip-row > :is(.kymo-tip-val, .kymo-tip-raw)::after { content: none; }
+
 .kymo-tip {
     /* fixed: positioned in viewport coords beside the cursor's vertical
        line, free to overflow the chart and any clipping ancestor */
@@ -1968,6 +2035,9 @@ input[type="checkbox"]:checked::before {
     text-align: left;
 }
 .run-overflow-menu button:hover { background: var(--bg2); }
+/* What deleting a run that is still logging costs, on a line of its own under the item's label. */
+.run-overflow-menu button:has(.run-menu-warning) { flex-wrap: wrap; }
+.run-menu-warning { flex-basis: 100%; color: var(--warning); }
 .run-overflow-divider {
     height: 1px;
     margin: var(--spacing-xs) 0;

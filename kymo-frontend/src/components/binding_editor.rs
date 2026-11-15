@@ -346,7 +346,8 @@ pub fn BindingEditor(
 
     rsx! {
         OptionsPanel {
-            title: "Configure Metric",
+            title: "Chart settings",
+            help: format!("{}\n{}", crate::help::LIVE_EDITING, crate::help::LAYOUT_SAVED),
             target: rect_title(&rect),
             // The opener, then the maximized chart's own Configure (shown again as the panel goes), then its grid copy's (once closing un-maximizes the chart).
             return_focus_ids: vec![return_focus_id, editor_trigger_id("rect-max", &rect.id), editor_trigger_id("rect-grid", &rect.id)],
@@ -385,6 +386,7 @@ pub fn BindingEditor(
 
             button {
                 class: "btn-link",
+                "data-help": crate::help::ADD_SOURCE,
                 onmousedown: primary(move |_| {
                     let row_id = *next_row_id.peek();
                     next_row_id.set(row_id + 1);
@@ -394,7 +396,7 @@ pub fn BindingEditor(
                         metric_name: String::new(),
                     }));
                 }),
-                "+ Add Source"
+                "+ Add data source"
             }
 
             if is_numeric {
@@ -431,7 +433,7 @@ pub fn BindingEditor(
                             }
                         }
                         if matches!(draft_opts.read().x_axis_mode, XAxisMode::Step) {
-                            div { class: "binding-field",
+                            div { class: "binding-field", "data-help": crate::help::X_METRIC,
                                 label { r#for: "{OPTIONS_ID_PREFIX}-x-metric", "X metric" }
                                 {
                                     let x_val = draft_opts.read().x_axis_metric.clone();
@@ -478,15 +480,16 @@ pub fn BindingEditor(
                         div { class: "binding-field",
                             label { r#for: "{OPTIONS_ID_PREFIX}-mode", "Mode" }
                             {
-                                let cdn_mode_value = match &draft_opts.read().cdn_display_mode {
-                                    CdnDisplayMode::SelectIndex => "select_index",
-                                    CdnDisplayMode::GroupByRun => "group_by_run",
-                                    CdnDisplayMode::Interleaved => "interleaved",
+                                let (cdn_mode_value, cdn_mode_help) = match &draft_opts.read().cdn_display_mode {
+                                    CdnDisplayMode::SelectIndex => ("select_index", Some(crate::help::SAME_IMAGE_POSITION)),
+                                    CdnDisplayMode::GroupByRun => ("group_by_run", None),
+                                    CdnDisplayMode::Interleaved => ("interleaved", Some(crate::help::INTERLEAVED)),
                                 };
                                 rsx! {
                                     select {
                                         id: "{OPTIONS_ID_PREFIX}-mode",
                                         value: "{cdn_mode_value}",
+                                        "data-help": cdn_mode_help,
                                         onchange: move |e: Event<FormData>| {
                                             let m = match e.value().as_str() {
                                                 "group_by_run" => CdnDisplayMode::GroupByRun,
@@ -531,7 +534,7 @@ pub fn BindingEditor(
             div { class: "editor-section-label", "Appearance" }
 
             div { class: "editor-options",
-                div { class: "binding-field",
+                div { class: "binding-field", "data-help": crate::help::WIDTH,
                     label { r#for: "{OPTIONS_ID_PREFIX}-width", "Width" }
                     input {
                         id: "{OPTIONS_ID_PREFIX}-width",
@@ -1108,7 +1111,7 @@ fn BindingRow(
     let remove_label = format!("Remove source {}", index + 1);
 
     rsx! {
-        div { class: "binding-row",
+        div { class: "binding-row", "data-help": is_foreign.then_some(crate::help::NAMED_PROJECT_RUNS),
             div { class: "binding-row-header",
                 span { class: "binding-label", "Source {index + 1}" }
                 button {
@@ -1166,6 +1169,11 @@ fn BindingRow(
                         id: "{id_prefix}-runs",
                         aria_label: "{runs_label}",
                         value: "{runs_value}",
+                        "data-help": match runs_value {
+                            SELECTED_RUNS_VALUE => Some(crate::help::SHOWN_RUNS),
+                            SPECIFIC_RUNS_VALUE => Some(crate::help::SPECIFIC_RUNS),
+                            _ => None,
+                        },
                         onchange: {
                             let binding = binding.clone();
                             move |e: Event<FormData>| {

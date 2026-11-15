@@ -77,6 +77,17 @@ pub(crate) fn sidebar_needs_run_ordinals(runs: &[RunInfo]) -> bool {
     names_repeat(runs.iter().map(|run| run.run_name.as_str()))
 }
 
+/// Whether the run filter's text (lowercased) finds a run: in its name, in its ID, or in its number, which may be typed as the list shows it, with a `#`.
+pub(crate) fn run_matches_filter(run: &RunInfo, filter: &str) -> bool {
+    filter.is_empty()
+        || run.run_name.to_lowercase().contains(filter)
+        || run.run_id.to_lowercase().contains(filter)
+        || run
+            .ordinal
+            .to_string()
+            .contains(filter.strip_prefix('#').unwrap_or(filter))
+}
+
 pub(crate) fn sidebar_run_label(run: &RunInfo, show_ordinal: bool) -> String {
     if show_ordinal {
         format!("{} #{}", run.run_name, run.ordinal)
@@ -159,10 +170,7 @@ fn remove_owned_legacy_run_selections(project_id: &str) {
 fn live_trash_warning(runs: &[RunInfo], pending: &HashSet<String>) -> String {
     let live = runs
         .iter()
-        .filter(|run| {
-            pending.contains(&run.run_id)
-                && matches!(run.status(), RunStatus::Running | RunStatus::Stuck)
-        })
+        .filter(|run| pending.contains(&run.run_id) && crate::state::app_state::is_live(run))
         .count();
     match live {
         0 => String::new(),
@@ -753,8 +761,9 @@ mod selection_pick_tests {
         all_or_none_selection, apply_rename_if_current, continue_selection_paint,
         is_json_run_selection, legacy_selected_runs_v1_key, legacy_selected_runs_v2_key,
         live_trash_warning, persisted_run_selection, restored_json_run_selection,
-        restored_run_selection, run_list_empty_message, selected_runs_key, selection_action_label,
-        sidebar_needs_run_ordinals, sidebar_run_label, summarize_trash_results, SelectionPaint,
+        restored_run_selection, run_list_empty_message, run_matches_filter, selected_runs_key,
+        selection_action_label, sidebar_needs_run_ordinals, sidebar_run_label,
+        summarize_trash_results, SelectionPaint,
     };
 
     #[test]
@@ -871,6 +880,26 @@ mod selection_pick_tests {
         assert_eq!(run_list_empty_message(0, 0), Some("No runs"));
         assert_eq!(run_list_empty_message(3, 0), Some("No matching runs"));
         assert_eq!(run_list_empty_message(3, 2), None);
+    }
+
+    #[test]
+    fn the_run_filter_matches_names_ids_and_numbers_with_or_without_the_hash() {
+        let run = RunInfo {
+            run_name: "Baseline".to_string(),
+            run_id: "3F9C-ab".to_string(),
+            ordinal: 117,
+            ..Default::default()
+        };
+        // A `#` alone, on the way to a number, narrows nothing.
+        for hit in ["", "base", "3f9c", "117", "#117", "#11", "17", "#17", "#"] {
+            assert!(run_matches_filter(&run, hit), "{hit:?} should find the run");
+        }
+        for miss in ["118", "#118", "candidate", "#base"] {
+            assert!(
+                !run_matches_filter(&run, miss),
+                "{miss:?} should not find the run"
+            );
+        }
     }
 
     #[test]

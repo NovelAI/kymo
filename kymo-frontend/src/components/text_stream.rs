@@ -15,7 +15,7 @@ use wasm_bindgen::JsCast;
 
 use crate::components::sidebar::{names_repeat, sidebar_run_label};
 use crate::components::uplot_chart::{hash_color, run_color};
-use crate::grpc::proto::{RunInfo, RunStatus, SeriesRef, TextLine};
+use crate::grpc::proto::{RunInfo, SeriesRef, TextLine};
 use crate::state::app_state::find_run;
 use crate::state::visibility::{self, Zone};
 use crate::state::{stamp_covers, DashboardState, UserConfigState};
@@ -229,7 +229,8 @@ pub fn TextStreamViewer(
                     class: "text-stream-search",
                     placeholder: "Search logs",
                     aria_label: "Search logs",
-                    title: "Search is performed on the server",
+                    title: crate::help::LOG_SEARCH,
+                    "data-help": crate::help::LOG_SEARCH,
                     maxlength: 128,
                     value: "{search_draft}",
                     oninput: move |event| search_draft.set(event.value()),
@@ -281,10 +282,7 @@ pub fn TextStreamViewer(
 
             if let (Some(run), Some(log_key)) = (runs.get(active), active_log) {
                 {
-                    // Stuck runs are alive but not logging, so their tail is still live.
-                    let live = find_run(&display_runs, &run.run_id).is_some_and(|info| {
-                        matches!(info.status(), RunStatus::Running | RunStatus::Stuck)
-                    });
+                    let live = find_run(&display_runs, &run.run_id).is_some_and(crate::state::app_state::is_live);
                     rsx! {
                         VirtualTextLog {
                             key: "{log_key}",
@@ -498,6 +496,7 @@ fn VirtualTextLog(
             class: "text-stream-log",
             role: "tabpanel",
             aria_label: "{display_name}",
+            "data-help": (live && search.is_empty()).then_some(crate::help::LOG_FOLLOW),
             style: "--kymo-text-line-height: {line_height_px}px;",
             onmounted: move |event| {
                 let Some(element) = event.data().downcast::<web_sys::Element>()

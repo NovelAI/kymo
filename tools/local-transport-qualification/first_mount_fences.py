@@ -595,11 +595,11 @@ def mount_scope(page: Page, peer: ScopePeer, origin: str) -> None:
 
 def remove_external_scope(page: Page, peer: ScopePeer) -> dict:
     before = dict(peer.scope_polls)
-    page.get_by_title("Delete section", exact=True).click()
+    page.get_by_role("button", name="Delete section", exact=True).click()
     drive(page, peer, lambda: peer.scope_polls[PROJECT] > before[PROJECT])
     settle(page, peer)
     assert peer.scope_polls["other"] == before["other"], peer.scope_polls
-    assert page.get_by_title("Delete section", exact=True).count() == 0
+    assert page.get_by_role("button", name="Delete section", exact=True).count() == 0
     return before
 
 

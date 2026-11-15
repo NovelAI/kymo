@@ -354,7 +354,9 @@ fn MetricRectBody(
     });
     rsx! {
         Fragment {
-            div { class: "rect-header",
+            div {
+                class: "rect-header",
+                "data-help": is_maximized.then_some(crate::help::MAXIMIZED_KEYS),
                 if *renaming.read() {
                     {
                         let id = config.id.clone();
@@ -403,7 +405,11 @@ fn MetricRectBody(
                                 },
                                 // Inner span is the hover reveal (.rect-title-pop in kymo.css).
                                 span { class: "rect-title-text fade-overflow",
-                                    span { class: "rect-title-pop", "{display_title}" }
+                                    span {
+                                        class: "rect-title-pop",
+                                        "data-help": (!out_of_layout).then_some(crate::help::CHART_TITLE),
+                                        "{display_title}"
+                                    }
                                 }
                             }
                         }
@@ -413,7 +419,8 @@ fn MetricRectBody(
                     if !is_maximized {
                         button {
                             class: "rect-action icon-button",
-                            title: "Maximize",
+                            title: crate::help::MAXIMIZE,
+                            "data-help": crate::help::MAXIMIZE,
                             onmousedown: primary({
                                 let id = config.id.clone();
                                 move |_| focus_chart(Some(id.clone()))
@@ -425,7 +432,8 @@ fn MetricRectBody(
                         button {
                             id: "{trigger_id}",
                             class: "rect-action icon-button",
-                            title: "Configure",
+                            title: crate::help::CHART_SETTINGS,
+                            "data-help": crate::help::CHART_SETTINGS,
                             onmousedown: primary({
                                 let rect = config.clone();
                                 move |_| {
@@ -454,12 +462,14 @@ fn MetricRectBody(
                     } else {
                         button {
                             class: "rect-action delete-action icon-button",
-                            title: "Delete chart",
+                            title: crate::help::CHART_TRASH,
+                            aria_label: "Delete chart",
+                            "data-help": crate::help::CHART_TRASH,
                             onmousedown: primary({
                                 let display_title = display_title.clone();
                                 let id = config.id.clone();
                                 move |_| {
-                                    if confirm(&format!("Delete chart \"{display_title}\"?")) {
+                                    if confirm(&format!("Delete chart \"{display_title}\"? Logged data is kept.")) {
                                         state.delete_rect(&id);
                                     }
                                 }
@@ -490,7 +500,8 @@ fn MetricRectBody(
                 div {
                     class: "rect-resize-handle",
                     "data-rect-id": "{config.id}",
-                    title: "Drag to resize",
+                    title: crate::help::CHART_RESIZE,
+                    "data-help": crate::help::CHART_RESIZE,
                     onmousedown: primary({
                         let rect_id = config.id.clone();
                         move |e: Event<MouseData>| {

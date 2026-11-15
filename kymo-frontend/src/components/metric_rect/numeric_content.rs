@@ -562,8 +562,10 @@ pub(super) fn NumericContent(
             // Each series' run_id names its run: run_name for the label, ordinal for the color.
             let all_runs = state.display_runs();
             let (mut labels, mut colors, mut run_names) = (Vec::new(), Vec::new(), Vec::new());
+            let mut live = false;
             for s in &chart.series {
                 let run = crate::state::app_state::find_run(&all_runs, &s.run_id);
+                live |= run.is_some_and(crate::state::app_state::is_live);
                 labels.push(run.map_or_else(
                     || s.label.clone(),
                     |run| crate::state::rewrite_label_with_run_name(&s.label, run),
@@ -578,6 +580,7 @@ pub(super) fn NumericContent(
             let axis = ShownAxis::of_request(request);
             // From the answer shown, not the zoom asked for: a refetch in flight keeps showing the previous window.
             let step_open = axis.step_axis() && request.step_max.is_none();
+            let step_zoomed = axis.step_axis() && request.step_min.is_some();
             rsx! {
                 UPlotChart {
                     chart: ChartModel(chart.clone()),
@@ -589,6 +592,8 @@ pub(super) fn NumericContent(
                     log_y: options.read().log_y,
                     smoothed: smoothed,
                     reply: *reply,
+                    live,
+                    step_zoomed,
                 }
             }
         }

@@ -55,9 +55,9 @@ fn offline_notice(generation: u64) -> Notice {
     Notice {
         key: format!("offline|{generation}"),
         text: if generation == 0 {
-            "Connecting to the server…"
+            "Connecting to the server… charts are paused until then"
         } else {
-            "Reconnecting to the server…"
+            "Reconnecting to the server… charts are paused until then"
         }
         .to_owned(),
         title: "Charts stop updating until the connection is back; waiting requests resume then."

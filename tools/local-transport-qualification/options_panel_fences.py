@@ -248,8 +248,8 @@ def chart_option_fields(
     order = panel.get_by_role("combobox", name="Fit order", exact=True)
     window = panel.get_by_role("spinbutton", name="Window", exact=True)
     window_slider = panel.get_by_role("slider", name="Window", exact=True)
-    tau = panel.get_by_role("spinbutton", name="Time constant (steps)", exact=True)
-    tau_slider = panel.get_by_role("slider", name="Time constant (steps)", exact=True)
+    tau = panel.get_by_role("spinbutton", name="Decay length", exact=True)
+    tau_slider = panel.get_by_role("slider", name="Decay length", exact=True)
     log_x = panel.get_by_role("checkbox", name="Log X", exact=True)
     max_runs = panel.get_by_role("spinbutton", name="Max runs", exact=True)
     scope, identity = "project", None
@@ -258,7 +258,7 @@ def chart_option_fields(
         identity = panel.get_by_role("textbox", name="Name", exact=True).get_attribute(
             "placeholder"
         )
-    elif name == "Configure Metric":
+    elif name == "Chart settings":
         scope = "rect"
         identity = trigger.locator("xpath=ancestor::*[@data-slot-id][1]").get_attribute(
             "data-slot-id"
@@ -286,7 +286,7 @@ def chart_option_fields(
     def reset_to_inherited(control: Locator) -> str | bool:
         reset = control.locator(
             "xpath=ancestor::div[contains(@class, 'binding-field')][1]"
-        ).get_by_title("Reset to inherited value", exact=True)
+        ).get_by_title("Reset to parent value", exact=True)
         if reset.count():
             reset.click()
         expect(reset).to_have_count(0)
@@ -522,7 +522,7 @@ def chart_option_override_chips(
         (section, "Configure section", "137", "19"),
         (defaults, "Project settings", "149", "29"),
     ):
-        panel = open_editor(page, metric, "Configure Metric")
+        panel = open_editor(page, metric, "Chart settings")
         panel.get_by_role("spinbutton", name="Window", exact=True).fill(pinned)
         panel.get_by_role("spinbutton", name="Max runs", exact=True).fill(limit)
         dismiss(page, panel, metric, "Close")
@@ -542,7 +542,7 @@ def chart_option_override_chips(
             if undo:
                 saving(page, storage_key, revert.click)
         dismiss(page, panel, trigger, "Close")
-        panel = open_editor(page, metric, "Configure Metric")
+        panel = open_editor(page, metric, "Chart settings")
         expect(
             panel.get_by_role("spinbutton", name="Window", exact=True)
         ).to_have_value(inherited_window)
@@ -554,7 +554,7 @@ def chart_option_override_chips(
 
 def metric_picker(page: Page, trigger: Locator, storage_key: str) -> None:
     """Sorted typed groups, substring filter, type gating, and a multi-run specific source, all rolled back by Revert."""
-    print("Configure Metric: metric picker", flush=True)
+    print("Chart settings: metric picker", flush=True)
     identity = trigger.locator("xpath=ancestor::*[@data-slot-id][1]").get_attribute(
         "data-slot-id"
     )
@@ -564,7 +564,7 @@ def metric_picker(page: Page, trigger: Locator, storage_key: str) -> None:
             ?.patch?.bindings ?? null;
     }"""
     saved_bindings = page.evaluate(read_bindings, [storage_key, identity])
-    panel = open_editor(page, trigger, "Configure Metric")
+    panel = open_editor(page, trigger, "Chart settings")
     metric = panel.get_by_role("combobox", name="Source 1 metric", exact=True)
     groups = metric.locator("optgroup")
     expect(groups.first).to_be_attached()
@@ -606,7 +606,7 @@ def metric_picker(page: Page, trigger: Locator, storage_key: str) -> None:
 
     # A second source may pick only the first source's type.
     kind = metric.evaluate("select => select.selectedOptions[0].parentElement.label")
-    panel.get_by_role("button", name="+ Add Source", exact=True).click()
+    panel.get_by_role("button", name="+ Add data source", exact=True).click()
     second = panel.get_by_role("combobox", name="Source 2 metric", exact=True)
     expect(second.locator("optgroup")).to_have_count(len(labels))
     expect(second.locator("optgroup:not([disabled])")).to_have_attribute("label", kind)
@@ -644,7 +644,7 @@ def metric_picker(page: Page, trigger: Locator, storage_key: str) -> None:
     )
 
     # Per-source state stays with its source when an earlier source is removed.
-    panel.get_by_role("button", name="+ Add Source", exact=True).click()
+    panel.get_by_role("button", name="+ Add data source", exact=True).click()
     first, second = (
         panel.get_by_role("textbox", name=f"Source {n} metric filter", exact=True)
         for n in (1, 2)
@@ -664,7 +664,7 @@ def metric_picker(page: Page, trigger: Locator, storage_key: str) -> None:
             === JSON.stringify(args[2])""",
         arg=[storage_key, identity, saved_bindings],
     )
-    panel = open_editor(page, trigger, "Configure Metric")
+    panel = open_editor(page, trigger, "Chart settings")
     expect(
         panel.get_by_role("group", name="Source 1 specific runs", exact=True)
     ).to_have_count(0)
@@ -779,7 +779,7 @@ def double_presses_act_once(
     # Un-maximizing the chart closes its panel too, by the chart's Close or a press on the overlay's backdrop (the section header comes back under it); presses paced as a person's land after the grid is back.
     overlay = page.locator(".maximize-overlay")
     for backdrop in (False, True):
-        open_editor(page, metric, "Configure Metric")
+        open_editor(page, metric, "Chart settings")
         box = (
             overlay if backdrop else overlay.locator('button[title="Close"]')
         ).bounding_box()
@@ -1031,7 +1031,7 @@ def panels_beside_maximize(
     expect(main).not_to_have_attribute("inert", re.compile(".*"))
 
     # Configure maximized the chart, so closing the panel returns to the grid even after it switched targets.
-    chart_panel = open_editor(page, metric, "Configure Metric")
+    chart_panel = open_editor(page, metric, "Chart settings")
     replacement = open_editor(page, defaults, "Project settings")
     expect(chart_panel).to_have_count(0)
     expect(overlay).to_be_visible()
@@ -1040,7 +1040,7 @@ def panels_beside_maximize(
     expect(page).not_to_have_url(re.compile(r"[?&]chart="))
 
     # A close the panel didn't ask for (the chart's own Close) still returns the focus it took along.
-    chart_panel = open_editor(page, metric, "Configure Metric")
+    chart_panel = open_editor(page, metric, "Chart settings")
     chart_panel.get_by_role("spinbutton", name="Max runs", exact=True).focus()
     overlay.locator('button[title="Close"]').click()
     expect(overlay).to_have_count(0)
@@ -1051,7 +1051,7 @@ def panels_beside_maximize(
     try:
         for width in (900, 640):
             page.set_viewport_size({"width": width, "height": VIEWPORT["height"]})
-            chart_panel = open_editor(page, metric, "Configure Metric")
+            chart_panel = open_editor(page, metric, "Chart settings")
             docked = chart_panel.bounding_box()
             maximized = overlay.bounding_box()
             assert docked is not None and maximized is not None
@@ -1070,7 +1070,7 @@ def panels_beside_maximize(
 def arrows_move_the_chart_panel(page: Page, metric: Locator) -> None:
     """←/→ move the maximize to a neighbouring chart and the chart panel follows: pressed in the panel, focus follows into it; pressed on the maximized chart, focus stays with the chart for its own keys. A text field keeps its own arrows, and closing still returns to where Configure started."""
     chart_param = "new URL(location.href).searchParams.get('chart')"
-    panel = open_editor(page, metric, "Configure Metric")
+    panel = open_editor(page, metric, "Chart settings")
     target = page.locator("#kymo-panel-target")
     opened, title = page.evaluate(chart_param), target.inner_text()
     forward, back = "ArrowRight", "ArrowLeft"
@@ -1110,8 +1110,8 @@ def follow_then_close_focus(page: Page, chart: Locator) -> None:
     """Opened from the maximized chart's own Configure: a ←/→ follow commits the chart's edits, so back on it Revert has nothing to undo; and it takes that button away with the chart, so closing the panel focuses the Configure of the chart now maximized."""
     chart.locator('button[title="Maximize"]').click()
     overlay = page.locator(".maximize-overlay")
-    configure = overlay.locator('button[title="Configure"]')
-    panel = open_editor(page, configure, "Configure Metric")
+    configure = overlay.locator('button[title="Chart settings"]')
+    panel = open_editor(page, configure, "Chart settings")
     revert = panel.get_by_role("button", name="Revert", exact=True)
     checked = log_y_control(panel).is_checked()
     log_y_control(panel).set_checked(not checked)
@@ -1136,7 +1136,7 @@ def panel_keys_and_tips(page: Page, metric: Locator, section: Locator) -> None:
     """The keyboard scrolls the panel it opens focused on, and a chart's hover readout ignores the panel beside it, painting over it."""
     page.set_viewport_size({"width": VIEWPORT["width"], "height": 360})
     try:
-        panel = open_editor(page, metric, "Configure Metric")
+        panel = open_editor(page, metric, "Chart settings")
         body = panel_body(panel)
         assert body.evaluate("e => e.scrollHeight > e.clientHeight")
         page.keyboard.press("PageDown")
@@ -1145,7 +1145,7 @@ def panel_keys_and_tips(page: Page, metric: Locator, section: Locator) -> None:
     finally:
         page.set_viewport_size(VIEWPORT)
 
-    panel = open_editor(page, metric, "Configure Metric")
+    panel = open_editor(page, metric, "Chart settings")
     body = panel_body(panel)
     plot = page.locator(".maximize-overlay .u-over").first
     expect(plot).to_be_visible()
@@ -1218,13 +1218,13 @@ def source_edit_keeps_sections(page: Page) -> None:
     rect = page.locator('.metric-rect[data-slot-id="info/run_info"]')
     rect.scroll_into_view_if_needed()
     rect.hover()
-    trigger = pin_trigger(page, rect.locator('button[title="Configure"]'))
-    panel = open_editor(page, trigger, "Configure Metric")
+    trigger = pin_trigger(page, rect.locator('button[title="Chart settings"]'))
+    panel = open_editor(page, trigger, "Chart settings")
     section = panel.get_by_role("button", name="Metadata", exact=True)
     expect(section).to_be_visible()
     # A remount, even for one render, leaves this node disconnected.
     shown = section.element_handle()
-    panel.get_by_role("button", name="+ Add Source", exact=True).click()
+    panel.get_by_role("button", name="+ Add data source", exact=True).click()
     expect(
         panel.get_by_role("textbox", name="Source 2 metric filter", exact=True)
     ).to_be_visible()
@@ -1292,7 +1292,9 @@ def follow_reuses_discovery(page: Page, chart: Locator) -> None:
         other.locator("main .metric-rect").first.wait_for(timeout=20_000)
         swept = tap.sent.count("ListRunSetMetrics")
         open_editor(
-            other, overlay.locator('button[title="Configure"]'), "Configure Metric"
+            other,
+            overlay.locator('button[title="Chart settings"]'),
+            "Chart settings",
         )
         other.wait_for_timeout(1500)
         assert tap.sent.count("ListRunSetMetrics") > swept, (
@@ -1300,7 +1302,7 @@ def follow_reuses_discovery(page: Page, chart: Locator) -> None:
         )
         opened = len(tap.sent)
         for key in ("ArrowRight", "ArrowLeft"):
-            follow(other, options_panel(other, "Configure Metric"), key)
+            follow(other, options_panel(other, "Chart settings"), key)
             other.wait_for_timeout(1500)
         follows = tap.sent[opened:]
         assert "ListRuns" not in follows and "ListRunSetMetrics" not in follows, follows
@@ -1311,8 +1313,10 @@ def editor_waits_for_the_run_list(page: Page, chart: Locator) -> None:
     with chart_tab(page, chart, hold="ListRuns") as (other, tap):
         open_editor(
             other,
-            other.locator(".maximize-overlay").locator('button[title="Configure"]'),
-            "Configure Metric",
+            other.locator(".maximize-overlay").locator(
+                'button[title="Chart settings"]'
+            ),
+            "Chart settings",
         )
         other.wait_for_timeout(1500)
         tap.release()
@@ -1331,9 +1335,9 @@ def chart_panel_ahead_of_the_sweep(
     dismiss(page, panel, defaults, "Close")
 
     with chart_tab(page, chart, hold="ListRunSetMetrics") as (other, tap):
-        configure = other.locator('.maximize-overlay button[title="Configure"]')
+        configure = other.locator('.maximize-overlay button[title="Chart settings"]')
         expect(other.locator("main .metric-rect")).to_have_count(0)
-        panel = open_editor(other, configure, "Configure Metric")
+        panel = open_editor(other, configure, "Chart settings")
         expect(log_y_control(panel)).to_be_checked()
         panel.get_by_role("button", name="Close", exact=True).click()
         # A project-settings edit made meanwhile is saved, and shows once the sweep lands.
@@ -1342,13 +1346,13 @@ def chart_panel_ahead_of_the_sweep(
         log_x = defaults_panel.get_by_role("checkbox", name="Log X", exact=True)
         logged = not toggle_live(other, log_x, storage_key)
         dismiss(other, defaults_panel, gear, "Close")
-        panel = open_editor(other, configure, "Configure Metric")
+        panel = open_editor(other, configure, "Chart settings")
         held = tap.release()
         assert held, "the metrics sweep landed before it was held"
         other.locator("main .metric-rect").first.wait_for(timeout=20_000)
         # An open panel keeps the values it opened with; reopened, it reads the swept layout.
         dismiss(other, panel, configure, "Close")
-        panel = open_editor(other, configure, "Configure Metric")
+        panel = open_editor(other, configure, "Chart settings")
         expect(log_y_control(panel)).to_be_checked()
         expect(panel.get_by_role("checkbox", name="Log X", exact=True)).to_be_checked(
             checked=logged
@@ -1358,7 +1362,7 @@ def chart_panel_ahead_of_the_sweep(
 def panel_leaves_with_its_chart(page: Page, metric: Locator) -> None:
     """Hiding every run takes the chart out of the layout: its panel closes, and the chart stays maximized on its snapshot, as it does with no panel open, showing the edits made before. Its Configure is gone until the layout holds it again."""
     overlay = page.locator(".maximize-overlay")
-    panel = open_editor(page, metric, "Configure Metric")
+    panel = open_editor(page, metric, "Chart settings")
     title = overlay.locator(".rect-title")
     original = title.inner_text()
     title.dblclick()
@@ -1370,13 +1374,13 @@ def panel_leaves_with_its_chart(page: Page, metric: Locator) -> None:
         expect(panel).to_have_count(0)
         expect(overlay).to_be_visible()
         expect(title).to_have_text("renamed before hiding")
-        expect(overlay.locator('button[title="Configure"]')).to_have_count(0)
+        expect(overlay.locator('button[title="Chart settings"]')).to_have_count(0)
         # Nor does it offer a rename, which could take no edit either.
         title.dblclick()
         expect(overlay.locator(".rect-title-input")).to_have_count(0)
     finally:
         page.get_by_role("button", name="Show all", exact=True).click()
-    expect(overlay.locator('button[title="Configure"]')).to_have_count(1)
+    expect(overlay.locator('button[title="Chart settings"]')).to_have_count(1)
     title.dblclick()
     overlay.locator(".rect-title-input").fill(original)
     overlay.locator(".rect-title-input").press("Enter")
@@ -1389,7 +1393,7 @@ def chart_panel_details(
 ) -> None:
     overlay = page.locator(".maximize-overlay")
     # Esc in a source's metric filter clears it first, like the app's other filters; the next Esc closes the panel.
-    panel = open_editor(page, metric, "Configure Metric")
+    panel = open_editor(page, metric, "Chart settings")
     box = panel.get_by_role("textbox", name="Source 1 metric filter", exact=True)
     box.fill("zzz")
     box.press("Escape")
@@ -1399,8 +1403,8 @@ def chart_panel_details(
 
     # Configure on a maximized chart, then its own Close: focus goes to the grid copy's Configure.
     chart.locator('button[title="Maximize"]').click()
-    maximized = pin_trigger(page, overlay.locator('button[title="Configure"]'))
-    panel = open_editor(page, maximized, "Configure Metric")
+    maximized = pin_trigger(page, overlay.locator('button[title="Chart settings"]'))
+    panel = open_editor(page, maximized, "Chart settings")
     panel.get_by_role("spinbutton", name="Max runs", exact=True).focus()
     overlay.locator('button[title="Close"]').click()
     expect(overlay).to_have_count(0)
@@ -1408,7 +1412,7 @@ def chart_panel_details(
     expect(metric).to_be_focused()
 
     # A section showing fewer columns than a chart's saved width keeps that width through the chart panel's edits and Revert.
-    panel = open_editor(page, metric, "Configure Metric")
+    panel = open_editor(page, metric, "Chart settings")
     panel.get_by_role("spinbutton", name="Width", exact=True).fill("2")
     dismiss(page, panel, metric, "Close")
     expect(chart.locator("xpath=..")).to_have_attribute("style", re.compile(r"span 2"))
@@ -1420,7 +1424,7 @@ def chart_panel_details(
     # So do grid drags that only change the chart's height (down, then back up).
     for dy in (40, -40):
         drag_chart_height(page, chart, dy)
-    panel = open_editor(page, metric, "Configure Metric")
+    panel = open_editor(page, metric, "Chart settings")
     expect(panel.get_by_role("spinbutton", name="Width", exact=True)).to_have_value("1")
     log_y = log_y_control(panel)
     log_y.set_checked(not log_y.is_checked())
@@ -1430,7 +1434,7 @@ def chart_panel_details(
     columns.fill(shown_columns if shown_columns != "1" else "4")
     dismiss(page, panel, section, "Close")
     expect(chart.locator("xpath=..")).to_have_attribute("style", re.compile(r"span 2"))
-    panel = open_editor(page, metric, "Configure Metric")
+    panel = open_editor(page, metric, "Chart settings")
     panel.get_by_role("spinbutton", name="Width", exact=True).fill("1")
     dismiss(page, panel, metric, "Close")
 
@@ -1511,7 +1515,7 @@ def other_tab_edit_survives(
         saved = page.evaluate("key => localStorage.getItem(key)", storage_key)
         for (trigger, name, scope), (parent, parent_name) in (
             ((editors[1][0], "Configure section", "section"), editors[0]),
-            ((metric, "Configure Metric", "rect"), editors[1]),
+            ((metric, "Chart settings", "rect"), editors[1]),
         ):
             print(
                 f"{name}: Reset unpins after another tab's {parent_name} edit",
@@ -1536,7 +1540,7 @@ def other_tab_edit_survives(
             reset = (
                 log_y_control(panel)
                 .locator("xpath=ancestor::div[contains(@class, 'binding-field')][1]")
-                .get_by_title("Reset to inherited value", exact=True)
+                .get_by_title("Reset to parent value", exact=True)
             )
             saving(page, storage_key, reset.click)
             assert inherits_log_y(scope, identity), f"{name}'s Reset pinned"
@@ -1549,23 +1553,25 @@ def other_tab_edit_survives(
             tab.reload(wait_until="domcontentloaded")
             tab.locator(".chart-container").first.wait_for(timeout=20_000)
 
-        print("Configure Metric: another tab's edit survives a rename", flush=True)
-        edits = edit_elsewhere(metric, "Configure Metric")
+        print("Chart settings: another tab's edit survives a rename", flush=True)
+        edits = edit_elsewhere(metric, "Chart settings")
         chart.locator(".rect-title").dblclick()
         rename = chart.locator(".rect-title-input")
         rename.fill("Renamed beside another tab")
         saving(page, storage_key, lambda: rename.press("Enter"))
         expect(chart.locator(".rect-title")).to_have_text("Renamed beside another tab")
-        expect_elsewhere(metric, "Configure Metric", edits)
+        expect_elsewhere(metric, "Chart settings", edits)
 
-        print("Configure Metric: another tab's delete wins", flush=True)
+        print("Chart settings: another tab's delete wins", flush=True)
         kept = page.evaluate("key => localStorage.getItem(key)", storage_key)
         slot = chart.get_attribute("data-slot-id")
-        panel = open_editor(page, metric, "Configure Metric")
+        panel = open_editor(page, metric, "Chart settings")
         twin = other.locator(f".metric-rect[data-slot-id={json.dumps(slot)}]")
         twin.hover()
         other.once("dialog", lambda dialog: dialog.accept())
-        saving(other, storage_key, twin.locator('button[title="Delete chart"]').click)
+        saving(
+            other, storage_key, twin.locator('button[aria-label="Delete chart"]').click
+        )
         # This tab learns of the delete at its next edit, which records nothing and closes the panel with the chart.
         log_y_control(panel).click()
         expect(panel).to_have_count(0)
@@ -1595,7 +1601,7 @@ def media_sections_open(page: Page) -> None:
     info.locator(SECTION_OF).get_by_title("Add panel", exact=True).click()
     expect(neighbours).to_have_count(2)
     # Adding opens the new panel's metric picker immediately.
-    panel = options_panel(page, "Configure Metric")
+    panel = options_panel(page, "Chart settings")
     expect(
         panel.get_by_role("combobox", name="Source 1 metric", exact=True)
     ).to_be_focused()
@@ -1619,11 +1625,11 @@ def media_sections_open(page: Page) -> None:
         # The grid copy has learned what it shows.
         rect.locator(content).first.wait_for()
         rect.hover()
-        trigger = pin_trigger(page, rect.locator('button[title="Configure"]'))
+        trigger = pin_trigger(page, rect.locator('button[title="Chart settings"]'))
         held = []
         page.route("**/cdn/*.json", lambda route: held.append(route))
         try:
-            panel = open_editor(page, trigger, "Configure Metric")
+            panel = open_editor(page, trigger, "Chart settings")
             section = panel.get_by_role("button", name=title, exact=True)
             expect(section).to_have_attribute("aria-expanded", "true")
             for _ in range(50):
@@ -1641,7 +1647,7 @@ def media_sections_open(page: Page) -> None:
         dismiss(page, panel, trigger, "Escape")
     neighbours.last.hover()
     page.once("dialog", lambda dialog: dialog.accept())
-    neighbours.last.get_by_title("Delete chart", exact=True).click()
+    neighbours.last.get_by_role("button", name="Delete chart", exact=True).click()
     expect(neighbours).to_have_count(1)
 
 
@@ -1710,16 +1716,18 @@ def run_fences(page: Page) -> None:
     chart = (
         page.locator(".metric-rect").filter(has=page.locator(".chart-container")).first
     )
-    metric = pin_trigger(page, chart.locator('button[title="Configure"]'))
+    metric = pin_trigger(page, chart.locator('button[title="Chart settings"]'))
     section = pin_trigger(
         page,
-        chart.locator(SECTION_OF).locator('.section-header button[title="Configure"]'),
+        chart.locator(SECTION_OF).locator(
+            '.section-header button[title="Configure section"]'
+        ),
     )
     defaults = pin_trigger(page, page.get_by_title("Project settings"))
     editors = (
         (defaults, "Project settings"),
         (section, "Configure section"),
-        (metric, "Configure Metric"),
+        (metric, "Chart settings"),
     )
     docking(page, defaults, section)
     double_presses_act_once(page, defaults, metric, storage_key)
@@ -1746,13 +1754,13 @@ def run_fences(page: Page) -> None:
     # Deleting the edited section closes its panel.
     panel = open_editor(page, section, "Configure section")
     page.once("dialog", lambda dialog: dialog.accept())
-    section.locator("xpath=..").get_by_title("Delete section", exact=True).click()
+    section.locator("xpath=..").locator('button[aria-label="Delete section"]').click()
     expect(panel).to_have_count(0)
 
     # Reset discards every customization, so an open editor must not survive to write its values back.
     page.once("dialog", lambda dialog: dialog.accept())
     panel = open_editor(page, defaults, "Project settings")
-    page.get_by_title("Reset layout to auto-generated", exact=True).click()
+    page.get_by_title("Reset layout", exact=True).click()
     expect(panel).to_have_count(0)
 
     # Restore saved pins and section settings for the steps below.
@@ -1790,14 +1798,16 @@ def run_fences(page: Page) -> None:
     chart.locator('button[title="Maximize"]').click()
     overlay = page.locator(".maximize-overlay")
     expect(overlay).to_be_visible()
-    maximized_trigger = pin_trigger(page, overlay.locator('button[title="Configure"]'))
-    panel = open_editor(page, maximized_trigger, "Configure Metric")
+    maximized_trigger = pin_trigger(
+        page, overlay.locator('button[title="Chart settings"]')
+    )
+    panel = open_editor(page, maximized_trigger, "Chart settings")
     # With its settings open beside it, the maximized chart's own Configure is gone; it comes back, with focus, as they close.
     expect(maximized_trigger).to_have_count(0)
     dismiss(page, panel, maximized_trigger, "Escape")
     expect(overlay).to_be_visible()
     # Project settings replace the chart panel; the chart stays maximized, and its own Esc still closes it.
-    panel = open_editor(page, maximized_trigger, "Configure Metric")
+    panel = open_editor(page, maximized_trigger, "Chart settings")
     replacement = open_editor(page, defaults, "Project settings")
     expect(panel).to_have_count(0)
     dismiss(page, replacement, defaults, "Escape")

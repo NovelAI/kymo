@@ -152,6 +152,7 @@ pub fn ProjectsPage() -> Element {
                 r#type: "button",
                 aria_label: "Sort by {label}",
                 aria_pressed: *sort.read() == by,
+                title: (by == Sort::LastLogged && *sort.read() == by).then_some(crate::help::LAST_LOGGED_SORT),
                 onmousedown: primary(move |_| {
                     sort.set(by);
                     if by == Sort::LastLogged {
@@ -239,7 +240,7 @@ pub fn ProjectsPage() -> Element {
                                             span { class: "project-row-name", "{pid}" }
                                             span {
                                                 class: "project-row-logged",
-                                                title: at.map(local_time),
+                                                title: at.map_or_else(|| crate::help::NO_LAST_LOGGED.to_string(), local_time),
                                                 {last_logged_label(at, now_ms)}
                                             }
                                         }

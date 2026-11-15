@@ -34,11 +34,12 @@ pub fn Navbar() -> Element {
             }
         }
     }
-    let collapse_verb = if any_open { "Collapse" } else { "Expand" };
-    let collapse_scope = if needle.is_empty() {
-        "all sections"
-    } else {
-        "all listed sections"
+    let help_page = (project_id.clone(), current_run.clone());
+    let collapse_title = match (any_open, needle.is_empty()) {
+        (true, true) => crate::help::COLLAPSE_ALL,
+        (false, true) => crate::help::EXPAND_ALL,
+        (true, false) => crate::help::COLLAPSE_LISTED,
+        (false, false) => crate::help::EXPAND_LISTED,
     };
     rsx! {
         nav { class: "navbar",
@@ -99,6 +100,7 @@ pub fn Navbar() -> Element {
                     r#type: "text",
                     placeholder: "Filter panels",
                     title: "Show only panels whose name contains this text (case-insensitive)",
+                    "data-help": crate::help::PANEL_FILTER,
                     value: "{filter_value}",
                     oninput: move |e: Event<FormData>| panel_filter.set(e.value()),
                     onkeydown: move |e: Event<KeyboardData>| {
@@ -120,7 +122,8 @@ pub fn Navbar() -> Element {
             }
             button {
                 class: "navbar-action icon-button",
-                title: "{collapse_verb} {collapse_scope}",
+                title: collapse_title,
+                "data-help": collapse_title,
                 disabled: shown_names.is_empty(),
                 onmousedown: primary(move |_| {
                     state.set_sections_collapsed(&shown_names, any_open, sections_visible);
@@ -165,14 +168,16 @@ pub fn Navbar() -> Element {
             button {
                 id: PROJECT_SETTINGS_TRIGGER_ID,
                 class: "navbar-action icon-button",
-                title: "Project settings",
+                title: crate::help::PROJECT_SETTINGS,
+                "data-help": crate::help::PROJECT_SETTINGS,
                 aria_expanded: state.options_panel.read().as_ref().is_some_and(|p| p.target == PanelTarget::ProjectDefaults),
                 onmousedown: primary(move |_| state.open_options_panel(PanelTarget::ProjectDefaults, PROJECT_SETTINGS_TRIGGER_ID.to_string())),
                 GearIcon {}
             }
             button {
                 class: "navbar-action icon-button",
-                title: "Reset layout to auto-generated",
+                title: crate::help::RESET_LAYOUT,
+                "data-help": crate::help::RESET_LAYOUT,
                 onmousedown: primary(move |_| {
                     if confirm("Reset layout? This will discard all customizations and regenerate from discovered metrics.") {
                         state.reset_layout();
@@ -182,7 +187,40 @@ pub fn Navbar() -> Element {
                 }),
                 ResetIcon {}
             }
+            HelpButton { page: help_page }
             ThemeToggle { class: "navbar-action" }
+        }
+    }
+}
+
+/// Tells util/help.js what happened to the ? button.
+fn help(call: &'static str) {
+    let _ = js_sys::eval(&format!("window.__kymo_help.{call}"));
+}
+
+/// The contextual-help trigger (docs/contextual-help.md): hovering or focusing it previews the notes, a press pins them. util/help.js owns all of that state, `aria-pressed` included, so help re-renders nothing. `page` is the dashboard page shown: another one (a project or run; a maximized chart is the same page) ends a pin, and so does leaving the dashboard.
+#[component]
+fn HelpButton(page: (String, Option<String>)) -> Element {
+    use_effect(use_reactive(&page, |_| help("end()")));
+    use_drop(|| help("end()"));
+    rsx! {
+        button {
+            id: "kymo-help",
+            class: "navbar-action navbar-help",
+            aria_label: "Explain controls",
+            aria_pressed: "false",
+            // Its own note, true pinned or not, so that pinning moves no other note.
+            "data-help": crate::help::PIN_HELP,
+            onmouseenter: |_| help("enter('pointer')"),
+            onmouseleave: |_| help("leave('pointer')"),
+            onfocus: |_| help("enter('focus')"),
+            onblur: |_| help("leave('focus')"),
+            onmousedown: primary(|e| {
+                // The press leaves focus, and an editor's caret, where they were.
+                e.prevent_default();
+                help("toggle()");
+            }),
+            "?"
         }
     }
 }

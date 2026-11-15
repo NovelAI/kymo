@@ -181,7 +181,8 @@ pub fn Section(
                 span {
                     class: "section-drag-handle",
                     draggable: "true",
-                    title: "Drag to reorder",
+                    title: crate::help::REORDER,
+                    "data-help": crate::help::REORDER,
                     aria_hidden: "true",
                     // Pressing the handle must not toggle collapse.
                     onmousedown: move |e: Event<MouseData>| e.stop_propagation(),
@@ -270,6 +271,7 @@ pub fn Section(
                     button {
                         r#type: "button",
                         class: "section-toggle",
+                        "data-help": crate::help::SECTION_HEADER,
                         aria_expanded: !collapsed,
                         // A collapsed section renders no body, so there is nothing to point at then.
                         aria_controls: (!collapsed).then(|| body_id.clone()),
@@ -283,14 +285,16 @@ pub fn Section(
                 button {
                     id: "{add_trigger_id}",
                     class: "section-action icon-button",
-                    title: "Add panel",
+                    title: crate::help::ADD_PANEL,
+                    "data-help": crate::help::ADD_PANEL,
                     onmousedown: primary(add_panel.clone()),
                     PlusIcon {}
                 }
                 button {
                     id: "{trigger_id}",
                     class: "section-action icon-button",
-                    title: "Configure",
+                    title: crate::help::SECTION_SETTINGS,
+                    "data-help": crate::help::SECTION_SETTINGS,
                     aria_expanded: options_target(),
                     onmousedown: primary({
                         let section_id = section_id.clone();
@@ -311,13 +315,15 @@ pub fn Section(
                 }
                 button {
                     class: "section-action delete-action icon-button",
-                    title: "Delete section",
+                    title: crate::help::SECTION_TRASH,
+                    aria_label: "Delete section",
+                    "data-help": crate::help::SECTION_TRASH,
                     onmousedown: primary({
                         let section_label = section_label.clone();
                         let section_id = section_id.clone();
                         move |e| {
                             e.stop_propagation();
-                            if confirm(&format!("Delete section \"{section_label}\"?")) {
+                            if confirm(&format!("Delete section \"{section_label}\" and its panels? Logged data is kept.")) {
                                 state.delete_section(&section_id);
                             }
                         }
