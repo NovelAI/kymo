@@ -38,4 +38,4 @@ The local backend stops after an hour without logging or viewing. `kymo open` re
 
 Everything else, including wandb import, is in the [client README](python_client/README.md).
 
-This mirrors our internal repository; see [CONTRIBUTING](.github/CONTRIBUTING.md). "kymo" comes from [kymograph](https://en.wikipedia.org/wiki/Kymograph).
+This mirrors our internal repository; see [CONTRIBUTING](.github/CONTRIBUTING.md). "kymo" comes from [kymograph](https://en.wikipedia.org/wiki/Kymograph). [Juan](https://github.com/jpossaz) started kymo; [Kevin](https://github.com/ad8e) continues development.
