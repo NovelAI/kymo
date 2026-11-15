@@ -2,22 +2,20 @@
 
 ![webpage screenshot](.github/screenshot.png)
 
-- ✅ Correct graphs, unlike the other experiment trackers
-- ❌ All webpage viewers have admin access, so you can't show untrusted friends your graphs
-- ❌ Vibe-coded. I can't read Rust and don't know Postgres or ClickHouse or webdev. That means I can't read your PRs
-- ❌ It's internal tooling. We don't dogfood the local mode
-- ❌ Someone decided to coerce all metric (chart) values to fp32, which will be fixed later but maybe not soon
+- ✅ Correct graphs. Other experiment trackers silently draw your data wrong
+- ✅ User-facing parts are good - UI speed and clarity, minimal logging overhead
+- ❌ The dashboard can't be put on the internet; all viewers have admin access
+- ❌ Vibe-coded; I don't know Rust or Postgres or ClickHouse or webdev
+- ❌ Metric (chart) values are coerced to fp32, which will be fixed later but maybe not soon
 
 ## Setup
 
-You will run your own backend, since I'm too lazy to make money hosting for anyone.
-
-Two options:
+You will run your own backend, since I'm too lazy to make money hosting.
 
 - **Local mode** (recommended) runs the backend on your machine. `pip install "kymo[local]"`
 - **Hosted mode** logs to a server which you must separately set up; see [self-hosting](docs/self-hosting.md). `pip install kymo`
 
-Python 3.10 or newer. The first time local mode starts, it downloads PostgreSQL and ClickHouse, about 700 MB. Linux x86-64 and Apple Silicon Mac, too bad for Windows users.
+Python 3.10+. Linux x86-64 or Apple Silicon Mac, no Windows support. Local mode installs PostgreSQL and ClickHouse, about 700 MB.
 
 ## Usage
 
@@ -34,16 +32,10 @@ if __name__ == "__main__":
     kymo.finish()
 ```
 
-Keep the `if __name__ == "__main__":` guard. kymo uploads from a helper process, and on macOS that process re-imports your script.
+Keep the `if __name__ == "__main__":` guard: kymo uploads from a helper process, and `spawn` and `forkserver` re-import your script.
 
-In local mode, the backend autostarts when logged to and stops after an hour idle; logging or viewing will reset the clock. `kymo open` starts it for viewing, since your browser can't autostart it.
+The local backend stops after an hour without logging or viewing. `kymo open` restarts it.
 
-The [client README](python_client/README.md) covers the `kymo` commands, remote machines, undelivered data, backups, logging to a server, and how configs and metadata are stored.
+Everything else, including wandb import, is in the [client README](python_client/README.md).
 
-This repository is a mirror of our internal repository. See [CONTRIBUTING](.github/CONTRIBUTING.md).
-
-"kymo" comes from [kymograph](https://en.wikipedia.org/wiki/Kymograph).
-
-## License
-
-Apache-2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+This mirrors our internal repository; see [CONTRIBUTING](.github/CONTRIBUTING.md). Apache-2.0: [LICENSE](LICENSE), [NOTICE](NOTICE). "kymo" comes from [kymograph](https://en.wikipedia.org/wiki/Kymograph).
