@@ -10,7 +10,7 @@
 
 ## Setup
 
-You will run your own backend, since I'm too lazy to make money hosting.
+You will run your own backend, since I'm too lazy to make money hosting. Two options:
 
 - **Local mode** (recommended) runs the backend on your machine. `pip install "kymo[local]"`
 - **Hosted mode** logs to a server which you must separately set up; see [self-hosting](docs/self-hosting.md). `pip install kymo`
