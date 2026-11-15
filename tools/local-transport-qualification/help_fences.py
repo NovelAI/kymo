@@ -448,6 +448,14 @@ def readout_labels(page: Page) -> None:
             return drawn('.kymo-tip-row:first-child > .kymo-tip-val') === '"Smoothed"' && drawn('.kymo-tip-rawval') === '"Raw value"';
         }"""
     )
+    # A label looks like a note (the release bundle's CSS minifier once dropped the labels' look).
+    look = """() => {
+        const tip = [...document.querySelectorAll('.kymo-tip-src')].find(tip => tip.style.display === 'block');
+        const of = style => [style.backgroundColor, style.color, style.fontWeight, style.paddingLeft, style.borderTopLeftRadius];
+        return [of(getComputedStyle(tip.querySelector('.kymo-tip-rawval'), '::after')), of(getComputedStyle(document.querySelector('.kymo-help-note')))];
+    }"""
+    label, note = page.evaluate(look)
+    assert label == note, (label, note)
     # A held press takes the labels off with the notes.
     page.mouse.down()
     assert page.evaluate(HELD_LABELS) == ["none", "none"]

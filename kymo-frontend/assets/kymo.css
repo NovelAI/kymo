@@ -1459,9 +1459,6 @@ input[type="checkbox"]:checked::before {
     z-index: 95;
     white-space: pre-line;
     box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
-}
-/* A note and a chart readout's label (below) look the same. */
-.kymo-help-note, :root[data-kymo-help] .kymo-tip-src :is(.kymo-tip-row:first-child > .kymo-tip-val, .kymo-tip-rawval, .kymo-tip-range)::after {
     padding: 1px 6px;
     border-radius: 3px;
     background: var(--text-headings);
@@ -1488,7 +1485,16 @@ input[type="checkbox"]:checked::before {
 /* The readout under the pointer goes over the page's notes (z-index 95), which would otherwise hide what is being read. */
 :root[data-kymo-help] .kymo-tip-src { z-index: 96; }
 :root[data-kymo-help] .kymo-tip-src :is(.kymo-tip-row:first-child > .kymo-tip-val, .kymo-tip-rawval, .kymo-tip-range) { position: relative; }
-:root[data-kymo-help] .kymo-tip-src :is(.kymo-tip-row:first-child > .kymo-tip-val, .kymo-tip-rawval, .kymo-tip-range)::after { position: absolute; bottom: calc(100% + 5px); }
+/* The note's look, repeated here: in one rule with `.kymo-help-note`, the release bundle's CSS minifier folds that rule into the note's own and drops this selector, so the labels lose their look in release builds only. */
+:root[data-kymo-help] .kymo-tip-src :is(.kymo-tip-row:first-child > .kymo-tip-val, .kymo-tip-rawval, .kymo-tip-range)::after {
+    position: absolute;
+    bottom: calc(100% + 5px);
+    padding: 1px 6px;
+    border-radius: 3px;
+    background: var(--text-headings);
+    color: var(--bg0);
+    font: 600 var(--font-size-12)/1.4 var(--font-ui);
+}
 :root[data-kymo-help] .kymo-tip-src .kymo-tip-row:first-child > .kymo-tip-val::after { content: var(--help-colored, none); right: 0; }
 :root[data-kymo-help] .kymo-tip-src .kymo-tip-rawval::after { content: var(--help-raw, none); left: 0; }
 :root[data-kymo-help] .kymo-tip-src .kymo-tip-range::after { content: var(--help-range, none); left: 0; }
