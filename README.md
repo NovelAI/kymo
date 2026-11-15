@@ -1,6 +1,6 @@
 `kymo` is an experiment tracker for machine learning.
 
-![webpage screenshot](.github/screenshot.png)
+<img src=".github/screenshot.png" width="616" alt="webpage screenshot">
 
 - ✅ Correct graphs. Other experiment trackers silently draw your data wrong
 - ✅ User-facing parts are good - UI speed and clarity, minimal logging overhead
