@@ -852,7 +852,7 @@ test("every text is at most eight words and has no closing period", () => {
   }
 });
 
-// The design document lists every text; the public export ships the code without it.
+// The design document lists every text.
 const design = new URL("../../docs/contextual-help.md", import.meta.url);
 if (existsSync(design)) {
   test("the code's texts are the design document's Explain and Conditional rows, one for one", () => {
