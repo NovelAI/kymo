@@ -15,7 +15,7 @@
     range: 'Range',
     markers: 'Hollow circles: non-finite, unplottable or log-clipped values',
     xnan: '×N: samples with unplottable X',
-    borrowed: '@: nearest sample’s X or bucket range',
+    borrowed: '@: nearest sample’s X',
   };
   const root = document.documentElement;
   window.__kymo_help.providers.chart = el => {

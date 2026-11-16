@@ -791,7 +791,7 @@ test("a chart's texts follow its state", () => {
   assert.deepEqual(lines("rich", { xnan: "true", smoothed: "true" }), ["Faint line: unsmoothed values", "Shaded band: range of values", "Hollow circles: non-finite, unplottable or log-clipped values", "×N: samples with unplottable X"]);
   // The readout's own labels are left on the readout, for kymo.css to draw on it while notes show.
   const labels = (id) => ({ ...f.window.__kymo_charts[id].__kymo_tip.style.labels });
-    assert.deepEqual(labels("plain"), { "--help-colored": "", "--help-raw": '"Raw value"', "--help-range": '"Range"', "--help-borrowed": '"@: nearest sample’s X or bucket range"', "--help-copy": '"⌘C copies values"' }, "an unsmoothed chart's colored values are not smoothed");
+    assert.deepEqual(labels("plain"), { "--help-colored": "", "--help-raw": '"Raw value"', "--help-range": '"Range"', "--help-borrowed": '"@: nearest sample’s X"', "--help-copy": '"⌘C copies values"' }, "an unsmoothed chart's colored values are not smoothed");
   assert.deepEqual(labels("rich"), { ...labels("plain"), "--help-colored": '"Smoothed"' });
   assert.deepEqual(lines("banded"), ["Shaded band: range of values"], "an envelope alone draws no raw trace");
   assert.ok(lines("stepOpen", { live: "true" }).includes(FOLLOW));
