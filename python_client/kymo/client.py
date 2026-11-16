@@ -67,12 +67,14 @@ from kymo._wire import (
     _SEND_MAX_DELAY,
     _cdn_refusal,
     _normalize_numeric_value,
+    _own_channel,
     _upload_to_cdn,
     _validate_ident,
     _validate_project_id,
 )
 from kymo.spool import (
     SPOOL_SUFFIX,
+    SpoolWriteCut,
     SpoolWriter,
     default_spool_dir,
     make_spool_path,
@@ -122,7 +124,7 @@ def _run_control_rpc(
 
     Under fork, initializing gRPC in the trainer makes the upload worker's fork unsafe and has caused shutdown hangs. Exec children keep control RPCs out of the trainer without requiring training scripts to use spawn.
 
-    timeout is the RPC's deadline; SIGALRM kills the process 2 s past it (kymo._control_rpc.BOOTSTRAP), and the caller kills it at the deadline. With leave, a function that says when to stop waiting, asked at each _SHUTDOWN_STEP, the process starts with the group's signals blocked, as the upload worker does, so no Ctrl-C or SIGTERM to the group kills it mid-send, and once it has its request it is never killed: once leave() says so or past the deadline the caller returns it, and on an interrupt re-raises, leaving it to end by itself (its interpreter's start alone can take much of a second). One interrupted before its request was written, by a handler raising as the spawn restores the signal mask, say, is killed. With after, the pid of such a process an earlier call left, it sends once that one has ended.
+    timeout is the RPC's deadline; SIGALRM kills the process ceil(timeout) + 2 s after it starts (kymo._control_rpc.BOOTSTRAP), and, without leave, the caller kills it at the deadline. With leave, a function that says when to stop waiting, asked at each _SHUTDOWN_STEP, the process starts with the group's signals blocked, as the upload worker does, so no Ctrl-C or SIGTERM to the group kills it mid-send, and once it has its request it is never killed: once leave() says so or past the deadline the caller returns it, and on an interrupt re-raises, leaving it to end by itself (its interpreter's start alone can take much of a second). One interrupted before its request was written, by a handler raising as the spawn restores the signal mask, say, is killed. With after, the pid of such a process an earlier call left, it sends once that one has ended.
     """
     global _left_control
     payload = {
@@ -594,6 +596,8 @@ def init(
         server_address=server_address,
         timeout=30.0,
         local_endpoint=local_endpoint,
+        # After the last TerminateRun an earlier shutdown left running (_terminate_run), which could otherwise end the run this InitRun resumes; one that died at its alarm waiting for an earlier send leaves that send unwaited for.
+        after=_left_control_pid(),
     )
     run_info = resp.run
     # An absent epoch reads 0.
@@ -1353,8 +1357,8 @@ def _upload_failure_message(failure: int) -> str:
     return (
         "kymo upload worker could not spool one or more undelivered "
         "points; delivery failed (disk full, spool unavailable, a "
-        "gallery it could not encode, or a queued item it could not "
-        "decode; see its log)"
+        "gallery it could not encode, a queued item it could not "
+        "decode, or its spill end passed before it spilled them; see its log)"
     )
 
 
@@ -1596,15 +1600,18 @@ def _lock_timeout(hard_deadline: Optional[float]) -> float:
 
 
 def _wait_to_put(item, hard_deadline: Optional[float]) -> bool:
-    """Put an item the queue had no room for in steps of the lock timeout: False, not put, once a step ends on the main thread with a shutdown signal deferred and no other held section running; _QueueStillFull past hard_deadline, or in the shutdown in progress on this thread past its own deadline, which a signal can bring forward, or once it is handed off (_Shutdown); _WorkerExited once the upload worker, which alone makes room, has exited."""
+    """Put an item the queue had no room for in steps of the lock timeout: False, not put, once a step ends on the main thread with a shutdown signal deferred and no other held section running; _QueueStillFull past hard_deadline, or in the shutdown in progress on this thread past its own deadline, or once its worker's delivery has ended, both of which a signal can bring forward, or once it is handed off (_Shutdown); _WorkerExited once the upload worker, which alone makes room, has exited."""
     while True:
         _check_worker()
         shutdown = _shutdown_claim.get("shutdown")
         if shutdown is not None and shutdown.thread == threading.get_ident():
-            if _handed_off:
-                raise _QueueStillFull
-            if hard_deadline is None or shutdown.hard < hard_deadline:
-                hard_deadline = shutdown.hard
+            try:
+                # A step of the shutdown: a handoff ends the wait, and a signal's bound plans its deadlines again, the worker's delivery end, which ends its last drain, among them.
+                shutdown.check()
+            except _HandedOff:
+                raise _QueueStillFull from None
+            end = min(shutdown.hard, shutdown.deliver_by)
+            hard_deadline = end if hard_deadline is None else min(hard_deadline, end)
         if hard_deadline is not None and _remaining_seconds(hard_deadline) <= 0:
             raise _QueueStillFull
         if (
@@ -2063,10 +2070,12 @@ def wait_for_upload(timeout: Optional[float] = None) -> bool:
 
 def finish(flush_timeout: Optional[float] = None) -> bool:
     """Flush against one ``flush_timeout`` deadline (default
-    ``$KYMO_FLUSH_TIMEOUT`` or 60), spool the rest to disk, and shut down.
+    ``$KYMO_FLUSH_TIMEOUT`` or 60), spool the rest to disk as far as that
+    deadline allows, and shut down.
 
     The recommended end-of-run call: unlike ``wait_for_upload``, every client
-    wait shares that deadline. A kernel-level filesystem or Queue operation can
+    wait shares that deadline, but for each TerminateRun that finds it spent,
+    which still gets up to 1 s. A kernel-level filesystem or Queue operation can
     still outlive a Python timeout; parent salvage therefore runs in a daemon
     thread and an unquiesced console/system-metrics publication makes the result false.
     Spooled points are delivered later from any CPU-only machine with
@@ -2650,7 +2659,7 @@ _DEFAULT_FLUSH_TIMEOUT = 60.0
 _SIGNAL_FLUSH_TIMEOUT = 10.0
 # A Ctrl-C that ends the program ends its run at once, and the upload worker, handed the run's remaining delivery, delivers and spills within this, or the signal budget if shorter, in the background (_Shutdown.hand_off).
 _INTERRUPT_FLUSH_TIMEOUT = 10.0
-# How long the parent may take to send a handed-off run's TerminateRun, before it gives the console back (_Shutdown.end_run).
+# How long the parent may take to send a handed-off run's TerminateRun, before it gives the console back, and the time a TerminateRun that finds the shutdown's time spent gets, a local endpoint's ensure included (_Shutdown.end_run); also how long init() waits for the TerminateRun of a run whose worker failed to start.
 _HANDOFF_TERMINATE_TIMEOUT = 1.0
 # How long a handoff's publications may wait for the pending calls' lock and the accounting lock, in all (_complete_handoff).
 _HANDOFF_DRAIN_TIMEOUT = 0.1
@@ -2688,49 +2697,53 @@ def _worker_window(now: float, end: float) -> tuple[float, float, float, float]:
     return now + (worker - spill), kill - min(spill, cleanup) / 2, kill, cleanup
 
 
-def _drain_queue_to_spool(
-    spool: SpoolWriter, *, source, held: list, hard_deadline: float
-) -> int:
-    """Parent-side salvage after the worker died, of source through an owner FIFO fence for _SPILL_GRACE at most and until hard_deadline (time.monotonic()), finish()'s shared one, unless source is None, then of held, the held-back groups, which were never put."""
+def _drain_queue_to_spool(spool: SpoolWriter, *, source, held: list) -> None:
+    """Parent-side salvage after the worker died: of source through an owner FIFO fence for _SPILL_GRACE at most, unless source is None, then of held, the held-back groups, which were never put; all until spool.until() (time.monotonic(), read as it goes, since a signal brings a shutdown's end forward). What it wrote reaches the file before a gallery's encode, as the worker's spill does."""
     if _init_pid is None or os.getpid() != _init_pid:
         raise RuntimeError("only the initializing process may fence the upload queue")
+    end = spool.until
 
     # Queue ordering is producer-local, so only the initializing process may publish this marker; a worker marker could overtake objects still being serialized by the parent's feeder.
     fence = ("__kymo_owner_drain__", uuid.uuid4().hex)
-    # Points not spooled: undecodable, unencodable, or left unwritten once a write failed.
-    dropped = 0
     write_failed = False
 
     def consume(item) -> None:
-        nonlocal dropped, write_failed
-        if item is None:
+        nonlocal write_failed
+        if item is None or write_failed:
             return
-        if write_failed:
-            dropped += _queue_item_size(item)
-            return
+        # A numeric batch's points each go to the writer's buffer as one small record, which reaches the file only whole; any other group (a gallery, metadata, text) can leave a record's start in the file and its tail in the buffer; the system poller's lists, of small points only, are flushed too, the check being per queue item. A flush after every group made the salvage of one-metric log() calls take 50% longer (macOS).
+        numeric = isinstance(item, tuple) and item[0] == _NUMERIC_BATCH_QUEUE_ITEM
         try:
             point_tuples = _decode_queue_item(item)
         except Exception as error:
-            dropped += _queue_item_size(item)
             _log.warning("failed to decode a queued item during salvage: %s", error)
             return
-        for index, point_tuple in enumerate(point_tuples):
-            written = spool.count
-            try:
-                if not _spill_tuple(spool, point_tuple):
-                    dropped += 1
-            except Exception as e:
-                # A failed write is normally disk-wide, and the writer has cut its record off, with any earlier records that had not reached the file: stop writing, but keep draining to the fence.
-                write_failed = True
-                # Lost: the failed point and the rest of its group, plus any counted records the cut removed.
-                dropped += len(point_tuples) - index + written - spool.count
+        try:
+            for index, point_tuple in enumerate(point_tuples):
+                gallery = point_tuple[0] == "cdn_batch_mutation"
+                # Checked before each gallery, whose encode can take seconds, and every 512th point, as the worker's spill checks its end; a record the end catches being sent is cut off whole (SpoolWriter.until).
+                if (gallery or not index & 511) and time.monotonic() >= end():
+                    raise SpoolWriteCut("the salvage's end has passed")
+                if gallery:
+                    spool.flush()
+                _spill_tuple(spool, point_tuple)
+            if not numeric:
+                spool.flush()
+        except Exception as e:
+            # A failed write, normally disk-wide, after which the writer has cut its record off, or the salvage's end (SpoolWriteCut). Stop writing; the drain goes on to the fence until its end.
+            write_failed = True
+            if isinstance(e, SpoolWriteCut):
                 _log.warning(
-                    "failed to spool during salvage; dropping the rest of the queue: %s",
+                    "the salvage reached its end; dropping what it has not spooled"
+                )
+            else:
+                _log.warning(
+                    "failed to spool during salvage; dropping the rest of the "
+                    "queue: %s",
                     e,
                 )
-                return
 
-    deadline = min(time.monotonic() + _SPILL_GRACE, hard_deadline)
+    grace = time.monotonic() + _SPILL_GRACE
     # A dead worker can leave the queue full (macOS bounds it at 32,767 groups): each group salvaged first makes room for the fence.
     fenced = reached = source is None
     while not reached:
@@ -2745,7 +2758,7 @@ def _drain_queue_to_spool(
                     "failed to publish the upload queue salvage fence: %s", error
                 )
                 break
-        remaining = deadline - time.monotonic()
+        remaining = min(grace, end()) - time.monotonic()
         if remaining <= 0:
             if not fenced:
                 _log.warning("upload queue salvage found no room for its owner fence")
@@ -2766,10 +2779,6 @@ def _drain_queue_to_spool(
         _log.warning("upload queue salvage ended before its owner fence")
     for group in held:
         consume(group)
-    if dropped:
-        _log.error("parent salvage dropped %d point(s)", dropped)
-    # The writer's count leaves out the records a failed write cut off.
-    return spool.count
 
 
 def _report_spool(paths: list[str]) -> bool:
@@ -2807,15 +2816,15 @@ def _retire_rejected_worker_spools(paths: list[str]) -> None:
     paths.clear()
 
 
-def _retire_or_report_run_spools(
+def _retire_or_list_run_spools(
     *,
     project_id: str,
     run_id: str,
     spool_dir: Optional[str],
     session: str,
     terminal_rejected: bool,
-) -> bool:
-    """Retire or report the spool files this run can still replay.
+) -> list[str]:
+    """Retire this run's spool files if it is deleted, else list them for the caller to report (_report_spool); return those left: the ones it could not retire, else all.
 
     Every input is passed in, never read from a module global: this runs in a
     daemon thread that may outlive `finish()` and overlap a later `init()` — the
@@ -2869,12 +2878,12 @@ def _retire_or_report_run_spools(
                 len(stranded),
                 " ".join(stranded),
             )
-        return bool(stranded)
-    return _report_spool(owned)
+        return stranded
+    return owned
 
 
-def _resolve_run_spools(*, terminal_rejected: bool, deadline) -> bool:
-    """Run spool cleanup off the caller's thread, like the parent's own salvage, until deadline (_await).
+def _start_spool_cleanup(*, terminal_rejected: bool, after=None):
+    """Start the run's spool cleanup on a daemon thread, like the parent's own salvage; it lists the files after (the salvage's thread, if any) has ended and closed its spool, which the listing must see. _await_spool_cleanup waits for it and reports. One that cannot start says so at once.
 
     Listing, the terminal writer-lock check, and rename all touch a shared
     cluster mount that can stall indefinitely, and `finish()` promises a bounded
@@ -2891,32 +2900,46 @@ def _resolve_run_spools(*, terminal_rejected: bool, deadline) -> bool:
         "session": _session_id,
         "terminal_rejected": terminal_rejected,
     }
+    outcome: dict = {"context": context}
     if not context["session"]:
-        # Validate before launching the daemon. With an exhausted deadline the
-        # caller may otherwise time out before the thread rejects the session and
-        # print a run-wide deletion pattern for an empty session.
+        # Validated before the daemon starts: an empty session prefix would take in every run's spool files.
         _log.error(
             "cannot resolve this run's spool files: session identity is missing; "
             "delivery remains unproven"
         )
-        return True
-    outcome: dict = {}
-    owned_prefix = spool_name_prefix(
-        context["project_id"], context["run_id"], context["session"]
-    )
+        return None, outcome
 
     def resolve() -> None:
         try:
-            outcome["had_spool"] = _retire_or_report_run_spools(**context)
+            if after is not None:
+                after.join()
+            outcome["spools"] = _retire_or_list_run_spools(**context)
         except BaseException as error:
             outcome["error"] = error
 
     thread = threading.Thread(target=resolve, name="kymo-spool-cleanup", daemon=True)
-    thread.start()
+    try:
+        thread.start()
+    except RuntimeError as error:
+        # No thread to be had: the run's end must still go out (_shut_down).
+        _log.error(
+            "failed to start this run's spool cleanup: %s; delivery remains unproven",
+            error,
+        )
+        return None, outcome
+    return thread, outcome
+
+
+def _await_spool_cleanup(cleanup, *, deadline) -> bool:
+    """Wait until deadline (_await) for the cleanup _start_spool_cleanup started, and report on this thread, after the salvage's own report, the files it found. Return whether delivery is left unproven, as it is by a cleanup that never started."""
+    thread, outcome = cleanup
+    if thread is None:
+        return True
+    context = outcome["context"]
     # Strictly inside finish()'s budget: the shutdown split ends the worker and
     # salvage phases _SPOOL_CLEANUP_RESERVE early to leave room for this.
     if not _await(_joiner(thread), deadline):
-        if terminal_rejected:
+        if context["terminal_rejected"]:
             # Never point an operator at a rejected run's spool: this daemon can
             # be killed at interpreter exit before it renames anything, and those
             # points are inadmissible — replaying them into a restored run is the
@@ -2927,7 +2950,9 @@ def _resolve_run_spools(*, terminal_rejected: bool, deadline) -> bool:
                 "spool cleanup exceeded the finish deadline. This run is deleted; "
                 "do not replay any remaining %s*%s file in the configured spool "
                 "directory — delete it after its writer exits",
-                owned_prefix,
+                spool_name_prefix(
+                    context["project_id"], context["run_id"], context["session"]
+                ),
                 SPOOL_SUFFIX,
             )
         else:
@@ -2939,7 +2964,48 @@ def _resolve_run_spools(*, terminal_rejected: bool, deadline) -> bool:
     if "error" in outcome:
         _log.error("failed to resolve this run's spool files: %s", outcome["error"])
         return True
-    return outcome["had_spool"]
+    paths = outcome["spools"]
+    # A deleted run's spools left are never offered for replay.
+    return bool(paths) if context["terminal_rejected"] else _report_spool(paths)
+
+
+def _report_queue_losses(shutdown: "_Shutdown") -> None:
+    """Say how many points reached neither the server nor a spool, once the shutdown has dealt with the worker and its queue, as one count that adds to the worker's own report: the points the queue is still charged with (the worker has resolved those it delivered or spooled, and released those it cut past its spill end), plus those of the uncharged groups taken for the salvage, less what the salvage's spool holds once closed. Held-back groups still left, which the shutdown drops and counts apart (_drain_and_shutdown, or an exit at once: _exit_now), are left out. At most after a kill or a crash (a worker that cannot release its cut exits as one), with unproven points (_unproven_points), after a handoff, or with the salvage still running, which counts as spooling nothing since its writer's buffer dies with the process: a killed or crashed worker may have delivered, spooled or reported lost points it had not resolved. Exact otherwise."""
+    salvage = shutdown.salvage
+    running = salvage is not None and salvage[0].is_alive()
+    spooled = 0 if salvage is None or running else salvage[2].count
+    # Read before the charge, and a copy: a log() on another thread can charge a group and hold it back meanwhile, which this count and the drop line then both count, never neither.
+    held = sum(map(_queue_item_size, list(_held_back)))
+    lost = _queue_status.get_obj().value - held + shutdown.uncharged_points - spooled
+    if lost < 0:
+        _log.error(
+            "the upload accounting is %d point(s) short: a point was resolved twice",
+            -lost,
+        )
+    if lost <= 0:
+        return
+    # -1: no exit published (a kill); 1: a crash's status, or a cut the worker could not release. A handoff tells the worker no salvage follows, so it may have reported the points it never read lost, which stay charged.
+    exact = (
+        _worker_exit.value not in (-1, 1)
+        and not running
+        and not _unproven_points
+        and not _handed_off
+    )
+    _log.error(
+        "%s%d point(s) reached neither the server nor the spool and are LOST",
+        "" if exact else "at most ",
+        lost,
+    )
+
+
+def _report_cut_short_shutdown(shutdown: "_Shutdown") -> None:
+    """Report, once, what a shutdown that had stopped the worker, or found it dead, leaves on disk and loses, where a Ctrl-C cut it short of its own report or of _spool_for_stopped_worker's (_complete_handoff, _exit_now): the salvage's spool, which the listing may not have named, and the closing count (_report_queue_losses). A deleted run's points were discarded, and said so."""
+    if shutdown.reported or _upload_terminal.get_obj().value:
+        return
+    shutdown.reported = True
+    if shutdown.salvage is not None and shutdown.salvage[2].count:
+        _report_spool([shutdown.salvage[2].path])
+    _report_queue_losses(shutdown)
 
 
 def _stop_upload_process(
@@ -2969,44 +3035,40 @@ def _stop_upload_process(
     return dead, dead and _worker_exitcode(process) == 0
 
 
-def _salvage_queue_before(shutdown: "_Shutdown", held: list) -> bool:
-    """Run potentially blocking encode/write/fsync work outside finish's thread until shutdown.pre_cleanup (_await): spool the queue's groups, then held, the groups held back, charged or not. The salvage is the shutdown's (shutdown.salvage): a Ctrl-C's handoff leaves it the queue (_complete_handoff), and its writer then cuts off whole a record still being written, since the process may exit as soon as the console is back."""
-    shutdown.salvage = _start_salvage(
-        held,
-        shutdown.pre_cleanup,
-        until=lambda: -math.inf if _handed_off else math.inf,
-    )
+def _await_queue_salvage(shutdown: "_Shutdown") -> bool:
+    """Wait for the shutdown's salvage (_start_salvage), which stops writing at its end (_Shutdown.salvage_end) and closes its spool after, until shutdown.hard (_await), as the spool cleanup waits for it, and report it: False if it goes on."""
     thread, outcome, spool = shutdown.salvage
-    if not _await(_joiner(thread), lambda: shutdown.pre_cleanup):
+    if not _await(_joiner(thread), lambda: shutdown.hard):
         _log.error(
-            "parent queue salvage exceeded the finish deadline; it may continue "
-            "in the background at %s",
+            "parent queue salvage did not end by the shutdown's deadline; it may "
+            "still be writing or closing %s",
             spool.path,
         )
         return False
     if outcome["error"] is not None:
         _log.error("parent queue salvage failed: %s", outcome["error"])
-    elif outcome["salvaged"]:
-        _log.warning(
-            "salvaged %d undelivered points from the queue", outcome["salvaged"]
-        )
+    elif spool.count:
+        _log.warning("salvaged %d undelivered points", spool.count)
     return True
 
 
-def _start_salvage(held: list, deadline: float, *, until):
-    """Start the parent's salvage in a daemon thread, which a stalled filesystem holds instead of the caller: spool the queue's groups through an owner fence until deadline (time.monotonic()), then held (_drain_queue_to_spool), and close the spool, whose writer cuts off whole a record still written at until() (SpoolWriter.until). Return the thread, its outcome ({"salvaged": points spooled, "error": its exception}) and the spool.
+def _start_salvage(shutdown: "_Shutdown", end) -> None:
+    """Start the shutdown's salvage in a daemon thread, which a stalled filesystem holds instead of the caller: spool, until end() (time.monotonic()), the queue's groups through an owner fence, then the groups held back, charged or not, which it takes at once (_drain_queue_to_spool), and close the spool, whose writer cuts off whole a record still written at end() (SpoolWriter.until). shutdown.salvage is then the thread, its outcome ({"error": its exception}) and the spool, whose count, once the thread has ended, is the points it spooled; shutdown.uncharged_points, whether or not the thread starts, the points of the uncharged groups it took, which the queue's charge leaves out.
 
-    A dead worker that held the queue's reader lock, part of a message read (kymo._worker._QueueReads) or killed inside a read, leaves the queue unreadable: then it reports the queue's points, at most the backlog, lost at once, and spools held alone.
+    A dead worker that held the queue's reader lock, part of a message read (kymo._worker._QueueReads) or killed inside a read, leaves the queue unreadable: then it says so at once and spools the held-back groups alone; its caller counts what it loses (_report_queue_losses, or _spool_for_stopped_worker's own line).
     """
+    held = _take_held_back()
+    uncharged = _take_held_back(_uncharged)
+    shutdown.uncharged_points = sum(map(_queue_item_size, uncharged))
+    held += uncharged
     # Capture the old queue before starting the daemon. A deadline-expired salvage may overlap a later init(), which replaces it.
     source = _metric_queue
     if source._rlock.acquire(False):
         source._rlock.release()
     else:
         _log.error(
-            "the upload worker left the upload queue unreadable: at most %d "
-            "queued point(s) are LOST",
-            max(0, _queue_status.get_obj().value),
+            "the upload worker left the upload queue unreadable; its points "
+            "cannot be salvaged"
         )
         source = None
     spool = SpoolWriter(
@@ -3026,18 +3088,13 @@ def _start_salvage(held: list, deadline: float, *, until):
             _session_id,
             _local_installation_uuid,
         ),
-        until=until,
+        until=end,
     )
-    outcome = {"salvaged": 0, "error": None}
+    outcome = {"error": None}
 
     def salvage() -> None:
         try:
-            outcome["salvaged"] = _drain_queue_to_spool(
-                spool,
-                source=source,
-                held=held,
-                hard_deadline=deadline,
-            )
+            _drain_queue_to_spool(spool, source=source, held=held)
         except BaseException as error:
             outcome["error"] = error
         finally:
@@ -3053,7 +3110,7 @@ def _start_salvage(held: list, deadline: float, *, until):
         daemon=True,
     )
     thread.start()
-    return thread, outcome, spool
+    shutdown.salvage = thread, outcome, spool
 
 
 def _put_shutdown_marker(timeout: float) -> bool:
@@ -3126,7 +3183,7 @@ class _Shutdown:
         self.signum = signum
         # The signals that interrupted the shutdown, in arrival order, which it handles as it returns (_drain_and_shutdown).
         self.arrived: list[int] = []
-        # The exit code the run's TerminateRun went out with, None until a send claims the run's end (end_run); from then on a signal that changes the code ends the run again.
+        # The exit code the run's last send claimed its end with, whether or not it went out, None until one does (end_run); from then on a signal that changes the code ends the run again.
         self.ended: Optional[int] = None
         # Held while a TerminateRun is in flight, which no other send nests in (end_run).
         self.sending = threading.Lock()
@@ -3142,12 +3199,17 @@ class _Shutdown:
         self.exiting: Optional[int] = None
         # Whether end_run has warned of the handoff.
         self.announced = False
-        # When the pending log() calls give up (plan_pending); when the worker stops delivering and spilling, its window ends and it is killed, the wait for it ends, and the forced cleanup's salvage ends (plan_worker).
+        # When the pending log() calls give up (plan_pending); when the worker stops delivering and spilling, its window ends and it is killed, the wait for it ends, and the forced cleanup's salvage ends (plan_worker; salvage_end).
         self.pending_by = self.deliver_by = self.spill_by = self.graceful = math.inf
         self.stop_by = self.pre_cleanup = math.inf
-        # The parent's salvage of a dead worker's queue, its thread, outcome and spool (_salvage_queue_before), once started.
+        # Whether it was handed off (hand_off), which ends the salvage (salvage_end): unlike _handed_off, a later init() leaves it alone.
+        self.handed_off = False
+        # The parent's salvage of a dead worker's queue once started (_start_salvage: the shutdown's, or a handoff's _spool_for_stopped_worker): its thread, outcome and spool; and the points of the uncharged groups taken for it, whether or not its thread started, which the queue's charge leaves out (_report_queue_losses).
         self.salvage = None
-        # Whether the shutdown has stopped waiting for the worker, and so dealt with its queue (_stop_upload_process).
+        self.uncharged_points = 0
+        # Whether the shutdown has reported what it left on disk and lost, which a Ctrl-C that cut it short reports instead (_report_cut_short_shutdown).
+        self.reported = False
+        # Whether the shutdown has stopped waiting for the worker (_stop_upload_process): a handoff from then on publishes nothing more to its queue (_complete_handoff).
         self.stopped = False
         self.result = False
         self.done = threading.Event()
@@ -3191,6 +3253,12 @@ class _Shutdown:
         if end < self.hard:
             self.hard = end
 
+    def salvage_end(self) -> float:
+        """When the parent's salvage of a dead worker's queue ends (_shut_down): pre_cleanup, moved with hard as a signal brings it forward, keeping the margin the last plan left before it, since the shutdown plans again only at its next step, which a TerminateRun can hold until hard (end_run). -inf from a handoff on (hand_off), since the process may exit as soon as the console is back."""
+        if self.handed_off:
+            return -math.inf
+        return self.pre_cleanup - (self.planned_hard - self.hard)
+
     def hand_off(self) -> None:
         """Leave the run's remaining delivery to the upload worker, which delivers, spills and exits by itself by hard: it gets that end in _handoff, never one already past (at least _CLEANUP_RESERVE_MIN, to close its spool), and a SIGTERM that arms it at once, even where the program owns SIGTERM (kymo._worker._own_signals). The parent ends the run (end_run), which then says so, and the shutdown waits no longer. finish() and wait_for_upload() cannot prove delivery from then on. Once handed off, it pushes a sooner end to the worker the same way."""
         global _handed_off
@@ -3199,10 +3267,10 @@ class _Shutdown:
         if not handoff.value or end < handoff.value:
             handoff.value = end
             _worker_alive(process, signal.SIGTERM)
-        _handed_off = True
+        self.handed_off = _handed_off = True
 
     def end_run(self) -> None:
-        """Send the run's TerminateRun with its exit code (_exit_code, else 0) unless that code has gone out, by hard. Once handed off, it waits _HANDOFF_TERMINATE_TIMEOUT at most and leaves a control process still running then to finish by itself, never killed, by hard but at least that long from now (_run_control_rpc). Then, with no send in flight, warn of a handoff, once: after the send, so a stderr whose reader has stalled (a full pipe) cannot hold it up. Then exit if a further signal asked to. The parent sends it, never a handed-off worker, which the cap or a crash can kill, or the program's container or process group take down; the server takes the worker's points after the run has ended.
+        """Send the run's TerminateRun with its exit code (_exit_code, else 0) unless that code has gone out, by hard. A send that finds the shutdown's time spent (a zero flush_timeout or signal budget, a parent the machine starved past hard, or a code that changed as it passed), and a handed-off run's, still go out and wait up to _HANDOFF_TERMINATE_TIMEOUT, a local endpoint's ensure included: a spent budget's so that it lands before the program exits, where the program's container or process group would take a control process left running down with it. A control process still running when the wait ends is left to finish by itself, never killed, within its alarm (_run_control_rpc). Then, once no send holds the run's end, warn of a handoff, once: after the send, so a stderr whose reader has stalled (a full pipe) cannot hold it up. Then exit if a further signal asked to. The parent sends it, never a handed-off worker, which the cap or a crash can kill, or the program's container or process group take down; the server takes the worker's points after the run has ended.
 
         A send claims the run's end first, and none nests in another, since the two could reach the server in either order: a signal during one only changes the code or asks for the exit, which the sender acts on once its send returns, or, once the send is superseded, within a step (_terminate_run), the next control process waiting for that one to end. A handed-off run keeps its code, so its send, which may go on, is the last.
         """
@@ -3210,13 +3278,18 @@ class _Shutdown:
             try:
                 code = _exit_code or 0
                 if code != self.ended:
-                    self.ended = code
-                    timeout, wait = _remaining_seconds(self.hard), None
-                    if _handed_off:
+                    timeout = _remaining_seconds(self.hard)
+                    spent = not timeout
+                    if spent or _handed_off:
+                        # A spent budget's send, given no end, waits this from its start, which a changed code or a Ctrl-C still cuts short (_terminate_run); a handoff's gets at least this, and is waited for this at most (wait).
                         timeout = max(_HANDOFF_TERMINATE_TIMEOUT, timeout)
-                        wait = _HANDOFF_TERMINATE_TIMEOUT
+                    self.ended = code
                     _terminate_run(
-                        code, timeout, run=self.run, wait=wait, end=lambda: self.hard
+                        code,
+                        timeout,
+                        run=self.run,
+                        wait=_HANDOFF_TERMINATE_TIMEOUT if _handed_off else None,
+                        end=None if spent else lambda: self.hard,
                     )
             finally:
                 self.sending.release()
@@ -3224,11 +3297,15 @@ class _Shutdown:
             return
         if _handed_off and not self.announced:
             self.announced = True
-            _log.warning(
-                "ending the run; the upload worker delivers what it can within "
-                "%.1fs in the background",
-                _remaining_seconds(self.hard),
-            )
+            if _worker_alive(_upload_process):
+                # Its end (hand_off): at least _CLEANUP_RESERVE_MIN after the handoff, so perhaps past by now.
+                _log.warning(
+                    "ending the run; the upload worker delivers what it can within "
+                    "%.1fs in the background",
+                    _remaining_seconds(_handoff.value),
+                )
+            else:
+                _log.warning("ending the run; the upload worker had already exited")
             if os.getpid() == 1:
                 _log.warning(
                     "this process is PID 1 of its namespace, as in a container: "
@@ -3237,7 +3314,7 @@ class _Shutdown:
                     "running, whose end of the run then never goes out"
                 )
         if self.exiting is not None:
-            _exit_now(self.exiting)
+            _exit_now(self.exiting, self)
 
 
 def _await(wait, deadline) -> bool:
@@ -3285,8 +3362,14 @@ def _disown_worker(process) -> None:
         tracker._pid = None
 
 
-def _exit_now(code: int) -> None:
-    """Exit with code at once, past the atexit hooks, once it has warned of the pending log() calls and held-back groups the exit drops and what the program printed to a file (a Slurm or redirect log) is flushed: never to a pipe, socket or terminal, whose reader may have stalled."""
+def _left_control_pid() -> Optional[int]:
+    """The pid of the control process an earlier TerminateRun left running (_left_control), while it runs: a control RPC sent after it waits for it to end (_run_control_rpc's after)."""
+    left = _left_control
+    return None if left is None or left.poll() is not None else left.pid
+
+
+def _exit_now(code: int, shutdown: "_Shutdown") -> None:
+    """Exit with code at once, past the atexit hooks: first warn of the pending log() calls and held-back groups the exit drops, report what a shutdown that had stopped the worker, or whose worker is dead, leaves on disk and loses (_report_cut_short_shutdown; a live worker, handed off, reports its own), and flush what the program printed to a file (a Slurm or redirect log), never to a pipe, socket or terminal, whose reader may have stalled."""
     held = sum(map(_queue_item_size, [*_held_back, *_uncharged]))
     if _pending or held:
         _log.warning(
@@ -3295,6 +3378,8 @@ def _exit_now(code: int) -> None:
             len(_pending),
             held,
         )
+    if shutdown.stopped or not _worker_alive(_upload_process):
+        _report_cut_short_shutdown(shutdown)
     for stream in (sys.stdout, sys.stderr):
         try:
             if stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
@@ -3314,7 +3399,7 @@ def _terminate_run(
 ) -> None:
     """Send run's TerminateRun (_Shutdown.run: server address, local installation, project, run, and the worker's run-deleted flag) with code within timeout, best effort: a failure is logged, never raised into the program's exit. After a control process an earlier send left running (_left_control), this one sends once that one has ended, so the server takes its code last, its RPC timeout then not capped at 5 s.
 
-    The waits for a local run's endpoint ensure (kymo._local_runtime) and for the control process (_run_control_rpc) go in steps of _SHUTDOWN_STEP and stop once leave() says so, killing the ensure, or leaving the control process running, never killed: wait seconds after the send began (a handoff's, which is the last); or, without wait, once end() has passed (the shutdown's hard, which a signal brings forward; else timeout from now), or once the send is superseded: its code is no longer the run's (_exit_code), or a Ctrl-C has handed the run off or waits in the held round this send may run in, whose handoff sends 130 behind it. A superseded send logs nothing, so a stalled stderr cannot hold up the one that follows. Each step of a send in flight scans the few deferred signals.
+    The waits for a local run's endpoint ensure (kymo._local_runtime) and for the control process (_run_control_rpc) go in steps of _SHUTDOWN_STEP and stop once leave() says so, killing the ensure, or leaving the control process running, never killed: wait seconds after the send began (a handoff's, which is the last); or, without wait, once end() has passed (the shutdown's hard, which a signal brings forward; else, as for a send that found that time spent, timeout from now), or once the send is superseded: its code is no longer the run's (_exit_code), or a Ctrl-C has handed the run off or waits in the held round this send may run in, whose handoff sends 130 behind it. A superseded send logs nothing, so a stalled stderr cannot hold up the one that follows. Each step of a send in flight scans the few deferred signals.
 
     Not once its worker observed the run deleted: if the run is restored before this old process exits, a stale TerminateRun must not mark the restored run finished.
 
@@ -3326,7 +3411,6 @@ def _terminate_run(
         terminal.get_obj().value
         or not (server_address or installation)
         or not (project_id and run_id)
-        or timeout <= 0
     ):
         return
     started = time.monotonic()
@@ -3358,9 +3442,7 @@ def _terminate_run(
                 leave=leave,
             )
         rpc_timeout = max(0.001, timeout - (time.monotonic() - started))
-        after = _left_control
-        if after is not None and after.poll() is not None:
-            after = None
+        after = _left_control_pid()
         if after is None:
             rpc_timeout = min(5.0, rpc_timeout)
         sent = _run_control_rpc(
@@ -3373,14 +3455,16 @@ def _terminate_run(
             timeout=rpc_timeout,
             local_endpoint=endpoint,
             leave=leave,
-            after=None if after is None else after.pid,
+            after=after,
         )
         if isinstance(sent, subprocess.Popen):
             if not superseded():
+                # Its alarm, armed as it starts, ends it ceil(rpc_timeout) + 2 s later (kymo._control_rpc.BOOTSTRAP).
                 _log.warning(
-                    "TerminateRun is still on its way; its control process goes "
-                    "on for up to %.1fs",
-                    rpc_timeout,
+                    "TerminateRun(%d) is still on its way; its control process goes "
+                    "on by itself for up to %ds from its start",
+                    code,
+                    math.ceil(rpc_timeout) + 2,
                 )
             return
     except Exception as e:
@@ -3396,7 +3480,7 @@ def _drain_and_shutdown(
     signum: Optional[int] = None,
     at_exit: bool = False,
 ) -> bool:
-    """Flush and shut the run down within flush_timeout, as the one shutdown in progress (_Shutdown), which a signal never nests in nor aborts (_signal_during_shutdown); True only if delivery was proven complete.
+    """Flush and shut the run down within flush_timeout (a TerminateRun that finds that time spent still gets up to _HANDOFF_TERMINATE_TIMEOUT), as the one shutdown in progress (_Shutdown), which a signal never nests in nor aborts (_signal_during_shutdown); True only if delivery was proven complete.
 
     signum is the signal that starts it: a SIGINT hands the run off at once, any other bounds it from the start; the run ends with its code. A signal that interrupts it is handled once it returns, in arrival order (_handle_deferred_signals), except in the atexit flush (at_exit), where a raise cannot set the exit status: there a Ctrl-C, which handed the run off, and a SIGTERM or SIGQUIT, which bounded the flush, leave the program's own exit status, and its later atexit hooks run; nor is a handler installed before init() called, since a 143 could make a scheduler retry a job that had finished its work, and a requeue or checkpoint handler could redo it. Only a further Ctrl-C exits at once (_signal_during_shutdown).
 
@@ -3503,14 +3587,8 @@ def _complete_handoff(shutdown: _Shutdown) -> None:
             _system_poller.stop(timeout=_SHUTDOWN_STEP)
             _system_poller = None
         if shutdown.stopped:
-            # The shutdown had stopped the worker and dealt with its queue: only the run was left to end. The salvage of a dead worker's queue may still read it (_salvage_queue_before), so nothing is published past its fence nor the queue closed under it; its writer now cuts off whole a record still being written, so an exit that follows tears none.
-            if shutdown.salvage is not None and shutdown.salvage[0].is_alive():
-                _log.warning(
-                    "the Ctrl-C cut short the parent's salvage of the upload queue; "
-                    "the points it had not spooled are LOST"
-                )
-                if shutdown.salvage[2].count:
-                    _report_spool([shutdown.salvage[2].path])
+            # The shutdown had stopped the worker, leaving only the run's end, sent above, and the report it cut short. The salvage of a dead worker's queue may still read it (_shut_down), so nothing is published past its fence nor the queue closed under it; its end has come (salvage_end): it writes nothing more from its next check of that end, its writer cutting off whole a record still being written, so an exit that follows tears none.
+            _report_cut_short_shutdown(shutdown)
             return
         # Its publications wait for nothing but the pending calls' lock and the accounting lock, within one small budget, by the shutdown's end.
         by = min(time.monotonic() + _HANDOFF_DRAIN_TIMEOUT, shutdown.hard)
@@ -3541,12 +3619,14 @@ def _complete_handoff(shutdown: _Shutdown) -> None:
         except Exception:
             pass
         if _kill_unstarted_worker(process, _metric_queue):
-            _spool_for_stopped_worker("had not started")
+            _spool_for_stopped_worker("had not started", shutdown, exact=True)
             return
         if not (_worker_alive(process) or _upload_terminal.get_obj().value):
-            # One that has exited reads no more: unless the run was deleted, which rejects them, the queue's groups are spooled the same way.
+            # One that has exited reads no more: unless the run was deleted, which rejects them, the queue's groups are spooled the same way. Killed (no exit published: -1) or crashed (1), it may have left points it delivered or spooled charged.
             _spool_for_stopped_worker(
-                f"had exited (exitcode {_worker_exitcode(process)})"
+                f"had exited (exitcode {_worker_exitcode(process)})",
+                shutdown,
+                exact=_worker_exit.value not in (-1, 1),
             )
             return
         # Once closed, the feeder writes what it holds and exits (_feeder_left).
@@ -3581,42 +3661,43 @@ def _kill_unstarted_worker(process, source) -> bool:
     return True
 
 
-def _spool_for_stopped_worker(state: str) -> None:
-    """Spool, from the parent, what a worker a handoff killed before it began (_kill_unstarted_worker), or found exited, was to read: the queue's groups and those held back, within _HANDOFF_FEEDER_GRACE, as the console's budget allows (_start_salvage). Report how many points it spooled and how many it could not; state says what became of the worker."""
-    held = _take_held_back()
-    uncharged = _take_held_back(_uncharged)
-    total = max(0, _queue_status.get_obj().value) + sum(
-        map(_queue_item_size, uncharged)
-    )
+def _spool_for_stopped_worker(
+    state: str, shutdown: "_Shutdown", *, exact: bool
+) -> None:
+    """Spool, from the parent, what a worker a handoff killed before it began (_kill_unstarted_worker), or found exited, was to read: the queue's groups and those held back, within _HANDOFF_FEEDER_GRACE, as the console's budget allows (_start_salvage). Report how many points it spooled and how many it could not, the count of the worker's points an upper bound ("at most") unless exact, since a worker killed or crashed may have delivered or spooled points it had not resolved (_report_queue_losses); state says what became of the worker. The salvage is shutdown's, which a Ctrl-C that exits at once before then reports instead (_report_cut_short_shutdown)."""
     deadline = time.monotonic() + _HANDOFF_FEEDER_GRACE
     # The process may exit at the deadline: a record still written then is cut off whole rather than torn, which would cost the whole file.
-    thread, outcome, spool = _start_salvage(
-        held + uncharged, deadline, until=lambda: deadline
-    )
+    _start_salvage(shutdown, lambda: deadline)
+    total = max(0, _queue_status.get_obj().value) + shutdown.uncharged_points
+    bound = "" if exact else "at most "
+    thread, outcome, spool = shutdown.salvage
     # Its spool's close comes after its deadline.
     thread.join(_remaining_seconds(deadline) + _SHUTDOWN_STEP)
     if thread.is_alive():
         _log.error(
-            "the upload worker %s; spooling its %d point(s) goes on in the "
-            "background at %s, and what is not spooled is lost if this process "
-            "exits now",
+            "the upload worker %s; spooling its %s%d point(s) to %s did not end by "
+            "its deadline, and what it has not spooled is lost",
             state,
+            bound,
             total,
             spool.path,
         )
-        return
-    if outcome["error"] is not None:
-        _log.error("spooling for the upload worker failed: %s", outcome["error"])
-    salvaged = outcome["salvaged"]
-    _log.warning(
-        "the upload worker %s; spooled %d of its %d point(s)%s",
-        state,
-        salvaged,
-        total,
-        "" if salvaged >= total else ", the rest are lost if this process exits now",
-    )
-    if salvaged:
-        _report_spool([spool.path])
+    else:
+        if outcome["error"] is not None:
+            _log.error("spooling for the upload worker failed: %s", outcome["error"])
+        salvaged = spool.count
+        # Nothing reads the queue again: the next init() makes its own.
+        _log.warning(
+            "the upload worker %s; spooled %d of its %s%d point(s)%s",
+            state,
+            salvaged,
+            bound,
+            total,
+            "" if salvaged >= total else ", the rest are lost",
+        )
+        if salvaged:
+            _report_spool([spool.path])
+    shutdown.reported = True
 
 
 def _feeder_left(source, deadline: float) -> int:
@@ -3671,21 +3752,25 @@ def _shut_down(shutdown: _Shutdown) -> bool:
     if backlog > 0:
         _log.info("flushing %d queued points (budget %.0fs)…", backlog, shutdown.budget)
 
+    # Planned before the last drain, which gets until the worker stops delivering: a queue that stays full by then holds the text back, for the salvage, rather than taking the worker's window and the salvage's.
+    shutdown.plan_worker(time.monotonic())
     # Cleared for this last drain (a previous run's shutdown, or a handoff's, may have set it), which off the main thread may pass a busy capture lock over, its text left in the buffer (_drain_capture_points).
     _capture_left_unsent = False
     try:
         _publish_queue_items(
             [],
             capture_ms=int(time.time() * 1000),
-            hard_deadline=shutdown.hard,
+            hard_deadline=shutdown.deliver_by,
             final=True,
         )
     except (OSError, RuntimeError, ValueError, queue.Full) as error:
         _capture_left_unsent = True
         shutdown.check()
-        _log.warning("failed to publish final captured output: %s", error)
+        _log.warning(
+            "failed to publish final captured output: %s",
+            str(error) or "the upload queue stayed full",
+        )
 
-    shutdown.plan_worker(time.monotonic())
     shutdown_marker_published = False
     try:
         shutdown_marker_published = _await(
@@ -3703,17 +3788,13 @@ def _shut_down(shutdown: _Shutdown) -> bool:
         stop_deadline=lambda: shutdown.stop_by,
     )
     shutdown.stopped = True
-
-    # The worker has delivered what it will, so the run's last metrics are persisted before it flips to CRASHED/FINISHED. End it now: the salvage and the spool listing below only write and read the disk, and the server takes points after a run has ended, so they must not use up TerminateRun's time.
     shutdown.check()
-    shutdown.end_run()
 
-    salvage_finished = True
     current_backlog = _queue_status.get_obj().value
     terminal_rejected = bool(_upload_terminal.get_obj().value)
     # Groups still held back, charged or not, were never put, and with the worker stopped never will be: they leave delivery unproven, and a salvage spools them; any it does not take the shutdown drops and counts (_drain_and_shutdown).
-    held_back = bool(_held_back or _uncharged)
-    needs_salvage = not worker_clean or current_backlog != 0 or held_back
+    had_held_back = bool(_held_back or _uncharged)
+    needs_salvage = not worker_clean or current_backlog != 0 or had_held_back
     if terminal_rejected:
         # The worker can be force-killed while draining a very large producer
         # queue after a lifecycle rejection. Those remaining points are known
@@ -3725,15 +3806,34 @@ def _shut_down(shutdown: _Shutdown) -> bool:
                 "point(s) instead of creating a replayable salvage spool",
                 max(0, current_backlog),
             )
-    elif needs_salvage and worker_dead and _remaining_seconds(shutdown.pre_cleanup) > 0:
-        # Worker was killed or crashed; the owner's fresh unique fence remains ordered after every earlier owner publication, even if its feeder is still pickling one.
-        salvage_finished = _salvage_queue_before(
-            shutdown, _take_held_back() + _take_held_back(_uncharged)
-        )
+    elif (
+        needs_salvage and worker_dead and _remaining_seconds(shutdown.salvage_end()) > 0
+    ):
+        # Worker was killed or crashed; the owner's fresh unique fence remains ordered after every earlier owner publication, even if its feeder is still pickling one. The salvage runs until its end (salvage_end) as the run ends, and is waited for after (_await_queue_salvage); a Ctrl-C's handoff leaves it the queue (_complete_handoff).
+        try:
+            _start_salvage(shutdown, shutdown.salvage_end)
+        except Exception as error:
+            # The run's end below must still go out.
+            _log.error(
+                "failed to start the parent's salvage of the upload queue: %s", error
+            )
     elif needs_salvage and not worker_dead:
         _log.error(
-            "upload worker is still alive after SIGKILL; skipping unsafe salvage"
+            "the upload worker had not exited when the wait after its SIGKILL "
+            "ended; skipping unsafe salvage"
         )
+    elif needs_salvage:
+        # A zero budget, or a parent starved past the salvage's end.
+        _log.error("no time was left to salvage the upload queue")
+
+    # Covers the pre-created worker path, every segment the worker rotated to, and the salvage spool, once the salvage has closed it: they all carry this init's session prefix.
+    cleanup = _start_spool_cleanup(
+        terminal_rejected=terminal_rejected,
+        after=None if shutdown.salvage is None else shutdown.salvage[0],
+    )
+    # The worker has delivered what it will, so the run's last metrics are persisted before it flips to CRASHED/FINISHED. End it now, as the salvage spools and the spool cleanup runs: they neither talk to the server nor use a control process, and the server takes points after a run has ended, so they must not use up TerminateRun's time, nor it theirs.
+    shutdown.end_run()
+    salvage_finished = shutdown.salvage is None or _await_queue_salvage(shutdown)
 
     # A killed worker leaves the queue's feeder thread wedged on a full
     # pipe, and Queue._finalize_join would join it forever at interpreter
@@ -3743,23 +3843,17 @@ def _shut_down(shutdown: _Shutdown) -> bool:
     if salvage_finished:
         _metric_queue.close()
 
-    # Covers the pre-created worker path, every segment the worker rotated to,
-    # and the salvage spool: they all carry this init's session prefix.
-    had_spool = _resolve_run_spools(
-        terminal_rejected=terminal_rejected, deadline=lambda: shutdown.hard
-    )
-
+    unproven = _await_spool_cleanup(cleanup, deadline=lambda: shutdown.hard)
     final_backlog = _queue_status.get_obj().value
     final_spooled = _upload_spooled.get_obj().value
-    if final_backlog != 0:
-        _log.error(
-            "shutdown accounting incomplete: %d point(s) remain unacknowledged",
-            final_backlog,
-        )
+    if not terminal_rejected:
+        _report_queue_losses(shutdown)
+    # Set only once the count is out: an exit at once before then reports the spool and the count itself (_report_cut_short_shutdown), perhaps naming the spool a second time, rather than leave the count out.
+    shutdown.reported = True
 
     # A gallery the worker published or spooled cut short, the one failure it records and exits cleanly after, leaves delivery incomplete.
     values_complete = (
-        not (_pending_incomplete or _pending or held_back)
+        not (_pending_incomplete or _pending or had_held_back)
         and not _upload_failure.get_obj().value
     )
     # Complete delivery takes every proof. A terminated worker takes its private in-RAM buffers with it, so queue salvage alone cannot prove it.
@@ -3769,7 +3863,7 @@ def _shut_down(shutdown: _Shutdown) -> bool:
         and not _capture_left_unsent
         and values_complete
         and poller_quiesced
-        and not had_spool
+        and not unproven
         and final_backlog == 0
         and final_spooled == 0
     )
@@ -4055,18 +4149,25 @@ class _RetainedLane:
         self.total_bytes = 0
 
 
+def _close_channel(channel) -> None:
+    """Close a gRPC channel the upload worker has let go of, on a daemon thread of its own or, if none can start, on the caller's thread: Channel.close() waits until each call it cancels has ended, and one whose bytes sit in a socket write that a black hole never drains ends only when TCP gives up, minutes later, or never against a peer that stops reading. On the worker's loop that wait would stop the queue's reading and the spill of what the worker holds. A close that never returns keeps its thread, channel and connection until the process exits."""
+    thread = threading.Thread(
+        target=channel.close, name="kymo-channel-close", daemon=True
+    )
+    try:
+        thread.start()
+    except RuntimeError:
+        # No thread to be had: close it on this thread, which may block.
+        channel.close()
+
+
 class _ConnectionAttempt:
     """One channel-readiness attempt, which the worker loop polls without blocking."""
 
     def __init__(self, server_address: str, *, local_endpoint=None):
         self._server_address = server_address
         self._deadline = time.monotonic() + _CONNECT_READY_TIMEOUT
-        if local_endpoint is None:
-            self._channel = grpc.insecure_channel(server_address)
-        else:
-            from kymo._local_runtime import grpc_channel
-
-            self._channel = grpc_channel(local_endpoint)
+        self._channel = _own_channel(server_address, local_endpoint)
         self._ready = grpc.channel_ready_future(self._channel)
 
     def poll(self, deadline_fn=None):
@@ -4096,6 +4197,7 @@ class _ConnectionAttempt:
             self._ready.cancel()
         except Exception:
             pass
+        # One not handed over carried no call, so its close does not wait.
         self._channel.close()
         self._channel = None
 

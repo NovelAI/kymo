@@ -42,6 +42,7 @@ import weakref
 from collections import deque
 from unittest import mock
 
+import httpx
 import numpy as np
 from PIL import Image as PILImage
 
@@ -2208,6 +2209,23 @@ print(k > 50, str(late).replace(" ", ""), 0.9 < armed <= 1)
             make_spool_path.call_args.kwargs["spool_dir"],
             os.path.abspath("relative-spool"),
         )
+
+    def test_init_sends_its_initrun_after_a_terminaterun_left_running(self):
+        # A TerminateRun an earlier shutdown left to finish by itself (a zero-budget finish()'s, say) could reach the server after the InitRun of the run it resumes, and end it: the InitRun goes once that control process has ended.
+        left = mock.Mock(pid=4321, **{"poll.return_value": None})
+        ended = mock.Mock(pid=4322, **{"poll.return_value": 0})
+        for control, after in ((left, 4321), (ended, None)):
+            with (
+                self.subTest(after=after),
+                self._init_without_a_server(mock.Mock(), _left_control=control),
+            ):
+                self._init()
+                (init_run,) = [
+                    call
+                    for call in client_module._run_control_rpc.call_args_list
+                    if call.args[0] == "InitRun"
+                ]
+                self.assertEqual(init_run.kwargs["after"], after)
 
     def test_an_empty_config_is_stored_and_none_is_left_out(self):
         collect = client_module._collect_run_metadata
@@ -7405,15 +7423,12 @@ class QueueDrainTests(unittest.TestCase):
             return event
 
     @staticmethod
-    def _salvage(source, held=(), spool=None, within=30.0):
-        """The parent's salvage of source, then held, into spool (by default a stand-in that counts nothing), by within seconds from now; returns what it salvaged."""
+    def _salvage(source, held=(), spool=None, end=lambda: math.inf):
+        """The parent's salvage of source, then held, into spool (by default a stand-in that counts nothing, whose until is end); returns the spool's count, what it salvaged."""
+        spool = mock.Mock(count=0, until=end) if spool is None else spool
         with mock.patch.object(client_module, "_init_pid", os.getpid()):
-            return client_module._drain_queue_to_spool(
-                mock.Mock(count=0) if spool is None else spool,
-                source=source,
-                held=list(held),
-                hard_deadline=time.monotonic() + within,
-            )
+            client_module._drain_queue_to_spool(spool, source=source, held=list(held))
+        return spool.count
 
     def test_the_salvage_keeps_no_group_alive_through_its_next_wait(self):
         # Its next wait can last until its deadline: the group it consumed last, perhaps a large serialized gallery, must not stay alive through it.
@@ -7435,6 +7450,95 @@ class QueueDrainTests(unittest.TestCase):
         with mock.patch.object(client_module, "_spill_tuple", return_value=True):
             self._salvage(source)
         self.assertEqual(alive, [True, False])
+
+    def test_the_salvage_leaves_whole_records_through_an_encode_and_a_wait(self):
+        # A process that exits as the salvage builds a gallery's record (its encode) or waits for its next group leaves its file in whole records, as the worker's spill does: here behind a record larger than the writer's buffer, whose tail would otherwise wait in it.
+        whole, build, decode = (
+            [],
+            client_module._spool_record,
+            client_module._decode_queue_item,
+        )
+
+        def readable():
+            try:
+                list(read_spool(path)[1])
+                return True
+            except Exception:
+                return False
+
+        def built(point_tuple):
+            if point_tuple[0] == "cdn_batch_mutation":
+                whole.append(("encode", readable()))
+            return build(point_tuple)
+
+        def decoded(item):
+            if whole:
+                whole.append(("wait", readable()))
+            return decode(item)
+
+        text = ("text_ts", "logs/std_out", 1, "x" * (3 << 20), 1)
+        batch, text_batch = client_module._NUMERIC_BATCH_KINDS
+        source = self.ScriptedQueue(
+            [
+                [text, _gallery(1, [Resource(b"image", "bin")])],
+                (text_batch, 1, 1, ["a"], [1.0], [], [text]),
+                (batch, 2, 1, ["a"], [2.0], []),
+                (batch, 3, 1, ["a"], [3.0], []),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as spool_dir:
+            path = make_spool_path("p", "r", "salvage", spool_dir, session="s")
+            spool = SpoolWriter(
+                path,
+                client_module._spool_header("srv", "p", "r", "run", "", "s"),
+                until=lambda: math.inf,
+            )
+            with (
+                mock.patch.multiple(
+                    client_module, _spool_record=built, _decode_queue_item=decoded
+                ),
+                mock.patch.object(spool, "flush", wraps=spool.flush) as flush,
+            ):
+                self._salvage(source, spool=spool)
+            spool.close()
+            self.assertEqual(len(list(read_spool(path)[1])), 6)
+        self.assertEqual(whole, [("encode", True)] + [("wait", True)] * 3)
+        # Before the gallery and after each group but a numeric batch, whose small records reach the file whole: a flush per log() call would cost a write call each.
+        self.assertEqual(flush.call_count, 3)
+
+    def test_a_salvage_past_its_end_writes_nothing_more(self):
+        # Its end passed (a signal brought it forward, a Ctrl-C's handoff), the salvage writes nothing more, not even a held-back group of small records, which the writer's buffer would take with no write the end could cut.
+        with mock.patch.object(client_module, "_spill_tuple") as spill:
+            self._salvage(None, held=[[numeric(1), numeric(2)]], end=lambda: -math.inf)
+        spill.assert_not_called()
+
+    def test_a_salvage_stops_at_its_end_brought_forward(self):
+        # A signal brings the shutdown's end forward as the salvage drains: read as it goes, that end stops it before the group's next gallery, which it would first encode, and its reading at the next group, rather than at the end it started with.
+        ends = [math.inf]
+        gallery = _gallery(2, [Resource(b"image", "bin")])
+        source = self.ScriptedQueue([[numeric(1), gallery], [numeric(3)], [numeric(4)]])
+
+        def spilled(spool, point_tuple):
+            ends[0] = time.monotonic()
+            return _spill_counted(spool, point_tuple)
+
+        with mock.patch.object(client_module, "_spill_tuple", side_effect=spilled):
+            salvaged = self._salvage(source, end=lambda: ends[0])
+        self.assertEqual(salvaged, 1)
+        self.assertEqual(source.events[:2], [[numeric(3)], [numeric(4)]])
+
+    def test_a_salvage_checks_its_end_every_512th_point_of_a_group(self):
+        # A group of 2000 numeric points whose end passes as its first is spilled: the salvage spools on to its next check of that end, the 512th point, then stops, as the worker's spill does (test_points_never_read_are_reported_lost_when_no_salvage_follows); the writer's until rarely cuts a small record, so this check is what bounds the writes past the end.
+        ends = [math.inf]
+        source = self.ScriptedQueue([[numeric(i) for i in range(2000)]])
+
+        def spilled(spool, point_tuple):
+            ends[0] = time.monotonic()
+            return _spill_counted(spool, point_tuple)
+
+        with mock.patch.object(client_module, "_spill_tuple", side_effect=spilled):
+            salvaged = self._salvage(source, end=lambda: ends[0])
+        self.assertEqual(salvaged, 512)
 
     def test_owner_drain_uses_a_fresh_fifo_fence_past_empty_reads(self):
         # One numeric batch carries the text points of a call's captured output as its 7th field.
@@ -7485,7 +7589,7 @@ class QueueDrainTests(unittest.TestCase):
         source = self.ScriptedQueue(
             [[numeric(1), gallery, numeric(2), numeric(3), numeric(4)], later]
         )
-        spool = mock.Mock()
+        spool = mock.Mock(until=lambda: math.inf)
         # A disk failure partway through the third record, which the writer cuts off.
         spool.write.side_effect = [None, None, OSError("no space left on device")]
         spool.count = 2
@@ -7501,20 +7605,20 @@ class QueueDrainTests(unittest.TestCase):
         ):
             salvaged = self._salvage(source, spool=spool)
 
-        # The unencodable gallery wrote nothing, so the next point still spooled; after the failed write nothing was written or even decoded, but the drain still reached its fence. The gallery counts as dropped with the three points the failed write cost.
+        # The unencodable gallery wrote nothing, so the next point still spooled; after the failed write nothing was written or even decoded, but the drain still reached its fence. The shutdown counts what it did not spool (_report_queue_losses).
         self.assertEqual(salvaged, 2)
         self.assertEqual(
             [call.args[0][2] for call in spool.write.call_args_list], [1, 2, 3]
         )
         self.assertEqual(decode.call_count, 1)
         self.assertEqual(source.events, [])
-        self.assertIn("dropped 4 point(s)", "\n".join(logs.output))
+        self.assertIn("failed to spool during salvage", "\n".join(logs.output))
 
-    def test_owner_drain_counts_the_points_it_cannot_decode_or_encode_as_dropped(self):
-        # A rich item that will not unpickle and a gallery that cannot be encoded spool nothing: the salvage's report counts them, with what a failed write cost.
+    def test_owner_drain_goes_on_past_points_it_cannot_decode_or_encode(self):
+        # A rich item that will not unpickle and a gallery that cannot be encoded spool nothing, and the salvage goes on to the next point: the shutdown counts them (_report_queue_losses).
         image = Image(b"\x89PNG\r\n\x1a\n", format="webp")
         undecodable = (client_module._SERIALIZED_RICH_QUEUE_ITEM, b"not a pickle")
-        spool = mock.Mock(count=0)
+        spool = mock.Mock(count=0, until=lambda: math.inf)
         spool.write.side_effect = lambda record: setattr(
             spool, "count", spool.count + 1
         )
@@ -7528,7 +7632,9 @@ class QueueDrainTests(unittest.TestCase):
             salvaged = self._salvage(source, spool=spool)
 
         self.assertEqual(salvaged, 1)
-        self.assertIn("parent salvage dropped 2 point(s)", "\n".join(logs.output))
+        self.assertIn(
+            "failed to decode a queued item during salvage", "\n".join(logs.output)
+        )
 
     def test_owner_drain_makes_room_for_its_fence_on_a_full_queue(self):
         # A dead worker can leave a bounded queue (every multiprocessing.Queue on macOS) full: salvage takes groups off until the fence fits, then spools the groups the full queue held back.
@@ -7556,10 +7662,12 @@ class QueueDrainTests(unittest.TestCase):
             ),
             self.assertLogs("kymo", level="WARNING") as logs,
         ):
-            salvaged = self._salvage(Full(), held=[[numeric(1)]], within=0.05)
+            salvaged = self._salvage(
+                Full(), held=[[numeric(1)]], end=_at(time.monotonic() + 0.05)
+            )
 
-        # The groups held back are spooled even so.
-        self.assertEqual(salvaged, 1)
+        # Past that end, the groups held back are left too: the shutdown counts them lost.
+        self.assertEqual(salvaged, 0)
         self.assertIn("no room for its owner fence", "\n".join(logs.output))
 
     def test_owner_drain_reports_a_missing_fence(self):
@@ -7572,7 +7680,7 @@ class QueueDrainTests(unittest.TestCase):
             mock.patch.object(source, "put", side_effect=drop_fence),
             self.assertLogs("kymo", level="WARNING") as logs,
         ):
-            salvaged = self._salvage(source, within=0.01)
+            salvaged = self._salvage(source, end=_at(time.monotonic() + 0.01))
 
         self.assertEqual(salvaged, 0)
         self.assertEqual(len(source.puts), 1)
@@ -7584,9 +7692,7 @@ class QueueDrainTests(unittest.TestCase):
             mock.patch.object(client_module, "_init_pid", os.getpid() + 1),
             self.assertRaisesRegex(RuntimeError, "initializing process"),
         ):
-            client_module._drain_queue_to_spool(
-                object(), source=source, held=[], hard_deadline=math.inf
-            )
+            client_module._drain_queue_to_spool(object(), source=source, held=[])
 
         self.assertEqual(source.puts, [])
 
@@ -7848,6 +7954,10 @@ class ShutdownProofTests(unittest.TestCase):
                 _shutdown_deadline=_QueueStatus(),
                 _spill_deadline=_QueueStatus(),
                 _worker_started=types.SimpleNamespace(value=1),
+                # No exit published: a kill's, unless a test publishes one.
+                _worker_exit=_QueueStatus(-1)
+                if client_module._worker_exit is None
+                else client_module._worker_exit,
             ),
             mock.patch.object(client_module, "_spool_dir", spool_dir),
             mock.patch.object(client_module, "_server_address", server_address),
@@ -7860,8 +7970,7 @@ class ShutdownProofTests(unittest.TestCase):
                 # A test's own failure code, else none.
                 _upload_failure=client_module._upload_failure or _QueueStatus(),
             ),
-            mock.patch.object(client_module, "SpoolWriter"),
-            mock.patch.object(client_module, "_drain_queue_to_spool", return_value=0),
+            mock.patch.object(client_module, "_drain_queue_to_spool"),
             mock.patch.object(client_module.time, "time", return_value=1.234),
             capture_patch,
         ):
@@ -8085,6 +8194,13 @@ class ShutdownProofTests(unittest.TestCase):
             client_module._put_shutdown_marker,
             client_module._stop_upload_process,
             client_module._terminate_run,
+            client_module._start_salvage,
+            client_module._await_queue_salvage,
+            client_module._start_spool_cleanup,
+            client_module._await_spool_cleanup,
+            client_module._report_queue_losses,
+            client_module._report_cut_short_shutdown,
+            client_module._spool_for_stopped_worker,
             *(
                 member
                 for member in vars(client_module._Shutdown).values()
@@ -8375,7 +8491,7 @@ class ShutdownProofTests(unittest.TestCase):
             events.append("arrived")
             return True
 
-        def exit_now(code):
+        def exit_now(code, shutdown):
             events.append("exit")
             raise Exited
 
@@ -8557,12 +8673,9 @@ class ShutdownProofTests(unittest.TestCase):
         self,
     ):
         # Under spawn the worker imports __main__ before it reads the queue, which can take seconds: a Ctrl-C hands off to a worker that holds nothing, and that would outlive the handoff's cap, or die opening the semaphores the program's exit unlinks, delivering and spooling none of it. The handoff kills it, holding the queue's reader lock, and spools the queue's groups and those held back from the parent, and says so; so it does for a worker that has exited, unless the run was deleted or the shutdown salvaged its queue already. A worker that has started, or is reading, keeps the run. Whether the worker runs is checked before the thread that reaps it starts: while a thread joins a process that has exited, multiprocessing's is_alive() can read it as running (the join reaps it before it records the exit code), so a worker that exits as the handoff's TerminateRun goes out (an OOM kill, say) would have its queue closed rather than spooled.
-        salvaged = threading.Thread(target=lambda: None)
-        salvaged.start()
-        salvaged.join()
-
         def shut_down_after_its_salvage(shutdown):
-            shutdown.stopped, shutdown.salvage = True, (salvaged, None, None)
+            shutdown.stopped = True
+            shutdown.salvage = _shutdown_salvage(1, path="salvage.mkspool")
             raise client_module._HandedOff
 
         class Joined(_Process):
@@ -8582,14 +8695,17 @@ class ShutdownProofTests(unittest.TestCase):
             "started",
             "reading",
             "exited",
+            "exited cleanly",
             "exits during the send",
             "deleted",
             "salvaged",
         ):
             source = _real_queue(self)
-            exited = state in ("exited", "deleted", "salvaged")
+            exited = state in ("exited", "exited cleanly", "deleted", "salvaged")
+            # The status it published as it exited: 1, a crash's, or 3 (_WORKER_EXIT_DRAIN_INCOMPLETE), once it had resolved its points; else -1, none, as after a kill.
+            published = {"exited": 1, "exited cleanly": 3}.get(state, -1)
             worker = (Joined if state == "exits during the send" else _Process)(
-                exitcode=1 if exited else None
+                exitcode=(3 if state == "exited cleanly" else 1) if exited else None
             )
             started = types.SimpleNamespace(value=int(state != "unstarted"))
             status = _QueueStatus(3)
@@ -8606,6 +8722,7 @@ class ShutdownProofTests(unittest.TestCase):
                     _upload_terminal=_QueueStatus(int(state == "deleted")),
                     _upload_process=worker,
                     _worker_started=started,
+                    _worker_exit=_QueueStatus(published),
                     _system_poller=None,
                     _shutdown_deadline=_QueueStatus(),
                     _handoff=_QueueStatus(),
@@ -8661,13 +8778,23 @@ class ShutdownProofTests(unittest.TestCase):
                     for record in spool_module.read_spool(path)[1]
                 ]
             output = "\n".join(logs.output)
-            if state in ("unstarted", "exited", "exits during the send"):
+            if state in (
+                "unstarted",
+                "exited",
+                "exited cleanly",
+                "exits during the send",
+            ):
                 self.assertEqual(worker.killed, int(state == "unstarted"))
                 self.assertEqual(spooled, [1, 2, 3, 4])
                 self.assertIn(
-                    "had not started; spooled 4 of its 4 point(s)"
-                    if state == "unstarted"
-                    else "had exited (exitcode 1); spooled 4 of its 4 point(s)",
+                    {
+                        "unstarted": "had not started; spooled 4 of its 4 point(s)",
+                        "exited cleanly": "had exited (exitcode 3); spooled 4 of its 4 point(s)",
+                    }.get(
+                        state,
+                        # Crashed or killed, it may have left points it delivered or spooled charged.
+                        "had exited (exitcode 1); spooled 4 of its at most 4 point(s)",
+                    ),
                     output,
                 )
                 self.assertIn("python -m kymo.sync", output)
@@ -8677,11 +8804,15 @@ class ShutdownProofTests(unittest.TestCase):
                 self.assertEqual((worker.killed, spooled), (0, []))
                 # The groups held back that the handoff could not put are dropped, and counted.
                 self.assertIn("dropped 2 point(s)", output)
+                if state == "salvaged":
+                    # The salvage's spool, which its thread closed before the handoff and no listing named, and the queue's points it left the handoff names and counts.
+                    self.assertIn("salvage.mkspool", output)
+                    self.assertIn(
+                        "1 point(s) reached neither the server nor the spool", output
+                    )
 
-    def test_an_unstarted_workers_spool_cuts_off_a_record_written_past_its_deadline(
-        self,
-    ):
-        # The process may exit as soon as the handoff's spooling for a worker that never started is over: its writer cuts off whole a record still written at the deadline, here a large text point, rather than let the exit tear it partway, which costs the whole file. The point is reported, not spooled.
+    def test_an_unstarted_workers_spool_writes_nothing_past_its_deadline(self):
+        # The process may exit as soon as the handoff's spooling for a worker that never started is over: past its deadline it writes nothing more, not even a small record, which the writer's buffer would take with no write the deadline could cut. The point is reported, not spooled.
         source = _real_queue(self)
         with (
             tempfile.TemporaryDirectory() as spool_dir,
@@ -8695,9 +8826,7 @@ class ShutdownProofTests(unittest.TestCase):
                 _project_id="p",
                 _run_id="r",
                 _session_id="session-a",
-                _held_back=deque(
-                    [[("text_ts", "logs/std_out", 1, "x" * (4 << 20), 1)]]
-                ),
+                _held_back=deque([[numeric(1)]]),
                 _uncharged=deque(),
                 _HANDOFF_FEEDER_GRACE=0.0,
                 # Room for a busy runner, which can take longer than the one step the report waits past the zero grace to finish the salvage; the join returns as soon as its thread ends.
@@ -8705,7 +8834,9 @@ class ShutdownProofTests(unittest.TestCase):
             ),
             self.assertLogs("kymo", level="WARNING") as logs,
         ):
-            client_module._spool_for_stopped_worker("had not started")
+            client_module._spool_for_stopped_worker(
+                "had not started", client_module._Shutdown(0.0), exact=True
+            )
             spooled = [
                 record[2]
                 for path in spool_module.run_spool_files(
@@ -8715,11 +8846,11 @@ class ShutdownProofTests(unittest.TestCase):
             ]
         self.assertEqual(spooled, [])
         output = "\n".join(logs.output)
-        self.assertIn("the spool's deadline passed while it wrote a record", output)
+        self.assertIn("the salvage reached its end", output)
         self.assertIn("spooled 0 of its 1 point(s)", output)
 
     def test_a_handed_off_runs_end_is_never_killed(self):
-        # The control process that sends a handed-off run's TerminateRun can take much of a second to start: the parent waits 1 s for it at most, then leaves it to finish by itself, by its RPC's deadline, never killing it, which would leave the run RUNNING.
+        # The control process that sends a handed-off run's TerminateRun can take much of a second to start: the parent waits 1 s for it at most, then leaves it to finish by itself, within its alarm, never killing it, which would leave the run RUNNING.
         class SlowControl:
             killed = False
             reaped = threading.Event()
@@ -8756,10 +8887,10 @@ class ShutdownProofTests(unittest.TestCase):
             self.assertTrue(SlowControl.reaped.wait(5))
         self.assertFalse(SlowControl.killed)
         self.assertEqual(payloads[0]["timeout"], 5.0)
-        self.assertIn("TerminateRun is still on its way", logs.output[-1])
+        self.assertIn("TerminateRun(130) is still on its way", logs.output[-1])
 
     def test_a_ctrl_c_during_the_runs_end_leaves_it_and_sends_130_after_it(self):
-        # A Ctrl-C during a plain shutdown's TerminateRun(0), which a slow server holds, hands the run off: the parent stops waiting for that send within a step, leaving its control process to finish by itself, never killed; and the TerminateRun(130) that follows sends once that one has ended, so the server takes 130 last.
+        # A Ctrl-C during a plain shutdown's TerminateRun(0), which a slow server holds, hands the run off: the parent stops waiting for that send within a step, leaving its control process to finish by itself, never killed; and the TerminateRun(130) that follows sends once that one has ended, so the server takes 130 last; the parent waits _HANDOFF_TERMINATE_TIMEOUT for that one, which never answers here, then leaves it too.
         def communicate(process, timeout):
             if process.sent.request()[0] == 0 and not client_module._handed_off:
                 client_module._signal_during_shutdown(shutdown, signal.SIGINT)
@@ -8772,12 +8903,32 @@ class ShutdownProofTests(unittest.TestCase):
             took = time.monotonic() - began
             self.assertTrue(client_module._handed_off)
         self.assertLess(took, client_module._HANDOFF_TERMINATE_TIMEOUT + 1.0)
+        self.assertGreaterEqual(took, client_module._HANDOFF_TERMINATE_TIMEOUT)
         self.assertEqual(
             [process.sent.request() for process in started],
             [(0, None), (130, started[0].pid)],
         )
         self.assertEqual(shutdown.ended, 130)
         self.assertFalse(any(process.killed for process in started))
+
+    def test_a_handoff_says_what_its_worker_does(self):
+        # The handoff's warning once its run's end is out: a live worker delivers what it can within the end hand_off gave it (_handoff); one already gone is said to be, rather than promised to deliver within no time.
+        for worker in (_Process(), _Process(1)):
+            with (
+                self.subTest(alive=worker.is_alive()),
+                self._signal_state(_upload_process=worker, _handed_off=True),
+            ):
+                client_module._handoff.value = time.monotonic() + 2.0
+                client_module._Shutdown(5.0).end_run()
+                (warning,) = client_module._log.warning.call_args_list
+            if worker.is_alive():
+                self.assertIn("delivers what it can within", warning.args[0])
+                self.assertAlmostEqual(warning.args[1], 2.0, delta=0.5)
+            else:
+                self.assertEqual(
+                    warning.args,
+                    ("ending the run; the upload worker had already exited",),
+                )
 
     def test_a_raise_out_of_the_runs_end_leaves_the_next_send_after_it(self):
         # A handler kymo does not own raises as finish()'s TerminateRun(0) waits for a slow server, leaving the 0's control process running: a SIGINT handler the program installed after init() aborts that shutdown, and the TerminateRun(130) of the shutdown that follows (the exception hook's) sends once that one has ended, so the server takes 130 last; so does the same shutdown's next send, after an Exception (a per-step timeout's) the send swallows or a KeyboardInterrupt.
@@ -8808,8 +8959,101 @@ class ShutdownProofTests(unittest.TestCase):
                     [(0, None), (130, started[0].pid)],
                 )
 
-    def test_a_send_that_never_starts_keeps_the_one_left_running_to_wait_for(self):
-        # A SIGTERM supersedes the shutdown's TerminateRun(0) as its end passes, leaving the 0's control process running; the 143 that follows has no time left and starts no process. The handoff's 130 after it still sends once the 0's process has ended, so the server takes 130 last.
+    def test_a_spent_budgets_send_still_goes_out(self):
+        # A shutdown whose time is spent still sends its TerminateRun and waits for it up to _HANDOFF_TERMINATE_TIMEOUT, a local endpoint's ensure before it included, so that it lands before the program exits, which in a container or a Slurm step takes a control process left running down with it; a changed code still supersedes it.
+        waits, ensured = [], []
+
+        def communicate(process, timeout):
+            waits.append(timeout)
+            if len(waits) < 3:
+                raise subprocess.TimeoutExpired("kymo control", timeout)
+            return b"", b""
+
+        def ensure(**kwargs):
+            ensured.append(kwargs["leave"]())
+            # A changed code (a SIGTERM's) supersedes the send: its ensure stops within a step.
+            with mock.patch.object(client_module, "_exit_code", 143):
+                ensured.append(kwargs["leave"]())
+            return mock.Mock(**{"worker_config.return_value": {}})
+
+        with (
+            self._control_processes(communicate) as started,
+            mock.patch.object(client_module, "_local_installation_uuid", "local"),
+            mock.patch("kymo._local_runtime.ensure_local_endpoint", side_effect=ensure),
+        ):
+            client_module._Shutdown(0.0).end_run()
+            warnings = client_module._log.warning.call_args_list
+            left = client_module._left_control
+        self.assertEqual(ensured, [False, True])
+        self.assertEqual([process.sent.request() for process in started], [(0, None)])
+        self.assertAlmostEqual(
+            json.loads(started[0].sent.written)["timeout"],
+            client_module._HANDOFF_TERMINATE_TIMEOUT,
+            delta=0.05,
+        )
+        self.assertEqual(waits, [client_module._SHUTDOWN_STEP] * 3)
+        self.assertEqual(warnings, [])
+        self.assertIsNone(left)
+
+    def test_a_spent_budgets_send_is_left_once_its_time_passes(self):
+        # One still running after _HANDOFF_TERMINATE_TIMEOUT is left to finish by itself, never killed, within its alarm, and says so in the words test_graceful_shutdown.py waits on.
+        import test_graceful_shutdown
+
+        def communicate(process, timeout):
+            time.sleep(timeout)
+            raise subprocess.TimeoutExpired("kymo control", timeout)
+
+        with (
+            self._control_processes(communicate) as started,
+            mock.patch.object(client_module, "_HANDOFF_TERMINATE_TIMEOUT", 0.2),
+        ):
+            began = time.monotonic()
+            client_module._Shutdown(0.0).end_run()
+            took = time.monotonic() - began
+            warning = client_module._log.warning.call_args.args
+            left = client_module._left_control
+        self.assertGreaterEqual(took, 0.2)
+        self.assertLess(took, 1.0)
+        self.assertFalse(started[0].killed)
+        self.assertIs(left, started[0])
+        self.assertEqual(
+            test_graceful_shutdown._LEFT_TERMINATE.findall(warning[0] % warning[1:]),
+            [("0", "3")],
+        )
+
+    def test_a_first_send_with_time_left_keeps_that_time(self):
+        # Only a send that finds the time spent gets _HANDOFF_TERMINATE_TIMEOUT: a send with time left keeps its own deadline, so a Ctrl-C's 130 chained after it is not left to wait out a longer one (kymo._control_rpc._dispatch counts that wait in the 130's deadline).
+        with (
+            self._control_processes(lambda process, timeout: (b"", b"")) as started,
+            # Longer than the time left, which a stall before end_run must not spend.
+            mock.patch.object(client_module, "_HANDOFF_TERMINATE_TIMEOUT", 5.0),
+        ):
+            client_module._Shutdown(3.0).end_run()
+        self.assertLess(json.loads(started[0].sent.written)["timeout"], 3.01)
+
+    def test_a_handed_off_send_gets_at_least_the_time_it_is_waited_for(self):
+        # A handoff gives its TerminateRun's RPC _HANDOFF_TERMINATE_TIMEOUT even with less left, and what is left when that is more; the parent waits for it _HANDOFF_TERMINATE_TIMEOUT at most.
+        for left, timeout in (
+            (0.3, client_module._HANDOFF_TERMINATE_TIMEOUT),
+            (3.0, 3.0),
+        ):
+            with (
+                self.subTest(left=left),
+                self._control_processes(lambda process, timeout: (b"", b"")) as started,
+            ):
+                shutdown = client_module._Shutdown(left)
+                client_module._exit_code = 130
+                shutdown.hand_off()
+                shutdown.end_run()
+            self.assertEqual(
+                [process.sent.request() for process in started], [(130, None)]
+            )
+            self.assertAlmostEqual(
+                json.loads(started[0].sent.written)["timeout"], timeout, delta=0.05
+            )
+
+    def test_a_code_changed_as_the_end_passes_still_goes_out_after_the_last(self):
+        # A SIGTERM supersedes the shutdown's TerminateRun(0) as its end passes, leaving the 0's control process running: the 143 that follows, with no time left, still gets _HANDOFF_TERMINATE_TIMEOUT and sends once the 0's process has ended, and the handoff's 130 after it, so the server takes 130 last.
         def communicate(process, timeout):
             if process is started[0]:
                 client_module._exit_code = 143
@@ -8825,7 +9069,12 @@ class ShutdownProofTests(unittest.TestCase):
             shutdown.end_run()
         self.assertEqual(
             [process.sent.request() for process in started],
-            [(0, None), (130, started[0].pid)],
+            [(0, None), (143, started[0].pid), (130, None)],
+        )
+        self.assertAlmostEqual(
+            json.loads(started[1].sent.written)["timeout"],
+            client_module._HANDOFF_TERMINATE_TIMEOUT,
+            delta=0.05,
         )
 
     def test_a_signal_during_a_slow_ensure_ends_the_run_at_once(self):
@@ -8929,6 +9178,105 @@ class ShutdownProofTests(unittest.TestCase):
         self.assertEqual(exits[0][0], 130)
         # The console comes back within a step or so of the Ctrl-C, not at the 143's RPC deadline 2 s later.
         self.assertLess(exits[0][1] - interrupted[0], 0.5)
+
+    def test_an_exit_at_once_counts_what_a_stopped_shutdown_loses(self):
+        # A Ctrl-C after a SIGTERM exits at once from the run's end (_exit_now): once the shutdown has stopped the worker (even one it had no time to see die), or the worker is dead (a handoff's, which found it exited), it counts the queue's points that exit loses too; a live worker, handed off, still holds them and reports its own.
+        for stopped, worker in (
+            (True, _Process()),
+            (False, _Process(1)),
+            (False, _Process()),
+        ):
+            with (
+                self.subTest(stopped=stopped, alive=worker.is_alive()),
+                _upload_state(
+                    _queue_status=_QueueStatus(4),
+                    _upload_terminal=_QueueStatus(),
+                    _worker_exit=_QueueStatus(3),
+                    _upload_process=worker,
+                ),
+                mock.patch.object(client_module.os, "_exit") as exit_,
+                mock.patch.object(client_module, "_log") as log,
+            ):
+                shutdown = client_module._Shutdown(0.0)
+                shutdown.stopped = stopped
+                client_module._exit_now(130, shutdown)
+            exit_.assert_called_once_with(130)
+            self.assertEqual(
+                [call.args[1:] for call in log.error.call_args_list],
+                [] if worker.is_alive() and not stopped else [("", 4)],
+            )
+
+    def test_a_second_ctrl_c_as_a_dead_workers_queue_spools_counts_it(self):
+        # A Ctrl-C hands off a run whose worker had died, and a second exits at once (_exit_now) as the handoff spools the worker's queue (_spool_for_stopped_worker): the exit names the spool and counts the points lost, at most, the spooling still running, its own line never coming. Once the spooling has reported, the exit adds nothing, whether the spooling ended or overran its deadline, which its line says, of at most the crashed worker's points.
+        replay = (client_module.replay_command(["salvage.mkspool"]),)
+        for case in ("during", "after", "overran"):
+            shutdown = client_module._Shutdown(0.0)
+            spooling = types.SimpleNamespace(
+                join=lambda timeout=None, shutdown=shutdown, case=case: (
+                    case == "during" and client_module._exit_now(130, shutdown)
+                ),
+                is_alive=lambda case=case: case != "after",
+            )
+            spool = types.SimpleNamespace(count=1, path="salvage.mkspool")
+            with (
+                self.subTest(case=case),
+                _upload_state(
+                    _queue_status=_QueueStatus(5),
+                    _upload_terminal=_QueueStatus(),
+                    _upload_process=_Process(1),
+                    _worker_exit=_QueueStatus(1),
+                    _handed_off=True,
+                    # Two uncharged points taken, as the real start records them.
+                    _start_salvage=lambda shutdown, *_, spooling=spooling, spool=spool, **__: (
+                        setattr(shutdown, "uncharged_points", 2),
+                        setattr(
+                            shutdown, "salvage", (spooling, {"error": None}, spool)
+                        ),
+                    ),
+                ),
+                mock.patch.object(client_module.os, "_exit", side_effect=SystemExit),
+                mock.patch.object(client_module, "_log") as log,
+                self.assertRaises(SystemExit),
+            ):
+                client_module._spool_for_stopped_worker(
+                    "had exited", shutdown, exact=False
+                )
+                client_module._exit_now(130, shutdown)
+            self.assertEqual(
+                [call.args[1:] for call in log.error.call_args_list],
+                {
+                    "during": [replay, ("at most ", 7)],
+                    "after": [replay],
+                    "overran": [("had exited", "at most ", 7, "salvage.mkspool")],
+                }[case],
+            )
+
+    def test_a_cut_short_shutdown_reports_once(self):
+        # Once: a second report adds nothing, the salvage's spool named and the loss counted once.
+        shutdown = client_module._Shutdown(0.0)
+        shutdown.salvage = _shutdown_salvage(1, path="salvage.mkspool")
+        with (
+            _upload_state(
+                _queue_status=_QueueStatus(3),
+                _upload_terminal=_QueueStatus(),
+                _worker_exit=_QueueStatus(3),
+            ),
+            mock.patch.object(client_module, "_log") as log,
+        ):
+            client_module._report_cut_short_shutdown(shutdown)
+            client_module._report_cut_short_shutdown(shutdown)
+            # A deleted run's points were discarded, and said so: nothing to report.
+            shutdown.reported = False
+            client_module._upload_terminal.get_obj().value = 1
+            client_module._report_cut_short_shutdown(shutdown)
+            # A salvage that spooled nothing names no spool, which may not exist.
+            client_module._upload_terminal.get_obj().value = 0
+            shutdown.salvage = _shutdown_salvage(0, path="none")
+            client_module._report_cut_short_shutdown(shutdown)
+        self.assertEqual(
+            [call.args[1:] for call in log.error.call_args_list],
+            [(client_module.replay_command(["salvage.mkspool"]),), ("", 2), ("", 3)],
+        )
 
     def test_a_ctrl_c_once_the_shutdown_stopped_the_worker_publishes_nothing(self):
         # A Ctrl-C during the shutdown's own TerminateRun(0), once the worker has stopped and the shutdown has dealt with its queue: the handoff only ends the run with 130, publishing nothing more to a queue nothing reads and spooling nothing again.
@@ -9056,9 +9404,9 @@ class ShutdownProofTests(unittest.TestCase):
         self.assertLessEqual(set(ends), {(True, False, False), (False, True, True)})
         self.assertEqual(ends.count((False, True, True)), 2)
 
-    def test_the_run_ends_before_the_salvage_and_the_spool_listing(self):
-        # Once the worker is gone the run ends, so a salvage or spool listing that takes what is left of a bounded shutdown never leaves TerminateRun without time: the server takes points after a run has ended.
-        order = []
+    def test_the_run_ends_as_the_salvage_spools_and_the_spool_listing_runs(self):
+        # Once the worker is gone the run ends as the salvage spools and the spool listing runs, so none takes another's time (a hung TerminateRun would otherwise leave the listing none, and finish() unproven with everything delivered): the server takes points after a run has ended. Both are waited for after it, in order.
+        order, salvage = [], _shutdown_salvage(0)
         with (
             self._signal_state(
                 _run_control_rpc=lambda method, request, *_, **__: order.append(
@@ -9067,13 +9415,31 @@ class ShutdownProofTests(unittest.TestCase):
             ),
             mock.patch.object(
                 client_module,
-                "_salvage_queue_before",
-                side_effect=lambda deadline, held: order.append("salvage") or True,
+                "_start_salvage",
+                side_effect=lambda shutdown, end: (
+                    order.append("salvage") or setattr(shutdown, "salvage", salvage)
+                ),
             ),
             mock.patch.object(
                 client_module,
-                "_resolve_run_spools",
-                side_effect=lambda **kwargs: order.append("spool listing") or False,
+                "_await_queue_salvage",
+                side_effect=lambda shutdown: order.append("salvage awaited") or True,
+            ),
+            mock.patch.object(
+                client_module,
+                "_start_spool_cleanup",
+                side_effect=lambda **kwargs: (
+                    order.append("spool listing")
+                    or self.assertIs(kwargs["after"], salvage[0])
+                    or (None, {})
+                ),
+            ),
+            mock.patch.object(
+                client_module,
+                "_await_spool_cleanup",
+                side_effect=lambda listing, **kwargs: (
+                    order.append("spool listing awaited") or False
+                ),
             ),
         ):
             self._run_shutdown(
@@ -9082,7 +9448,16 @@ class ShutdownProofTests(unittest.TestCase):
                 flush_timeout=1,
                 server_address="127.0.0.1:1",
             )
-        self.assertEqual(order, ["TerminateRun(0)", "salvage", "spool listing"])
+        self.assertEqual(
+            order,
+            [
+                "salvage",
+                "spool listing",
+                "TerminateRun(0)",
+                "salvage awaited",
+                "spool listing awaited",
+            ],
+        )
 
     def test_a_signal_once_the_shutdown_forgot_its_run_still_ends_it_through_its_endpoint(
         self,
@@ -9222,7 +9597,7 @@ class ShutdownProofTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 3.0, raised.exception)
 
     def test_a_queue_whose_reader_lock_a_dead_worker_kept_is_not_salvaged(self):
-        # A worker that exits holding part of a message, or is killed inside a read, keeps the queue's reader lock: the salvage reports the queue's points lost at once rather than wait out its deadline reading nothing, and spools the groups held back.
+        # A worker that exits holding part of a message, or is killed inside a read, keeps the queue's reader lock: the salvage says at once that the queue cannot be salvaged rather than wait out its deadline reading nothing, and spools the groups held back; the shutdown counts the rest lost, at most, since the worker never published its exit.
         source = _real_queue(self)
         self.assertTrue(source._rlock.acquire(False))
         self.addCleanup(source._rlock.release)
@@ -9237,21 +9612,31 @@ class ShutdownProofTests(unittest.TestCase):
                 _project_id="p",
                 _run_id="r",
                 _session_id="session",
+                _held_back=deque([[numeric(1)]]),
+                _uncharged=deque(),
+                _worker_exit=_QueueStatus(-1),
             ),
-            self.assertLogs("kymo", level="ERROR") as logs,
+            self.assertLogs("kymo", level="WARNING") as logs,
         ):
             started = time.monotonic()
-            finished = client_module._salvage_queue_before(
-                types.SimpleNamespace(pre_cleanup=time.monotonic() + 5),
-                [[numeric(1)]],
+            shutdown = types.SimpleNamespace(
+                hard=time.monotonic() + 5, salvage=None, uncharged_points=0
             )
+            client_module._start_salvage(shutdown, lambda: shutdown.hard)
+            finished = client_module._await_queue_salvage(shutdown)
             elapsed = time.monotonic() - started
+            client_module._report_queue_losses(shutdown)
             (path,) = (os.path.join(spool_dir, name) for name in os.listdir(spool_dir))
             records = list(read_spool(path)[1])
         self.assertTrue(finished)
         self.assertLess(elapsed, 1.0)
         self.assertEqual(records, [numeric(1)])
-        self.assertIn("at most 3 queued point(s) are LOST", "\n".join(logs.output))
+        output = "\n".join(logs.output)
+        self.assertIn("upload queue unreadable; its points cannot be salvaged", output)
+        self.assertIn("salvaged 1 undelivered points", output)
+        self.assertIn(
+            "at most 2 point(s) reached neither the server nor the spool", output
+        )
 
     def test_a_shutdown_tells_the_worker_when_to_stop_spilling(self):
         # The worker's spill ends a margin before the shutdown's kill, half the shorter of its spill share and the cleanup tail, as a signal's does, so it reports what it lost and exits by itself; a signal's bound brings it forward.
@@ -9387,7 +9772,7 @@ class ShutdownProofTests(unittest.TestCase):
                     _handoff=handoff,
                     _exit_code=code,
                     _terminate_run=lambda code, timeout, **_: ended.append(code),
-                    _exit_now=exits.append,
+                    _exit_now=lambda code, shutdown: exits.append(code),
                 ),
                 mock.patch.dict(os.environ, {"KYMO_SIGNAL_FLUSH_TIMEOUT": "30"}),
             ):
@@ -9418,7 +9803,7 @@ class ShutdownProofTests(unittest.TestCase):
                 _init_pid=os.getpid(),
                 _upload_process=None,
                 _terminate_run=lambda code, timeout, **_: ended.append(code),
-                _exit_now=exits.append,
+                _exit_now=lambda code, shutdown: exits.append(code),
             ),
             mock.patch.dict(os.environ, {"KYMO_SIGNAL_FLUSH_TIMEOUT": "3"}),
         ):
@@ -9616,36 +10001,29 @@ class ShutdownProofTests(unittest.TestCase):
         )
 
     def test_a_ctrl_c_during_a_dead_workers_salvage_leaves_it_the_queue(self):
-        # A Ctrl-C hands the shutdown off while the parent salvages a dead worker's queue: the queue stays open to the salvage, nothing more is put past its fence, and from then on its writer cuts off whole a record still being written, since the process may exit as soon as the console is back.
+        # A Ctrl-C hands the shutdown off while the parent salvages a dead worker's queue: the queue stays open to the salvage, nothing more is put past its fence, and the salvage's end, which was pre_cleanup, is now at once: the writer cuts off whole a record still being written, since the process may exit as soon as the console is back.
         target, released, seen, ended = _ListQueue(), threading.Event(), {}, []
         target.close = lambda: seen.setdefault("closed", True)
 
-        class Spool:
-            count, path = 1, "salvage.mkspool"
-
-            def __init__(self, path, header, until=None):
-                seen["until"] = until
-
-            def close(self):
-                pass
-
-        def salvage(spool, *, source, held, hard_deadline):
-            seen["before"] = seen["until"]()
+        def salvage(spool, *, source, held):
+            seen["before"] = spool.until()
+            seen["planned"] = client_module._shutdown_claim["shutdown"].pre_cleanup
+            # The run's end goes out as the salvage spools (_shut_down): the Ctrl-C follows it.
+            _wait_for(lambda: ended)
             os.kill(os.getpid(), signal.SIGINT)
             released.wait(5)
-            seen["after"] = seen["until"]()
+            seen["after"] = spool.until()
             seen["closed while salvaging"] = "closed" in seen
-            return 1
 
         def run():
             with (
-                mock.patch.multiple(
-                    client_module, SpoolWriter=Spool, _drain_queue_to_spool=salvage
-                ),
+                mock.patch.object(client_module, "_drain_queue_to_spool", salvage),
                 self.assertRaises(KeyboardInterrupt),
             ):
                 client_module._drain_and_shutdown(flush_timeout=10)
             put = list(target.items)
+            # A later init() starting a run clears _handed_off: the old salvage's end stays at once.
+            client_module._handed_off = False
             released.set()
             for thread in threading.enumerate():
                 if thread.name == "kymo-parent-salvage":
@@ -9662,9 +10040,37 @@ class ShutdownProofTests(unittest.TestCase):
                 target=target, backlog=3, process=_Process(-9), run=run
             )
         self.assertEqual(put, [None])
-        self.assertEqual((seen["before"], seen["after"]), (math.inf, -math.inf))
+        self.assertEqual(seen["before"], seen["planned"])
+        self.assertEqual(seen["after"], -math.inf)
         self.assertFalse(seen["closed while salvaging"])
         self.assertEqual(ended, [0, 130])
+
+    def test_a_signal_as_the_run_ends_brings_the_salvages_end_forward_at_once(self):
+        # A SIGTERM's bound as the run's end goes out, which can hold the shutdown's thread until hard against a server that never answers (end_run), moves the salvage's end with hard at once, keeping the margin its plan left, rather than at the shutdown's next step: else an exit at the new hard could stop the salvage inside a record.
+        seen, sending, bounded = {}, threading.Event(), threading.Event()
+
+        def salvage(spool, *, source, held):
+            shutdown = client_module._shutdown_claim["shutdown"]
+            sending.wait(5)
+            margin = shutdown.hard - spool.until()
+            # As kymo's SIGTERM handler does (_signal_during_shutdown).
+            shutdown.bound(time.monotonic() + 2)
+            seen["margins"] = margin, shutdown.hard - spool.until()
+            bounded.set()
+
+        def terminate(code, timeout, **_):
+            sending.set()
+            bounded.wait(5)
+
+        def run():
+            with mock.patch.object(client_module, "_drain_queue_to_spool", salvage):
+                client_module._drain_and_shutdown(flush_timeout=10)
+
+        with self._signal_state(_terminate_run=terminate):
+            self._run_shutdown(backlog=3, process=_Process(-9), run=run)
+        before, after = seen["margins"]
+        self.assertGreater(before, 0)
+        self.assertAlmostEqual(after, before, places=6)
 
     def test_a_shutdown_signal_anywhere_in_a_pending_calls_handoff_loses_nothing(self):
         # kymo's own handler flushes and exits wherever its signal lands while the oldest pending call is handed over to the queue, its pop, flag and assembly included: the call reaches the queue once, before the shutdown marker.
@@ -9718,18 +10124,22 @@ class ShutdownProofTests(unittest.TestCase):
 
     def test_a_dead_workers_salvage_takes_the_held_back_groups(self):
         # The salvage spools the held-back groups, and finish() still reports them undelivered. A shutdown entered again meanwhile, by a handler kymo does not own, say, runs no second one.
-        salvaged = []
+        salvaged, start = [], client_module._start_salvage
 
-        def salvage(shutdown, held):
-            salvaged.append((held, list(client_module._held_back)))
+        def salvage(shutdown, end):
+            start(shutdown, end)
+            shutdown.salvage[0].join()
+            salvaged.append(
+                (
+                    client_module._drain_queue_to_spool.call_args.kwargs["held"],
+                    list(client_module._held_back),
+                )
+            )
             self.assertFalse(client_module._drain_and_shutdown(flush_timeout=0.1))
-            return True
 
         with (
             mock.patch.object(client_module, "_held_back", deque([[numeric(7)]])),
-            mock.patch.object(
-                client_module, "_salvage_queue_before", side_effect=salvage
-            ),
+            mock.patch.object(client_module, "_start_salvage", side_effect=salvage),
             self.assertLogs("kymo", level="WARNING"),
         ):
             complete = self._run_shutdown(
@@ -9741,11 +10151,16 @@ class ShutdownProofTests(unittest.TestCase):
 
     def test_the_salvage_takes_the_groups_no_charge_let_out(self):
         # The accounting lock stays busy through the shutdown: the groups held back uncharged, and the captured tail, which joins them, never reach the queue and add nothing to the backlog, yet the salvage spools them, even after a clean exit of the worker, and finish() reports them undelivered.
-        salvaged = []
+        salvaged, start = [], client_module._start_salvage
 
-        def salvage(shutdown, held):
-            salvaged.append(held)
-            return True
+        def salvage(shutdown, end):
+            start(shutdown, end)
+            shutdown.salvage[0].join()
+            salvaged.append(
+                client_module._drain_queue_to_spool.call_args.kwargs["held"]
+            )
+            # One spooled of the two: the closing count, which the charge alone would leave at nothing, counts the other.
+            shutdown.salvage = _shutdown_salvage(1)
 
         def lock_busy(points, hard_deadline):
             raise client_module._AccountingLockUnavailable("busy")
@@ -9754,10 +10169,8 @@ class ShutdownProofTests(unittest.TestCase):
             mock.patch.object(client_module, "_held_back", deque()),
             mock.patch.object(client_module, "_uncharged", deque([[numeric(8)]])),
             mock.patch.object(client_module, "_charge_backlog", lock_busy),
-            mock.patch.object(
-                client_module, "_salvage_queue_before", side_effect=salvage
-            ),
-            self.assertLogs("kymo", level="WARNING"),
+            mock.patch.object(client_module, "_start_salvage", side_effect=salvage),
+            self.assertLogs("kymo", level="WARNING") as logs,
         ):
             complete = self._run_shutdown(capture=("tail", ""))
             self.assertEqual(list(client_module._uncharged), [])
@@ -9766,24 +10179,272 @@ class ShutdownProofTests(unittest.TestCase):
             salvaged,
             [[[numeric(8)], [("text_ts", "logs/std_out", 1234, "tail", 1234)]]],
         )
+        self.assertIn(
+            "1 point(s) reached neither the server nor the spool",
+            "\n".join(logs.output),
+        )
 
     def test_the_groups_held_back_that_no_salvage_takes_are_dropped_and_counted(self):
         # A worker still alive after SIGKILL is never salvaged: the groups a full queue held back are dropped and counted.
-        class Unkillable(_Process):
-            def kill(self):
-                self.killed += 1
-
         with (
             mock.patch.object(client_module, "_held_back", deque([[numeric(7)]])),
             mock.patch.object(client_module, "_uncharged", deque([[numeric(8)]])),
             self.assertLogs("kymo", level="WARNING") as logs,
         ):
-            complete = self._run_shutdown(target=_FullQueue(), process=Unkillable())
+            complete = self._run_shutdown(
+                target=_FullQueue(), process=_UnkillableProcess()
+            )
         self.assertFalse(complete)
         self.assertIn(
             "dropped 2 point(s) that never reached the upload queue",
             "\n".join(logs.output),
         )
+
+    def test_a_spent_budget_says_it_had_no_time_and_counts_what_it_loses(self):
+        # A zero budget kills the worker with no time to see it die, or to salvage its queue: the shutdown says so, rather than blame the worker, and counts the queue's points lost, at most, since the worker never published its exit.
+        for process, cause in (
+            (_UnkillableProcess(), "had not exited when the wait after its SIGKILL"),
+            (_Process(), "no time was left to salvage the upload queue"),
+        ):
+            with (
+                self.subTest(cause=cause),
+                mock.patch.object(client_module, "_worker_exit", _QueueStatus(-1)),
+                self.assertLogs("kymo", level="WARNING") as logs,
+            ):
+                complete = self._run_shutdown(
+                    backlog=5, process=process, flush_timeout=0.0
+                )
+            output = "\n".join(logs.output)
+            self.assertFalse(complete)
+            self.assertIn(cause, output)
+            self.assertIn(
+                "at most 5 point(s) reached neither the server nor the spool", output
+            )
+
+    def test_the_spool_cleanup_waits_for_the_salvage_to_close_its_spool(self):
+        # A spool's file appears with its first record: listed before the salvage wrote its first record, the shutdown would not name the salvage's spool.
+        order = []
+        salvage = mock.Mock()
+        salvage.join.side_effect = lambda: order.append("salvage closed")
+
+        def list_spools(**_):
+            order.append("listed")
+            return ["salvage.mkspool"]
+
+        with mock.patch.multiple(
+            client_module,
+            _session_id="session-a",
+            _retire_or_list_run_spools=list_spools,
+        ):
+            thread, outcome = client_module._start_spool_cleanup(
+                terminal_rejected=False, after=salvage
+            )
+            thread.join(5)
+        self.assertEqual(order, ["salvage closed", "listed"])
+        self.assertEqual(outcome["spools"], ["salvage.mkspool"])
+
+    def test_a_spool_listing_that_cannot_start_still_lets_the_run_end(self):
+        # No thread to be had (a process's thread limit): the run's end, which the listing starts before, still goes out, and delivery stays unproven.
+        start, codes = threading.Thread.start, []
+
+        def no_cleanup_thread(thread):
+            if thread.name == "kymo-spool-cleanup":
+                raise RuntimeError("can't start new thread")
+            return start(thread)
+
+        with (
+            self._signal_state(codes),
+            mock.patch.object(threading.Thread, "start", no_cleanup_thread),
+        ):
+            complete = self._run_shutdown(flush_timeout=1, server_address="127.0.0.1:1")
+            errors = [call.args[0] for call in client_module._log.error.call_args_list]
+        self.assertFalse(complete)
+        self.assertEqual(codes, [0])
+        self.assertTrue(
+            any("failed to start this run's spool cleanup" in e for e in errors), errors
+        )
+
+    def test_a_salvage_that_cannot_start_still_lets_the_run_end(self):
+        # No thread to be had for the dead worker's salvage: the run's end, which the salvage starts before, still goes out, and the closing count counts the queue's points lost.
+        start, codes = threading.Thread.start, []
+
+        def no_salvage_thread(thread):
+            if thread.name == "kymo-parent-salvage":
+                raise RuntimeError("can't start new thread")
+            return start(thread)
+
+        def lock_busy(points, hard_deadline):
+            raise client_module._AccountingLockUnavailable("busy")
+
+        with (
+            self._signal_state(codes),
+            mock.patch.object(threading.Thread, "start", no_salvage_thread),
+            # One point held back uncharged, which the busy lock keeps from the queue: the salvage takes it, counted lost with the charge.
+            mock.patch.object(client_module, "_uncharged", deque([[numeric(8)]])),
+            mock.patch.object(client_module, "_charge_backlog", lock_busy),
+        ):
+            complete = self._run_shutdown(
+                backlog=5,
+                process=_Process(1),
+                flush_timeout=1,
+                server_address="127.0.0.1:1",
+            )
+            errors = [call.args for call in client_module._log.error.call_args_list]
+        self.assertFalse(complete)
+        self.assertEqual(codes, [0])
+        self.assertTrue(
+            any("failed to start the parent's salvage" in e[0] for e in errors), errors
+        )
+        # No salvage recorded that never started, which the spool cleanup would wait for.
+        self.assertFalse(any("failed to resolve" in e[0] for e in errors), errors)
+        self.assertIn(("at most ", 6), [e[1:] for e in errors], errors)
+
+    def test_a_shutdown_reads_as_reported_once_its_count_is_out(self):
+        # A Ctrl-C as the shutdown's own report ends finds it reported only once its closing count is out: one that then hands the run off adds nothing (_complete_handoff), and one that exits at once before then reports in its place (_report_cut_short_shutdown), rather than leaving the count out.
+        reported, report = [], client_module._report_queue_losses
+
+        def count_then_ctrl_c(shutdown):
+            reported.append(shutdown.reported)
+            report(shutdown)
+            client_module._handed_off = True
+
+        with (
+            self._signal_state([]),
+            mock.patch.object(
+                client_module, "_report_queue_losses", side_effect=count_then_ctrl_c
+            ),
+        ):
+            self._run_shutdown(backlog=4, process=_Process(3), flush_timeout=1)
+            counts = [
+                call.args[1:]
+                for call in client_module._log.error.call_args_list
+                if "reached neither" in call.args[0]
+            ]
+        self.assertEqual(reported, [False])
+        self.assertEqual(counts, [("at most ", 4)])
+
+    def test_a_handed_off_shutdowns_put_stops_waiting(self):
+        # A Ctrl-C hands the shutdown off: its put on a full queue gives up at once, the handoff publishing nothing more, rather than wait out the shutdown's end.
+        def run():
+            began = time.monotonic()
+            with self.assertRaises(client_module._QueueStillFull):
+                client_module._wait_to_put([numeric(1)], None)
+            return time.monotonic() - began
+
+        with mock.patch.multiple(
+            client_module,
+            _handed_off=True,
+            _shutdown_claim={"shutdown": client_module._Shutdown(2.0)},
+        ):
+            took = self._run_shutdown(target=_FullQueue(), process=_Process(), run=run)
+        self.assertLess(took, 0.5)
+
+    def test_a_signal_during_the_last_drain_brings_its_end_forward(self):
+        # A SIGTERM during finish() plans the shutdown again from its bound: the last drain, waiting on a full queue, stops at the delivery end planned again, not the one planned before, so the worker and the salvage keep their window.
+        def run():
+            shutdown = client_module._Shutdown(60.0)
+            self.assertIsNone(client_module._claim_shutdown(shutdown))
+            try:
+                shutdown.plan_worker(time.monotonic())
+                planned = shutdown.deliver_by
+                shutdown.bound(time.monotonic() + 1.0)
+                began = time.monotonic()
+                with self.assertRaises(client_module._QueueStillFull):
+                    client_module._wait_to_put([numeric(1)], planned)
+                return time.monotonic() - began, planned - began
+            finally:
+                client_module._shutdown_claim.clear()
+
+        took, planned_in = self._run_shutdown(
+            target=_FullQueue(), process=_Process(), run=run
+        )
+        self.assertGreater(planned_in, 20)
+        self.assertLess(took, 1.0)
+
+    def test_a_deleted_runs_shutdown_counts_nothing_lost(self):
+        # A deleted run's points are discarded, and said so; the closing count does not count them again.
+        def run():
+            client_module._upload_terminal.get_obj().value = 1
+            return client_module._drain_and_shutdown(flush_timeout=0.1)
+
+        with self.assertLogs("kymo", level="ERROR") as logs:
+            complete = self._run_shutdown(backlog=5, process=_Process(4), run=run)
+        output = "\n".join(logs.output)
+        self.assertFalse(complete)
+        self.assertIn("run is deleted or no longer exists; discarding 5", output)
+        self.assertNotIn("reached neither the server nor the spool", output)
+
+    def test_the_shutdown_counts_what_its_salvage_left_once(self):
+        # The closing count (_report_queue_losses), once: 10 charged, less 1 held back, plus 2 uncharged, less what the salvage spooled; exact, then at most for each condition its docstring names (an exit the worker did not publish or a crash's, an unproven charge, a handoff, a salvage still running, which counts as spooling nothing); nothing when the salvage spooled the rest; and a shortfall, which says a point was resolved twice.
+        # The thread of a salvage still running: the count reads only is_alive().
+        alive = types.SimpleNamespace(is_alive=lambda: True)
+        exact = "7 point(s) reached neither the server nor the spool and are LOST"
+        for exited, unproven, handed_off, running, spooled, expected in (
+            (3, 0, False, False, 4, exact),
+            (-1, 0, False, False, 4, "at most 7 point(s) reached neither"),
+            (1, 0, False, False, 4, "at most 7 point(s) reached neither"),
+            (3, 1, False, False, 4, "at most 7 point(s) reached neither"),
+            (3, 0, True, False, 4, "at most 7 point(s) reached neither"),
+            (3, 0, False, True, 4, "at most 11 point(s) reached neither"),
+            (3, 0, False, False, 11, None),
+            (3, 0, False, False, 13, "the upload accounting is 2 point(s) short"),
+        ):
+            shutdown = types.SimpleNamespace(
+                salvage=_shutdown_salvage(spooled, thread=alive if running else None),
+                uncharged_points=2,
+            )
+            with (
+                self.subTest(
+                    exited=exited,
+                    unproven=unproven,
+                    handed_off=handed_off,
+                    running=running,
+                    spooled=spooled,
+                ),
+                mock.patch.multiple(
+                    client_module,
+                    _queue_status=_QueueStatus(10),
+                    _held_back=deque([[numeric(1)]]),
+                    _worker_exit=_QueueStatus(exited),
+                    _unproven_points=unproven,
+                    _handed_off=handed_off,
+                ),
+            ):
+                if expected is None:
+                    with self.assertNoLogs("kymo", level="ERROR"):
+                        client_module._report_queue_losses(shutdown)
+                    continue
+                with self.assertLogs("kymo", level="ERROR") as logs:
+                    client_module._report_queue_losses(shutdown)
+            (message,) = logs.output
+            self.assertTrue(message.startswith(f"ERROR:kymo:{expected}"), message)
+
+    def test_a_group_held_back_as_the_count_is_taken_is_counted(self):
+        # A log() on another thread charges a group and holds it back between the closing count's reads (_report_queue_losses): read before the charge, the held-back groups leave it in this count and in the drop line, rather than in neither.
+        class Charge:
+            # 10 charged; the log() charges its point and holds it back right after the read.
+            def __init__(self):
+                self.charged = 10
+
+            @property
+            def value(self):
+                read, self.charged = self.charged, self.charged + 1
+                client_module._held_back.append([numeric(1)])
+                return read
+
+        charge = Charge()
+        with (
+            _upload_state(
+                _queue_status=types.SimpleNamespace(get_obj=lambda: charge),
+                _worker_exit=_QueueStatus(3),
+            ),
+            self.assertLogs("kymo", level="ERROR") as logs,
+        ):
+            client_module._report_queue_losses(client_module._Shutdown(0.0))
+            held = list(client_module._held_back)
+        (message,) = logs.output
+        self.assertIn("ERROR:kymo:10 point(s) reached neither", message)
+        self.assertEqual(held, [[numeric(1)]])
 
     def test_shutdown_puts_groups_held_back_for_a_signal_first(self):
         status = _QueueStatus(1)
@@ -9908,6 +10569,28 @@ class ShutdownProofTests(unittest.TestCase):
         self.assertFalse(complete)
         self.assertEqual(target.items, [None])
         self.assertLess(time.monotonic() - started, 0.25)
+
+    def test_the_last_drain_waits_for_room_until_the_worker_stops_delivering(self):
+        # A queue that stays full (a worker that reads nothing; macOS bounds the queue) would otherwise hold the captured output's last drain until the shutdown's end, leaving the worker and the salvage no time: the worker is planned first, and the drain gets until it stops delivering, which the worker is told.
+        seen = []
+
+        def publish(items, *, hard_deadline=None, final=False, **_):
+            if final:
+                seen.append((hard_deadline, client_module._shutdown_deadline.value))
+                raise client_module._QueueStillFull
+
+        with (
+            mock.patch.object(client_module, "_publish_queue_items", publish),
+            self.assertLogs("kymo", level="WARNING") as logs,
+        ):
+            self.assertFalse(self._run_shutdown(flush_timeout=1.0))
+        ((deadline, told),) = seen
+        self.assertGreater(deadline, 0)
+        self.assertEqual(deadline, told)
+        self.assertIn(
+            "failed to publish final captured output: the upload queue stayed full",
+            "\n".join(logs.output),
+        )
 
     def test_calls_after_the_run_ended_return_its_shutdown_result(self):
         # A second finish() (a framework's teardown, then the program's) or a wait_for_upload() must not report a failed delivery as proven: one that spooled a point, or dropped what was held back as the run ended.
@@ -10175,7 +10858,7 @@ class ShutdownProofTests(unittest.TestCase):
                 mock.patch.object(client_module, "_server_address", "server"),
                 mock.patch.object(client_module, "_project_id", "p"),
                 mock.patch.object(client_module, "_run_id", "r"),
-                mock.patch.object(client_module, "_salvage_queue_before") as salvage,
+                mock.patch.object(client_module, "_start_salvage") as salvage,
                 mock.patch.object(client_module, "_run_control_rpc") as terminate,
                 self.assertLogs("kymo", level="ERROR"),
             ):
@@ -10225,7 +10908,7 @@ class ShutdownProofTests(unittest.TestCase):
             mock.patch.object(client_module, "_session_id", "session-a"),
             self.assertLogs("kymo", level="ERROR") as logs,
         ):
-            had_spool = client_module._resolve_run_spools(
+            had_spool = _resolve_spools(
                 terminal_rejected=False,
                 deadline=_at(time.monotonic() + deadline_in),
             )
@@ -10243,9 +10926,8 @@ class ShutdownProofTests(unittest.TestCase):
         every earlier phase must be handed the earlier deadline."""
         captured = []
 
-        def salvage(shutdown, held):
-            captured.append(shutdown.pre_cleanup)
-            return True
+        def salvage(shutdown, end):
+            captured.append(end())
 
         flush_timeout = 10.0
         # Taken from the forced-cleanup tail, capped at the reserve.
@@ -10255,9 +10937,7 @@ class ShutdownProofTests(unittest.TestCase):
         started = time.monotonic()
         with (
             mock.patch.object(client_module, "run_spool_files", return_value=[]),
-            mock.patch.object(
-                client_module, "_salvage_queue_before", side_effect=salvage
-            ),
+            mock.patch.object(client_module, "_start_salvage", side_effect=salvage),
             mock.patch.object(client_module, "_is_initialized", True),
             mock.patch.object(client_module, "_init_pid", os.getpid()),
             mock.patch.object(client_module, "_metric_queue", _ListQueue()),
@@ -10268,6 +10948,7 @@ class ShutdownProofTests(unittest.TestCase):
                 _upload_terminal=_QueueStatus(),
                 _upload_failure=_QueueStatus(),
                 _upload_spooled=_QueueStatus(),
+                _worker_exit=_QueueStatus(0),
             ),
             mock.patch.object(client_module, "_upload_process", _Process(0)),
             mock.patch.object(client_module, "_system_poller", None),
@@ -10321,7 +11002,7 @@ class ShutdownProofTests(unittest.TestCase):
                 self.assertLogs("kymo", level="ERROR"),
             ):
                 self.assertTrue(
-                    client_module._resolve_run_spools(
+                    _resolve_spools(
                         terminal_rejected=True, deadline=_at(time.monotonic())
                     )
                 )
@@ -10355,7 +11036,7 @@ class ShutdownProofTests(unittest.TestCase):
             mock.patch.object(client_module, "_session_id", "mine"),
             self.assertLogs("kymo", level="ERROR") as logs,
         ):
-            had_spool = client_module._resolve_run_spools(
+            had_spool = _resolve_spools(
                 terminal_rejected=True, deadline=_at(time.monotonic() + 0.05)
             )
 
@@ -10391,7 +11072,7 @@ class ShutdownProofTests(unittest.TestCase):
                 mock.patch.object(client_module, "_session_id", "mine"),
                 self.assertLogs("kymo", level="ERROR") as logs,
             ):
-                had_spool = client_module._resolve_run_spools(
+                had_spool = _resolve_spools(
                     terminal_rejected=True, deadline=_at(time.monotonic() + 0.2)
                 )
 
@@ -10425,7 +11106,7 @@ class ShutdownProofTests(unittest.TestCase):
                 mock.patch.object(client_module, "_session_id", "mine"),
                 self.assertLogs("kymo", level="ERROR") as logs,
             ):
-                had_spool = client_module._resolve_run_spools(
+                had_spool = _resolve_spools(
                     terminal_rejected=True, deadline=_at(time.monotonic() + 5)
                 )
 
@@ -10457,7 +11138,7 @@ class ShutdownProofTests(unittest.TestCase):
                 mock.patch.object(client_module, "_spool_dir", spool_dir),
                 mock.patch.object(client_module, "_session_id", "this-session"),
             ):
-                had_spool = client_module._resolve_run_spools(
+                had_spool = _resolve_spools(
                     terminal_rejected=False, deadline=_at(time.monotonic() + 5)
                 )
 
@@ -10482,7 +11163,7 @@ class ShutdownProofTests(unittest.TestCase):
                 mock.patch.object(client_module, "retire_deleted_spool") as retire,
                 self.assertLogs("kymo", level="ERROR") as logs,
             ):
-                had_spool = client_module._resolve_run_spools(
+                had_spool = _resolve_spools(
                     terminal_rejected=True, deadline=_at(time.monotonic())
                 )
 
@@ -10529,7 +11210,7 @@ class ShutdownProofTests(unittest.TestCase):
                 ) as open_file,
                 self.assertLogs("kymo", level="ERROR") as logs,
             ):
-                had_spool = client_module._resolve_run_spools(
+                had_spool = _resolve_spools(
                     terminal_rejected=False, deadline=_at(time.monotonic() + 5)
                 )
 
@@ -10576,7 +11257,7 @@ class ShutdownProofTests(unittest.TestCase):
                     side_effect=FileNotFoundError(path),
                 ),
             ):
-                had_spool = client_module._retire_or_report_run_spools(
+                had_spool = client_module._retire_or_list_run_spools(
                     project_id="p",
                     run_id="r",
                     spool_dir=spool_dir,
@@ -10597,7 +11278,7 @@ class ShutdownProofTests(unittest.TestCase):
                 mock.patch.object(client_module, "retire_deleted_spool") as retire,
                 self.assertLogs("kymo", level="ERROR") as logs,
             ):
-                had_spool = client_module._retire_or_report_run_spools(
+                had_spool = client_module._retire_or_list_run_spools(
                     project_id="p",
                     run_id="r",
                     spool_dir=spool_dir,
@@ -10624,7 +11305,7 @@ class ShutdownProofTests(unittest.TestCase):
             mock.patch.object(client_module, "_session_id", "session-a"),
             self.assertLogs("kymo", level="ERROR") as logs,
         ):
-            had_spool = client_module._resolve_run_spools(
+            had_spool = _resolve_spools(
                 terminal_rejected=True, deadline=_at(time.monotonic() + 5)
             )
 
@@ -10680,9 +11361,7 @@ class ShutdownProofTests(unittest.TestCase):
             )
             with (
                 self._signal_state(_worker_exit=_QueueStatus(-1)),
-                mock.patch.object(
-                    client_module, "_salvage_queue_before", return_value=True
-                ) as salvage,
+                mock.patch.object(client_module, "_start_salvage") as salvage,
             ):
                 self.assertFalse(self._run_shutdown(process=worker, flush_timeout=5.0))
             salvage.assert_called_once()
@@ -10724,12 +11403,10 @@ class ShutdownProofTests(unittest.TestCase):
         old_queue = types.SimpleNamespace(_rlock=threading.Lock())
         captured_sources = []
 
-        def blocked_drain(_spool, *, source, held, hard_deadline):
+        def blocked_drain(_spool, *, source, held):
             captured_sources.append(source)
             self.assertEqual(held, [])
-            self.assertGreater(hard_deadline, 0)
             release.wait(timeout=1)
-            return 1
 
         started = time.monotonic()
         with (
@@ -10741,11 +11418,12 @@ class ShutdownProofTests(unittest.TestCase):
                 client_module, "_drain_queue_to_spool", side_effect=blocked_drain
             ),
             mock.patch.object(client_module, "_metric_queue", old_queue),
+            mock.patch.multiple(client_module, _held_back=deque(), _uncharged=deque()),
             self.assertLogs("kymo", level="ERROR") as logs,
         ):
-            finished = client_module._salvage_queue_before(
-                types.SimpleNamespace(pre_cleanup=time.monotonic() + 0.02), []
-            )
+            shutdown = types.SimpleNamespace(hard=time.monotonic() + 0.02)
+            client_module._start_salvage(shutdown, lambda: shutdown.hard)
+            finished = client_module._await_queue_salvage(shutdown)
         elapsed = time.monotonic() - started
         release.set()
         self.assertTrue(closed.wait(timeout=1))
@@ -10753,7 +11431,28 @@ class ShutdownProofTests(unittest.TestCase):
         self.assertFalse(finished)
         self.assertEqual(captured_sources, [old_queue])
         self.assertLess(elapsed, 0.2)
-        self.assertIn("exceeded the finish deadline", "\n".join(logs.output))
+        self.assertIn("did not end by the shutdown's deadline", "\n".join(logs.output))
+
+    def test_a_salvage_closing_its_spool_past_its_end_is_waited_for(self):
+        # The salvage stops writing at its end and closes its spool after, a flush and an fsync that take what the file system takes: it is waited for until the shutdown's end, as the spool cleanup waits for it, rather than said not to have ended.
+        class SlowSpool:
+            path, count = "/tmp/salvage.mkspool", 0
+
+            @staticmethod
+            def close():
+                time.sleep(0.1)
+
+        with (
+            mock.patch.object(client_module, "SpoolWriter", return_value=SlowSpool()),
+            mock.patch.object(client_module, "_drain_queue_to_spool"),
+            mock.patch.object(client_module, "_metric_queue", _ListQueue()),
+            mock.patch.multiple(client_module, _held_back=deque(), _uncharged=deque()),
+        ):
+            now = time.monotonic()
+            shutdown = types.SimpleNamespace(pre_cleanup=now, hard=now + 5)
+            client_module._start_salvage(shutdown, lambda: shutdown.pre_cleanup)
+            finished = client_module._await_queue_salvage(shutdown)
+        self.assertTrue(finished)
 
 
 class PollerPublicationTests(unittest.TestCase):
@@ -11568,6 +12267,41 @@ class ConnectionTests(unittest.TestCase):
         ready.result.assert_called_once_with()
         channel.close.assert_not_called()
 
+    def test_connect_attempts_and_replays_open_connections_of_their_own(self):
+        # gRPC shares a connection between channels with the same target, so a reconnect after a channel was dropped from a dead connection would find it, read as connected and hang on its first call.
+        own = (("grpc.use_local_subchannel_pool", 1),)
+        with (
+            mock.patch.object(client_module.grpc, "insecure_channel") as open_channel,
+            mock.patch("kymo._local_runtime.grpc_channel") as local_channel,
+            mock.patch.object(client_module.grpc, "channel_ready_future"),
+        ):
+            for local_endpoint in (None, "endpoint"):
+                client_module._ConnectionAttempt(
+                    "server:1", local_endpoint=local_endpoint
+                ).cancel()
+                sync_module._connect("server:1", local_endpoint)
+        self.assertEqual(
+            open_channel.call_args_list, [mock.call("server:1", options=own)] * 2
+        )
+        self.assertEqual(
+            local_channel.call_args_list, [mock.call("endpoint", options=own)] * 2
+        )
+
+    def test_a_channel_close_with_no_thread_to_be_had_closes_here(self):
+        # A process at its thread limit: the close runs on the caller's thread, which may block, rather than raise out of a failover before its spill.
+        closed = []
+        with mock.patch.object(
+            threading.Thread,
+            "start",
+            side_effect=RuntimeError("can't start new thread"),
+        ):
+            client_module._close_channel(
+                types.SimpleNamespace(
+                    close=lambda: closed.append(threading.current_thread())
+                )
+            )
+        self.assertEqual(closed, [threading.current_thread()])
+
     def test_connect_timeout_closes_channel(self):
         channel = mock.Mock()
         ready = mock.Mock()
@@ -11606,6 +12340,23 @@ class ConnectionTests(unittest.TestCase):
         channel.close.assert_called_once_with()
 
 
+def _shutdown_salvage(count, *, path=None, thread=None):
+    """A shutdown's salvage (kymo.client._start_salvage): its thread, by default one that has ended, its outcome and its spool, which holds count points at path."""
+    if thread is None:
+        thread = threading.Thread(target=lambda: None)
+        thread.start()
+        thread.join()
+    return thread, {"error": None}, types.SimpleNamespace(count=count, path=path)
+
+
+def _resolve_spools(*, terminal_rejected, deadline):
+    """The run's spool cleanup, started and awaited as a shutdown does (kymo.client._start_spool_cleanup)."""
+    return client_module._await_spool_cleanup(
+        client_module._start_spool_cleanup(terminal_rejected=terminal_rejected),
+        deadline=deadline,
+    )
+
+
 class _Process:
     """An upload worker process, alive or, with exitcode, exited; it counts the SIGTERMs and SIGKILLs it gets, and a SIGKILL ends it."""
 
@@ -11625,6 +12376,13 @@ class _Process:
     def kill(self):
         self.killed += 1
         self.exitcode = -9
+
+
+class _UnkillableProcess(_Process):
+    """An upload worker process a SIGKILL does not end: one stuck in the kernel, or one a shutdown had no time to see die."""
+
+    def kill(self):
+        self.killed += 1
 
 
 class _ControlStdin(io.BytesIO):
@@ -11867,6 +12625,25 @@ def _worker_thread(case, source, status, spool_path, *, name=None, **kwargs):
     return thread
 
 
+@contextlib.contextmanager
+def _spill_end_passing_at(points):
+    """Patch the upload worker so it spills what it reads at once, its signal's deadline long past, until its spill end passes as it writes its points-th point."""
+    spill_tuple, written = client_module._spill_tuple, []
+
+    def spill(spool, point):
+        written.append(point)
+        if len(written) == points:
+            worker_module._spill_by = 1.0
+        return spill_tuple(spool, point)
+
+    with (
+        mock.patch.object(worker_module, "_signal_deadline", 1.0),
+        mock.patch.object(worker_module, "_spill_by", time.monotonic() + 3600),
+        mock.patch.object(client_module, "_spill_tuple", spill),
+    ):
+        yield
+
+
 def _held_encode():
     """An _encode_image stand-in that sets .encoding and returns once .release is set."""
 
@@ -11940,6 +12717,7 @@ class WorkerResponsivenessTests(unittest.TestCase):
                 source, status = _charged_queue(
                     [numeric(1)], _queued_gallery(2, [image])
                 )
+                failure = _QueueStatus()
                 try:
                     with (
                         tempfile.TemporaryDirectory() as spool_dir,
@@ -11954,7 +12732,11 @@ class WorkerResponsivenessTests(unittest.TestCase):
                         self.assertLogs("kymo", level="ERROR") as logs,
                     ):
                         worker = _worker_thread(
-                            self, source, status, os.path.join(spool_dir, "w.mkspool")
+                            self,
+                            source,
+                            status,
+                            os.path.join(spool_dir, "w.mkspool"),
+                            upload_failure=failure,
                         )
                         self.assertTrue(encode.encoding.wait(timeout=5))
                         started = time.monotonic()
@@ -11976,7 +12758,9 @@ class WorkerResponsivenessTests(unittest.TestCase):
                 self.assertEqual(
                     [record[2] for record in records], [] if cut == 2 else [1]
                 )
-                self.assertEqual(status.value, cut)
+                # Reported, those cut leave the charge, which the parent's shutdown counts as its own losses, under the spill's failure, so a wait_for_upload() that reads the charge at 0, everything cut, claims no delivery.
+                self.assertEqual(status.value, 0)
+                self.assertEqual(failure.value, client_module._WORKER_EXIT_SPOOL_FAILED)
                 self.assertIn(f"{cut} past the spill deadline", "\n".join(logs.output))
 
     def test_a_raw_gallery_spilled_after_the_delivery_end_is_encoded_until_the_spill_end(
@@ -12017,7 +12801,8 @@ class WorkerResponsivenessTests(unittest.TestCase):
         output = "\n".join(logs.output)
         self.assertIn("1 past the spill deadline, 0 never read", output)
         self.assertIn("with 1 point(s) unread; parent salvage is required", output)
-        self.assertEqual(status.value, 2)
+        # The one cut, reported, leaves the charge; the one unread stays, for the parent's salvage.
+        self.assertEqual(status.value, 1)
 
     def test_what_a_spill_wrote_is_on_disk_while_a_gallery_after_it_encodes(self):
         # A raw gallery the deadline spill encodes comes after a flush: the records the spill wrote before it are on disk while the encode runs, so a kill during a slow encode loses none of them with the writer's buffer.
@@ -12051,6 +12836,39 @@ class WorkerResponsivenessTests(unittest.TestCase):
         self.assertEqual(while_encoding, [1])
         self.assertEqual((worker.code, records, status.value), (0, [1, 2], 0))
 
+    def test_a_cut_the_worker_cannot_release_makes_the_shutdowns_count_inexact(self):
+        # The points cut past the spill end leave the charge once reported; with the accounting lock held past that end (a stalled owner), they stay charged, the parent's count includes them again, and the worker exits with a crash's status, which that count reads as at most.
+        source, status = _charged_queue(
+            *[[numeric(index)] * 1000 for index in range(2)]
+        )
+
+        class HoldLock(logging.Handler):
+            # Takes the accounting lock as the worker reports its losses, before it releases them.
+            def emit(self, record):
+                if "reached neither the server nor the spool" in record.getMessage():
+                    status.lock.acquire()
+
+        self.addCleanup(lambda: status.lock.locked() and status.lock.release())
+        with (
+            tempfile.TemporaryDirectory() as spool_dir,
+            _spill_end_passing_at(1500),
+            mock.patch.object(client_module, "_STATUS_LOCK_TIMEOUT", 0.05),
+            self.assertLogs("kymo", level="ERROR") as logs,
+        ):
+            # After assertLogs, which replaces the logger's handlers.
+            logging.getLogger("kymo").addHandler(HoldLock())
+            worker = _worker_thread(
+                self, source, status, os.path.join(spool_dir, "w.mkspool")
+            )
+            worker.join(timeout=10)
+        self.assertEqual(worker.code, 1)
+        self.assertEqual(status.value, 488)
+        self.assertIn(
+            "the shutdown's count of lost points includes the 488 past the spill "
+            "deadline again",
+            "\n".join(logs.output),
+        )
+
     def test_points_never_read_are_reported_lost_when_no_salvage_follows(self):
         # The drain stops at the spill end with groups still queued. Once the parent has exited, or has handed the run off, no salvage follows: the worker reports them lost with those it cut.
         # An owner that has exited.
@@ -12059,22 +12877,9 @@ class WorkerResponsivenessTests(unittest.TestCase):
         source, status = _charged_queue(
             *[[numeric(index)] * 1000 for index in range(5)]
         )
-        written = []
-        spill_tuple = client_module._spill_tuple
-
-        def spill_until_the_end_passes(spool, point):
-            written.append(point)
-            if len(written) == 1500:
-                worker_module._spill_by = 1.0
-            return spill_tuple(spool, point)
-
         with (
             tempfile.TemporaryDirectory() as spool_dir,
-            mock.patch.object(worker_module, "_signal_deadline", 1.0),
-            mock.patch.object(worker_module, "_spill_by", time.monotonic() + 3600),
-            mock.patch.object(
-                client_module, "_spill_tuple", spill_until_the_end_passes
-            ),
+            _spill_end_passing_at(1500),
             self.assertLogs("kymo", level="ERROR") as logs,
         ):
             worker = _worker_thread(
@@ -12087,8 +12892,8 @@ class WorkerResponsivenessTests(unittest.TestCase):
             worker.join(timeout=10)
             spooled = len(list(read_spool(os.path.join(spool_dir, "w.mkspool"))[1]))
         self.assertEqual(worker.code, client_module._WORKER_EXIT_SPOOL_FAILED)
-        # The first group spilled whole; the second, whose spill end passed as its 500th point was written, cut at the next check of that end, at its 512th point; the last three never read. The spool and the report account for every point.
-        self.assertEqual((spooled, status.value), (1512, 3488))
+        # The first group spilled whole; the second, whose spill end passed as its 500th point was written, cut at the next check of that end, at its 512th point; the last three never read. The spool and the report account for every point; those cut, reported, leave the charge, and those never read, which no salvage takes, stay.
+        self.assertEqual((spooled, status.value), (1512, 3000))
         self.assertIn(
             "3488 points reached neither the server nor the spool (0 unspoolable "
             "(disk full?), 0 unencodable, 0 undecodable, 488 past the spill "
@@ -13417,6 +14222,29 @@ class WorkerResponsivenessTests(unittest.TestCase):
             # The first stream after recovery opens at once, not when the old backoff ends.
             self.assertTrue(_wait_for(lambda: len(stream.opened) >= 2, timeout=1.0))
 
+    def test_a_channel_close_that_never_returns_does_not_stop_the_worker(self):
+        # Behind a black hole, closing a channel that carried calls waits until TCP gives up, minutes later: the worker closes it off its loop (_close_channel), on a daemon thread, which the worker process's exit does not join, so a failover still spills what it held, and replays it.
+        released, closing = threading.Event(), []
+        self.addCleanup(released.set)
+
+        class StuckChannel(_Channel):
+            def close(self):
+                thread = threading.current_thread()
+                closing.append((thread.name, thread.daemon))
+                released.wait(30)
+
+        replay = self._replay_stand_in()
+        with self._numeric_outage(
+            replay,
+            connect=lambda lane: _ImmediateConnectionAttempt(StuckChannel(), object()),
+        ) as lane:
+            lane.server_up.set()
+            self.assertTrue(lane.opens.wait(timeout=5))
+            lane.put_item([numeric(step) for step in range(1, 202)])
+            self.assertTrue(_wait_for(lambda: len(replay.numeric) == 201))
+            self.assertIn(("kymo-channel-close", True), closing)
+        self.assertEqual(sorted(replay.numeric), list(range(1, 202)))
+
     def test_a_lane_whose_replay_empties_the_disk_goes_live_and_sends_live(self):
         replay = self._replay_stand_in()
         with self._numeric_outage(replay) as lane:
@@ -14251,8 +15079,9 @@ class WorkerResponsivenessTests(unittest.TestCase):
         source.put(None)
         status = _QueueStatus(3)
 
-        # The gallery's first publication sees the gRPC side of a server rollout, and metadata's first fails independently. The content-addressed uploads succeed throughout, so only retaining each queue head can make its already-uploaded content visible once publication recovers.
+        # The gallery's first upload is refused, its first publication sees the gRPC side of a server rollout, and metadata's first fails independently. The content-addressed uploads succeed after that, so only retaining each queue head can make its already-uploaded content visible once publication recovers.
         upload_results = [
+            httpx.ConnectError("refused"),
             "resource.bin",
             "manifest.json",
             "resource.bin",
@@ -14268,12 +15097,23 @@ class WorkerResponsivenessTests(unittest.TestCase):
             None,
         ]
 
+        # The rich channel, on a connection of its own, whose close never returns, as behind a black hole: a failed attempt, an upload's or a publication's, retries on a fresh one, and off the worker's loop the closes do not hold it (kymo.client._close_channel).
+        released = threading.Event()
+        self.addCleanup(released.set)
+
+        closing, http = [], mock.Mock(spec=self._HttpClient)
+
+        class StuckChannel(_Channel):
+            def close(self):
+                closing.append(self)
+                released.wait(30)
+
         with tempfile.TemporaryDirectory() as spool_dir:
             spool_path = os.path.join(spool_dir, "cdn-outage.mkspool")
             deadline = _QueueStatus()
             with (
-                _channel_stand_ins(),
-                mock.patch("httpx.Client", return_value=self._HttpClient()),
+                _channel_stand_ins() as open_channel,
+                mock.patch("httpx.Client", return_value=http) as http_client,
                 mock.patch.object(
                     client_module,
                     "_upload_to_cdn",
@@ -14286,6 +15126,7 @@ class WorkerResponsivenessTests(unittest.TestCase):
                 ) as publish,
                 mock.patch.object(client_module, "_cdn_retry_delay", return_value=0.0),
             ):
+                open_channel.return_value = StuckChannel()
                 worker = _worker_thread(
                     self,
                     source,
@@ -14306,7 +15147,15 @@ class WorkerResponsivenessTests(unittest.TestCase):
             self.assertFalse(worker.is_alive())
             self.assertFalse(os.path.exists(spool_path))
 
-        self.assertEqual(upload.call_count, 6)
+        # A channel and HTTP client for each failed attempt, an upload's or a publication's, and one for the last; each closed, the last at the worker's exit.
+        self.assertEqual(
+            open_channel.call_args_list,
+            [mock.call("unused", options=(("grpc.use_local_subchannel_pool", 1),))] * 4,
+        )
+        self.assertEqual(http_client.call_count, 4)
+        self.assertTrue(_wait_for(lambda: len(closing) == 4))
+        self.assertEqual(http.close.call_count, 4)
+        self.assertEqual(upload.call_count, 7)
         # Each publication under its own name, step, timestamp and version.
         self.assertEqual(
             [call.args[3:] for call in publish.call_args_list],
@@ -14476,14 +15325,17 @@ class WorkerResponsivenessTests(unittest.TestCase):
         self.assertEqual(fed_steps, [[1, 2, 3], [2, 3]])
         self.assertEqual(status.value, 0)
 
-    def test_ack_watchdog_cancels_and_retries_before_deadline_spill(self):
-        stream_attempts = 0
-        cancel_times = []
+    def test_a_stream_the_ack_watchdog_breaks_reconnects_on_a_fresh_channel(self):
+        # No ACK for the watchdog's time: the stream is cancelled and, since its connection may be dead without a reset (a black hole), the old channel is closed, so the next stream goes out on a fresh one, rather than on the old one, which gRPC would keep until TCP gives up.
+        connects, closed, streams, cancelled = [], [], [], []
+
+        def connect(*_, **__):
+            connects.append((_Channel(), object()))
+            return _ImmediateConnectionAttempt(*connects[-1])
 
         class SilentStream:
-            def __init__(self, _stub, _feed_cap):
-                nonlocal stream_attempts
-                stream_attempts += 1
+            def __init__(self, stub, _feed_cap):
+                streams.append((stub, list(closed), list(cancelled)))
                 self.fed = False
 
             def feed_has_room(self):
@@ -14499,19 +15351,24 @@ class WorkerResponsivenessTests(unittest.TestCase):
 
             @staticmethod
             def half_close():
-                # Request EOF is correct even with unacked work; this fake then
-                # hangs forever without the final ACK/response EOF.
+                # Request EOF is correct even with unacked work; this fake then hangs forever without the final ACK/response EOF.
                 return True
 
             def cancel(self):
-                cancel_times.append(time.monotonic())
+                cancelled.append(self)
 
         source, status = _charged_queue([numeric(1)], None)
-        deadline = _QueueStatus(time.monotonic() + 0.2)
+        # Far off until the second stream has gone out, then past: the worker spills and exits.
+        deadline = _QueueStatus(time.monotonic() + 30)
         with tempfile.TemporaryDirectory() as spool_dir:
             spool_path = os.path.join(spool_dir, "watchdog.mkspool")
             with (
-                _connected(SilentStream),
+                mock.patch.multiple(
+                    client_module,
+                    _ConnectionAttempt=connect,
+                    _BidiStream=SilentStream,
+                    _close_channel=closed.append,
+                ),
                 mock.patch.object(wire_module, "_SEND_INITIAL_DELAY", 0.01),
                 mock.patch.object(client_module, "_IDLE_POLL_TIMEOUT", 0.005),
                 mock.patch.object(client_module, "_ACTIVE_POLL_TIMEOUT", 0.005),
@@ -14520,14 +15377,17 @@ class WorkerResponsivenessTests(unittest.TestCase):
                 worker = _worker_thread(
                     self, source, status, spool_path, shutdown_deadline=deadline
                 )
+                _wait_for(lambda: len(streams) >= 2)
+                deadline.value = time.monotonic()
                 worker.join(timeout=2)
-
             self.assertTrue(os.path.exists(spool_path))
-
         self.assertFalse(worker.is_alive())
-        self.assertGreaterEqual(stream_attempts, 2)
-        self.assertTrue(cancel_times)
         self.assertEqual(status.value, 0)
+        (first_channel, first_stub), (_, second_stub) = connects[:2]
+        self.assertEqual([stub for stub, *_ in streams[:2]], [first_stub, second_stub])
+        # Cancelled and closed before the second stream went out.
+        self.assertEqual(len(streams[1][2]), 1)
+        self.assertIn(first_channel, streams[1][1])
 
     def test_shutdown_eof_flushes_a_partial_unacked_tail(self):
         class EofFlushStream(self._immediate_stream_class(lambda _batch: None)):

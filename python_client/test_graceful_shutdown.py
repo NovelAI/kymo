@@ -67,6 +67,8 @@ fake kymo server):
                           sent from a threading atexit hook after a normal end,
                           where Python ignores what it raises: the run ends
                           with 143, as kymo's own handling would end it
+ 31. zero budget       → finish(flush_timeout=0): the run still ends with
+                          TerminateRun(0)
 
 Run:  python3 test_graceful_shutdown.py
 """
@@ -575,6 +577,44 @@ def load_factor() -> float:
         return 1.0
 
 
+# The client's warning when it leaves a TerminateRun's control process to finish by itself, as it does when the process outlasts the parent's wait (the shutdown's end, or 1 s in a handoff or for a send that finds the shutdown's time spent; kymo.client._Shutdown.end_run).
+_LEFT_TERMINATE = re.compile(
+    r"TerminateRun\((\d+)\) is still on its way; its control process goes on by "
+    r"itself for up to (\d+)s from its start"
+)
+
+
+def await_left_terminate(servicer, output):
+    """If the driver's output says its client left TerminateRuns to finish by themselves, wait for each, up to the longest bound their warnings name plus 1 s: they may land after the driver has exited."""
+    left = _LEFT_TERMINATE.findall(output)
+    if left:
+        codes = {int(code) for code, _ in left}
+        deadline = time.monotonic() + max(int(bound) for _, bound in left) + 1
+        while time.monotonic() < deadline:
+            with servicer.lock:
+                if codes <= {code for _, code in servicer.terminates}:
+                    return
+            time.sleep(0.05)
+
+
+def check_terminated(servicer, run_id, code, output, earlier=()):
+    """Assert the run ended with TerminateRun(code), each code once, after only codes of earlier, which it superseded and whose control processes can land first, and return when it came (time.monotonic()); or None if the client said it left that TerminateRun(code) to finish by itself and it did not come within the wait, as its control process may die at its alarm first on a starved machine."""
+    left = {int(left_code) for left_code, _ in _LEFT_TERMINATE.findall(output)}
+    with servicer.lock:
+        got = servicer.terminates
+        codes = [sent for _, sent in got]
+        missing = code in left and code not in codes
+        assert (
+            (missing or codes[-1:] == [code])
+            and all(run == run_id for run, _ in got)
+            and set(codes) <= {code, *earlier}
+            and len(set(codes)) == len(codes)
+        ), (
+            f"expected TerminateRun({code}) last, after only {earlier}, got {got}\n{output}"
+        )
+        return None if missing else servicer.terminated_at[-1]
+
+
 def run_driver(cfg: dict, timeout: float):
     """Runs the driver subprocess. Returns (returncode, wall_time, output)."""
     t0 = time.monotonic()
@@ -752,8 +792,13 @@ def scenario_slow_server(spool_dir):
     assert spooled > 0, (
         f"expected a spool with flush_timeout=3 and a slow server\n{out}"
     )
-    assert servicer.terminates, "TerminateRun not received"
+    await_left_terminate(servicer, out)
+    terminated = check_terminated(servicer, run_id, 0, out)
     stop()
+    if terminated is None:
+        print(
+            "    TerminateRun, left to finish by itself, did not come within the wait"
+        )
     # A loaded machine can leave the server no time to ack a flush within the budget: then everything spools, which is as correct, but leaves the acks' deletes untested here (scenario 6 covers them).
     print(
         "    OK\n" if delivered else "    OK, with no flush acked: everything spooled\n"
@@ -1301,7 +1346,7 @@ def signal_driver(
 ):
     """Run the driver as run name, logging STEPS steps of METRICS metrics unless cfg says otherwise, against a fake server started with server (start_fake_server's arguments); once its output shows wait_for, 0.3 s more have passed and the fake server has its first point, send it signals, 50 ms apart, to its whole process group as a terminal's Ctrl-C or a scheduler's cancel does, or else to it alone. With pause_worker, its upload worker is stopped (SIGSTOP) 0.2 s before them and resumed, if it is still there, once the driver has exited.
 
-    Returns (servicer, run_id, returncode, output, sent, console, gone): the fake server's servicer, the run's id, the driver's exit status and its output, when (time.monotonic()) the first signal went, and the seconds from then to the driver's exit, which gives the console back, and to the end of its output, which every process of its group holds open, the upload worker included. The group must be gone within 60 s, scaled by the machine's load (load_factor).
+    Returns (servicer, run_id, returncode, output, sent, console, gone): the fake server's servicer, the run's id, the driver's exit status and its output, when (time.monotonic()) the first signal went, and the seconds from then to the driver's exit, which gives the console back, and to the end of its output, which every process of its group holds open, the upload worker included. The group must be gone within 60 s, scaled by the machine's load (load_factor). A TerminateRun the client left to finish by itself is waited for before the fake server stops (await_left_terminate).
     """
     servicer, grpc_addr, cdn_addr, stop = start_fake_server(
         **(server or {"call_delay": 0.1, "per_point_delay": 0.0002})
@@ -1380,6 +1425,8 @@ def signal_driver(
         proc.wait(timeout=5)
         if console is None:
             console = gone
+        out = output.decode(errors="replace")
+        await_left_terminate(servicer, out)
     except BaseException:
         kill_driver_group(proc)
         raise
@@ -1387,15 +1434,14 @@ def signal_driver(
         selector.close()
         proc.stdout.close()
         stop()
-    out = output.decode(errors="replace")
     assert_no_grpc_fork_warning(out)
     return servicer, run_id, proc.returncode, out, sent, console, gone
 
 
 def ctrl_c_scenario(
-    spool_dir, name, cfg, wait_for, signals, *, budget, exits=None, **driver
+    spool_dir, name, cfg, wait_for, signals, *, budget, exits=None, earlier=(), **driver
 ):
-    """Ctrl-C a run's process group (signal_driver, given driver's keywords) at a signal budget of budget seconds: the run ends with TerminateRun(130) and the console comes back at once, and the upload worker, which carries on through the Ctrl-C, delivers or spools what it can and is gone within budget. Nothing claims a delivery that lost points. The program exits on the Ctrl-C, or with exits, its own status."""
+    """Ctrl-C a run's process group (signal_driver, given driver's keywords) at a signal budget of budget seconds: the console comes back within 1.5 s (scaled by the machine's load, load_factor), after the run's TerminateRun(130), and only the codes of earlier before it (check_terminated), unless the client left that send to finish by itself after its 1 s wait (then it may land late, or never if its control process dies at its alarm), and the upload worker, which carries on through the Ctrl-C, delivers or spools what it can and is gone within budget (plus 0.5 s, scaled the same way). Nothing claims a delivery that lost points. The program exits on the Ctrl-C, or with exits, its own status."""
     servicer, run_id, rc, out, sent, console, gone = signal_driver(
         name,
         cfg,
@@ -1416,14 +1462,18 @@ def ctrl_c_scenario(
         f"the worker outlived Ctrl-C by {gone:.1f}s\n{out}"
     )
     assert "worker exiting" in out, f"the upload worker died of the Ctrl-C\n{out}"
-    assert servicer.terminates == [(run_id, 130)], (
-        f"expected one TerminateRun(130), got {servicer.terminates}\n{out}"
-    )
-    terminated = servicer.terminated_at[0] - sent
-    assert terminated < console, (
-        f"TerminateRun came {terminated:.2f}s after Ctrl-C, after the console "
-        f"({console:.2f}s)\n{out}"
-    )
+    terminated = check_terminated(servicer, run_id, 130, out, earlier)
+    # The parent waits 1 s for the send, then leaves it to finish by itself (_Shutdown.end_run).
+    if any(code == "130" for code, _ in _LEFT_TERMINATE.findall(out)):
+        assert console > 1.0, (
+            f"the console came back {console:.2f}s after Ctrl-C, inside the send's 1 s "
+            f"wait\n{out}"
+        )
+    else:
+        assert terminated - sent < console, (
+            f"TerminateRun came {terminated - sent:.2f}s after Ctrl-C, after the "
+            f"console ({console:.2f}s)\n{out}"
+        )
     delivered = servicer.train_point_keys()
     spooled = spooled_train_point_keys(spool_files(spool_dir, run_id))
     # A program that logs until interrupted says how many steps it logged.
@@ -1434,8 +1484,9 @@ def ctrl_c_scenario(
     assert "fully_delivered=True" not in out, (
         f"a run a Ctrl-C ended claimed complete delivery\n{out}"
     )
+    ended = "not within the wait" if terminated is None else f"{terminated - sent:.2f}s"
     print(
-        f"    OK — TerminateRun {terminated:.2f}s, console {console:.2f}s, worker "
+        f"    OK — TerminateRun {ended}, console {console:.2f}s, worker "
         f"gone {gone:.1f}s after Ctrl-C; delivered={len(delivered)} "
         f"spooled={len(spooled - delivered)} of {len(expected)}\n"
     )
@@ -1465,6 +1516,8 @@ def scenario_ctrl_c_during_finish(spool_dir):
         "DRIVER_FINISHING",
         [signal.SIGINT],
         budget=3,
+        # The finish()'s own TerminateRun(0), which the Ctrl-C can supersede in flight.
+        earlier=(0,),
     )
 
 
@@ -1478,11 +1531,12 @@ def scenario_ctrl_c_during_atexit_flush(spool_dir):
         [signal.SIGINT],
         budget=3,
         exits=0,
+        earlier=(0,),
     )
 
 
 def exit_code_scenario(spool_dir, name, cfg, exits, code):
-    """Run the driver with cfg against a fresh fake server: the program exits with exits, and the run ends with one TerminateRun(code)."""
+    """Run the driver with cfg against a fresh fake server: the program exits with exits, and the run ends with one TerminateRun(code), which the client may have left to finish by itself (await_left_terminate)."""
     servicer, grpc_addr, cdn_addr, stop = start_fake_server()
     run_id = uuid.uuid4().hex
     rc, _wall, out = run_driver(
@@ -1499,6 +1553,7 @@ def exit_code_scenario(spool_dir, name, cfg, exits, code):
         },
         timeout=60,
     )
+    await_left_terminate(servicer, out)
     stop()
     assert rc == exits, f"exit {rc}\n{out}"
     assert [c for rid, c in servicer.terminates if rid == run_id] == [code], (
@@ -1507,7 +1562,7 @@ def exit_code_scenario(spool_dir, name, cfg, exits, code):
     print(f"    OK — {name}: exit {exits}, TerminateRun({code})")
 
 
-# Scenarios 25-30, which the module docstring describes: the driver's cfg, the program's exit status and the code its run ends with.
+# Scenarios 25-31, which the module docstring describes: the driver's cfg, the program's exit status and the code its run ends with.
 EXIT_CODE_SCENARIOS = (
     (25, "helper-finish", {"exit_with_helper_finish": 7}, 7, 7),
     (
@@ -1535,6 +1590,7 @@ EXIT_CODE_SCENARIOS = (
         0,
         143,
     ),
+    (31, "zero-budget", {"flush_timeout": 0}, 0, 0),
 )
 
 
@@ -1567,6 +1623,7 @@ def scenario_second_ctrl_c(spool_dir):
         "DRIVER_FINISHING",
         [signal.SIGINT, signal.SIGINT],
         budget=3,
+        earlier=(0,),
     )
 
 
@@ -1668,8 +1725,8 @@ def scenario_resource_tracker_mask(spool_dir):
     print("    OK — the tracker keeps those four blocked, the worker none\n")
 
 
-def sigterm_scenario(spool_dir, name, cfg, wait_for, *, group):
-    """SIGTERM a run with the signal budget at 3 s: it exits 143 within the budget, and every logged point is delivered or spooled."""
+def sigterm_scenario(spool_dir, name, cfg, wait_for, *, group, earlier=()):
+    """SIGTERM a run with the signal budget at 3 s: it exits 143 within the budget, its TerminateRun(143) after only the codes of earlier (check_terminated), and every logged point is delivered or spooled."""
     servicer, run_id, rc, out, sent, console, gone = signal_driver(
         name,
         cfg,
@@ -1690,12 +1747,10 @@ def sigterm_scenario(spool_dir, name, cfg, wait_for, *, group):
         f"{len(delivered)} delivered, {len(spooled)} spooled, "
         f"{len(expected)} expected\n{out}"
     )
-    assert servicer.terminates == [(run_id, 143)], (
-        f"expected one TerminateRun(143), got {servicer.terminates}\n{out}"
-    )
-    terminated = servicer.terminated_at[0] - sent
+    terminated = check_terminated(servicer, run_id, 143, out, earlier)
+    ended = "not within the wait" if terminated is None else f"{terminated - sent:.1f}s"
     print(
-        f"    OK — exit {console:.1f}s, TerminateRun {terminated:.1f}s, group gone "
+        f"    OK — exit {console:.1f}s, TerminateRun {ended}, group gone "
         f"{gone:.1f}s after SIGTERM; delivered={len(delivered)} "
         f"spooled={len(spooled - delivered)} of {len(expected)}\n"
     )
@@ -1717,7 +1772,7 @@ def scenario_group_sigterm(spool_dir):
 def scenario_sigterm_during_finish(spool_dir):
     print("=== 19. SIGTERM during finish(): one shutdown, bounded by the budget ===")
     out = sigterm_scenario(
-        spool_dir, "sigterm-finish", {}, "DRIVER_FINISHING", group=False
+        spool_dir, "sigterm-finish", {}, "DRIVER_FINISHING", group=False, earlier=(0,)
     )
     assert out.count("ending the shutdown within 3s") == 1, out
     assert "flushing metrics before exit" not in out, (

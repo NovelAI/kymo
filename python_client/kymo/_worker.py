@@ -15,8 +15,6 @@ import time
 from multiprocessing.reduction import ForkingPickler
 from typing import Optional
 
-import grpc
-
 from kymo._cdn import metadata_manifest
 from kymo._env import integer as _env_integer
 from kymo._env import number as _env_number
@@ -276,6 +274,7 @@ def _upload_worker(
         _CONNECT_PENDING,
         _CONNECT_POLL_TIMEOUT,
         _ConnectionAttempt,
+        _close_channel,
         _DEFAULT_MAX_BUFFER_BYTES,
         _DEFAULT_MAX_BUFFER_POINTS,
         _DRAIN_MAX_ITEMS_PER_CYCLE,
@@ -326,6 +325,7 @@ def _upload_worker(
         _chunk_tuples,
         _estimate_tuple_bytes,
         _is_terminal_run_error,
+        _own_channel,
         _publish_rich_mutation,
         _terminal_run_error,
     )
@@ -570,10 +570,10 @@ def _upload_worker(
         )
 
     def close_numeric_channel() -> None:
-        """Close the bidi channel, so the next stream needs a fresh connect."""
+        """Close the bidi channel, off this loop (_close_channel), so the next stream needs a fresh connect."""
         nonlocal channel, stub
         if channel is not None:
-            channel.close()
+            _close_channel(channel)
         channel = stub = None
 
     def end_stream() -> None:
@@ -665,13 +665,12 @@ def _upload_worker(
         if local_endpoint is None:
             import httpx
 
-            cdn_channel = grpc.insecure_channel(server_address)
             http_client = httpx.Client(timeout=60.0)
         else:
-            from kymo._local_runtime import grpc_channel, http_client as local_http
+            from kymo._local_runtime import http_client as local_http
 
-            cdn_channel = grpc_channel(local_endpoint)
             http_client = local_http(local_endpoint, timeout=60.0)
+        cdn_channel = _own_channel(server_address, local_endpoint)
         cdn_stub = kymo_pb2_grpc.KymoStub(cdn_channel)
 
     def close_rich_transport() -> None:
@@ -680,7 +679,7 @@ def _upload_worker(
             http_client.close()
             http_client = None
         if cdn_channel is not None:
-            cdn_channel.close()
+            _close_channel(cdn_channel)
             cdn_channel = None
         cdn_stub = None
 
@@ -773,7 +772,7 @@ def _upload_worker(
             if lost:
                 _log.warning("failed to spool %d point(s): %s", lost, error)
                 spool_failed += lost
-        # Those cut stay charged: the worker exits with them reported lost.
+        # Those cut stay charged until the worker's exit reports them lost, which releases them.
         resolve_points(
             len(tuples) - cut_now,
             spooled=True if spooled_now else None,
@@ -1099,14 +1098,10 @@ def _upload_worker(
             return
         terminal_rejected = True
         terminal_reason = str(error) or "run is no longer writable"
-        # Publish the irreversible lifecycle observation before transport
-        # teardown: channel close/cancellation may block until the parent
-        # reaches its force-kill deadline, and parent salvage must already know
-        # that every remaining queue item is permanently inadmissible.
+        # Publish the irreversible lifecycle observation before transport teardown: parent salvage must already know that every remaining queue item is permanently inadmissible.
         resolve_points(0, failure=_WORKER_EXIT_RUN_DELETED, terminal=True)
         drop_numeric_transport()
-        # Closing the rich transport cancels a concurrent rich publication. It
-        # may have uploaded content-addressed bytes, but cannot publish a row.
+        # Closing the rich transport, off this loop, cancels a concurrent rich publication, perhaps not at once: it may have uploaded content-addressed bytes, but the deleted run refuses any row it still publishes.
         close_rich_transport()
         cdn_attempt = None
         encode_attempt = None
@@ -1662,6 +1657,8 @@ def _upload_worker(
             and now - ack_progress_at >= ack_progress_timeout
         ):
             handle_break(RuntimeError(f"no ack progress for {ack_progress_timeout:g}s"))
+            # Its connection may be dead without a reset (a black hole), which gRPC would keep until TCP gives up: the next stream connects afresh.
+            close_numeric_channel()
         # A live lane that holds points and gets no ACK for this long goes to disk, as over the RAM cap.
         # A draining lane is exempt: its points wait for the replay ahead of them, so the catch-up converges.
         # So are shutdown, which has its own deadline, from the parent's sentinel or once a signal, the handoff or the parent's shutdown has set the spill end, and a failed spool, where spill() would only count the points lost.
@@ -1805,9 +1802,9 @@ def _upload_worker(
                     else:
                         resolve_points(1)
                 elif not past_deadline():
-                    if local_endpoint is not None:
-                        close_rich_transport()
-                        mark_local_transport_stale()
+                    # The next attempt opens a fresh channel and HTTP client (in local mode, behind a refresh of its endpoint): the failure may have been a connection dead without a reset (a black hole), which the old channel would keep until TCP gives up.
+                    close_rich_transport()
+                    mark_local_transport_stale()
                     cdn_fails += 1
                     if cdn_fails < _CDN_MAX_ATTEMPTS:
                         cdn_backoff_until = time.monotonic() + _cdn_retry_delay(
@@ -1954,6 +1951,18 @@ def _upload_worker(
             cut,
             unread_lost,
         )
+        if cut:
+            # Released once reported, so the charge holds only the points the worker never read and the parent's held-back groups, for the parent's salvage or its closing count (kymo.client._report_queue_losses). The failure flag keeps a wait_for_upload() from reading their release as delivery.
+            try:
+                resolve_points(cut, failure=_WORKER_EXIT_SPOOL_FAILED)
+            except RuntimeError:
+                _log.error(
+                    "the accounting lock stayed busy: the shutdown's count of lost "
+                    "points includes the %d past the spill deadline again",
+                    cut,
+                )
+                # A status the parent's count reads as a crash's, so it says at most.
+                sys.exit(1)
         sys.exit(_WORKER_EXIT_SPOOL_FAILED)
     if terminal_rejected:
         sys.exit(_WORKER_EXIT_RUN_DELETED)

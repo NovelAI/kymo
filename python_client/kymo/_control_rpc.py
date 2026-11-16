@@ -75,7 +75,7 @@ def _dispatch(payload: dict) -> bytes:
         channel = grpc_channel(endpoint)
 
     if after is not None:
-        # after is the pid of a control process an earlier end of the run left running: send once it has ended (_ended), within the same deadline, so the server takes this code last (kymo.client._terminate_run). The alarm bounds the wait.
+        # after is the pid of an earlier TerminateRun's control process, left running: send once it has ended (_ended), within the same deadline, so the server takes this request after that code: the run's next code (kymo.client._terminate_run), or an InitRun, which may resume that run (kymo.client.init). The alarm bounds the wait.
         started = time.monotonic()
         while not _ended(after):
             time.sleep(0.01)

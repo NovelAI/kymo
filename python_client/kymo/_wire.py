@@ -65,6 +65,16 @@ class _RichMutationDataLoss(RuntimeError):
     """A versioned rich mutation conflicts with authoritative server state."""
 
 
+def _own_channel(server_address: str, local_endpoint=None):
+    """A channel to server_address, or to local_endpoint's server, on a connection of its own, for the worker's lanes, its connect attempts and every replay (kymo.sync's included, one per spool file): gRPC shares one between channels with the same target and options, so once a channel on a dead connection (behind a black hole) is dropped, a reconnect would find that connection, read as connected and hang."""
+    options = (("grpc.use_local_subchannel_pool", 1),)
+    if local_endpoint is None:
+        return grpc.insecure_channel(server_address, options=options)
+    from kymo._local_runtime import grpc_channel
+
+    return grpc_channel(local_endpoint, options=options)
+
+
 def _is_terminal_run_error(error: BaseException) -> bool:
     """Return whether queued data must never be retried for this run."""
     code = error.code() if hasattr(error, "code") else None

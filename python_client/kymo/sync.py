@@ -69,6 +69,7 @@ from kymo._wire import (
     _point_sort_key,
     _send_tuples,
     _send_unary_point,
+    _own_channel,
     _upload_to_cdn,
     _validate_ident,
     _validate_project_id,
@@ -272,12 +273,7 @@ def _directory_candidate_unchanged(path: str, identity: tuple[int, int]) -> bool
 
 
 def _connect(server_address: str, local_endpoint=None):
-    if local_endpoint is None:
-        channel = grpc.insecure_channel(server_address)
-    else:
-        from kymo._local_runtime import grpc_channel
-
-        channel = grpc_channel(local_endpoint)
+    channel = _own_channel(server_address, local_endpoint)
     try:
         grpc.channel_ready_future(channel).result(timeout=15)
         stub = kymo_pb2_grpc.KymoStub(channel)

@@ -313,7 +313,7 @@ _CUT_CHUNK = 1 << 20
 
 
 class SpoolWriteCut(Exception):
-    """A record was still being written when its writer's deadline passed (SpoolWriter.until), and was cut off: the file ends in whole records."""
+    """A record was still being written when its writer's deadline passed (SpoolWriter.until), and was cut off: the file ends in whole records. The parent's salvage raises it too, at its end, before a write (kymo.client._drain_queue_to_spool)."""
 
 
 class _SpoolFile(io.FileIO):
@@ -399,7 +399,7 @@ class SpoolWriter:
                 io.DEFAULT_BUFFER_SIZE, min(os.fstat(fd).st_blksize, 8 << 20)
             )
             if self.until is not None:
-                # One chunk at most, for every writer kymo makes, which all have until (the worker's spill end, the parent's salvage end), infinite until set. What it buffers can go out past the deadline, in the flush after a cut record or a spill's last flush, so it must stay within the one chunk any write the deadline catches may send, which its writes send at once anyway.
+                # One chunk at most, for every writer kymo makes, which all have until (the worker's spill end, infinite until set, or the parent's salvage end). What it buffers can go out past the deadline in any later flush or close, so it must stay within the one chunk any write the deadline catches may send, which its writes send at once anyway.
                 buffer_size = min(buffer_size, _CUT_CHUNK)
             raw = _SpoolFile(fd, "a")
         except BaseException:
