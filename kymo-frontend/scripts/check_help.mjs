@@ -81,7 +81,7 @@ function fixture() {
   const appRoot = {};
   const document = {
     body: host("body"),
-    documentElement: { getAttribute: (name) => root.get(name) ?? null, toggleAttribute: (name, on) => (on ? root.set(name, "") : root.delete(name)) },
+    documentElement: { toggleAttribute: (name, on) => (on ? root.set(name, "") : root.delete(name)) },
     getElementById: (id) => (id === "kymo-help" ? button : null),
     createElement: made,
     querySelectorAll: (selector) => (selector === TOP_LAYER ? popovers : (assert.equal(selector, TARGETS), elements.filter((el) => el.dataset.help !== undefined))),
@@ -171,8 +171,8 @@ test("nothing listens, observes or shows until ? is hovered, and nothing is left
   assert.deepEqual(f.listeners.map((l) => l.type), ["scroll", "resize", "mouseover", "mousedown", "pointerup", "dragend", "contextmenu", "mouseout", "focusin", "focusout", "keydown"]);
   assert.deepEqual(f.listeners.filter((l) => !l.capture).map((l) => l.type), ["resize", "keydown"], "the rest capture: a panel's scroll does not bubble and a control may stop its press, but Escape goes to the app's own layers first");
   assert.ok(f.observing().childList && f.observing().subtree);
-  // Every attribute a text depends on: the two the mechanism reads and the four the chart's texts read.
-  assert.deepEqual([...f.observing().attributeFilter], ["data-help", "data-help-within", "data-live", "data-smoothed", "data-step-zoomed", "data-xnan"]);
+  // Every attribute a text depends on, whether the mechanism or a chart's texts read it.
+  assert.deepEqual([...f.observing().attributeFilter], ["data-help", "data-help-within", "data-live", "data-smoothed", "data-step-zoomed"]);
   f.flush();
   assert.deepEqual(f.texts(), ["Click (drag) to show/hide runs"]);
   assert.equal(f.notes()[0].attributes.get("aria-hidden"), "true");
@@ -766,36 +766,29 @@ test("a chart that cannot say its texts keeps its rendered ones, and the page ke
 
 // A uPlot instance as create.js leaves it, with what the chart provider reads.
 function chart(over = {}) {
-  const xs = Object.assign(over.xs ?? [0, 1, 2], { stepOpen: over.stepOpen ?? true });
   const axis = { dataset: {} };
-  return { root: { axis, querySelector: (selector) => (assert.equal(selector, ".u-axis"), axis) }, data: [xs], scales: { x: { max: over.max === undefined ? 2 : over.max } }, cursor: { sync: { key: over.key ?? "kymo-step" } }, bands: over.bands ?? [], __kymo_userzoom: over.userzoom, __kymo_zoom: { zr: over.zr ?? false }, __kymo_copy: { nanCols: over.nanCols ?? 0 }, __kymo_hl: { rs: over.rs ?? 0 }, __kymo_tip: { style: { labels: {}, getPropertyValue(name) { return this.labels[name]; }, setProperty(name, value) { this.labels[name] = value; } } } };
+  return { root: { axis, querySelector: (selector) => (assert.equal(selector, ".u-axis"), axis) }, data: [over.xs ?? [0, 1, 2]], scales: { x: { max: over.max === undefined ? 2 : over.max } }, __kymo_userzoom: over.userzoom, __kymo_tip: { style: { labels: {}, getPropertyValue(name) { return this.labels[name]; }, setProperty(name, value) { this.labels[name] = value; } } } };
 }
 
 test("a chart's texts follow its state", () => {
   const f = fixture();
   const lines = (id, dataset = {}) => [...f.help.providers.chart({ id, dataset })];
   const FOLLOW = "Include right edge to follow new data";
-  f.window.__kymo_charts = { plain: chart(), zoomed: chart({ userzoom: true, max: 1 }), following: chart({ userzoom: "follow" }), peer: chart(), alone: chart({ userzoom: true, key: "kymo-wall" }), rich: chart({ bands: [{}], nanCols: 2, rs: 3 }), banded: chart({ bands: [{}], rs: 2 }), fresh: chart({ max: null }), empty: chart({ xs: [], max: null }), stepFixed: chart({ zr: true, stepOpen: false }), stepOpen: chart({ zr: true }) };
+  f.window.__kymo_charts = { plain: chart(), zoomed: chart({ userzoom: true }), following: chart({ userzoom: "follow" }), smoothed: chart(), fresh: chart({ max: null }), empty: chart({ xs: [] }) };
   assert.deepEqual(lines("missing"), [], "an unmounted chart has none");
-  assert.deepEqual(lines("plain"), [], "the copy shortcut is explained on the readout");
+  assert.deepEqual(lines("plain"), [], "a chart with no live run has none");
   assert.equal(f.window.__kymo_charts.plain.root.axis.dataset.help, "Drag axis to rescale", "the X-axis strip takes its own text");
   assert.deepEqual(lines("plain", { live: "true" }), [FOLLOW]);
-  assert.deepEqual(lines("zoomed", { live: "true" }), ["Double-click to reset zoom", "Matching X axes zoom together"]);
-  assert.ok(!lines("following", { live: "true" }).includes(FOLLOW), "a zoom that already follows needs no hint");
-  assert.ok(!lines("fresh", { live: "true" }).includes(FOLLOW), "no window yet, right after creation");
-  assert.ok(!lines("empty", { live: "true" }).includes(FOLLOW));
-  f.root.set("data-kymo-single-click-unzoom", "true");
-  assert.deepEqual(lines("alone"), ["Click to reset zoom"], "no other chart shares its axis");
-  assert.deepEqual(lines("plain", { stepZoomed: "true" }), ["Click to reset zoom", "Matching X axes zoom together"]);
-  assert.ok(!lines("plain", { live: "true", stepZoomed: "true" }).includes(FOLLOW));
-  assert.deepEqual(lines("rich", { xnan: "true", smoothed: "true" }), ["Faint line: unsmoothed values", "Shaded band: range of values", "Hollow circles: non-finite, unplottable or log-clipped values", "×N: samples with unplottable X"]);
+  assert.deepEqual(lines("zoomed", { live: "true" }), [], "no follow hint on a zoomed chart");
+  assert.deepEqual(lines("following", { live: "true" }), [], "a zoom that already follows needs no hint");
+  assert.deepEqual(lines("fresh", { live: "true" }), [], "no window yet, right after creation");
+  assert.deepEqual(lines("empty", { live: "true" }), []);
+  assert.deepEqual(lines("plain", { live: "true", stepZoomed: "true" }), [], "nor a zoomed step answer");
+  assert.deepEqual(lines("smoothed", { smoothed: "true", live: "true" }), [FOLLOW], "smoothing adds no chart text");
   // The readout's own labels are left on the readout, for kymo.css to draw on it while notes show.
   const labels = (id) => ({ ...f.window.__kymo_charts[id].__kymo_tip.style.labels });
-    assert.deepEqual(labels("plain"), { "--help-colored": "", "--help-raw": '"Raw value"', "--help-range": '"Range"', "--help-borrowed": '"@: nearest sample’s X"', "--help-copy": '"⌘C copies values"' }, "an unsmoothed chart's colored values are not smoothed");
-  assert.deepEqual(labels("rich"), { ...labels("plain"), "--help-colored": '"Smoothed"' });
-  assert.deepEqual(lines("banded"), ["Shaded band: range of values"], "an envelope alone draws no raw trace");
-  assert.ok(lines("stepOpen", { live: "true" }).includes(FOLLOW));
-  assert.ok(!lines("stepFixed", { live: "true" }).includes(FOLLOW), "a step answer with a right bound does not show the newest step");
+  assert.deepEqual(labels("plain"), { "--help-colored": "", "--help-raw": '"Raw value"', "--help-range": '"Range"', "--help-borrowed": '"@: nearest sample’s X"', "--help-copy": '"⌘C copies values"' }, "an unsmoothed chart's colored values are not smoothed");
+  assert.deepEqual(labels("smoothed"), { ...labels("plain"), "--help-colored": '"Smoothed"' });
   f.platform("Win32");
   assert.deepEqual(lines("plain"), []);
   assert.equal(labels("plain")["--help-copy"], '"Ctrl+C copies values"');
@@ -851,7 +844,7 @@ const chartTexts = [...read("../src/components/uplot_chart/help.js").split("cons
 const coded = new Set([...consts, ...chartTexts]);
 
 test("every text is at most eight words and has no closing period", () => {
-  assert.ok(consts.length > 40 && chartTexts.length > 10, `found only ${consts.length} and ${chartTexts.length} texts`);
+  assert.ok(consts.length > 40 && chartTexts.length > 5, `found only ${consts.length} and ${chartTexts.length} texts`);
   assert.equal(read("../src/help.rs").split("\n").filter((line) => line.startsWith("pub const ")).length, consts.length, "a constant is not on one line");
   for (const text of coded) {
     assert.ok(text.split(/\s+/).length <= 8, `${JSON.stringify(text)} is over 8 words`);

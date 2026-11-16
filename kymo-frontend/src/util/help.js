@@ -1,4 +1,4 @@
-// Contextual help (docs/contextual-help.md): while the navbar's ? is hovered, focused or pinned, every on-screen element with a data-help attribute gets a short note beside it. A text shows once however many elements of a kind carry it (one example per repeated family), and an element's lines are separated by newlines. Nothing here runs, and no listener or observer exists, until the ? button's own handlers (navbar.rs) call enter or toggle, and none after the preview and the pin have both ended.
+// Contextual help (docs/contextual-help.md): while the navbar's ? is hovered, focused or pinned, every on-screen element with a data-help attribute gets a short note beside it. A text shows once however many elements of a kind carry it (one example per repeated family), and an element's lines are separated by newlines. Nothing listens or observes until the ? button's own handlers (navbar.rs) call enter or toggle, and nothing after the preview and the pin have both ended.
 (() => {
   if (window.__kymo_help) return;
   // Esc closes these natively, and page notes paint beneath them (util::TOP_LAYER_SELECTOR, put here by main.rs).
@@ -276,7 +276,7 @@
     settle = true;
     rescan();
   });
-  const RENDERED = {subtree: true, childList: true, attributeFilter: ['data-help', 'data-help-within', 'data-live', 'data-smoothed', 'data-step-zoomed', 'data-xnan']};
+  const RENDERED = {subtree: true, childList: true, attributeFilter: ['data-help', 'data-help-within', 'data-live', 'data-smoothed', 'data-step-zoomed']};
   // A scroll that can move an explained control: the page's, or that of something holding one (not a log following its tail).
   const scrolled = e => {
     if (e.target === document || e.target.querySelector?.(TARGETS)) rescan();

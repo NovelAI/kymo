@@ -452,7 +452,6 @@ pub fn UPlotChart(
             "data-live": live.then_some("true"),
             "data-smoothed": smoothed.then_some("true"),
             "data-step-zoomed": step_zoomed.then_some("true"),
-            "data-xnan": chart.0.series.iter().any(|s| s.xnan_count > 1).then_some("true"),
         }
     }
 }

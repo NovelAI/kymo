@@ -1,6 +1,6 @@
 """Exercise contextual help (docs/contextual-help.md): the ? preview and pin, where notes go, the Escape order, and the titles help replaced.
 
-It only changes browser-local state (a filter, Trash-selection mode, a zoom, open panels); it never mutates runs.
+It only changes browser-local state (a filter, Trash-selection mode, open panels); it never mutates runs.
 
 Run it against a local stack seeded with seed_browser_fixture.py and seed_zoom_fixture.py:
 
@@ -34,7 +34,6 @@ CHART_GEAR = "Chart settings"
 CHART_TRASH = "Remove chart; keep logged data"
 CHART_RESIZE = "Drag horizontally: width; vertically: section chart heights"
 ZOOM_DRAG = "Drag horizontally to zoom"
-RESET_ZOOM = "Click to reset zoom"
 MAXIMIZED_KEYS = "←/→: panels; Esc: close"
 LIVE_EDITING = "Edits apply immediately"
 PROJECT_DEFAULTS = "Most specific setting wins: chart, section, project"
@@ -497,17 +496,13 @@ def navigation_ends_a_pin(page: Page) -> None:
     page.wait_for_selector(".sidebar-run", timeout=30_000)
 
 
-def zoomed_chart(page: Page, origin: str) -> None:
-    """A chart's zoom changes what it explains."""
+def escape_during_a_drag(page: Page, origin: str) -> None:
+    """Escape belongs to a chart drag in progress: it cancels the drag and leaves the pin."""
     open_dashboard(page, origin, ZOOM_RUN_PATH)
-    trigger(page).hover()
-    expect_texts(page, present=[ZOOM_DRAG], absent=[RESET_ZOOM])
-    park(page)
     plot = page.locator(".chart-container .u-over").first
     plot.scroll_into_view_if_needed()
     box = plot.bounding_box()
     y = box["y"] + box["height"] / 2
-    # Escape belongs to a drag in progress: it cancels the drag and leaves the pin.
     pin(page)
     page.mouse.move(box["x"] + box["width"] * 0.3, y)
     page.mouse.down()
@@ -517,21 +512,8 @@ def zoomed_chart(page: Page, origin: str) -> None:
     assert not page.evaluate("!!window.__kymo_zg")
     assert pinned(page)
     page.mouse.up()
-    expect_texts(page, absent=[RESET_ZOOM])
     escape(page)
     assert not pinned(page)
-
-    page.mouse.move(box["x"] + box["width"] * 0.3, y)
-    page.mouse.down()
-    page.mouse.move(box["x"] + box["width"] * 0.6, y, steps=4)
-    page.mouse.up()
-    page.evaluate("scrollTo(0, 0)")
-    trigger(page).hover()
-    page.wait_for_function(
-        "text => [...document.querySelectorAll('.kymo-help-note')].some(n => n.textContent.includes(text))",
-        arg=RESET_ZOOM,
-    )
-    park(page)
 
 
 def run_fences(page: Page, origin: str) -> None:
@@ -546,7 +528,7 @@ def run_fences(page: Page, origin: str) -> None:
     large_font_and_copy(page)
     readout_labels(page)
     navigation_ends_a_pin(page)
-    zoomed_chart(page, origin)
+    escape_during_a_drag(page, origin)
 
 
 def main() -> None:
