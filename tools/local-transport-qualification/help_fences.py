@@ -30,38 +30,53 @@ SECTION_TRASH = "Remove section and panels; keep logged data"
 CHART_TITLE = "Double-click to rename"
 TRASH_SELECT = "Delete runs"
 RESET_LAYOUT = "Reset layout"
-CHART_GEAR = "Chart settings"
+CHART_SETTINGS = "Chart settings"
 CHART_TRASH = "Remove chart; keep logged data"
 CHART_RESIZE = "Drag horizontally: width; vertically: section chart heights"
 ZOOM_DRAG = "Drag horizontally to zoom"
 MAXIMIZED_KEYS = "←/→: panels; Esc: close"
 LIVE_EDITING = "Edits apply immediately"
-PROJECT_DEFAULTS = "Most specific setting wins: chart, section, project"
+DEFAULTS = "Most specific setting wins: chart, section, project"
 LAYOUT_SAVED = "Settings and layout saved in this browser only"
 CLICK_TO_COPY = "Click to copy"
 LOG_SEARCH = "Searches the full log; resubmit to refresh"
 LAST_LOGGED_SORT = "Press again to refresh the order"
 
-# Each note's lines, where it is drawn and what holds it, after the frame that places it.
-NOTES = """() => new Promise(done => requestAnimationFrame(() => requestAnimationFrame(() => done(
-    [...document.querySelectorAll('.kymo-help-note')].map(note => {
+# Each note's lines, where it is drawn, whether it sits off its control and what holds it, after the frame that places it; and what notes lie on that they must keep off: another note, or a shown icon-sized explained button or ? (its own family's aside).
+NOTES = """() => new Promise(done => requestAnimationFrame(() => requestAnimationFrame(() => {
+    const over = (a, b) => a.left < b.right - 1 && b.left < a.right - 1 && a.top < b.bottom - 1 && b.top < a.bottom - 1;
+    const notes = [...document.querySelectorAll('.kymo-help-note')].map(note => {
         const box = note.getBoundingClientRect();
         const hit = document.elementFromPoint((box.left + box.right) / 2, (box.top + box.bottom) / 2);
         return {
             lines: note.textContent.split('\\n'),
+            box,
+            far: note.dataset.far !== undefined,
             inside: box.left >= 0 && box.top >= 0 && box.right <= innerWidth && box.bottom <= innerHeight,
             hit: hit === note,
             popover: !!note.parentElement.closest('[popover]'),
         };
-    })))))"""
+    });
+    const buttons = [...document.querySelectorAll('button[data-help], #kymo-help')]
+        .filter(el => el.checkVisibility({opacityProperty: true, visibilityProperty: true}))
+        .map(el => ({el, lines: (el.dataset.help ?? '?').split('\\n'), box: el.getBoundingClientRect()}))
+        .filter(({el, box: b}) => b.width && b.width <= 48 && b.height <= 48 && el.contains(document.elementFromPoint((b.left + b.right) / 2, (b.top + b.bottom) / 2)));
+    const lying = [];
+    notes.forEach((note, i) => {
+        for (const other of notes.slice(i + 1)) if (over(note.box, other.box)) lying.push([note.lines[0], other.lines[0]]);
+        for (const button of buttons) if (over(note.box, button.box) && !button.lines.some(line => note.lines.includes(line))) lying.push([note.lines[0], button.lines[0]]);
+    });
+    done({notes: notes.map(({box, ...note}) => ({...note, left: Math.round(box.left), top: Math.round(box.top)})), lying});
+})))"""
 
 
 def notes(page: Page) -> list[dict]:
     found = page.evaluate(NOTES)
-    for note in found:
+    assert not found["lying"], f"notes lie on other notes or buttons: {found['lying']}"
+    for note in found["notes"]:
         assert note["inside"], f"a note reaches outside the window: {note['lines']}"
         assert not note["hit"], f"a note takes pointer events: {note['lines']}"
-    return found
+    return found["notes"]
 
 
 # For the first three rendered elements matching a selector (a family's note may sit on any of them): how each note carrying a text lies against the nearest.
@@ -157,17 +172,22 @@ def preview(page: Page) -> None:
     before = page.evaluate(stored)
     assert notes(page) == []
     trigger(page).hover()
-    shown = expect_texts(
+    # Every run row's … button is brought out while notes show, and one is explained.
+    expect_texts(
         page,
-        present=[VISIBILITY_DRAG, COUNTER_SHOWN, RESIZE, SECTION_HEADER],
+        present=[
+            VISIBILITY_DRAG,
+            COUNTER_SHOWN,
+            RESIZE,
+            SECTION_HEADER,
+            ZOOM_DRAG,
+            CHART_TITLE,
+            TRASH_SELECT,
+            RESET_LAYOUT,
+            MORE_ACTIONS,
+        ],
         absent=[RUN_FILTER, TRASH_RUN, COUNTER_TRASH, CHART_TRASH, MAXIMIZED_KEYS],
     )
-    assert ZOOM_DRAG in shown, f"the chart's own texts are missing: {shown}"
-    assert CHART_TITLE in shown, f"the chart title is not explained: {shown}"
-    # Titles that already explained their control show under ? too.
-    assert TRASH_SELECT in shown and RESET_LAYOUT in shown, shown
-    # Every run row's … button is brought out while notes show, and one is explained.
-    assert MORE_ACTIONS in shown, shown
     dots = "[...document.querySelectorAll('.run-overflow-trigger')].map(el => getComputedStyle(el).opacity)"
     assert set(page.evaluate(dots)) == {"1"}
     park(page)
@@ -238,10 +258,10 @@ def pin_and_unpin(page: Page) -> None:
 def presses_and_reveals(page: Page) -> None:
     """While pinned: no note under a held press, and controls that appear on hover are explained then."""
     pin(page)
-    expect_texts(page, present=[SECTION_HEADER], absent=[CHART_TRASH, CHART_GEAR])
+    expect_texts(page, present=[SECTION_HEADER], absent=[CHART_TRASH, CHART_SETTINGS])
     chart = page.locator(".metric-rect").first
     chart.hover()
-    expect_texts(page, present=[CHART_TRASH, CHART_GEAR, CHART_RESIZE])
+    expect_texts(page, present=[CHART_TRASH, CHART_SETTINGS, CHART_RESIZE])
     page.locator(".section-header").first.hover()
     expect_texts(page, present=[SECTION_TRASH])
     count = page.locator(".sidebar-meta")
@@ -337,7 +357,7 @@ def maximized_and_panel(page: Page) -> None:
     panel = page.locator("#kymo-panel")
     expect(panel).to_be_visible()
     park(page)
-    shown = expect_texts(page, present=[LIVE_EDITING, PROJECT_DEFAULTS, LAYOUT_SAVED])
+    shown = expect_texts(page, present=[LIVE_EDITING, DEFAULTS, LAYOUT_SAVED])
     # The run list's edge and the panel's are two families with one text.
     assert shown.count(RESIZE) == 2, shown
     panel.locator("input, select").first.focus()
@@ -359,16 +379,16 @@ def replaced_titles(page: Page) -> None:
     expect(
         chart.get_by_role("button", name="Delete chart", exact=True)
     ).to_have_attribute("title", CHART_TRASH)
-    expect(chart.get_by_role("button", name=CHART_GEAR, exact=True)).to_have_attribute(
-        "title", CHART_GEAR
-    )
+    expect(
+        chart.get_by_role("button", name=CHART_SETTINGS, exact=True)
+    ).to_have_attribute("title", CHART_SETTINGS)
     expect(chart.locator(".rect-resize-handle")).to_have_attribute(
         "title", CHART_RESIZE
     )
     # The maximized chart's gear says the same.
     chart.get_by_title("Maximize", exact=True).click()
     maximized = page.locator(".maximize-overlay .metric-rect")
-    expect(maximized.get_by_title(CHART_GEAR, exact=True)).to_have_count(1)
+    expect(maximized.get_by_title(CHART_SETTINGS, exact=True)).to_have_count(1)
     escape(page)
     expect(page.locator(".maximize-overlay")).to_have_count(0)
     search = page.locator(".text-stream-search").first
@@ -377,7 +397,7 @@ def replaced_titles(page: Page) -> None:
 
 
 def large_font_and_copy(page: Page) -> None:
-    """At the largest font every note still fits the window; captions say they copy."""
+    """At the largest font every note still fits the window, off the others and the buttons (notes() checks), in a short and a narrow window too; captions say they copy."""
     page.evaluate(
         "document.documentElement.style.setProperty('--kymo-user-font-size', '24px')"
     )
@@ -386,16 +406,44 @@ def large_font_and_copy(page: Page) -> None:
     assert texts(page), "no notes at the largest font"
     expect_beside(page, ".cdn-caption", CLICK_TO_COPY)
     park(page)
-    # A short window: every note still fits (notes() checks each).
-    page.set_viewport_size({"width": VIEWPORT["width"], "height": 420})
-    trigger(page).hover()
-    assert texts(page), "no notes in a short window"
-    park(page)
+    page.evaluate("scrollTo(0, 0)")
+    for size in (
+        {"width": VIEWPORT["width"], "height": 420},
+        {"width": 800, "height": 600},
+    ):
+        page.set_viewport_size(size)
+        # The page follows the new size over a few frames.
+        page.wait_for_timeout(500)
+        trigger(page).hover()
+        assert texts(page), f"no notes in a window of {size}"
+        park(page)
     page.set_viewport_size(VIEWPORT)
     page.evaluate(
         "document.documentElement.style.removeProperty('--kymo-user-font-size')"
     )
-    page.evaluate("scrollTo(0, 0)")
+
+
+def placement(page: Page) -> None:
+    """No note against its control moves when the pointer brings out a chart's or a section's actions."""
+    pin(page)
+    before = notes(page)
+    for owner in (
+        page.locator(".metric-rect").first,
+        page.locator(".section-header").first,
+    ):
+        owner.hover()
+        after = notes(page)
+        moved = [
+            note
+            for note in before
+            if not note["far"]
+            and note not in after
+            and any(other["lines"] == note["lines"] for other in after)
+        ]
+        assert not moved, f"notes moved as the pointer brought out controls: {moved}"
+    park(page)
+    escape(page)
+    assert not pinned(page)
 
 
 # The stylesheet's readout labels, on stand-in readouts built the way hover.js builds one (no seeded chart has a range or a borrowed point). Per readout: the labels drawn (over the first row's colored value, over the gray column's first populated cell, under a readout with a borrowed point, and the copy shortcut's over the readout), whether each has its tick and no other element one (a borrowed point's is on the last row's @ cell), and the looks of the labels drawn that differ from a note's.
@@ -497,7 +545,7 @@ def navigation_ends_a_pin(page: Page) -> None:
 
 
 def escape_during_a_drag(page: Page, origin: str) -> None:
-    """Escape belongs to a chart drag in progress: it cancels the drag and leaves the pin."""
+    """Escape during a held chart drag cancels the drag and leaves the pin."""
     open_dashboard(page, origin, ZOOM_RUN_PATH)
     plot = page.locator(".chart-container .u-over").first
     plot.scroll_into_view_if_needed()
@@ -526,6 +574,7 @@ def run_fences(page: Page, origin: str) -> None:
     maximized_and_panel(page)
     replaced_titles(page)
     large_font_and_copy(page)
+    placement(page)
     readout_labels(page)
     navigation_ends_a_pin(page)
     escape_during_a_drag(page, origin)

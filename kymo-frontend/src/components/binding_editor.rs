@@ -347,7 +347,6 @@ pub fn BindingEditor(
     rsx! {
         OptionsPanel {
             title: "Chart settings",
-            help: format!("{}\n{}", crate::help::LIVE_EDITING, crate::help::LAYOUT_SAVED),
             target: rect_title(&rect),
             // The opener, then the maximized chart's own Configure (shown again as the panel goes), then its grid copy's (once closing un-maximizes the chart).
             return_focus_ids: vec![return_focus_id, editor_trigger_id("rect-max", &rect.id), editor_trigger_id("rect-grid", &rect.id)],

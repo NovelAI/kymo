@@ -22,7 +22,7 @@ pub const OPTIONS_ID_PREFIX: &str = "kymo-options";
 fn Field(
     overridden: bool,
     onreset: EventHandler<()>,
-    #[props(default)] help: Option<&'static str>,
+    help: Option<&'static str>,
     children: Element,
 ) -> Element {
     rsx! {
@@ -31,6 +31,7 @@ fn Field(
                 button {
                     class: "field-reset-dot",
                     title: crate::help::RESET_INHERITED,
+                    aria_label: crate::help::RESET_INHERITED,
                     "data-help": crate::help::RESET_INHERITED,
                     onmousedown: primary(move |_| onreset.call(())),
                     "●"
@@ -275,7 +276,7 @@ pub fn ProjectDefaultsEditor(return_focus_id: String) -> Element {
     rsx! {
         OptionsPanel {
             title: "Project settings",
-            help: format!("{}\n{}\n{}", crate::help::LIVE_EDITING, crate::help::DEFAULTS, crate::help::LAYOUT_SAVED),
+            help: crate::help::DEFAULTS,
             return_focus_ids: vec![return_focus_id],
             revert_disabled: unchanged,
             on_revert: {
@@ -296,11 +297,7 @@ pub fn ProjectDefaultsEditor(return_focus_id: String) -> Element {
 
 /// Collapsible editor content, open until the user collapses it. `help` is its explanation for the ? button (see util/help.js), shown while it is open.
 #[component]
-pub fn EditorSection(
-    title: String,
-    #[props(default)] help: Option<&'static str>,
-    children: Element,
-) -> Element {
+pub fn EditorSection(title: String, help: Option<&'static str>, children: Element) -> Element {
     let mut open = use_signal(|| true);
     rsx! {
         button {
@@ -326,7 +323,7 @@ pub fn EditorSection(
 pub fn SmoothingFields(
     draft: Signal<RectOptions>,
     anchor: RectOptions,
-    #[props(default)] chips: Option<OverrideChips>,
+    chips: Option<OverrideChips>,
 ) -> Element {
     let state = use_context::<DashboardState>();
     let chips_for = |field| override_chips(state, field, chips);
@@ -392,7 +389,7 @@ pub fn SmoothingFields(
             {chips_for("smoothing_window")}
         }
         if o.smoothing == SmoothingAlgorithm::EmaPolyfit {
-            Field { overridden: o.smoothing_alpha != anchor.smoothing_alpha, help: crate::help::TIME_CONSTANT, onreset: move |_| draft.write().smoothing_alpha = anchor.smoothing_alpha,
+            Field { overridden: o.smoothing_alpha != anchor.smoothing_alpha, help: crate::help::DECAY_LENGTH, onreset: move |_| draft.write().smoothing_alpha = anchor.smoothing_alpha,
                 {tc_slider.inputs("time-constant", "Decay length", ema_time_constant(o.smoothing_alpha), write_time_constant)}
             }
             {chips_for("smoothing_alpha")}
@@ -408,7 +405,7 @@ pub fn SmoothingFields(
 pub fn AxisFields(
     draft: Signal<RectOptions>,
     anchor: RectOptions,
-    #[props(default)] chips: Option<OverrideChips>,
+    chips: Option<OverrideChips>,
 ) -> Element {
     let state = use_context::<DashboardState>();
     let chips_for = |field| override_chips(state, field, chips);

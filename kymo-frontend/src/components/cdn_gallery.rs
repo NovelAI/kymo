@@ -977,12 +977,7 @@ pub fn CdnGallery(
             // Step slider — pointless with a single step (e.g. info/run_info metadata, always step 0)
             if total_steps > 1 {
                 // MAXIMIZE_KEYS_JS (dashboard_layout.rs) presses the step buttons by aria-label for ↑/↓ in a maximized panel.
-                div { class: "cdn-step-nav", "data-help": match (runs.iter().any(|run| !run.ended), absent) {
-                    (true, true) => Some(format!("{}\n{}", crate::help::GALLERY_STEP_HOLD, crate::help::GALLERY_STEP_RUNS)),
-                    (true, false) => Some(crate::help::GALLERY_STEP_HOLD.to_string()),
-                    (false, true) => Some(crate::help::GALLERY_STEP_RUNS.to_string()),
-                    (false, false) => None,
-                },
+                div { class: "cdn-step-nav", "data-help": crate::help::note([runs.iter().any(|run| !run.ended).then_some(crate::help::GALLERY_STEP_HOLD), absent.then_some(crate::help::GALLERY_STEP_RUNS)]),
                     button {
                         class: "cdn-nav-btn icon-button",
                         title: "Previous step",

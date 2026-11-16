@@ -33,7 +33,6 @@ pub(crate) fn CopyText(
     class: &'static str,
     display: Option<String>,
     /// The text's explanation for the ? button (util/help.js): gallery captions carry one; a metadata table says it once itself.
-    #[props(default)]
     help: Option<&'static str>,
 ) -> Element {
     let display = display.as_deref().unwrap_or(&text);

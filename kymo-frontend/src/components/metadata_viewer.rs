@@ -219,7 +219,10 @@ fn render_rows(
                                 "{key}"
                             }
                             for (column, tint) in columns.iter().zip(tints) {
-                                {value_cell(column, tint, resolve_path(&column.data, &path))}
+                                {
+                                    let value = resolve_path(&column.data, &path);
+                                    value_cell(column, tint, value, value.is_none())
+                                }
                             }
                         }
                     }
@@ -255,7 +258,8 @@ fn render_rows(
                             }
                             if let Some(tints) = tints {
                                 for ((column, cell), tint) in columns.iter().zip(cells).zip(tints) {
-                                    {value_cell(column, tint, cell)}
+                                    // A branch row's blanks carry no note: the rows under it say which keys a run lacks.
+                                    {value_cell(column, tint, cell, false)}
                                 }
                             } else {
                                 // No `{}` on this row: plain cells, which skip value_cell's style edit and placeholder node.
@@ -274,22 +278,21 @@ fn render_rows(
     }
 }
 
-/// A run's value cell: its value, if any, as copyable text, tinted in the run's color when `tint`.
-fn value_cell(column: &MetadataColumn, tint: bool, value: Option<&Value>) -> Element {
+/// A run's value cell: its value, if any, as copyable text, tinted in the run's color when `tint`; `missing` when the run lacks the key, which the blank cell's note says.
+fn value_cell(
+    column: &MetadataColumn,
+    tint: bool,
+    value: Option<&Value>,
+    missing: bool,
+) -> Element {
     let cell = value.map(|value| {
         let display = format_value(value);
         (copy_payload(value, &display).to_owned(), display)
     });
-    let help = match (tint, cell.is_none()) {
-        (true, true) => Some(format!(
-            "{}\n{}",
-            crate::help::METADATA_TINT,
-            crate::help::METADATA_BLANK
-        )),
-        (true, false) => Some(crate::help::METADATA_TINT.to_string()),
-        (false, true) => Some(crate::help::METADATA_BLANK.to_string()),
-        (false, false) => None,
-    };
+    let help = crate::help::note([
+        tint.then_some(crate::help::METADATA_TINT),
+        missing.then_some(crate::help::METADATA_BLANK),
+    ]);
     rsx! {
         // An untinted cell has no style: Dioxus keeps the old background when it sets `style: ""`.
         td { class: "metadata-val-cell", style: tint.then(|| format!("background: {}22;", column.color)), "data-help": help,
@@ -735,8 +738,15 @@ mod tests {
     }
 
     /// What a VirtualDom's first render shows, as `rendered` reads a table.
-    fn shown(mut dom: VirtualDom) -> Vec<String> {
-        let mut shown = Vec::new();
+    fn shown(dom: VirtualDom) -> Vec<String> {
+        attributes(dom, |name, value| {
+            name == "title" || (name == "style" && value.starts_with("background"))
+        })
+    }
+
+    /// The attribute values a VirtualDom's first render sets that `keep` takes, in document order.
+    fn attributes(mut dom: VirtualDom, keep: impl Fn(&str, &str) -> bool) -> Vec<String> {
+        let mut out = Vec::new();
         for edit in dom.rebuild_to_vec().edits {
             if let Mutation::SetAttribute {
                 name,
@@ -744,12 +754,43 @@ mod tests {
                 ..
             } = edit
             {
-                if name == "title" || (name == "style" && value.starts_with("background")) {
-                    shown.push(value);
+                if keep(name, &value) {
+                    out.push(value);
                 }
             }
         }
-        shown
+        out
+    }
+
+    #[test]
+    fn a_branch_rows_blanks_carry_no_note() {
+        let runs = columns(vec![
+            ("empty", json!({"config": {}})),
+            ("full", json!({"config": {"lr": 1}})),
+            ("absent", json!({"other": 2})),
+        ]);
+        let (tint, blank) = (crate::help::METADATA_TINT, crate::help::METADATA_BLANK);
+        // The table's note; the config row: the empty run's tinted `{}` only (the rows under it say which keys a run lacks); then the lr and other rows.
+        let props = MetadataViewerProps {
+            columns: runs,
+            diff_only: false,
+        };
+        assert_eq!(
+            attributes(
+                VirtualDom::new_with_props(MetadataViewer, props),
+                |name, _| name == "data-help"
+            ),
+            [
+                crate::help::METADATA_COPY,
+                tint,
+                blank,
+                tint,
+                blank,
+                blank,
+                blank,
+                tint
+            ]
+        );
     }
 
     #[test]

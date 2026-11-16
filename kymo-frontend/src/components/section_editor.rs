@@ -98,7 +98,6 @@ pub fn SectionEditor(return_focus_id: String, config: SectionConfig) -> Element 
     rsx! {
         OptionsPanel {
             title: "Configure section",
-            help: format!("{}\n{}", crate::help::LIVE_EDITING, crate::help::LAYOUT_SAVED),
             // The catch-all section of unprefixed metrics has no name to show.
             target: Some(config.display_name()).filter(|name| !name.is_empty()).map(str::to_string),
             return_focus_ids: vec![return_focus_id],

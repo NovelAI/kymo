@@ -23,9 +23,8 @@ pub fn OptionsPanel(
     /// Whether the panel body takes focus as it mounts (see `OpenPanel::take_focus`); an unconfigured chart panel focuses its metric picker instead.
     #[props(default = true)]
     take_focus: bool,
-    /// The panel's explanations for the ? button, one per line (see util/help.js). None in the user settings panel.
-    #[props(default)]
-    help: Option<String>,
+    /// The panel's own explanation for the ? button (see util/help.js), between the two every dashboard panel shows: edits apply at once and are saved in this browser.
+    help: Option<&'static str>,
     revert_disabled: bool,
     on_revert: EventHandler<()>,
     on_close: EventHandler<()>,
@@ -68,7 +67,7 @@ pub fn OptionsPanel(
             },
             // Dragged by util/width_drag.js, which sizes its parent: it must stay a direct child of this aside.
             div { class: "options-panel-resize", "data-help": crate::help::RESIZE }
-            div { class: "options-panel-header", "data-help": help,
+            div { class: "options-panel-header", "data-help": dashboard.map(|_| [crate::help::LIVE_EDITING].into_iter().chain(help).chain([crate::help::LAYOUT_SAVED]).collect::<Vec<_>>().join("\n")),
                 div { class: "options-panel-heading",
                     h3 { id: "kymo-panel-title", "{title}" }
                     if let Some(target) = target {

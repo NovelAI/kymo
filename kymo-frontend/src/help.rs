@@ -1,4 +1,4 @@
-//! The texts of contextual help (docs/contextual-help.md), one constant per text. A control shows its text by carrying it in a `data-help` attribute, which util/help.js reads while the navbar's ? is hovered, focused or pinned; several texts on one element are joined with a newline. Where a text is also a control's `title` (one that replaced a title, or a title that already explained its control), the title is the same constant. The texts only chart script state decides live in uplot_chart/help.js. scripts/check_help.mjs holds every text to the design document, its eight-word limit and its no-period rule.
+//! The texts of contextual help (docs/contextual-help.md), one constant per text. A control shows its text by carrying it in a `data-help` attribute, which util/help.js reads while the navbar's ? is hovered, focused or pinned; several texts on one element are joined with a newline. Where a text is also a control's `title`, the title is the same constant. The texts only chart script state decides live in uplot_chart/help.js. scripts/check_help.mjs holds every text to the design document, its eight-word limit and its no-period rule.
 
 pub const VISIBILITY_DRAG: &str = "Click (drag) to show/hide runs";
 pub const RUN_NUMBER: &str = "#N: run number, shown when names repeat";
@@ -47,7 +47,7 @@ pub const X_METRIC: &str = "Use this metric instead of step";
 pub const MAX_RUNS: &str = "0 means unlimited";
 pub const WIDTH: &str = "Width in section columns";
 pub const WINDOW: &str = "Smoothing width counts points, not steps";
-pub const TIME_CONSTANT: &str = "Larger values keep more history";
+pub const DECAY_LENGTH: &str = "Larger values keep more history";
 pub const SAME_IMAGE_POSITION: &str = "Same image position across runs";
 pub const INTERLEAVED: &str = "One grid per image index";
 pub const SECTION_HEADER: &str = "Collapse/expand section";
@@ -68,3 +68,9 @@ pub const METADATA_COPY: &str = "Click a value to copy";
 pub const METADATA_DIFF_ONLY: &str = "Showing only keys that differ across runs";
 pub const METADATA_BLANK: &str = "Blank: run lacks this key";
 pub const COLOR_SAVED: &str = "Saved in this browser";
+
+/// The note of a control explained by whichever of these lines apply, joined by newlines; none when none do.
+pub fn note(lines: impl IntoIterator<Item = Option<&'static str>>) -> Option<String> {
+    let lines: Vec<&str> = lines.into_iter().flatten().collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}

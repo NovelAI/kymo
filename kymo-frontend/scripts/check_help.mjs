@@ -28,6 +28,7 @@ function fixture() {
   const elements = [];
   const appended = [];
   let layer = null;
+  let maximized = null;
   let popovers = [];
   let observing = null;
   let rendered;
@@ -85,7 +86,7 @@ function fixture() {
     getElementById: (id) => (id === "kymo-help" ? button : null),
     createElement: made,
     querySelectorAll: (selector) => (selector === TOP_LAYER ? popovers : (assert.equal(selector, TARGETS), elements.filter((el) => el.dataset.help !== undefined))),
-    querySelector: (selector) => (selector === ".app-root" ? appRoot : (assert.equal(selector, LAYERS), layer)),
+    querySelector: (selector) => (selector === ".app-root" ? appRoot : selector === ".maximize-overlay" ? maximized : (assert.equal(selector, LAYERS), layer)),
     elementFromPoint: (x, y) => (x >= 1000 || y >= 600 ? null : elements.findLast((el) => !el.covered && x >= el.getBoundingClientRect().left && x < el.getBoundingClientRect().right && y >= el.getBoundingClientRect().top && y < el.getBoundingClientRect().bottom) ?? null),
   };
   // As in a browser, adding a listener that is there and removing one that is not do nothing.
@@ -137,6 +138,8 @@ function fixture() {
     flush: () => {
       for (const fn of frames.splice(0)) fn?.();
     },
+    // Scans still queued.
+    pending: () => frames.filter(Boolean).length,
     fire: (type, event = {}) => {
       event.type = type;
       // A scroll is the page's unless a test says what scrolled.
@@ -145,6 +148,10 @@ function fixture() {
     },
     covers: (value) => {
       layer = value;
+    },
+    // A maximized chart over `rect`, holding the elements in `within`.
+    maximizes: (rect, within = []) => {
+      maximized = { getBoundingClientRect: () => rect, contains: (el) => within.includes(el) };
     },
     opens: (...rects) => {
       popovers = rects.map((rect) => ({ getBoundingClientRect: () => rect }));
@@ -169,7 +176,7 @@ test("nothing listens, observes or shows until ? is hovered, and nothing is left
   assert.equal(f.observing(), null);
   f.help.enter("pointer");
   assert.deepEqual(f.listeners.map((l) => l.type), ["scroll", "resize", "mouseover", "mousedown", "pointerup", "dragend", "contextmenu", "mouseout", "focusin", "focusout", "keydown"]);
-  assert.deepEqual(f.listeners.filter((l) => !l.capture).map((l) => l.type), ["resize", "keydown"], "the rest capture: a panel's scroll does not bubble and a control may stop its press, but Escape goes to the app's own layers first");
+  assert.deepEqual(f.listeners.filter((l) => !l.capture).map((l) => l.type), ["resize", "keydown"], "the rest capture: a panel's scroll does not bubble and a control may stop its press, but Escape bubbles, after the page's own handlers (a chart drag's, added later on the window, help checks for)");
   assert.ok(f.observing().childList && f.observing().subtree);
   // Every attribute a text depends on, whether the mechanism or a chart's texts read it.
   assert.deepEqual([...f.observing().attributeFilter], ["data-help", "data-help-within", "data-live", "data-smoothed", "data-step-zoomed"]);
@@ -368,7 +375,7 @@ test("the same page is arranged the same way on every scan, and past the work bo
   f.flush();
   const first = f.boxes();
   assert.equal(first.length, 400);
-  // Unbounded, the icons at the block's edges would have spots (and the scan would take fifty times as long).
+  // Unbounded, the icons at the block's edges would have spots (and the scan would take many times as long).
   for (const node of f.notes()) assert.equal(node.dataset.side, undefined);
   for (const note of first) assert.ok(note.left >= 0 && note.top >= 0 && note.right <= 1000 && note.bottom <= 600, `a note leaves the window: ${JSON.stringify(note)}`);
   f.fire("resize");
@@ -393,6 +400,17 @@ test("a note with no room against its control sits a row off, tied to it by a li
   f.fire("resize");
   f.flush();
   assert.deepEqual([f.notes()[0].dataset.side, f.notes()[0].dataset.far], ["above", ""]);
+});
+
+test("a note further off takes a spot whose line crosses nothing kept off, over a cheaper one whose line does", () => {
+  const f = fixture();
+  f.element("x", "xx", box(500, 300, 20, 20));
+  // Every spot against it is shut: under it across the line's path, over it beside that path, and at both sides.
+  f.opens(box(505, 326, 10, 20), box(512, 274, 10, 20), box(526, 290, 20, 40), box(476, 290, 20, 40));
+  f.help.enter("pointer");
+  f.flush();
+  const [note] = f.notes();
+  assert.deepEqual([note.dataset.side, note.dataset.far, note.style.top], ["above", "", "248px"]);
 });
 
 test("a family's hidden member carries no note", () => {
@@ -431,7 +449,6 @@ test("a page's only chart: its actions coming out move no note either", () => {
   f.help.enter("pointer");
   f.flush();
   const before = f.boxes()[0];
-  // No other chart's actions stay hidden to say what these are: they were seen hidden while the notes were up.
   for (const action of actions) action.shown = true;
   f.fire("mouseover", { buttons: 0, target: { closest: () => null } });
   f.flush();
@@ -452,10 +469,7 @@ test("Escape during a held press leaves the pin, and the pointer leaving the win
   assert.deepEqual(f.texts(), ["Maximize"]);
   // The chart's action goes when the pointer leaves the window, and no crossing onto another element says so.
   action.shown = false;
-  f.fire("mouseout", { relatedTarget: {} });
-  f.flush();
-  assert.deepEqual(f.texts(), ["Maximize"], "a crossing inside the window is the mouseover's business");
-  f.fire("mouseout", { relatedTarget: null });
+  f.fire("mouseout", { target: { closest: () => null }, relatedTarget: null, buttons: 0 });
   f.flush();
   assert.deepEqual(f.texts(), []);
 });
@@ -466,6 +480,63 @@ test("a target with no room around it takes its note inside", () => {
   f.help.enter("pointer");
   f.flush();
   assert.deepEqual([f.notes()[0].style.left, f.notes()[0].style.top], ["6px", "6px"]);
+});
+
+test("a note with no place outside its control takes the first one inside it clear of the other notes", () => {
+  const f = fixture();
+  // Nothing outside: an open popover over everything above them, and the window's bottom below.
+  f.opens(box(0, 0, 1000, 535));
+  f.element("c", "the big control", box(0, 540, 1000, 60));
+  // A small control in it, near the window's bottom, whose note goes over it: where the big control's corner would be.
+  f.element("d", "dd", box(40, 575, 20, 20));
+  f.help.enter("pointer");
+  f.flush();
+  const [big, small] = f.boxes();
+  assert.ok(!overlaps(small, big), `${JSON.stringify(small)} and ${JSON.stringify(big)}`);
+  assert.deepEqual([big.top, f.notes()[0].dataset.side], [546, undefined], "inside the big control, along its top");
+});
+
+test("a kept box overhanging a spot by under a pixel does not close it", () => {
+  const f = fixture();
+  f.opens(box(140, 96, 30, 30.5));
+  f.element("a", "a text", box(100, 100, 40, 20));
+  f.help.enter("pointer");
+  f.flush();
+  assert.deepEqual([f.notes()[0].style.left, f.notes()[0].style.top], ["100px", "126px"], "the note slid away from a half-pixel overhang");
+});
+
+test("a hidden control under a maximized chart neither takes a pick nor keeps a note off", () => {
+  const f = fixture();
+  const shown = f.element("max", "the maximized chart's text", box(100, 100, 40, 20));
+  f.element("grid-action", "Maximize", box(100, 126, 20, 20)).shown = false;
+  f.maximizes(box(0, 40, 1000, 560), [shown]);
+  f.help.enter("pointer");
+  f.flush();
+  assert.deepEqual([f.texts(), f.notes()[0].style.top, f.notes()[0].dataset.side], [["the maximized chart's text"], "126px", "below"]);
+});
+
+test("a note with no spot against its control chooses among its spots further off before the others take them", () => {
+  const f = fixture();
+  // Z's spots against it (under, over and at both sides), and the one a row under it, are shut, clear of its line's path; a row over it is the spot under Y.
+  f.opens(...[274, 326, 352].map((top) => box(122, top, 20, 20)), box(146, 290, 20, 40), box(76, 290, 20, 40));
+  f.element("z", "zz", box(100, 300, 40, 20));
+  f.element("y", "yy", box(100, 222, 40, 20));
+  f.help.enter("pointer");
+  f.flush();
+  const [z, y] = f.notes();
+  assert.deepEqual([z.style.top, z.dataset.far, y.style.top, y.dataset.side], ["248px", "", "196px", "above"]);
+});
+
+test("the X axis takes its text once: its write brings one more scan, not one every frame", () => {
+  const f = fixture();
+  const u = chart();
+  const written = {};
+  u.root.axis.dataset = new Proxy(written, { set: (target, key, value) => ((target[key] = value), f.render([{ type: "attributes", addedNodes: [], removedNodes: [] }]), true) });
+  f.window.__kymo_charts = { "uplot-1": u };
+  f.element("chart-container", "Drag horizontally to zoom", box(300, 100, 400, 200), { id: "uplot-1", dataset: { helpFn: "chart" } });
+  f.help.enter("pointer");
+  for (let i = 0; i < 4; i++) f.flush();
+  assert.deepEqual([written.help, f.pending()], ["Drag axis to rescale", 0]);
 });
 
 test("a note for a control inside an open popover is that popover's child, and page notes keep clear of the popover", () => {
@@ -650,6 +721,7 @@ test("a render refreshes the notes; the notes' own comings and goings do not", (
   f.render([{ type: "childList", addedNodes: [note], removedNodes: [] }, { type: "childList", addedNodes: [], removedNodes: [node("sidebar-run", "inside")] }]);
   f.flush();
   assert.deepEqual(f.texts(), ["second"]);
+  f.flush();
   first.shown = true;
   f.render([{ type: "attributes", addedNodes: [], removedNodes: [] }]);
   f.flush();
@@ -695,6 +767,17 @@ test("scrolls and resizes move the notes with their targets", () => {
     f.flush();
     assert.equal(f.notes()[0].style.top, `${top + 26}px`);
   }
+  f.flush();
+  // Run rows a scroll brings into view report themselves not rendered for up to two frames, so two more scans follow a scroll.
+  const row = f.element("row", "a row's text", box(500, 100, 20, 20));
+  row.gone = true;
+  f.fire("scroll");
+  f.flush();
+  f.flush();
+  assert.ok(!f.texts().includes("a row's text"));
+  row.gone = false;
+  f.flush();
+  assert.ok(f.texts().includes("a row's text"), "the second scan after the scroll sees the row");
   // A scroll of something that holds no explained control (a log following its tail) moves no note, and scans nothing.
   Object.assign(rect, box(10, 400, 20, 20));
   f.fire("scroll", { target: { querySelector: () => null } });
@@ -767,7 +850,7 @@ test("a chart that cannot say its texts keeps its rendered ones, and the page ke
 // A uPlot instance as create.js leaves it, with what the chart provider reads.
 function chart(over = {}) {
   const axis = { dataset: {} };
-  return { root: { axis, querySelector: (selector) => (assert.equal(selector, ".u-axis"), axis) }, data: [over.xs ?? [0, 1, 2]], scales: { x: { max: over.max === undefined ? 2 : over.max } }, __kymo_userzoom: over.userzoom, __kymo_tip: { style: { labels: {}, getPropertyValue(name) { return this.labels[name]; }, setProperty(name, value) { this.labels[name] = value; } } } };
+  return { root: { axis, querySelector: (selector) => (assert.equal(selector, ".u-axis"), axis) }, data: [over.xs ?? [0, 1, 2]], scales: { x: { max: over.max === undefined ? 2 : over.max } }, __kymo_userzoom: over.userzoom, __kymo_tip: { style: { labels: {}, setProperty(name, value) { this.labels[name] = value; } } } };
 }
 
 test("a chart's texts follow its state", () => {
@@ -804,7 +887,7 @@ test("a chart container shows its rendered lines and its script's together", () 
   assert.deepEqual(f.texts(), ["Drag horizontally to zoom\nInclude right edge to follow new data"]);
 });
 
-// The release bundle's CSS minifier (lightningcss, in `dx bundle`) splits off a selector it must rewrite for older browsers (one with a functional pseudo-class such as `:is()`), and when the rest of the selector list is the rule just before, that selector loses the declarations. The readout labels lost their look that way, in release builds only.
+// The release bundle's CSS minifier (lightningcss, in `dx bundle`) splits a selector with a pseudo-class off its list (`:is()`, also `:focus-visible` and `:focus-within`), and when the rest of the list is the rule just before, the selector split off loses the declarations. The readout labels lost their look that way, in release builds only.
 test("no rule repeats the rule before it and adds a selector the release minifier splits off", () => {
   const css = read("../assets/kymo.css").replace(/\/\*[\s\S]*?\*\//g, "");
   const list = (selectors) => {
@@ -821,21 +904,28 @@ test("no rule repeats the rule before it and adds a selector the release minifie
   let before = [];
   for (const [, head] of css.matchAll(/([^{}]+)\{[^{}]*\}/g)) {
     const selectors = list(head);
-    assert.ok(!(before.length && before.every((selector) => selectors.includes(selector)) && selectors.some((selector) => !before.includes(selector) && /:[a-z-]+\(/.test(selector))), `"${selectors.join(", ")}": give the selector with a functional pseudo-class its own rule`);
+    assert.ok(!(before.length && before.every((selector) => selectors.includes(selector)) && selectors.some((selector) => !before.includes(selector) && /:/.test(selector))), `"${selectors.join(", ")}": give the selector with a pseudo-class its own rule`);
     before = selectors;
   }
 });
 
-test("components take their help texts from help.rs", () => {
-  // A text written where it is used would escape the word limit and the design document's check. Only the format strings that join constants may be literals.
+test("components take their help texts from help.rs, and a title written as one carries it as its note too", () => {
+  // A text written where it is used would escape the word limit and the design document's check: only the format strings that join constants may be literals. Rule 8: an explained control's title is its note's text, so the control never says two things; losing the data-help would leave the title alone.
   const src = new URL("../src/", import.meta.url);
+  let titles = 0;
   for (const name of readdirSync(src, { recursive: true }).filter((name) => name.endsWith(".rs") && name !== "help.rs")) {
-    for (const [at, line] of readFileSync(new URL(name, src), "utf8").split("\n").entries()) {
+    const lines = readFileSync(new URL(name, src), "utf8").split("\n");
+    for (const [at, line] of lines.entries()) {
       const value = /"data-help(?:-fn)?":(.*)|\bhelp: (.*)/.exec(line);
       const literals = (value?.[1] ?? value?.[2] ?? "").match(/"[^"]*"/g) ?? [];
       for (const literal of literals) assert.ok(/^"(?:[{}]|\\n)*"$/.test(literal) || literal === '"chart"', `${name}:${at + 1} writes a help text in place: ${literal}`);
+      const title = /\btitle: crate::help::(\w+)/.exec(line)?.[1];
+      if (!title) continue;
+      titles++;
+      assert.ok(lines.slice(Math.max(0, at - 6), at + 7).some((near) => near.includes(`"data-help": crate::help::${title}`)), `${name}:${at + 1} has the title ${title} and no data-help with it`);
     }
   }
+  assert.ok(titles > 10, `found only ${titles} titles`);
 });
 
 // Every text shown: the constants of help.rs and the chart script's TEXT table.

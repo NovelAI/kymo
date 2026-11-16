@@ -1481,7 +1481,7 @@ input[type="checkbox"]:checked::before {
 .kymo-help-note[data-far]::before { border: 0; background: var(--text-headings); width: 2px; height: var(--reach); margin-left: 3px; }
 .kymo-help-note[data-far]:is([data-side="beside"], [data-side="before"])::before { width: var(--reach); height: 2px; margin: 3px 0 0; }
 
-/* A chart readout's own labels (left on it as custom properties by uplot_chart/help.js), each just over a value of the hovered chart's readout with a tick down at it, while help's notes show: one on the first row's colored value, one on the gray column's first populated cell, saying what it holds, a raw value or a range (hover.js classes that cell). They lie over what is above them (the readout's header line), out of flow, so the readout keeps the size hover.js measured; the gray one can reach past the readout's right edge, and so past the window's when the readout is against it. */
+/* A chart readout's own labels (left on it as custom properties by uplot_chart/help.js), each just over a value of the hovered chart's readout with a tick down at it, while help's notes show and no mouse button is held (data-kymo-help without data-kymo-held, which every rule giving a label or tick its content requires): one on the first row's colored value, one on the gray column's first populated cell, saying what it holds, a raw value or a range (hover.js classes that cell). They lie over what is above them (the readout's header line, or the empty cells above a later row's value), out of flow, so the readout keeps the size hover.js measured; the gray one does not wrap: it can reach past the readout's right edge, across the cursor line when the readout is left of the pointer, and past the window's when the readout is against it. */
 /* The readout under the pointer goes over the page's notes (z-index 95), which would otherwise hide what is being read. */
 :root[data-kymo-help] .kymo-tip-src { z-index: 96; }
 :root[data-kymo-help] .kymo-tip-src :is(.kymo-tip-row:first-child > .kymo-tip-val, .kymo-tip-rawval, .kymo-tip-range, .kymo-tip-borrowed, .kymo-tip-row:last-child > .kymo-tip-x) { position: relative; }
@@ -1498,9 +1498,9 @@ input[type="checkbox"]:checked::before {
     color: var(--bg0);
     font: 600 var(--font-size-12)/1.4 var(--font-ui);
 }
-:root[data-kymo-help] .kymo-tip-src .kymo-tip-row:first-child > .kymo-tip-val::after { content: var(--help-colored, none); bottom: calc(100% + 5px); right: 0; }
-:root[data-kymo-help] .kymo-tip-src .kymo-tip-rawval::after { content: var(--help-raw, none); bottom: calc(100% + 5px); left: 0; }
-:root[data-kymo-help] .kymo-tip-src .kymo-tip-range::after { content: var(--help-range, none); bottom: calc(100% + 5px); left: 0; }
+:root[data-kymo-help]:not([data-kymo-held]) .kymo-tip-src .kymo-tip-row:first-child > .kymo-tip-val::after { content: var(--help-colored, none); bottom: calc(100% + 5px); right: 0; }
+:root[data-kymo-help]:not([data-kymo-held]) .kymo-tip-src .kymo-tip-rawval::after { content: var(--help-raw, none); bottom: calc(100% + 5px); left: 0; }
+:root[data-kymo-help]:not([data-kymo-held]) .kymo-tip-src .kymo-tip-range::after { content: var(--help-range, none); bottom: calc(100% + 5px); left: 0; }
 /* The tick, drawn where its label is (the same property gives both their content, and none of either where it is unset): at the value's middle, but no further from the label's own end than the shortest label reaches (a range is wider than "Range"). */
 :root[data-kymo-help] .kymo-tip-src .kymo-tip-row:first-child > .kymo-tip-val::before,
 :root[data-kymo-help] .kymo-tip-src .kymo-tip-rawval::before,
@@ -1517,11 +1517,11 @@ input[type="checkbox"]:checked::before {
     border-bottom: 0;
     border-top-color: var(--text-headings);
 }
-:root[data-kymo-help] .kymo-tip-src .kymo-tip-rawval::before { content: var(--help-raw, none); }
-:root[data-kymo-help] .kymo-tip-src .kymo-tip-range::before { content: var(--help-range, none); }
-:root[data-kymo-help] .kymo-tip-src .kymo-tip-row:first-child > .kymo-tip-val::before { content: var(--help-colored, none); left: auto; right: max(3px, min(50% - 5px, 1.5 * var(--font-size-12))); }
+:root[data-kymo-help]:not([data-kymo-held]) .kymo-tip-src .kymo-tip-rawval::before { content: var(--help-raw, none); }
+:root[data-kymo-help]:not([data-kymo-held]) .kymo-tip-src .kymo-tip-range::before { content: var(--help-range, none); }
+:root[data-kymo-help]:not([data-kymo-held]) .kymo-tip-src .kymo-tip-row:first-child > .kymo-tip-val::before { content: var(--help-colored, none); left: auto; right: max(3px, min(50% - 5px, 1.5 * var(--font-size-12))); }
 /* A borrowed point's @ is explained under the readout that shows one (hover.js classes its grid), with a tick up at the last row's @ cell. The label wraps to the grid's width, which keeps it off the pointer beside the readout, and is lost where the readout touches the window's bottom. */
-:root[data-kymo-help] .kymo-tip-src .kymo-tip-borrowed::after {
+:root[data-kymo-help]:not([data-kymo-held]) .kymo-tip-src .kymo-tip-borrowed::after {
     content: var(--help-borrowed, none);
     top: calc(100% + var(--spacing-xs) + 6px);
     right: 0;
@@ -1529,7 +1529,7 @@ input[type="checkbox"]:checked::before {
     max-width: 100%;
     white-space: normal;
 }
-:root[data-kymo-help] .kymo-tip-src .kymo-tip-row:last-child > .kymo-tip-x::before {
+:root[data-kymo-help]:not([data-kymo-held]) .kymo-tip-src .kymo-tip-row:last-child > .kymo-tip-x::before {
     content: var(--help-borrowed, none);
     top: calc(100% + var(--spacing-xs) + 1px);
     bottom: auto;
@@ -1537,7 +1537,7 @@ input[type="checkbox"]:checked::before {
     border-bottom: 5px solid var(--text-headings);
 }
 /* The copy shortcut is explained over the readout, with a tick down at it. It wraps to the readout's width for the same reason, is lost where the readout touches the window's top, and stays clear of the value labels, which lie over the readout's header line. */
-:root[data-kymo-help] .kymo-tip-src::after {
+:root[data-kymo-help]:not([data-kymo-held]) .kymo-tip-src::after {
     content: var(--help-copy, none);
     bottom: calc(100% + 6px);
     left: -1px;
@@ -1545,17 +1545,11 @@ input[type="checkbox"]:checked::before {
     max-width: calc(100% + 2px);
     white-space: normal;
 }
-:root[data-kymo-help] .kymo-tip-src::before {
+:root[data-kymo-help]:not([data-kymo-held]) .kymo-tip-src::before {
     content: var(--help-copy, none);
     bottom: calc(100% + 1px);
     left: calc(1.5 * var(--font-size-12));
 }
-/* Not while a mouse button is held (data-kymo-held, which matches nothing but these): the labels go with the notes. Listed after the rules above and no less specific. */
-:root[data-kymo-help][data-kymo-held] .kymo-tip-src .kymo-tip-grid .kymo-tip-row > :is(.kymo-tip-val, .kymo-tip-raw, .kymo-tip-x)::before,
-:root[data-kymo-help][data-kymo-held] .kymo-tip-src .kymo-tip-grid .kymo-tip-row > :is(.kymo-tip-val, .kymo-tip-raw, .kymo-tip-x)::after,
-:root[data-kymo-help][data-kymo-held] .kymo-tip-src::before,
-:root[data-kymo-help][data-kymo-held] .kymo-tip-src::after,
-:root[data-kymo-help][data-kymo-held] .kymo-tip-src .kymo-tip-grid.kymo-tip-borrowed::after { content: none; }
 
 .kymo-tip {
     /* fixed: positioned in viewport coords beside the cursor's vertical
