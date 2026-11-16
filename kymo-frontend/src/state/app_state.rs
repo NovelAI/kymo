@@ -526,7 +526,6 @@ impl DashboardState {
     /// Open the options panel on `target`, opened by the control `return_focus_id`, replacing whatever it showed. The open target's own trigger, shown pressed meanwhile, closes it instead; a chart panel's never shows while it is open (hidden on the maximized chart, inert in the grid beneath), so a Configure pressed again before its maximize lands opens it again.
     /// A chart panel opened with nothing maximized comes from Configure on a grid chart, which maximizes the chart next; closing the panel un-maximizes it again, whichever target the panel shows by then.
     pub fn open_options_panel(&self, target: PanelTarget, return_focus_id: String) {
-        crate::util::panel_moved();
         let mut open = self.options_panel;
         let current = open.peek().clone();
         let shown =
@@ -551,7 +550,6 @@ impl DashboardState {
         let Some(panel) = open.peek().clone() else {
             return;
         };
-        crate::util::panel_moved();
         open.set(None);
         if panel.unmaximize_on_close {
             let mut maximized = self.maximized;

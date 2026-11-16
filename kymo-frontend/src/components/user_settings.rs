@@ -18,11 +18,7 @@ pub fn UserSettingsButton(mut open: Signal<bool>) -> Element {
             title: "User settings",
             // Shown pressed while the panel is open, and closes it.
             aria_expanded: *open.read(),
-            onmousedown: primary(move |_| {
-                // The docked panel narrows the page under the pointer as it opens and closes.
-                crate::util::panel_moved();
-                open.toggle()
-            }),
+            onmousedown: primary(move |_| open.toggle()),
             GearIcon {}
             span { "Settings" }
         }
@@ -89,10 +85,7 @@ pub fn UserSettingsPanel(mut open: Signal<bool>) -> Element {
             return_focus_ids: vec![TRIGGER_ID.to_string()],
             revert_disabled: current == initial,
             on_revert: move |_| save(initial),
-            on_close: move |_| {
-                crate::util::panel_moved();
-                open.set(false)
-            },
+            on_close: move |_| open.set(false),
 
             for r in [*refusals.read()] {
                 div { key: "{r}",

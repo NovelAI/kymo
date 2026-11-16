@@ -52,7 +52,7 @@ const OVERFLOW_FADE_JS: &str = include_str!("util/overflow_fade.js");
 const WIDTH_DRAG_JS: &str = include_str!("util/width_drag.js");
 const HELP_JS: &str = include_str!("util/help.js");
 const CHART_HELP_JS: &str = include_str!("components/uplot_chart/help.js");
-const PANEL_PRESSES_JS: &str = include_str!("util/panel_presses.js");
+const MULTI_CLICK_GUARD_JS: &str = include_str!("util/multi_click_guard.js");
 const PRESS_TARGET_JS: &str = include_str!("util/press_target.js");
 
 const VISIBILITY_BRIDGE_JS: &str = r#"(()=>{
@@ -162,7 +162,8 @@ fn main() {
     ))
     .expect("failed to install contextual help");
     js_sys::eval(CHART_HELP_JS).expect("failed to install chart help");
-    js_sys::eval(PANEL_PRESSES_JS).expect("failed to install the panel press guard");
+    // Ahead of the press target record, so a swallowed press records nothing.
+    js_sys::eval(MULTI_CLICK_GUARD_JS).expect("failed to install the multi-click guard");
     js_sys::eval(PRESS_TARGET_JS).expect("failed to install the press target record");
     js_sys::eval(util::js_bridge::LIFECYCLE_JS)
         .expect("failed to install the JavaScript bridge registry");

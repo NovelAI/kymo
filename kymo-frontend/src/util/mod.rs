@@ -120,12 +120,6 @@ pub fn unique_id(prefix: &str) -> String {
     format!("{prefix}-{ms}-{rand:08x}")
 }
 
-/// A press just opened, closed or switched the options panel: the rest of its double-click goes nowhere (`panel_presses.js`).
-pub fn panel_moved() {
-    #[cfg(target_arch = "wasm32")]
-    let _ = js_sys::eval("window.__kymo_panel_moved?.()");
-}
-
 /// Browser-console warning (stderr in host tests).
 pub fn warn(msg: &str) {
     #[cfg(target_arch = "wasm32")]

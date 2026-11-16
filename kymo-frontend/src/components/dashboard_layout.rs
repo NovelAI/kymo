@@ -684,11 +684,8 @@ fn MaximizeOverlay() -> Element {
                     focus_on_mount(e)
                 }
             },
-            // Dismiss on click (mouseup) can be annoying if you drag the x-axis and release in the border.
-            onmousedown: primary(move |_| {
-                crate::util::panel_moved();
-                focus_chart(None)
-            }),
+            // Dismiss on the press, not the release: a drag of the x-axis that ends in the border would dismiss too.
+            onmousedown: primary(move |_| focus_chart(None)),
             div {
                 class: "maximize-content",
                 onmousedown: move |e| e.stop_propagation(),

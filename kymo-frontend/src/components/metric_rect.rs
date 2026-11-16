@@ -452,11 +452,7 @@ fn MetricRectBody(
                         button {
                             class: "rect-action icon-button",
                             title: "Close",
-                            onmousedown: primary(move |_| {
-                                // Closing the chart takes a chart panel along, undocking it under the pointer.
-                                crate::util::panel_moved();
-                                focus_chart(None);
-                            }),
+                            onmousedown: primary(move |_| focus_chart(None)),
                             CloseIcon {}
                         }
                     } else {
