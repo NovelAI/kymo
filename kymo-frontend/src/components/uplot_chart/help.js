@@ -1,9 +1,9 @@
-// Contextual help for a numeric chart (docs/contextual-help.md): the texts only chart script state decides, for util/help.js to show on the chart's container. It runs when help scans the page and at no other time, reads what create.js already keeps on the uPlot instance, what uplot_chart.rs renders on the container (data-live, data-smoothed, data-step-zoomed, data-xnan) and two preferences on the root element, and writes only the X axis's text and the readout's label properties, so it adds nothing to hover, repaint or rebuild.
+// Contextual help for a numeric chart (docs/contextual-help.md): the texts only chart script state decides, for util/help.js to show on the chart's container. It runs when help scans the page and at no other time, reads what create.js already keeps on the uPlot instance, what uplot_chart.rs renders on the container (data-live, data-smoothed, data-step-zoomed, data-xnan) and one preference on the root element, and writes only the X axis's text and the readout's label properties, so it adds nothing to hover, repaint or rebuild.
 (() => {
   const TEXT = {
     axis: 'Drag axis to rescale',
-    copyMac: 'Hover, then ⌘C copies values',
-    copy: 'Hover, then Ctrl+C copies values',
+    copyMac: '⌘C copies values',
+    copy: 'Ctrl+C copies values',
     reset: 'Double-click to reset zoom',
     resetClick: 'Click to reset zoom',
     synced: 'Matching X axes zoom together',
@@ -25,7 +25,7 @@
     // The X-axis strip's own note sits on uPlot's element for that axis (its first), which takes the text here, at the first scan after the chart's creation, so that creating a chart does no work for help; the attribute's arrival brings the next scan (util/help.js).
     const axis = u.root.querySelector('.u-axis');
     if (axis && !axis.dataset.help) axis.dataset.help = TEXT.axis;
-    const out = [navigator.platform.startsWith('Mac') ? TEXT.copyMac : TEXT.copy];
+    const out = [];
     // A step chart zooms through the step store and keeps no zoom on its instance (create.js); uplot_chart.rs says whether the answer shown is a zoomed one.
     const zoomed = u.__kymo_userzoom || el.dataset.stepZoomed;
     if (zoomed) {
@@ -41,14 +41,13 @@
     if (u.__kymo_hl.rs % 2) out.push(TEXT.trace);
     if (u.bands.length) out.push(TEXT.bands);
     if (u.__kymo_copy.nanCols) out.push(TEXT.markers);
-    // The readout's colored values (smoothed ones, on a smoothed chart) and its gray column (raw values or ranges; hover.js classes the first cell that holds one) are labelled on the readout itself, which follows the pointer: this only leaves the labels on it, as custom properties, and kymo.css draws the ones that fit what the hovered chart's readout shows while notes show, so help runs no script as the pointer moves.
+    // What labels the readout is left on the readout itself, as custom properties: its colored values (smoothed ones, on a smoothed chart), its gray column (raw value or range; hover.js classes the first cell that holds one), the copy shortcut, and a borrowed point's @ (hover.js classes a readout that has one). kymo.css draws them while notes show, so help runs no script as the readout follows the pointer.
     const tip = u.__kymo_tip.style;
-    for (const [name, value] of [['--help-colored', el.dataset.smoothed ? JSON.stringify(TEXT.colored) : ''], ['--help-raw', JSON.stringify(TEXT.raw)], ['--help-range', JSON.stringify(TEXT.range)]]) {
+    for (const [name, value] of [['--help-colored', el.dataset.smoothed ? JSON.stringify(TEXT.colored) : ''], ['--help-raw', JSON.stringify(TEXT.raw)], ['--help-range', JSON.stringify(TEXT.range)], ['--help-borrowed', JSON.stringify(TEXT.borrowed)], ['--help-copy', JSON.stringify(navigator.platform.startsWith('Mac') ? TEXT.copyMac : TEXT.copy)]]) {
       if (tip.getPropertyValue(name) !== value) tip.setProperty(name, value);
     }
-    // What else this chart's readout can hold: an unplottable-x count, and, with the nearest-point preference on and a second series to borrow from, a borrowed point's x.
+    // ×N after a readout value, which a chart with unplottable-x samples can show.
     if (el.dataset.xnan) out.push(TEXT.xnan);
-    if (u.__kymo_copy.seriesCount > 1 && root.getAttribute('data-kymo-show-nearest-point') === 'true') out.push(TEXT.borrowed);
     return out;
   };
 })();

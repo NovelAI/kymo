@@ -224,6 +224,7 @@ test("default-off and exact-only readouts omit the metadata column", () => {
       for (const row of rows) assert.deepEqual(row.cells.map(cell => cell.role), source ? (withRaw ? ["name", "val", "raw"] : ["name", "val"]) : ["val"]);
       const columns = f.tip.innerHTML.match(/grid-template-columns:([^"]+)/)?.[1];
       assert.equal(columns, source ? (withRaw ? "minmax(0,max-content) max-content max-content" : "minmax(0,max-content) max-content") : "max-content");
+      assert.ok(!f.tip.innerHTML.includes("kymo-tip-borrowed"), "a readout without a borrowed point is not classed for contextual help");
     }
   }
 });
@@ -240,6 +241,7 @@ test("source and synced borrowed buckets show their real, unshifted x range", ()
     assert.match(f.tip.innerHTML, /kymo-tip-step">9–11<\/div>/);
     assert.equal(tooltipCell(f.tip, 1, "val").text, "5.000");
     assert.equal(tooltipCell(f.tip, 1, "x").text, "@ 2–8");
+    assert.ok(f.tip.innerHTML.includes('class="kymo-tip-grid kymo-tip-borrowed"'), "a readout with a borrowed point is classed for contextual help");
     assert.equal(f.hotpt.style.left, `${10 + shift}px`, "marker stays at the hovered bucket center");
     f.window.__kymo_hoversrc = "peer";
     f.run();

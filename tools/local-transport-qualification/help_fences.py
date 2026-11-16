@@ -8,6 +8,7 @@ Run it against a local stack seeded with seed_browser_fixture.py and seed_zoom_f
 """
 
 import argparse
+import sys
 
 from playwright.sync_api import Page, expect, sync_playwright
 
@@ -398,69 +399,84 @@ def large_font_and_copy(page: Page) -> None:
     page.evaluate("scrollTo(0, 0)")
 
 
-# The stylesheet's readout labels, on stand-in readouts built the way hover.js builds one (no seeded chart has a range): per readout, the label over the first row's colored value and the one over the gray column's first populated cell.
+# The stylesheet's readout labels, on stand-in readouts built the way hover.js builds one (no seeded chart has a range or a borrowed point). Per readout: the labels drawn (over the first row's colored value, over the gray column's first populated cell, under a readout with a borrowed point, and the copy shortcut's over the readout), whether each has its tick and no other element one (a borrowed point's is on the last row's @ cell), and the looks of the labels drawn that differ from a note's.
 READOUT_LABELS = """() => Object.fromEntries([
     ['raw', [['0.5', 'kymo-tip-rawval'], ['0.1\u20130.9', '']]],
     ['range', [['', ''], ['0.1\u20130.9', 'kymo-tip-range']]],
     ['bare', [['', ''], ['', '']]],
-].map(([name, grays]) => {
+    ['borrowed', [['', '', ''], ['', '', '@ 3']]],
+].map(([name, rows]) => {
     const tip = Object.assign(document.createElement('div'), {className: 'kymo-tip kymo-tip-src'});
-    for (const [property, text] of [['--help-colored', 'Smoothed'], ['--help-raw', 'Raw value'], ['--help-range', 'Range']]) {
+    for (const [property, text] of [['--help-colored', 'Smoothed'], ['--help-raw', 'Raw value'], ['--help-range', 'Range'], ['--help-borrowed', '@'], ['--help-copy', 'Copy']]) {
         tip.style.setProperty(property, JSON.stringify(text));
     }
-    tip.innerHTML = '<div class="kymo-tip-step">1</div><div class="kymo-tip-grid">' + grays.map(([gray, cls]) =>
-        '<div class="kymo-tip-row"><span class="kymo-tip-name">a</span><span class="kymo-tip-val">1</span><span class="kymo-tip-raw ' + cls + '">' + gray + '</span></div>').join('') + '</div>';
+    tip.innerHTML = '<div class="kymo-tip-step">1</div><div class="kymo-tip-grid' + (name === 'borrowed' ? ' kymo-tip-borrowed' : '') + '" style="grid-template-columns:minmax(0,max-content) max-content max-content' + (name === 'borrowed' ? ' max-content' : '') + '">' + rows.map(([gray, cls, x]) =>
+        '<div class="kymo-tip-row"><span class="kymo-tip-name">a</span><span class="kymo-tip-val">1</span><span class="kymo-tip-raw ' + cls + '">' + gray + '</span>' + (x === undefined ? '' : '<span class="kymo-tip-x">' + x + '</span>') + '</div>').join('') + '</div>';
     document.body.appendChild(tip);
-    const drawn = el => getComputedStyle(el, '::after').content;
-    const labels = [...tip.querySelectorAll('.kymo-tip-val, .kymo-tip-raw')].map(drawn);
+    const style = (el, pseudo) => getComputedStyle(el, pseudo);
+    const cells = [...tip.querySelectorAll('.kymo-tip-val, .kymo-tip-raw')], grid = tip.querySelector('.kymo-tip-grid'), xs = [...tip.querySelectorAll('.kymo-tip-x')];
+    const labelled = [...cells, grid, tip];
+    const labels = labelled.map(el => style(el, '::after').content);
+    // The grid's tick is on the last @ cell; no other @ cell, and neither the grid itself, has anything.
+    const ticks = [...cells, xs.at(-1) ?? grid, tip].map(el => style(el, '::before').content);
+    const stray = [...xs.slice(0, -1).flatMap(el => [style(el, '::before').content, style(el, '::after').content]), ...xs.slice(-1).map(el => style(el, '::after').content), ...(xs.length ? [style(grid, '::before').content] : [])];
+    const look = look => [look.backgroundColor, look.color, look.fontWeight, look.fontSize, look.paddingLeft, look.borderTopLeftRadius].join();
+    const unlike = labelled.filter((el, at) => labels[at] !== 'none').map(el => look(style(el, '::after'))).filter(drawn => drawn !== look(style(document.querySelector('.kymo-help-note'))));
     tip.remove();
-    return [name, labels];
+    return [name, {labels, ticked: ticks.join() === labels.join() && stray.every(content => content === 'none'), unlike}];
 }))"""
 
-
-# What the shown readout's first row draws over its colored value and over its gray one.
-HELD_LABELS = """() => {
+# What the shown readout draws, if one shows: its copy tick and label, its first row's labels over the colored value and the gray one, and its grid's @ label.
+SHOWN_LABELS = """() => {
     const tip = [...document.querySelectorAll('.kymo-tip-src')].find(tip => tip.style.display === 'block');
-    return ['.kymo-tip-row:first-child > .kymo-tip-val', '.kymo-tip-rawval'].map(selector => getComputedStyle(tip.querySelector(selector), '::after').content);
+    const cell = selector => getComputedStyle(tip.querySelector(selector), '::after').content;
+    return tip && [getComputedStyle(tip, '::before').content, getComputedStyle(tip, '::after').content, cell('.kymo-tip-row:first-child > .kymo-tip-val'), cell('.kymo-tip-rawval'), cell('.kymo-tip-grid')];
 }"""
+
+COPY = (
+    '"\u2318C copies values"' if sys.platform == "darwin" else '"Ctrl+C copies values"'
+)
 
 
 def readout_labels(page: Page) -> None:
-    """A chart readout's columns are labelled while help is pinned, the gray one for what it holds."""
-    assert page.evaluate(READOUT_LABELS) == {
-        name: ["none"] * 4 for name in ("raw", "range", "bare")
+    """A chart readout is labelled while help is pinned: its columns (the gray one for what it holds), a borrowed point's @, and the copy shortcut."""
+    names = ("raw", "range", "bare", "borrowed")
+    off = {
+        name: {"labels": ["none"] * 6, "ticked": True, "unlike": []} for name in names
     }
+    assert page.evaluate(READOUT_LABELS) == off
     pin(page)
-    assert page.evaluate(READOUT_LABELS) == {
-        "raw": ['"Smoothed"', '"Raw value"', "none", "none"],
-        "range": ['"Smoothed"', "none", "none", '"Range"'],
-        "bare": ['"Smoothed"', "none", "none", "none"],
+    drawn = {
+        "raw": ['"Smoothed"', '"Raw value"', "none", "none", "none", '"Copy"'],
+        "range": ['"Smoothed"', "none", "none", '"Range"', "none", '"Copy"'],
+        "bare": ['"Smoothed"', "none", "none", "none", "none", '"Copy"'],
+        "borrowed": ['"Smoothed"', "none", "none", "none", '"@"', '"Copy"'],
     }
+    readouts = page.evaluate(READOUT_LABELS)
+    assert {name: readouts[name]["labels"] for name in names} == drawn
+    # Every label has its tick and looks like a note (the release bundle's CSS minifier once took the labels' look away).
+    assert all(
+        readout["ticked"] and not readout["unlike"] for readout in readouts.values()
+    ), readouts
+    # A held press takes every label and tick off with the notes.
+    page.evaluate("document.documentElement.setAttribute('data-kymo-held', '')")
+    held = page.evaluate(READOUT_LABELS)
+    page.evaluate("document.documentElement.removeAttribute('data-kymo-held')")
+    assert held == off, held
     # A real readout: the seeded chart is smoothed, and its script and hover.js leave what the stylesheet reads.
     plot = page.locator(".chart-container .u-over").first
     plot.scroll_into_view_if_needed()
     box = plot.bounding_box()
     page.mouse.move(box["x"] + box["width"] * 0.4, box["y"] + box["height"] / 2)
+    # No row of it is borrowed, so nothing explains an @.
+    shown = [COPY, COPY, '"Smoothed"', '"Raw value"', "none"]
     page.wait_for_function(
-        """() => {
-            const tip = [...document.querySelectorAll('.kymo-tip-src')].find(tip => tip.style.display === 'block');
-            const drawn = selector => tip && getComputedStyle(tip.querySelector(selector), '::after').content;
-            return drawn('.kymo-tip-row:first-child > .kymo-tip-val') === '"Smoothed"' && drawn('.kymo-tip-rawval') === '"Raw value"';
-        }"""
+        f"shown => String(({SHOWN_LABELS})()) === String(shown)", arg=shown
     )
-    # A label looks like a note (the release bundle's CSS minifier once dropped the labels' look).
-    look = """() => {
-        const tip = [...document.querySelectorAll('.kymo-tip-src')].find(tip => tip.style.display === 'block');
-        const of = style => [style.backgroundColor, style.color, style.fontWeight, style.paddingLeft, style.borderTopLeftRadius];
-        return [of(getComputedStyle(tip.querySelector('.kymo-tip-rawval'), '::after')), of(getComputedStyle(document.querySelector('.kymo-help-note')))];
-    }"""
-    label, note = page.evaluate(look)
-    assert label == note, (label, note)
-    # A held press takes the labels off with the notes.
     page.mouse.down()
-    assert page.evaluate(HELD_LABELS) == ["none", "none"]
+    assert page.evaluate(SHOWN_LABELS) == ["none"] * 5
     page.mouse.up()
-    assert page.evaluate(HELD_LABELS) == ['"Smoothed"', '"Raw value"']
+    assert page.evaluate(SHOWN_LABELS) == shown
     park(page)
     page.evaluate("scrollTo(0, 0)")
     escape(page)

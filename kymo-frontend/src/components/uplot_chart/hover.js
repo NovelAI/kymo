@@ -110,7 +110,8 @@ function updateHover(u){
       u.data.__kymo_tipc={key:key,empty:true};
       tip.style.display='none';return
     }
-    html+='<div class="kymo-tip-grid" style="grid-template-columns:'+(isSrc?('minmax(0,max-content) max-content'+((hasRange||hasRaw)?' max-content':'')):'max-content')+(hasPointX?' max-content':'')+'">'+rows+'</div>';
+    // A readout with a borrowed point is classed, so contextual help can explain its @ (kymo.css).
+    html+='<div class="kymo-tip-grid'+(hasPointX?' kymo-tip-borrowed':'')+'" style="grid-template-columns:'+(isSrc?('minmax(0,max-content) max-content'+((hasRange||hasRaw)?' max-content':'')):'max-content')+(hasPointX?' max-content':'')+'">'+rows+'</div>';
     tip.innerHTML=html;
     tip.style.display='block';
     // Measure at left 0 so fixed-position shrink-to-fit uses only the intended 33vw cap. Reposition before paint.

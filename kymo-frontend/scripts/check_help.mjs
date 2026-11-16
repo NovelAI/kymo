@@ -768,49 +768,69 @@ test("a chart that cannot say its texts keeps its rendered ones, and the page ke
 function chart(over = {}) {
   const xs = Object.assign(over.xs ?? [0, 1, 2], { stepOpen: over.stepOpen ?? true });
   const axis = { dataset: {} };
-  return { root: { axis, querySelector: (selector) => (assert.equal(selector, ".u-axis"), axis) }, data: [xs], scales: { x: { max: over.max === undefined ? 2 : over.max } }, cursor: { sync: { key: over.key ?? "kymo-step" } }, bands: over.bands ?? [], __kymo_userzoom: over.userzoom, __kymo_zoom: { zr: over.zr ?? false }, __kymo_copy: { nanCols: over.nanCols ?? 0, seriesCount: over.series ?? 2 }, __kymo_hl: { rs: over.rs ?? 0 }, __kymo_tip: { style: { labels: {}, getPropertyValue(name) { return this.labels[name]; }, setProperty(name, value) { this.labels[name] = value; } } } };
+  return { root: { axis, querySelector: (selector) => (assert.equal(selector, ".u-axis"), axis) }, data: [xs], scales: { x: { max: over.max === undefined ? 2 : over.max } }, cursor: { sync: { key: over.key ?? "kymo-step" } }, bands: over.bands ?? [], __kymo_userzoom: over.userzoom, __kymo_zoom: { zr: over.zr ?? false }, __kymo_copy: { nanCols: over.nanCols ?? 0 }, __kymo_hl: { rs: over.rs ?? 0 }, __kymo_tip: { style: { labels: {}, getPropertyValue(name) { return this.labels[name]; }, setProperty(name, value) { this.labels[name] = value; } } } };
 }
 
 test("a chart's texts follow its state", () => {
   const f = fixture();
   const lines = (id, dataset = {}) => [...f.help.providers.chart({ id, dataset })];
   const FOLLOW = "Include right edge to follow new data";
-  f.window.__kymo_charts = { plain: chart(), zoomed: chart({ userzoom: true, max: 1 }), following: chart({ userzoom: "follow" }), peer: chart(), alone: chart({ userzoom: true, key: "kymo-wall" }), rich: chart({ bands: [{}], nanCols: 2, rs: 3 }), banded: chart({ bands: [{}], rs: 2 }), fresh: chart({ max: null }), empty: chart({ xs: [], max: null }), stepFixed: chart({ zr: true, stepOpen: false }), stepOpen: chart({ zr: true }), lone: chart({ series: 1 }) };
+  f.window.__kymo_charts = { plain: chart(), zoomed: chart({ userzoom: true, max: 1 }), following: chart({ userzoom: "follow" }), peer: chart(), alone: chart({ userzoom: true, key: "kymo-wall" }), rich: chart({ bands: [{}], nanCols: 2, rs: 3 }), banded: chart({ bands: [{}], rs: 2 }), fresh: chart({ max: null }), empty: chart({ xs: [], max: null }), stepFixed: chart({ zr: true, stepOpen: false }), stepOpen: chart({ zr: true }) };
   assert.deepEqual(lines("missing"), [], "an unmounted chart has none");
-  assert.deepEqual(lines("plain"), ["Hover, then ⌘C copies values"]);
+  assert.deepEqual(lines("plain"), [], "the copy shortcut is explained on the readout");
   assert.equal(f.window.__kymo_charts.plain.root.axis.dataset.help, "Drag axis to rescale", "the X-axis strip takes its own text");
-  assert.deepEqual(lines("plain", { live: "true" }).slice(1), [FOLLOW]);
-  assert.deepEqual(lines("zoomed", { live: "true" }).slice(1), ["Double-click to reset zoom", "Matching X axes zoom together"]);
+  assert.deepEqual(lines("plain", { live: "true" }), [FOLLOW]);
+  assert.deepEqual(lines("zoomed", { live: "true" }), ["Double-click to reset zoom", "Matching X axes zoom together"]);
   assert.ok(!lines("following", { live: "true" }).includes(FOLLOW), "a zoom that already follows needs no hint");
   assert.ok(!lines("fresh", { live: "true" }).includes(FOLLOW), "no window yet, right after creation");
   assert.ok(!lines("empty", { live: "true" }).includes(FOLLOW));
   f.root.set("data-kymo-single-click-unzoom", "true");
-  assert.deepEqual(lines("alone").slice(1), ["Click to reset zoom"], "no other chart shares its axis");
-  assert.deepEqual(lines("plain", { stepZoomed: "true" }).slice(1), ["Click to reset zoom", "Matching X axes zoom together"]);
+  assert.deepEqual(lines("alone"), ["Click to reset zoom"], "no other chart shares its axis");
+  assert.deepEqual(lines("plain", { stepZoomed: "true" }), ["Click to reset zoom", "Matching X axes zoom together"]);
   assert.ok(!lines("plain", { live: "true", stepZoomed: "true" }).includes(FOLLOW));
-  assert.deepEqual(lines("rich", { xnan: "true", smoothed: "true" }).slice(1), ["Faint line: unsmoothed values", "Shaded band: range of values", "Hollow circles: non-finite, unplottable or log-clipped values", "×N: samples with unplottable X"]);
-  // The readout's own labels are left on the readout, for kymo.css to draw over its values while notes show.
+  assert.deepEqual(lines("rich", { xnan: "true", smoothed: "true" }), ["Faint line: unsmoothed values", "Shaded band: range of values", "Hollow circles: non-finite, unplottable or log-clipped values", "×N: samples with unplottable X"]);
+  // The readout's own labels are left on the readout, for kymo.css to draw on it while notes show.
   const labels = (id) => ({ ...f.window.__kymo_charts[id].__kymo_tip.style.labels });
-  assert.deepEqual(labels("rich"), { "--help-colored": '"Smoothed"', "--help-raw": '"Raw value"', "--help-range": '"Range"' });
-  assert.deepEqual(labels("plain"), { "--help-colored": "", "--help-raw": '"Raw value"', "--help-range": '"Range"' }, "an unsmoothed chart's colored values are not smoothed");
-  assert.deepEqual(lines("banded").slice(1), ["Shaded band: range of values"], "an envelope alone draws no raw trace");
+    assert.deepEqual(labels("plain"), { "--help-colored": "", "--help-raw": '"Raw value"', "--help-range": '"Range"', "--help-borrowed": '"@: nearest sample’s X or bucket range"', "--help-copy": '"⌘C copies values"' }, "an unsmoothed chart's colored values are not smoothed");
+  assert.deepEqual(labels("rich"), { ...labels("plain"), "--help-colored": '"Smoothed"' });
+  assert.deepEqual(lines("banded"), ["Shaded band: range of values"], "an envelope alone draws no raw trace");
   assert.ok(lines("stepOpen", { live: "true" }).includes(FOLLOW));
   assert.ok(!lines("stepFixed", { live: "true" }).includes(FOLLOW), "a step answer with a right bound does not show the newest step");
-  f.root.set("data-kymo-show-nearest-point", "true");
-  assert.equal(lines("plain").at(-1), "@: nearest sample’s X or bucket range");
-  assert.notEqual(lines("lone").at(-1), "@: nearest sample’s X or bucket range", "one run has no other to borrow from");
   f.platform("Win32");
-  assert.equal(lines("plain")[0], "Hover, then Ctrl+C copies values");
+  assert.deepEqual(lines("plain"), []);
+  assert.equal(labels("plain")["--help-copy"], '"Ctrl+C copies values"');
 });
 
 test("a chart container shows its rendered lines and its script's together", () => {
   const f = fixture();
   f.window.__kymo_charts = { "uplot-1": chart() };
-  f.element("chart-container", "Drag horizontally to zoom", box(300, 100, 400, 200), { id: "uplot-1", dataset: { helpFn: "chart" } });
+  f.element("chart-container", "Drag horizontally to zoom", box(300, 100, 400, 200), { id: "uplot-1", dataset: { helpFn: "chart", live: "true" } });
   f.element("chart-container", "Drag horizontally to zoom", box(300, 320, 400, 200), { id: "uplot-2", dataset: { helpFn: "chart" } });
   f.help.enter("pointer");
   f.flush();
-  assert.deepEqual(f.texts(), ["Drag horizontally to zoom\nHover, then ⌘C copies values"]);
+  assert.deepEqual(f.texts(), ["Drag horizontally to zoom\nInclude right edge to follow new data"]);
+});
+
+// The release bundle's CSS minifier (lightningcss, in `dx bundle`) splits off a selector it must rewrite for older browsers (one with a functional pseudo-class such as `:is()`), and when the rest of the selector list is the rule just before, that selector loses the declarations. The readout labels lost their look that way, in release builds only.
+test("no rule repeats the rule before it and adds a selector the release minifier splits off", () => {
+  const css = read("../assets/kymo.css").replace(/\/\*[\s\S]*?\*\//g, "");
+  const list = (selectors) => {
+    const out = [];
+    let depth = 0, from = 0;
+    for (let at = 0; at <= selectors.length; at++) {
+      const c = selectors[at];
+      if (c === "(" || c === "[") depth++;
+      else if (c === ")" || c === "]") depth--;
+      else if (c === undefined || (c === "," && !depth)) { out.push(selectors.slice(from, at).trim().replace(/\s+/g, " ")); from = at + 1; }
+    }
+    return out;
+  };
+  let before = [];
+  for (const [, head] of css.matchAll(/([^{}]+)\{[^{}]*\}/g)) {
+    const selectors = list(head);
+    assert.ok(!(before.length && before.every((selector) => selectors.includes(selector)) && selectors.some((selector) => !before.includes(selector) && /:[a-z-]+\(/.test(selector))), `"${selectors.join(", ")}": give the selector with a functional pseudo-class its own rule`);
+    before = selectors;
+  }
 });
 
 test("components take their help texts from help.rs", () => {
