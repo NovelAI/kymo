@@ -1,4 +1,4 @@
-//! Icon paths from Bootstrap Icons (MIT), Material Icons (Apache 2.0) and Twemoji (CC-BY 4.0); their notices ship from assets/vendor.
+//! Icon paths from Bootstrap Icons (MIT), Material Icons and Material Symbols (Apache 2.0) and Twemoji (CC-BY 4.0); their notices ship from assets/vendor.
 
 use dioxus::prelude::*;
 
@@ -108,6 +108,12 @@ pub fn ExpandAllIcon() -> Element {
 #[component]
 pub fn MoreIcon() -> Element {
     bootstrap_icon("M3 9.5a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3m5 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3m5 0a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3", false)
+}
+
+/// Material Symbols "question_mark" (outlined, weight 400). The glyph is drawn x 274–687, y −840 to −80; the viewBox is the 823-unit square around it, so it is as tall as the gear beside it in the navbar (a text "?" stood a third shorter, and Bootstrap's "question-lg" at this height was too bold).
+#[component]
+pub fn QuestionIcon() -> Element {
+    path_icon("69 -872 823 823", "M431-330q1-72 16.5-105t58.5-72q42-38 64.5-70.5T593-647q0-45-30-75t-84-30q-52 0-80 29.5T358-661l-84-37q22-59 74.5-100.5T479-840q100 0 154 55.5T687-651q0 48-20.5 87T601-482q-49 47-59 72t-11 80H431Zm48 250q-29 0-49.5-20.5T409-150q0-29 20.5-49.5T479-220q29 0 49.5 20.5T549-150q0 29-20.5 49.5T479-80Z", false)
 }
 
 /// Bootstrap Icons "grip-vertical", trimmed to its middle 2×3 dots.

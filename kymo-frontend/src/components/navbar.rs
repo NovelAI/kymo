@@ -1,6 +1,8 @@
 use dioxus::prelude::*;
 
-use crate::components::icons::{CloseIcon, CollapseAllIcon, ExpandAllIcon, GearIcon, ResetIcon};
+use crate::components::icons::{
+    CloseIcon, CollapseAllIcon, ExpandAllIcon, GearIcon, QuestionIcon, ResetIcon,
+};
 use crate::components::sidebar::RunStatusIcon;
 use crate::components::theme_toggle::ThemeToggle;
 use crate::route::Route;
@@ -188,7 +190,7 @@ fn HelpButton() -> Element {
     rsx! {
         button {
             id: "kymo-help",
-            class: "navbar-action navbar-help",
+            class: "navbar-action navbar-help icon-button",
             aria_label: "Explain controls",
             aria_pressed: "false",
             // Its own note, true pinned or not, so that pinning moves no other note.
@@ -202,7 +204,7 @@ fn HelpButton() -> Element {
                 e.prevent_default();
                 help("toggle()");
             }),
-            "?"
+            QuestionIcon {}
         }
     }
 }

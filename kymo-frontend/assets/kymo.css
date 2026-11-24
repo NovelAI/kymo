@@ -1448,7 +1448,6 @@ input[type="checkbox"]:checked::before {
 
 /* === Contextual Help === */
 /* util/help.js places one note beside each explained control while the navbar's ? is hovered, focused or pinned; a note for a control inside a popover is that popover's child, so it paints above it. Notes take no pointer events and sit above everything in the page but the top layer and the hovered chart's readout. */
-.navbar-help { min-width: 1lh; font-weight: 600; }
 .kymo-help-note {
     position: fixed;
     left: 0;
