@@ -11,9 +11,7 @@ use crate::state::visibility::retry_visible;
 use crate::state::{DashboardState, DirectRunLoad, LayoutConfig};
 
 fn refresh_direct_run(state: DashboardState) {
-    if state.current_run.peek().is_some()
-        || !matches!(&*state.direct_run.peek(), DirectRunLoad::Idle)
-    {
+    if state.current_run.peek().is_some() {
         request_refresh(state.direct_run_refresh);
     }
 }

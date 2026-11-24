@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use dioxus::prelude::*;
 
-use crate::grpc::proto::{RunInfo, RunRecord, RunStatus};
+use crate::grpc::proto::{RunInfo, RunLifecycleState, RunRecord, RunStatus};
 use crate::grpc::GrpcClient;
 use crate::route::Route;
 use crate::state::layout_config::{
@@ -120,13 +120,6 @@ impl DirectRunView {
     pub fn authoritative_now_ms(&self) -> i64 {
         crate::state::trash::extrapolated_now_ms(self.server_now_ms, self.observed_monotonic_ms)
     }
-
-    pub fn matches(&self, project_id: &str, run_id: &str) -> bool {
-        self.record
-            .run
-            .as_ref()
-            .is_some_and(|run| run.project_id == project_id && run.run_id == run_id)
-    }
 }
 
 /// Identity of a saved `Specific` binding: (project_id, run_id).
@@ -170,12 +163,7 @@ fn push_unseen(runs: &mut Vec<RunInfo>, seen: &mut HashSet<ExplicitRunKey>, run:
     }
 }
 
-/// Merge the display-metadata sources in precedence order. Freshness, not
-/// convenience, sets the order: the active list is re-read whole on every
-/// project-version bump; explicit metadata is a point lookup keyed to that
-/// same generation; the direct-run record is a point lookup refreshed on its
-/// own route triggers; the FIFO cache is stale by construction — it only
-/// remembers rows that have already left a fresher source.
+/// Merge the display-metadata sources in precedence order. Freshness, not convenience, sets the order: the active list is re-read whole on every rise of the project version it doesn't already cover; explicit metadata is a point lookup keyed to that same generation; the direct-run record is a point lookup the same rises refresh, so it ties with the list (the run page's navbar prefers it: `resolve_page_run`); the FIFO cache is stale by construction — it only remembers rows that have already left a fresher source.
 ///
 /// The FIFO must stay last. It remembers runs as they leave the active list,
 /// so ranking it above the direct-run record let a remembered pre-rename row
@@ -201,6 +189,29 @@ fn merge_display_sources(
         push_unseen(&mut runs, &mut seen, run);
     }
     runs
+}
+
+/// A run page's run: its name (its id while no source has it), and its liveness status while it is active.
+///
+/// The page's own GetRun record wins once loaded: every live rise of the project's version refreshes it (the active list only when its loaded version doesn't cover the rise), and its reply is one row where the list's can be megabytes. Until then the list's row stands in; `list_row` is a closure so that the caller subscribes to the list only then. A settled miss or error leaves the id.
+///
+/// A run outside the active lifecycle has no status: from Trash on, the server refuses the run's new data and stops tracking its liveness, so any status would be a stale guess. The Trash page shows none either.
+fn resolve_page_run(
+    direct: &DirectRunLoad,
+    list_row: impl FnOnce() -> Option<RunInfo>,
+    run_id: &str,
+) -> (String, Option<RunStatus>) {
+    let known = match direct {
+        DirectRunLoad::Loaded(view) => view.record.run.as_ref().map(|run| {
+            let active = view.record.state() == RunLifecycleState::Active;
+            (run.run_name.clone(), active.then(|| run.status()))
+        }),
+        DirectRunLoad::NotFound | DirectRunLoad::Error(_) => None,
+        DirectRunLoad::Idle | DirectRunLoad::Loading => {
+            list_row().map(|run| (run.run_name.clone(), Some(run.status())))
+        }
+    };
+    known.unwrap_or_else(|| (run_id.to_string(), None))
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -319,14 +330,8 @@ impl DashboardState {
         let selected_runs = Signal::new(HashSet::new());
         let current_run = Signal::new(None);
         let display_runs = Memo::new(move || {
-            let project_id = project_id.read();
             let direct = match &*direct_run.read() {
-                DirectRunLoad::Loaded(view) => view
-                    .record
-                    .run
-                    .as_ref()
-                    .filter(|run| run.project_id == *project_id)
-                    .cloned(),
+                DirectRunLoad::Loaded(view) => view.record.run.clone(),
                 _ => None,
             };
             Rc::new(merge_display_sources(
@@ -392,6 +397,17 @@ impl DashboardState {
             naming_draft: CopyValue::new(String::new()),
             grpc: CopyValue::new(GrpcClient::new()),
         }
+    }
+
+    /// A run page's run as its navbar shows it ([`resolve_page_run`]); `None` on a project page. Subscribes the caller to the sources it reads.
+    pub fn page_run(&self) -> Option<(String, Option<RunStatus>)> {
+        let current_run = self.current_run.read();
+        let run_id = current_run.as_deref()?;
+        Some(resolve_page_run(
+            &self.direct_run.read(),
+            || find_run(&self.runs.read(), run_id).cloned(),
+            run_id,
+        ))
     }
 
     pub fn remember_display_runs(&self, runs: &[RunInfo]) {
@@ -1086,5 +1102,80 @@ mod display_precedence_tests {
                 .collect::<Vec<_>>(),
             vec!["a", "e", "d", "c"]
         );
+    }
+
+    fn loaded(run: RunInfo, state: RunLifecycleState) -> DirectRunLoad {
+        let record = RunRecord {
+            run: Some(run),
+            state: state as i32,
+            ..Default::default()
+        };
+        DirectRunLoad::Loaded(DirectRunView::new(record, 0))
+    }
+
+    fn with_status(run_name: &str, status: RunStatus) -> RunInfo {
+        RunInfo {
+            status: status as i32,
+            ..named(run_name)
+        }
+    }
+
+    fn page(direct: &DirectRunLoad, list_row: Option<RunInfo>) -> (String, Option<RunStatus>) {
+        resolve_page_run(direct, || list_row, "r")
+    }
+
+    #[test]
+    fn a_loaded_get_run_record_outranks_the_list_row() {
+        let direct = loaded(
+            with_status("point", RunStatus::Finished),
+            RunLifecycleState::Active,
+        );
+        assert_eq!(
+            page(&direct, Some(with_status("listed", RunStatus::Running))),
+            ("point".to_string(), Some(RunStatus::Finished))
+        );
+    }
+
+    #[test]
+    fn a_run_outside_the_active_lifecycle_shows_no_status() {
+        for state in [
+            RunLifecycleState::Trashed,
+            RunLifecycleState::Expired,
+            RunLifecycleState::Purging,
+            RunLifecycleState::Unknown,
+        ] {
+            let direct = loaded(with_status("trashed", RunStatus::Running), state);
+            assert_eq!(
+                page(&direct, None),
+                ("trashed".to_string(), None),
+                "{state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_list_row_stands_in_until_get_run_answers() {
+        for direct in [DirectRunLoad::Idle, DirectRunLoad::Loading] {
+            assert_eq!(
+                page(&direct, Some(with_status("listed", RunStatus::Stuck))),
+                ("listed".to_string(), Some(RunStatus::Stuck)),
+                "{direct:?}"
+            );
+        }
+        assert_eq!(page(&DirectRunLoad::Loading, None), ("r".to_string(), None));
+    }
+
+    #[test]
+    fn a_settled_miss_leaves_the_id() {
+        for direct in [
+            DirectRunLoad::NotFound,
+            DirectRunLoad::Error("x".to_string()),
+        ] {
+            assert_eq!(
+                page(&direct, Some(named("listed"))),
+                ("r".to_string(), None),
+                "{direct:?}"
+            );
+        }
     }
 }

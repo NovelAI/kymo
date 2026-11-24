@@ -90,7 +90,7 @@ A run that is still logging says so in its Delete item, as the bulk footer does 
 
 ### Run status glyphs
 
-Shape and colour alone say a run’s state, so each glyph carries a note naming it, which is also its title and accessible name (`role="img"`, not focusable). One note shows per state on screen.
+Shape and colour alone say a run’s state, so each glyph carries a note naming it, which is also its title and accessible name (`role="img"`, not focusable). A glyph precedes each sidebar run’s name and follows an active run’s page title once the run is known. A run in Trash shows none: the server stops tracking its liveness there. One note shows per state on screen.
 
 | Item | Decision | Displayed explanation | Justification | Source |
 | --- | --- | --- | --- | --- |
@@ -373,6 +373,7 @@ Esc for the maximized chart, the image preview, a chart drag and inline renames 
 
 ## Changelog
 
+- 2026-11-23: a run page shows its run’s glyph right after its title (owner), except in Trash.
 - 2026-11-16: whole-feature review (six reviewers and four Claude lenses). A branch row’s blanks carry no note (one under a run’s non-empty object had said the run lacks the key). A note with no spot against its control chooses among the next ring’s spots before the others take them, and one with none anywhere takes the first place inside its control clear of the other notes (at the largest font, notes had overlapped in windows narrower than about 850 px). A kept box overhanging a spot by under a pixel no longer closes it (the run counter’s note had gone rows away at large fonts). Hidden controls under a maximized chart no longer steer notes. Two scans follow a scroll (run rows scrolled into view had lost their notes). The reset dot’s accessible name is its text. New checks: the fence’s placement, the X axis’s single write, a minifier shape with any pseudo-class, titles written as help constants paired with their `data-help`. A cleanup round followed (the same reviewers).
 - 2026-11-16: published with the public export, so its mentions of unpublished docs gave way to what they said, and a project name to its size.
 - 2026-11-15: the reset-zoom, shared-zoom, faint-line, shaded-band, hollow-circle and `×N` notes removed (owner); their rows are Skip, and a Skip row may now give a reason other than sufficiency. The copy shortcut’s and the `@` explanations moved from the chart’s note onto the hovered chart’s readout, shown only while it shows them (owner). **?** says “Press to keep help shown” (was “Press to keep notes shown or hide them”; owner). The `@` text is “@: nearest sample’s X” (was “… or bucket range”; owner). In release builds the readout labels had lost their look to the CSS minifier (Implementation); fixed, with a check on the stylesheet’s shape and the browser fence comparing every label’s look with a note’s.

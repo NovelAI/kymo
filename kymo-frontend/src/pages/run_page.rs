@@ -11,9 +11,8 @@ use crate::util::{primary, use_clock_tick};
 #[component]
 pub fn RunPage(project_id: String, run_id: String, chart: ChartQuery) -> Element {
     let state = use_context::<DashboardState>();
-    // `chart` is consumed by ProjectDashboard's URL→overlay sync, not here;
-    // it is a prop only because route fields are.
-    let _ = chart;
+    // ProjectDashboard consumes the route: `direct_run` always describes this run, and `chart` drives its URL→overlay sync. They are props only because route fields are.
+    let _ = (project_id, run_id, chart);
 
     // Re-render at the authoritative expiry boundary (and once a minute for
     // the relative label). This is a display clock only: the server remains
@@ -28,34 +27,22 @@ pub fn RunPage(project_id: String, run_id: String, chart: ChartQuery) -> Element
     // A focused chart lives outside this page's subtree. Close that sibling
     // overlay when the read deadline arrives, otherwise it could outlive the
     // MetricGrid that the terminal shell unmounts.
-    use_effect(use_reactive(
-        (&project_id, &run_id),
-        move |(terminal_project_id, terminal_run_id)| {
-            let _ = *clock_tick.read();
-            let terminal = match &*state.direct_run.read() {
-                DirectRunLoad::Loaded(view)
-                    if view.matches(&terminal_project_id, &terminal_run_id) =>
-                {
-                    matches!(
-                        effective_lifecycle(&view.record, view.authoritative_now_ms()),
-                        RunLifecycleState::Expired | RunLifecycleState::Purging
-                    )
-                }
-                DirectRunLoad::NotFound => true,
-                _ => false,
-            };
-            if terminal && state.maximized.peek().is_some() {
-                crate::route::focus_chart(None);
-            }
-        },
-    ));
-
-    let load = match state.direct_run.read().clone() {
-        DirectRunLoad::Loaded(view) if !view.matches(&project_id, &run_id) => {
-            DirectRunLoad::Loading
+    use_effect(move || {
+        let _ = *clock_tick.read();
+        let terminal = match &*state.direct_run.read() {
+            DirectRunLoad::Loaded(view) => matches!(
+                effective_lifecycle(&view.record, view.authoritative_now_ms()),
+                RunLifecycleState::Expired | RunLifecycleState::Purging
+            ),
+            DirectRunLoad::NotFound => true,
+            _ => false,
+        };
+        if terminal && state.maximized.peek().is_some() {
+            crate::route::focus_chart(None);
         }
-        load => load,
-    };
+    });
+
+    let load = state.direct_run.read().clone();
     match load {
         DirectRunLoad::Idle | DirectRunLoad::Loading => rsx! {
             div { class: "empty-state", "Loading run…" }

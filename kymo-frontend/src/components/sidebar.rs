@@ -1,6 +1,6 @@
 mod view;
 
-pub use view::Sidebar;
+pub use view::{RunStatusIcon, Sidebar};
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;

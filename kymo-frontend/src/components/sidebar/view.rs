@@ -4,7 +4,7 @@ use dioxus::core::{current_scope_id, Runtime};
 
 /// A run's liveness glyph: shape tells the kind of state, CSS color its severity.
 #[component]
-fn RunStatusIcon(status: RunStatus) -> Element {
+pub fn RunStatusIcon(status: RunStatus) -> Element {
     const DOT: &str = "M5 1.5a3.5 3.5 0 1 1 0 7 3.5 3.5 0 1 1 0-7z";
     let (state, title, path, stroked) = match status {
         RunStatus::Running => ("running", crate::help::STATUS_RUNNING, DOT, false),

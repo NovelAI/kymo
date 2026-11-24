@@ -1,9 +1,10 @@
 use dioxus::prelude::*;
 
 use crate::components::icons::{CloseIcon, CollapseAllIcon, ExpandAllIcon, GearIcon, ResetIcon};
+use crate::components::sidebar::RunStatusIcon;
 use crate::components::theme_toggle::ThemeToggle;
 use crate::route::Route;
-use crate::state::{DashboardState, DirectRunLoad, PanelTarget, SectionConfig, UserConfigState};
+use crate::state::{DashboardState, PanelTarget, SectionConfig, UserConfigState};
 use crate::util::{confirm, is_app_escape, primary, unique_id};
 
 /// The Project settings button's id, which focus returns to when its panel closes.
@@ -14,7 +15,10 @@ pub fn Navbar() -> Element {
     let state = use_context::<DashboardState>();
     let user_config = use_context::<UserConfigState>();
     let project_id = state.project_id.read().clone();
-    let current_run = state.current_run.read().clone();
+    // The breadcrumb's last name, which titles the tab too, and a run page's status when it has one.
+    let run = state.page_run();
+    let on_run_page = run.is_some();
+    let (page_name, status) = run.unwrap_or_else(|| (project_id.clone(), None));
     // The breadcrumb carries the focused chart along (like the sidebar's run links), so the overlay follows dashboard navigation. Hook, so it must run unconditionally up here.
     let chart_focus = use_route::<Route>().chart_param();
 
@@ -34,7 +38,6 @@ pub fn Navbar() -> Element {
             }
         }
     }
-    let help_page = (project_id.clone(), current_run.clone());
     let collapse_title = match (any_open, needle.is_empty()) {
         (true, true) => crate::help::COLLAPSE_ALL,
         (false, true) => crate::help::EXPAND_ALL,
@@ -42,10 +45,11 @@ pub fn Navbar() -> Element {
         (false, false) => crate::help::EXPAND_LISTED,
     };
     rsx! {
+        document::Title { "{page_name}" }
         nav { class: "navbar",
             Link { to: Route::ProjectsPage {}, class: "navbar-brand", "kymo" }
             span { class: "navbar-sep", "/" }
-            if current_run.is_some() {
+            if on_run_page {
                 Link {
                     to: Route::ProjectPage {
                         project_id: project_id.clone(),
@@ -56,41 +60,15 @@ pub fn Navbar() -> Element {
                     // The link paints a focus ring, so the fade clips an inner span.
                     span { class: "fade-overflow", span { "{project_id}" } }
                 }
-            } else {
-                span {
-                    class: "navbar-current fade-overflow",
-                    title: "{project_id}",
-                    span { "{project_id}" }
-                }
+                span { class: "navbar-sep", "/" }
             }
-            if let Some(run_id) = current_run {
-                {
-                    let runs = state.runs.read();
-                    let run_name = runs
-                        .iter()
-                        .find(|r| r.run_id == run_id)
-                        .map(|r| r.run_name.clone())
-                        .or_else(|| match &*state.direct_run.read() {
-                            DirectRunLoad::Loaded(view) => view
-                                .record
-                                .run
-                                .as_ref()
-                                .filter(|run| {
-                                    run.project_id == project_id && run.run_id == run_id
-                                })
-                                .map(|run| run.run_name.clone()),
-                            _ => None,
-                        })
-                        .unwrap_or_else(|| run_id.clone());
-                    rsx! {
-                        span { class: "navbar-sep", "/" }
-                        span {
-                            class: "navbar-current fade-overflow",
-                            title: "{run_name}",
-                            span { "{run_name}" }
-                        }
-                    }
-                }
+            span {
+                class: "navbar-current fade-overflow",
+                title: "{page_name}",
+                span { "{page_name}" }
+            }
+            if let Some(status) = status {
+                RunStatusIcon { status }
             }
             div { class: "navbar-spacer" }
             // Panel filter; narrows the grid live. See `DashboardState::panel_filter` for scope and persistence.
@@ -187,7 +165,7 @@ pub fn Navbar() -> Element {
                 }),
                 ResetIcon {}
             }
-            HelpButton { page: help_page }
+            HelpButton {}
             ThemeToggle { class: "navbar-action" }
         }
     }
@@ -198,10 +176,14 @@ fn help(call: &'static str) {
     let _ = js_sys::eval(&format!("window.__kymo_help.{call}"));
 }
 
-/// The contextual-help trigger (docs/contextual-help.md): hovering or focusing it previews the notes, a press pins them. util/help.js owns all of that state, `aria-pressed` included, so help re-renders nothing. `page` is the dashboard page shown: another one (a project or run; a maximized chart is the same page) ends a pin, and so does leaving the dashboard.
+/// The contextual-help trigger (docs/contextual-help.md): hovering or focusing it previews the notes, a press pins them. util/help.js owns all of that state, `aria-pressed` included, so help re-renders nothing. Another dashboard page (a project or run; a maximized chart is the same page) ends a pin, and so does leaving the dashboard: another project remounts the dashboard, so only the run can change under it.
 #[component]
-fn HelpButton(page: (String, Option<String>)) -> Element {
-    use_effect(use_reactive(&page, |_| help("end()")));
+fn HelpButton() -> Element {
+    let state = use_context::<DashboardState>();
+    use_effect(move || {
+        let _ = state.current_run.read();
+        help("end()");
+    });
     use_drop(|| help("end()"));
     rsx! {
         button {

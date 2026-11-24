@@ -102,17 +102,21 @@ class Peer:
         self.connections = 0
         self.allow_reconnect = False
         self.hold_list_responses = False
+        # GetRun's run alone takes a set status: the list's row stays finished.
+        self.direct_running = False
 
-    def run(self, index: int) -> pb.RunInfo:
-        return pb.RunInfo(
+    def run(self, index: int, *, running: bool = False) -> pb.RunInfo:
+        run = pb.RunInfo(
             project_id=PROJECT,
             run_id=f"run-{index}",
             run_name=f"{'after' if self.published else 'before'} snapshot {index:05d}",
             ordinal=self.runs - index,
             created_at_ms=1_700_000_000_000,
-            status=pb.RUN_STATUS_FINISHED,
-            terminated_at_ms=1_700_000_001_000,
+            status=pb.RUN_STATUS_RUNNING if running else pb.RUN_STATUS_FINISHED,
         )
+        if not running:
+            run.terminated_at_ms = 1_700_000_001_000
+        return run
 
     def connect(self, socket: WebSocketRoute) -> None:
         if self.socket is not None and not self.allow_reconnect:
@@ -145,7 +149,7 @@ class Peer:
         elif method == "GetRun":
             response = pb.GetRunResponse(
                 run=pb.RunRecord(
-                    run=self.run(0),
+                    run=self.run(0, running=self.direct_running),
                     # Return Trash until the restore becomes visible.
                     state=(
                         pb.RUN_LIFECYCLE_STATE_ACTIVE
@@ -387,6 +391,7 @@ def run_fences(browser: Browser, origin: str) -> None:
     )
     results.append(empty_project(browser, origin))
     results.append(project_and_global_direct_push(browser, origin))
+    results.append(direct_status(browser, origin))
     print(json.dumps({"first_mount_fixture": results}, sort_keys=True), flush=True)
 
 
@@ -431,19 +436,24 @@ def empty_project(browser: Browser, origin: str) -> dict:
         return {"scenario": "empty-project-no-token", "rpc_counts": dict(peer.counts)}
 
 
+def open_trashed_run(page: Page, peer: Peer, origin: str) -> None:
+    """Open the run page and settle once it shows the run in Trash, its first poll held."""
+    page.goto(origin + f"/{PROJECT}/{RUN}")
+    drive(
+        page,
+        peer,
+        lambda: (
+            bool(peer.polls)
+            and page.locator('[aria-label="Run is in Trash"]').count() == 1
+        ),
+    )
+    settle(page, peer)
+
+
 def project_and_global_direct_push(browser: Browser, origin: str) -> dict:
     peer = Peer(Scenario("project-and-global-direct-push", 11, 11, 2), 1)
     with fixture_page(browser, origin, peer) as page:
-        page.goto(origin + f"/{PROJECT}/{RUN}")
-        drive(
-            page,
-            peer,
-            lambda: (
-                bool(peer.polls)
-                and page.locator('[aria-label="Run is in Trash"]').count() == 1
-            ),
-        )
-        settle(page, peer)
+        open_trashed_run(page, peer, origin)
         before = peer.counts["GetRun"]
         assert before == 1, peer.counts
         # Keep the initial poll held so its lifecycle refresh cannot interfere.
@@ -460,6 +470,45 @@ def project_and_global_direct_push(browser: Browser, origin: str) -> dict:
             "get_run_after": peer.counts["GetRun"],
             "rpc_counts": dict(peer.counts),
         }
+
+
+def direct_status(browser: Browser, origin: str) -> dict:
+    """A run page's navbar shows its GetRun record's status right after the run's name: none while that record is in Trash, and a change as soon as GetRun's reply lands, which the larger list reply then doesn't undo."""
+    peer = Peer(Scenario("direct-status", 11, 11, 1), 1)
+    glyph = ".navbar .navbar-current.fade-overflow + .run-status"
+    with fixture_page(browser, origin, peer) as page:
+        open_trashed_run(page, peer, origin)
+        # The list holds the run too, as an active row, but the page's own record says Trash.
+        assert peer.counts["ListRuns"] == 1, peer.counts
+        assert page.locator(".navbar .run-status").count() == 0, (
+            "a run in Trash shows a status"
+        )
+        peer.release_poll()
+        drive(
+            page,
+            peer,
+            lambda: page.locator(f"{glyph}.finished").count() == 1 and not peer.pending,
+        )
+        # The status changes to running in GetRun alone; its reply lands while the list's is held.
+        peer.direct_running = True
+        peer.hold_list_responses = True
+        before = peer.responses["GetRun"]
+        peer.push(12)
+        drive(
+            page,
+            peer,
+            lambda: (
+                peer.responses["GetRun"] > before
+                and any(item[1] == "ListRuns" for item in peer.pending)
+                and page.locator(f"{glyph}.running").count() == 1
+            ),
+        )
+        peer.hold_list_responses = False
+        settle(page, peer)
+        assert page.locator(f"{glyph}.running").count() == 1, (
+            "the list's finished row replaced GetRun's status"
+        )
+        return {"scenario": "direct-status", "rpc_counts": dict(peer.counts)}
 
 
 def warm_direct_and_reconnect(browser: Browser, origin: str) -> dict:

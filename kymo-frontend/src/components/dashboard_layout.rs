@@ -167,26 +167,28 @@ fn ProjectDashboard(project_id: String) -> Element {
         Route::RunPage { run_id, .. } => Some(run_id.clone()),
         _ => None,
     };
-    // Panels resolve `RunRef::Selected` through `current_run`, so it follows the route from the first render.
-    set_if_changed(state.current_run, scope_run);
+    // Panels resolve `RunRef::Selected` through `current_run`, so it follows the route from the first render. `direct_run` restarts with it, so it only ever describes `current_run`: the fetch below writes a record only for the run the route still shows.
+    if *state.current_run.peek() != scope_run {
+        let direct = if scope_run.is_some() {
+            DirectRunLoad::Loading
+        } else {
+            DirectRunLoad::Idle
+        };
+        state.current_run.set(scope_run);
+        state.direct_run.set(direct);
+    }
 
     // A run page's layout gates on its run's readability alone, so a GetRun refresh that leaves the run readable does not re-list its metrics.
-    let scope_readable = use_memo({
-        let project_id = project_id.clone();
-        move || {
-            let Some(run_id) = &*state.current_run.read() else {
-                return true;
-            };
-            match &*state.direct_run.read() {
-                DirectRunLoad::Loaded(view) if view.matches(&project_id, run_id) => matches!(
-                    crate::state::trash::effective_lifecycle(
-                        &view.record,
-                        view.authoritative_now_ms()
-                    ),
-                    RunLifecycleState::Active | RunLifecycleState::Trashed
-                ),
-                _ => false,
-            }
+    let scope_readable = use_memo(move || {
+        if state.current_run.read().is_none() {
+            return true;
+        }
+        match &*state.direct_run.read() {
+            DirectRunLoad::Loaded(view) => matches!(
+                crate::state::trash::effective_lifecycle(&view.record, view.authoritative_now_ms()),
+                RunLifecycleState::Active | RunLifecycleState::Trashed
+            ),
+            _ => false,
         }
     });
 
@@ -270,43 +272,39 @@ fn ProjectDashboard(project_id: String) -> Element {
             let resync_gen = *state.resync_gen.read();
             async move {
                 let Some(run_id) = run_id else {
-                    set_if_changed(state.direct_run, DirectRunLoad::Idle);
                     return;
                 };
 
                 let mut direct = state.direct_run;
-                let already_showing_this_run = matches!(&*direct.peek(),
-                    DirectRunLoad::Loaded(view) if view.matches(&project_id, &run_id)
-                );
-                if !already_showing_this_run {
-                    direct.set(DirectRunLoad::Loading);
+                // A refresh keeps the record shown; anything else waits on the lookup.
+                if !matches!(&*direct.peek(), DirectRunLoad::Loaded(_)) {
+                    set_if_changed(direct, DirectRunLoad::Loading);
                 }
                 if resync_gen == 0 {
                     return;
                 }
                 let grpc = state.grpc.read().clone();
-                match retry_visible_run("get_run", async || {
-                    grpc.get_run(&project_id, &run_id).await
-                })
-                .await
-                {
+                let result =
+                    retry_visible_run("get_run", async || grpc.get_run(&project_id, &run_id).await)
+                        .await;
+                // A route change cancels this task only when it next runs, so a reply for the previous run can land after `direct_run` restarted for the next.
+                if state.current_run.peek().as_deref() != Some(run_id.as_str()) {
+                    return;
+                }
+                match result {
                     Ok(response) => match response.run {
-                        Some(record)
-                            if record.run.as_ref().is_some_and(|run| {
-                                run.project_id == project_id && run.run_id == run_id
-                            }) =>
-                        {
-                            if let Some(run) = record.run.as_ref() {
+                        Some(record) => match record.run.as_ref() {
+                            Some(run) if run.project_id == project_id && run.run_id == run_id => {
                                 state.remember_display_runs(std::slice::from_ref(run));
+                                direct.set(DirectRunLoad::Loaded(DirectRunView::new(
+                                    record,
+                                    response.server_now_ms,
+                                )))
                             }
-                            direct.set(DirectRunLoad::Loaded(DirectRunView::new(
-                                record,
-                                response.server_now_ms,
-                            )))
-                        }
-                        Some(_) => direct.set(DirectRunLoad::Error(
-                            "The server returned a different run.".to_string(),
-                        )),
+                            _ => direct.set(DirectRunLoad::Error(
+                                "The server returned a different run.".to_string(),
+                            )),
+                        },
                         None => direct.set(DirectRunLoad::NotFound),
                     },
                     // A terminal run status: the only error retry_visible_run returns.
@@ -458,26 +456,23 @@ fn ProjectDashboard(project_id: String) -> Element {
     // this page's ListRuns. Key each lookup on that project's metadata version:
     // RenameRun then refreshes RunInfo labels without touching run_versions
     // (and therefore without refetching chart data).
-    let explicit_metadata = use_memo({
-        let project_id = project_id.clone();
-        move || {
-            let layout = state.layout_config.read();
-            let Some(layout) = layout.as_ref() else {
-                return Vec::new();
-            };
-            let active_keys = state
-                .runs
-                .read()
-                .iter()
-                .map(|run| (run.project_id.clone(), run.run_id.clone()))
-                .collect::<HashSet<_>>();
-            explicit_metadata_plan(
-                layout,
-                &project_id,
-                &active_keys,
-                &state.project_versions.read(),
-            )
-        }
+    let explicit_metadata = use_memo(move || {
+        let layout = state.layout_config.read();
+        let Some(layout) = layout.as_ref() else {
+            return Vec::new();
+        };
+        let active_keys = state
+            .runs
+            .read()
+            .iter()
+            .map(|run| (run.project_id.clone(), run.run_id.clone()))
+            .collect::<HashSet<_>>();
+        explicit_metadata_plan(
+            layout,
+            &project_id,
+            &active_keys,
+            &state.project_versions.read(),
+        )
     });
     // Lookups land independently under a bounded concurrency limit so a large
     // saved layout cannot flood the point RPC.
@@ -566,32 +561,7 @@ fn ProjectDashboard(project_id: String) -> Element {
         }
     });
 
-    // Deleted run metadata comes from the point lookup and is never inserted
-    // into the active list just to name its direct page.
-    let title = match &route {
-        Route::RunPage {
-            project_id, run_id, ..
-        } => state
-            .runs
-            .read()
-            .iter()
-            .find(|run| run.run_id == *run_id)
-            .map(|run| run.run_name.clone())
-            .or_else(|| match &*state.direct_run.read() {
-                DirectRunLoad::Loaded(view) => view
-                    .record
-                    .run
-                    .as_ref()
-                    .filter(|run| run.project_id == *project_id && run.run_id == *run_id)
-                    .map(|run| run.run_name.clone()),
-                _ => None,
-            })
-            .unwrap_or_else(|| run_id.clone()),
-        _ => project_id,
-    };
-
     rsx! {
-        document::Title { "{title}" }
         div {
             class: "app-shell",
             onmounted: move |_| {
