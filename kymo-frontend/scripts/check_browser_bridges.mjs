@@ -61,9 +61,9 @@ try {
   });
   await command("Runtime.enable");
   const deadline = Date.now() + 10_000;
-  while (!(await evaluate("window.__kymo_kbActivate === 1"))) {
+  while (!(await evaluate("typeof window.__kymo_bridges?.mount === 'function'"))) {
     if (Date.now() >= deadline) {
-      throw new Error("frontend did not install the keyboard activation bridge");
+      throw new Error("frontend did not install its bridges");
     }
     await new Promise((resolve) => setTimeout(resolve, 50));
   }

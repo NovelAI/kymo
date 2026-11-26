@@ -102,7 +102,7 @@ def clear_events(page: Page, *, intercept: bool = True) -> None:
 
 
 def events(page: Page) -> list[dict[str, Any]]:
-    return page.evaluate("window.__kymo_zoom_fence.events.map(event => ({...event}))")
+    return page.evaluate("window.__kymo_zoom_fence.events")
 
 
 def chart_snapshot(page: Page, identifier: str) -> dict[str, Any]:
@@ -165,6 +165,21 @@ def strip_y(chart: dict[str, Any]) -> float:
             float(chart["top"]) + float(chart["height"]) + 10,
         )
     )
+
+
+def assert_resets(page: Page, source_id: str, count: int = 1) -> None:
+    """Exactly `count` zoom resets from `source_id`, and no other zoom event."""
+    settle(page)
+    expected = [{"source": source_id, "xmin": None, "xmax": None}] * count
+    if (captured := events(page)) != expected:
+        raise AssertionError(f"expected {expected}, got {captured}")
+
+
+def assert_no_zoom(page: Page, failure: str) -> None:
+    """No zoom event at all; `failure` says what one would mean."""
+    settle(page)
+    if captured := events(page):
+        raise AssertionError(f"{failure}: {captured}")
 
 
 def assert_close(actual: float | None, expected: float, message: str) -> None:
@@ -285,7 +300,7 @@ def traverse_onto_peer(
 
 
 def true_edge(page: Page, source: dict[str, Any]) -> None:
-    """A drag released on the plot's true right edge reaches it: the unzoomed source follows its newest step, and showing a closed window it includes exactly the final bucket."""
+    """A drag released at the first whole pixel at or past the plot's right edge reaches it: the unzoomed source follows its newest step, and a closed window ends as far past its coverage as the release landed past the edge."""
     drag_to_true_edge(page, source)
     event = one_event(page, source["id"])
     if event["xmax"] is not None:
@@ -293,26 +308,21 @@ def true_edge(page: Page, source: dict[str, Any]) -> None:
             f"true-edge drag past the newest step did not follow it: {event}"
         )
     with showing_a_closed_window(page, source["id"]):
-        drag_to_true_edge(page, source)
+        past = drag_to_true_edge(page, source)
     event = one_event(page, source["id"])
+    # A release past the edge extrapolates at one coverage span per plot width.
     coverage_max = float(source["coverage_max"])
-    last_slot = source["slots"][-1]
-    bucket_span = max(1.0, float(last_slot["hi"]) - float(last_slot["lo"]))
-    if (
-        event["xmax"] is None
-        or event["xmax"] < coverage_max - 1e-6
-        or event["xmax"] >= coverage_max + bucket_span + 1e-6
-    ):
-        raise AssertionError(
-            "rounded edge drag did not include exactly the final bucket: "
-            f"coverage={coverage_max}, bucket_span={bucket_span}, event={event}"
-        )
+    coverage_span = coverage_max - float(source["coverage_min"])
+    reach = past * coverage_span / float(source["width"])
+    assert_close(event["xmax"], coverage_max + reach, "closed-window true-edge end")
 
 
-def drag_to_true_edge(page: Page, source: dict[str, Any]) -> None:
+def drag_to_true_edge(page: Page, source: dict[str, Any]) -> float:
+    """Drags from inside the plot to the first whole pixel at or past its right edge, since one short of it is inside the plot, where the pointer reads the x under it. Returns how far past the edge the release landed (0 at a whole edge)."""
     clear_events(page)
     start = (x_at_fraction(source, 0.4), y_mid(source))
-    end = (mouse_pixel(float(source["left"]) + float(source["width"])), start[1])
+    edge = float(source["left"]) + float(source["width"])
+    end = (math.ceil(edge), start[1])
     page.mouse.move(*start)
     page.mouse.down()
     try:
@@ -324,6 +334,7 @@ def drag_to_true_edge(page: Page, source: dict[str, Any]) -> None:
     finally:
         page.mouse.up()
     assert_no_selection(page)
+    return end[0] - edge
 
 
 def sparse_gap_noop(page: Page, sparse: dict[str, Any]) -> None:
@@ -364,9 +375,7 @@ def sparse_gap_noop(page: Page, sparse: dict[str, Any]) -> None:
             raise AssertionError("gap-only positive-control gesture never armed")
     finally:
         page.mouse.up()
-    settle(page)
-    if events(page):
-        raise AssertionError(f"gap-only drag emitted a zoom: {events(page)}")
+    assert_no_zoom(page, "gap-only drag emitted a zoom")
     assert_no_selection(page)
 
 
@@ -374,16 +383,12 @@ def click_and_doubleclick(page: Page, source: dict[str, Any]) -> None:
     point = (x_at_fraction(source, 0.5), y_mid(source))
     clear_events(page)
     page.mouse.click(*point)
-    settle(page)
-    if events(page):
-        raise AssertionError(f"plain click emitted a zoom: {events(page)}")
+    assert_no_zoom(page, "plain click emitted a zoom")
     assert_no_selection(page)
 
     clear_events(page)
     page.mouse.dblclick(*point, delay=50)
-    settle(page)
-    if events(page) != [{"source": source["id"], "xmin": None, "xmax": None}]:
-        raise AssertionError(f"double click reset was not singular: {events(page)}")
+    assert_resets(page, source["id"])
     assert_no_selection(page)
 
 
@@ -405,9 +410,7 @@ def assert_drag_noop(
             page.mouse.move(*start, steps=6)
     finally:
         page.mouse.up()
-    settle(page)
-    if events(page):
-        raise AssertionError(f"no-op drag emitted a zoom event: {events(page)}")
+    assert_no_zoom(page, "no-op drag emitted a zoom event")
     after = chart_snapshot(page, source["id"])
     assert_close(after["scale_min"], before["scale_min"], "no-op drag min")
     assert_close(after["scale_max"], before["scale_max"], "no-op drag max")
@@ -431,17 +434,12 @@ def single_click_unzoom(page: Page, source: dict[str, Any]) -> None:
     with single_click_enabled(page):
         clear_events(page)
         page.mouse.click(*point)
-        event = one_event(page, source["id"])
-        if event["xmin"] is not None or event["xmax"] is not None:
-            raise AssertionError(f"single click did not reset zoom: {event}")
+        assert_resets(page, source["id"])
 
-        # A browser double-click emits click(detail=1), click(detail=2), then
-        # dblclick. Enabled mode must reset exactly once through the first.
+        # Every click acts: each click of a double-click resets (the step store keeps the same window, so the second refetches nothing), and its dblclick resets nothing more.
         clear_events(page)
         page.mouse.dblclick(*point, delay=50)
-        event = one_event(page, source["id"])
-        if event["xmin"] is not None or event["xmax"] is not None:
-            raise AssertionError(f"enabled double click emitted a range: {event}")
+        assert_resets(page, source["id"], 2)
 
         vertical_drags_do_not_reset(page, source)
 
@@ -520,9 +518,7 @@ def cancellation(page: Page, source: dict[str, Any]) -> None:
     page.mouse.move(*end, steps=8)
     page.evaluate("window.dispatchEvent(new Event('blur'))")
     page.mouse.up()
-    settle(page)
-    if events(page):
-        raise AssertionError(f"blur cancellation committed: {events(page)}")
+    assert_no_zoom(page, "blur cancellation committed")
     assert_no_selection(page)
 
     clear_events(page)
@@ -531,9 +527,7 @@ def cancellation(page: Page, source: dict[str, Any]) -> None:
     page.mouse.move(*end, steps=8)
     page.keyboard.press("Escape")
     page.mouse.up()
-    settle(page)
-    if events(page):
-        raise AssertionError(f"Escape cancellation committed: {events(page)}")
+    assert_no_zoom(page, "Escape cancellation committed")
     assert_no_selection(page)
 
 
@@ -562,9 +556,7 @@ def real_resize_cancels(page: Page, source: dict[str, Any]) -> None:
         container.evaluate("(e, width) => { e.style.width = width; }", original_style)
         fitted_box(container)
 
-    settle(page)
-    if events(page):
-        raise AssertionError(f"real resize committed a zoom: {events(page)}")
+    assert_no_zoom(page, "real resize committed a zoom")
     assert_no_selection(page)
 
 
@@ -587,7 +579,7 @@ def fractional_width_edge_line(page: Page, source: dict[str, Any]) -> None:
         )
         chart = chart_snapshot(page, source["id"])
         page.mouse.move(x_at_fraction(chart, 0.5), y_mid(chart))
-        # Into the right padding, which plotPosition snaps to the plot's edge.
+        # Into the right padding, which plotPosition clamps to the plot's edge.
         page.mouse.move(mouse_pixel(chart["left"] + chart["width"] + 4), y_mid(chart))
         state = page.evaluate(
             """id => {
@@ -600,7 +592,7 @@ def fractional_width_edge_line(page: Page, source: dict[str, Any]) -> None:
             }""",
             source["id"],
         )
-        # The positive control: the hover reached the edge, where a fractional width loses the line.
+        # The positive control: the hover reached the plot's edge, where a fractional plot width would hide the line (this one is whole, so it shows).
         if abs(state["left"] - state["plot"]) > 0.01:
             raise AssertionError(f"right-edge hover missed the plot's edge: {state}")
         if not state["line"]:
@@ -658,9 +650,7 @@ def single_click_reset(
     with single_click_enabled(page):
         clear_events(page, intercept=False)
         page.mouse.click(x_at_fraction(chart, 0.5), y_mid(chart))
-        reset = one_event(page, chart["id"])
-        if reset["xmin"] is not None or reset["xmax"] is not None:
-            raise AssertionError(f"single click did not dispatch reset: {reset}")
+        assert_resets(page, chart["id"])
         wait_for_coverage(page, expected)
     assert_no_selection(page)
 
@@ -1014,8 +1004,7 @@ def axis_pull_holds_gutter(page: Page, chart: dict[str, Any]) -> None:
         assert_close(
             state["max"], chart["scale_max"], f"{end} restores the start window's max"
         )
-        if events(page):
-            raise AssertionError(f"a pull ended by {end} committed: {events(page)}")
+        assert_no_zoom(page, f"a pull ended by {end} committed")
     # Pull 3: a right-half pull, released: the pinned min at its coverage, the hand's max as shown.
     clear_events(page)
     pull_holding_gutter(page, chart, 0.55, right_end)
@@ -1055,8 +1044,7 @@ def axis_pull_holds_gutter(page: Page, chart: dict[str, Any]) -> None:
             page.keyboard.press("Escape")
         page.mouse.up()
         assert_gutter_fits(page, chart["id"], f"still hand, labels changed, then {end}")
-        if events(page):
-            raise AssertionError(f"a pull without travel committed: {events(page)}")
+        assert_no_zoom(page, "a pull without travel committed")
         restore_data(page, chart)
         assert_gutter_fits(page, chart["id"], "data restored")
     # A selection's owner holds nothing: the same reply mid-drag re-fits the gutter under it, an internal resize that leaves the selection live.
@@ -1083,8 +1071,7 @@ def axis_pull_holds_gutter(page: Page, chart: dict[str, Any]) -> None:
         page.mouse.up()
     restore_data(page, chart)
     assert_gutter_fits(page, chart["id"], "selection cancelled")
-    if events(page):
-        raise AssertionError(f"a cancelled selection committed: {events(page)}")
+    assert_no_zoom(page, "a cancelled selection committed")
 
 
 def client_zoom_fences(
@@ -1115,9 +1102,7 @@ def client_zoom_fences(
         (x_at_fraction(source, 0.25), y_mid(source)),
         (x_at_fraction(source, 0.75), y_mid(source)),
     )
-    settle(page)
-    if events(page):
-        raise AssertionError(f"client-only zoom emitted a server event: {events(page)}")
+    assert_no_zoom(page, "client-only zoom emitted a server event")
     zoomed = states()
     for state in zoomed:
         if not state["userzoom"] or not (
@@ -1189,8 +1174,7 @@ def client_zoom_fences(
         assert_close(
             state["min"], held["min"], "the pulled start on every client chart"
         )
-    if events(page):
-        raise AssertionError(f"a client pull emitted a server event: {events(page)}")
+    assert_no_zoom(page, "a client pull emitted a server event")
     restore_data(page, source)
     reset_window(page, peer)
 

@@ -101,6 +101,8 @@ function buildSourceMap({
     width,
     visualTLo,
     visualSpan: visualTHi - visualTLo,
+    coverageLo,
+    coverageHi,
     coverageTLo,
     coverageTHi,
     coverageSpan: coverageTHi - coverageTLo,
@@ -110,6 +112,9 @@ function buildSourceMap({
 /** Map a plot x through a source map. */
 function mapSourcePlotX(sourceMap, pixel) {
   if (!sourceMap || !finite(pixel)) return null;
+  // An edge reads its coverage bound itself: through log space and back, step 1000 reads 999.9999999999998.
+  if (pixel === 0) return sourceMap.coverageLo;
+  if (pixel === sourceMap.width) return sourceMap.coverageHi;
   const fraction = pixel / sourceMap.width;
   let transformed;
 

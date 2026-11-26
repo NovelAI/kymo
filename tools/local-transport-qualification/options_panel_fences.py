@@ -23,9 +23,7 @@ from fences_common import (
 
 from user_settings_fences import (
     VIEWPORT,
-    centre_shift,
     close_panel,
-    multi_click,
     open_editor,
     options_panel,
     panel_body,
@@ -550,7 +548,7 @@ def chart_option_override_chips(
             panel.get_by_role("spinbutton", name="Max runs", exact=True)
         ).to_have_value(inherited_max_runs)
         dismiss(page, panel, metric, "Close")
-    # With two pins on one field, a double-click on the first chip clears it alone: the second chip slides under the pointer, but as another element, so the second press goes nowhere.
+    # Every click acts, a later press on what moved under the pointer included: of two pinned chips, a double-click clears the first and then the second, another button that slid into its place.
     for trigger, name in ((metric, "Chart settings"), (section, "Configure section")):
         panel = open_editor(page, trigger, name)
         panel.get_by_role("spinbutton", name="Window", exact=True).fill("131")
@@ -558,12 +556,15 @@ def chart_option_override_chips(
     panel = open_editor(page, defaults, "Project settings")
     chips = panel.get_by_role("button").filter(has_text=re.compile(r" = 131\s*$"))
     expect(chips).to_have_count(2)
-    assert multi_click(page, chips.first) == 1, (
-        "the second press on a cleared chip reached the next"
-    )
+    first = chips.first.element_handle()
+    chips.first.click(position={"x": 4, "y": 4})
     expect(chips).to_have_count(1)
-    chips.click()
+    assert not first.evaluate("chip => chip.isConnected"), (
+        "the cleared chip's button was reused"
+    )
+    page.mouse.down(click_count=2)
     expect(chips).to_have_count(0)
+    page.mouse.up(click_count=2)
     dismiss(page, panel, defaults, "Close")
 
 
@@ -775,103 +776,6 @@ def settings_beside_the_panel(page: Page, section: Locator) -> None:
     )
     dismiss(page, panel, section, "Close")
     expect(container).to_have_attribute("data-options-target", "false")
-
-
-def double_presses(
-    page: Page, chart: Locator, defaults: Locator, metric: Locator, section: Locator
-) -> None:
-    """A later press of a double-click acts on the first press's control, even one that swaps its icon (the gears open and close their panel; Collapse sections collapses and expands), and goes nowhere else: not onto what moved under the pointer (the section header beside the panel's Close; the maximized chart over Configure) nor onto a neighbour."""
-    defaults.evaluate(
-        """gear => {
-            new MutationObserver(() => window.__kymo_expanded.push(gear.getAttribute('aria-expanded'))).observe(gear, {attributeFilter: ['aria-expanded']});
-        }"""
-    )
-    for start, flips in (("closed", ["true", "false"]), ("open", ["false", "true"])):
-        if start == "open":
-            open_editor(page, defaults, "Project settings")
-        page.evaluate("window.__kymo_expanded = []")
-        assert multi_click(page, defaults) == 2, "the gear's second press went nowhere"
-        shown = page.evaluate("window.__kymo_expanded")
-        assert shown == flips, f"from {start}, the gear's presses showed {shown}"
-    # Later presses are judged against the first: of a triple-click on the panel's Close, neither the second nor the third reaches the section header that moved in.
-    panel = options_panel(page, "Project settings")
-    close = panel.get_by_role("button", name="Close", exact=True)
-    assert multi_click(page, close, clicks=3) == 1, (
-        "a later press on the panel's Close reached the page"
-    )
-    expect(panel).to_have_count(0)
-    # A section's gear stays put, so a second press just off it lands on its header; and one on the header that slips onto the gear inside it doesn't open Configure section.
-    dx = section.evaluate("gear => gear.offsetWidth / 2 + 3")
-    assert multi_click(page, section, shift=(dx, 0)) == 1, (
-        "a second press off the section's gear reached its header"
-    )
-    dismiss(page, options_panel(page, "Configure section"), section, "Escape")
-    header = section.locator(SECTION_OF).locator(".section-header")
-    assert multi_click(page, header, shift=centre_shift(header, section)) == 1, (
-        "a second press off the section header reached its gear"
-    )
-    expect(options_panel(page, "Configure section")).to_have_count(0)
-    # The header's press collapsed the section; open it again.
-    header.click()
-
-    # Configure and Maximize put the chart over the grid; un-maximizing it by the chart's Close or a press on the overlay's backdrop brings the grid back, the section header under it, and closes its panel too. A swallowed press takes no focus from the panel.
-    assert multi_click(page, metric) == 1, "Configure's second press reached the page"
-    panel = options_panel(page, "Chart settings")
-    expect(panel_body(panel)).to_be_focused()
-    # A label is a control of its own (the browser presses its box), not part of the panel around it: a second press that slips from Log X's label onto Log Y's goes nowhere. Revert puts Log X back.
-    labels = [
-        panel.locator("label").filter(has_text=re.compile(rf"^{name}$"))
-        for name in ("Log X", "Log Y")
-    ]
-    log_y = log_y_control(panel).is_checked()
-    assert multi_click(page, labels[0], shift=centre_shift(*labels)) == 1, (
-        "a second press that slipped onto Log Y's label reached it"
-    )
-    expect(log_y_control(panel)).to_be_checked(checked=log_y)
-    panel.get_by_role("button", name="Revert", exact=True).click()
-    expect(panel_body(panel)).to_be_focused()
-    dismiss(page, panel, metric, "Escape")
-    overlay = page.locator(".maximize-overlay")
-    maximize = chart.locator('button[title="Maximize"]')
-    assert multi_click(page, maximize) == 1, "Maximize's second press reached the page"
-    expect(overlay).to_have_count(1)
-    page.keyboard.press("Escape")
-    expect(overlay).to_have_count(0)
-    for target, top, name in (
-        (overlay.locator('button[title="Close"]'), None, "the chart's Close"),
-        (overlay, 6, "the overlay's backdrop"),
-    ):
-        open_editor(page, metric, "Chart settings")
-        assert multi_click(page, target, top=top) == 1, (
-            f"the second press on {name} reached the page"
-        )
-        expect(overlay).to_have_count(0)
-    collapse = page.locator(
-        'nav button[title^="Collapse"], nav button[title^="Expand"]'
-    )
-    title = collapse.get_attribute("title")
-    assert multi_click(page, collapse) == 2, (
-        "Collapse sections' second press went nowhere"
-    )
-    expect(collapse).to_have_attribute("title", title)
-    # A chart's title renames on a double-click anywhere on it, so a second press may land beside the name.
-    pop = chart.locator(".rect-title-pop")
-    dx = pop.evaluate("pop => pop.offsetWidth / 2 + 3")
-    assert multi_click(page, pop, shift=(dx, 0)) == 2, (
-        "a second press beside the chart title's name went nowhere"
-    )
-    rename = chart.locator(".rect-title-input")
-    expect(rename).to_be_focused()
-    rename.press("Escape")
-    expect(rename).to_have_count(0)
-    # A chart is its own control, though uPlot, not the app, listens on its plot: a second press off it, in the gap beside it, goes nowhere.
-    plot = chart.locator(".u-over")
-    box, card = plot.bounding_box(), chart.bounding_box()
-    assert box is not None and card is not None
-    dx = card["x"] + card["width"] + 2 - box["x"] - box["width"] / 2
-    assert multi_click(page, plot, shift=(dx, 0)) == 1, (
-        "a second press beside the chart reached the page"
-    )
 
 
 def docking(page: Page, defaults: Locator, section: Locator) -> None:
@@ -1118,6 +1022,11 @@ def panels_beside_maximize(
     expect(overlay).to_have_count(0)
     expect(chart_panel).to_have_count(0)
     expect(metric).to_be_focused()
+    # A press on the overlay's backdrop un-maximizes the chart and closes its panel too.
+    chart_panel = open_editor(page, metric, "Chart settings")
+    overlay.click(position={"x": 8, "y": 6})
+    expect(overlay).to_have_count(0)
+    expect(chart_panel).to_have_count(0)
 
     # However narrow the window, the panel docks beside the maximized chart, never over it: the chart's own Close stays in reach.
     try:
@@ -1633,18 +1542,6 @@ def other_tab_edit_survives(
         saving(page, storage_key, lambda: rename.press("Enter"))
         expect(chart.locator(".rect-title")).to_have_text("Renamed beside another tab")
         expect_elsewhere(metric, "Chart settings", edits)
-        # A triple-click's third press lands in the field its double-click opened in the title's place, and selects the name there.
-        assert multi_click(page, chart.locator(".rect-title"), clicks=3) == 3, (
-            "the third press on the title went nowhere"
-        )
-        selected = rename.evaluate(
-            "field => field.value.slice(field.selectionStart, field.selectionEnd)"
-        )
-        assert selected == "Renamed beside another tab", (
-            f"the triple-click selected {selected!r}"
-        )
-        rename.press("Escape")
-        expect(rename).to_have_count(0)
 
         print("Chart settings: another tab's delete wins", flush=True)
         kept = page.evaluate("key => localStorage.getItem(key)", storage_key)
@@ -1814,7 +1711,6 @@ def run_fences(page: Page) -> None:
         (metric, "Chart settings"),
     )
     docking(page, defaults, section)
-    double_presses(page, chart, defaults, metric, section)
     panel_resize(page, defaults)
     for trigger, name in editors:
         open_and_escape(page, trigger, name)

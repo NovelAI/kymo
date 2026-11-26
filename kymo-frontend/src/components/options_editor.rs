@@ -238,7 +238,6 @@ fn override_chips(
                     let name = format!("{kind} \"{}\" overrides this field — click to clear so it re-inherits", o.label);
                     rsx! {
                         button {
-                            // Keyed by target, so Dioxus can't reuse a cleared chip's button for its neighbour: a double-click's second press then reaches another element and goes nowhere (util/multi_click_guard.js).
                             key: "{o.target:?}",
                             class: "override-chip",
                             title: crate::help::CLEAR_OVERRIDE,

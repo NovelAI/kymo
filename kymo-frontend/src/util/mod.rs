@@ -222,6 +222,7 @@ pub fn set_if_changed<T: PartialEq + 'static>(mut signal: dioxus::prelude::Signa
 }
 
 /// Instant actions run on primary press (AI-1418), excluding right/middle buttons and macOS Control-click context menus.
+/// Every press acts on whatever is under the pointer, a multi-click's later presses included, and its release must not act again. The release's click goes to the pressed element unless the press removed or disabled it (no click) or put something else under the pointer (the click goes to an ancestor the two share). So a press-acting element whose click something else acts on must cancel that click, as the run marker's label does (the browser passes a label's click to its box).
 pub fn primary<F>(mut f: F) -> impl FnMut(Event<MouseData>) + Clone + 'static
 where
     F: FnMut(Event<MouseData>) + Clone + 'static,

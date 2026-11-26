@@ -226,25 +226,13 @@ assert.equal(copiedText, expected);
 assert.equal(event.defaultPrevented, true);
 assert.equal(lastPos, 10);
 
+// Copy reads the pointer as the hover cursor does: through the live plot rect, its edge pixels as they are, a side gutter as that edge.
 plotRect = { left: 120, top: 60, width: 100, height: 50 };
-mousemoveListener({ clientX: 150, clientY: 80 });
-lastPos = null;
-event = copyEvent();
-copyListener(event);
-assert.equal(lastPos, 30, "copy converts viewport coordinates through the live plot rectangle");
-
-mousemoveListener({ clientX: 90, clientY: 80 });
-lastPos = null;
-event = copyEvent();
-copyListener(event);
-assert.equal(lastPos, 0, "copy clamps a side-gutter hover to the first point");
-
-for (const [clientX, pos] of [[120.6, 0], [219.5, 100]]) {
+for (const [clientX, pos] of [[150, 30], [121, 1], [219, 99], [90, 0], [230, 100]]) {
   mousemoveListener({ clientX, clientY: 80 });
   lastPos = null;
-  event = copyEvent();
-  copyListener(event);
-  assert.equal(lastPos, pos, "copy snaps the outer pixel of the plot to its bound, like the hover cursor");
+  copyListener(copyEvent());
+  assert.equal(lastPos, pos, `copy at clientX ${clientX}`);
 }
 
 mousemoveListener({ clientX: 150, clientY: 111 });

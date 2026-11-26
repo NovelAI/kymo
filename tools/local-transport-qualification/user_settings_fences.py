@@ -55,53 +55,6 @@ def close_panel(page: Page, panel: Locator, trigger: Locator, how: str) -> None:
     expect(trigger).to_be_focused()
 
 
-def multi_click(
-    page: Page,
-    target: Locator,
-    *,
-    shift: tuple[float, float] = (0, 0),
-    top: float | None = None,
-    clicks: int = 2,
-) -> int:
-    """Send `clicks` primary presses 150 ms apart as a person would: the first at `target`'s middle (or `top` px below its top), each later one `shift` px right and down of that. Return how many mousedowns reach the document, and assert that a press whose mousedown is swallowed (util/multi_click_guard.js) sends no other event there either."""
-    box = target.bounding_box()
-    assert box is not None
-    # Each press's events that reach the document, wherever they land.
-    page.evaluate(
-        """() => {
-            if (window.__kymo_press_events === undefined)
-                for (const type of ['mousedown', 'mouseup', 'click', 'dblclick'])
-                    document.addEventListener(type, () => window.__kymo_press_events.push(type));
-        }"""
-    )
-    x = box["x"] + box["width"] / 2
-    y = box["y"] + (box["height"] / 2 if top is None else top)
-    presses = 0
-    for count in range(1, clicks + 1):
-        page.evaluate("window.__kymo_press_events = []")
-        dx, dy = shift if count > 1 else (0, 0)
-        page.mouse.move(x + dx, y + dy)
-        page.mouse.down(click_count=count)
-        page.mouse.up(click_count=count)
-        page.wait_for_timeout(150)
-        events = page.evaluate("window.__kymo_press_events")
-        if "mousedown" in events:
-            presses += 1
-        else:
-            assert not events, f"a swallowed press's {events} reached the page"
-    return presses
-
-
-def centre_shift(source: Locator, target: Locator) -> tuple[float, float]:
-    """`multi_click`'s `shift` from `source`'s middle to `target`'s, so a later press slips onto `target`."""
-    a, b = source.bounding_box(), target.bounding_box()
-    assert a is not None and b is not None
-    return (
-        b["x"] + b["width"] / 2 - a["x"] - a["width"] / 2,
-        b["y"] + b["height"] / 2 - a["y"] - a["height"] / 2,
-    )
-
-
 def expect_stored(page: Page, expected: dict | None) -> None:
     """Wait for the stored settings to equal `expected`: each change commits from its event handler, after the input event Playwright waits for."""
     try:
@@ -384,44 +337,10 @@ def run_fences(page: Page, *, dashboard_path: str | None = None) -> None:
     expect(panel).to_have_count(0)
     expect(trigger).to_be_focused()
     expect(trigger).to_have_attribute("aria-expanded", "false")
-    # The docking panel narrows the page, moving Settings out from under the pointer, and the panel's Close goes with the panel, so the second press of a double-click on either goes nowhere, taking no focus from the panel.
-    assert multi_click(page, trigger) == 1, "Settings' second press reached the page"
-    panel = options_panel(page, "Settings")
-    expect(panel_body(panel)).to_be_focused()
-    assert (
-        multi_click(page, panel.get_by_role("button", name="Close", exact=True)) == 1
-    ), "the second press on the panel's Close reached the page"
-    expect(panel).to_have_count(0)
-    # The theme button stays under the pointer, so it takes both presses: the theme flips and flips back.
-    theme = page.locator('.page-action[title^="Switch to"]')
-    title = theme.get_attribute("title")
-    assert multi_click(page, theme) == 2, "the theme button's second press went nowhere"
-    expect(theme).to_have_attribute("title", title)
-    # A second press that lands on Settings beside it goes nowhere, release and all, though a keyboard press comes between: its click and the mousedown KB_ACTIVATE_JS (main.rs) replays for it both reach the guard with detail 0, and neither may be swallowed or end the swallow.
-    multi_click(page, theme, clicks=1)
-    trigger.hover()
-    page.mouse.down(click_count=2)
-    expect(options_panel(page, "Settings")).to_have_count(0)
-    theme.press("Enter")
-    expect(theme).to_have_attribute("title", title)
-    page.evaluate("window.__kymo_press_events = []")
-    page.mouse.up(click_count=2)
-    page.wait_for_timeout(150)
-    released = page.evaluate("window.__kymo_press_events")
-    assert not released, f"the swallowed press's {released} reached the page"
     panel = open_settings(page, key="Enter")
     expect(
         page.get_by_role("checkbox", name="Single-click to exit chart zoom")
     ).to_be_checked()
-    # A label is one control with the box it labels: a double-click that strays from the box onto its label toggles it twice, as one on the box does.
-    box = page.get_by_role(
-        "checkbox", name="Highlight all runs with the same name", exact=True
-    )
-    width = box.evaluate("box => box.offsetWidth")
-    assert multi_click(page, box, shift=(width / 2 + 3, 0)) == 2, (
-        "a second press on the box's own label went nowhere"
-    )
-    expect(box).not_to_be_checked()
 
     # Each change applies and saves as it is made.
     for name in (
@@ -659,6 +578,11 @@ def run_fences(page: Page, *, dashboard_path: str | None = None) -> None:
         ):
             raise AssertionError(f"narrow options panel is misplaced: {laid}")
         close_panel(page, panel, defaults, "Escape")
+        # Every click acts. The gear stays under the pointer as its panel docks, so it takes both presses of a double-click: the first opens the panel and the second closes it, on the press.
+        panel = open_editor(page, defaults, "Project settings")
+        page.mouse.down(click_count=2)
+        expect(page.locator("#kymo-panel")).to_have_count(0)
+        page.mouse.up(click_count=2)
 
         # A maximize right after a window resize builds its chart at the new height (a stale one would jump and draw twice), and the chart then follows the window by resizing in place. Each chart records the height uPlot was built at.
         page.evaluate(

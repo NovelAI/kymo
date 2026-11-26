@@ -4,13 +4,13 @@
 
 The chart where a gesture (a selection or an axis pull) begins owns it, through one page-level slot, until commit or cancellation. Pointer movement may cross gutters or other charts, but every horizontal coordinate is interpreted through the source chart. Synced peers only mirror the source range; they never become gesture owners or contribute coordinates.
 
-A selection reads the source's plot as it is now, so it can take in points a live reply adds mid-drag. It reads the pointer as hover does, so within 1 px of an edge is that edge. The press keeps the x it had or, made at or past an edge, its distance past that edge; the moving end is the x under the pointer. Past an edge, a step-axis chart extrapolates from its current bucket coverage at one coverage span per plot width, and a client-only time or custom-x chart takes that edge's current x bound.
+A selection reads the source's plot as it is now, so it can take in points a live reply adds mid-drag. The press keeps the x it had or, made at or past an edge, its pixel distance past that edge; the moving end is the x under the pointer. Past an edge, a step-axis chart extrapolates from its current bucket coverage at one coverage span per plot width, and a client-only time or custom-x chart takes that edge's current x bound.
 
 Step-axis selections resolve against the complete x extents of the buckets rendered when they resolve. Every bucket intersecting the selected interval is included once, a selection wholly inside a data gap is a no-op, and extrapolated space outside the coverage is retained.
 
 Live replies only add data; one that removed some mid-drag could leave the window outside what remains, and the commit would keep it.
 
-A selection whose end reaches the right edge of a chart that showed its newest data makes a following zoom: the window keeps its start, and its end stays on the newest data as replies arrive. A selection that ends inside the plot, or at the edge of a window short of the newest data, makes a fixed zoom. A rebuild carries a following zoom onto the data it brings, and a reset clears it.
+A selection follows when the source shows its newest data at commit and either the press or the release is at or past its right plot edge: the window keeps its start, and its end stays on the newest data as replies arrive. Other selections make a fixed zoom. A rebuild carries a following zoom onto the data it brings, and a reset clears it.
 
 A client-only chart shows its newest data when its window ends at or past its newest x, and each synced chart follows its own newest x (one whose data ends before the start, or has none, keeps the window it was given).
 

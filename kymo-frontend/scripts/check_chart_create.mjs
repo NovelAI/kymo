@@ -953,17 +953,17 @@ test("a selection on a time chart takes in points a live reply adds mid-drag", (
   assert.deepEqual([c.scales.x.min, c.scales.x.max], [200, 800]);
 });
 
-test("a selection pressed past a time chart's right edge, or in its last pixel column, keeps that edge as a reply moves it", () => {
-  for (const press of [405, 399.5]) {
+test("a selection pressed past a time chart's right edge keeps that edge as a reply moves it; one pressed in its last pixel keeps its x", () => {
+  for (const [press, expected] of [[405, [600, 800]], [399.5, [399.5, 600]]]) {
     const p = page();
     const c = p.create("g", [0, 100, 200, 300, 400]);
     const at = selectAt(p, "g");
     at("mousedown", press);
     at("mousemove", 300);
     c.setData(chartData([0, 200, 400, 600, 800]));
-    assert.deepEqual([c.box.left, c.box.left + c.box.width], [600, 800], `pressed at ${press}`);
+    assert.deepEqual([c.box.left, c.box.left + c.box.width], expected, `pressed at ${press}`);
     at("mouseup", 300);
-    assert.deepEqual([c.scales.x.min, c.scales.x.max], [600, 800]);
+    assert.deepEqual([c.scales.x.min, c.scales.x.max], expected, `pressed at ${press}`);
   }
 });
 
@@ -980,20 +980,22 @@ test("a peer's own reply mid-drag repaints its box from its new scale", () => {
   at("mouseup", 390);
 });
 
-test("a selection within 1 px of a log chart's edge, as the hover reads it, ends exactly on that edge", () => {
+test("a selection released on a log chart's edge ends exactly on that edge, and one released just inside on the x under the pointer", () => {
   // Through log space those edges read 3600.0009999999957 and 5.000000000000001, just inside the points they are on. The right one is zoomed short of its newest point so its window is fixed, ending on the edge; a following one would end on the newest x whatever the edge read.
   const p = page();
   const right = p.create("g", [0.001, 1, 10, 100, 3600.001, 7200.001], { logX: true });
   zoomTo(right, 0.001, 3600.001);
-  let at = selectAt(p, "g");
-  at("mousedown", 200);
-  at("mousemove", 399.5);
-  at("mouseup", 399.5);
+  dragSelect(p, "g", 200, 400);
   assert.equal(right.scales.x.max, 3600.001);
   const q = page();
   const left = q.create("g", [5, 50, 500, 5000], { logX: true });
-  dragSelect(q, "g", 200, 0.5);
+  dragSelect(q, "g", 200, 0);
   assert.equal(left.scales.x.min, 5);
+  const r = page();
+  const inside = r.create("g", [5, 50, 500, 5000], { logX: true });
+  const under = inside.posToVal(0.5);
+  dragSelect(r, "g", 200, 0.5);
+  assert.equal(inside.scales.x.min, under, "the x under the pointer, not the scale's bound");
 });
 
 test("a step chart's selection extrapolates past the plot at both ends", () => {
@@ -1053,6 +1055,18 @@ test("a step chart's selection takes in whole buckets as a reply re-buckets them
   assert.deepEqual(p.zooms("st"), [[0, 149]]);
 });
 
+test("a selection released exactly on a log step chart's right edge reads that step itself, not its round trip through log space", () => {
+  // Through log10 and back, step 1000 reads 999.9999999999998 and step 100 reads 100.00000000000004: the first missed both samples and made no selection, the second asked the store for step 101.
+  const p = page();
+  p.create("open", [1, 1000], { axis: "step", logX: true, stepOpen: true });
+  dragSelect(p, "open", 200, 400);
+  assert.deepEqual(p.zooms("open").map(([, hi]) => hi), [null]);
+  const q = page();
+  q.create("closed", [1, 100], { axis: "step", logX: true, stepOpen: false });
+  dragSelect(q, "closed", 200, 400);
+  assert.deepEqual(q.zooms("closed").map(([, hi]) => hi), [100]);
+});
+
 test("a log step chart's selection reads real steps through its 1 step shift, and takes in steps a reply adds", () => {
   const p = page();
   // Steps 0, 1, 10 and 100, plotted 1 step late; the selection maps the real steps in log(1 + step).
@@ -1071,14 +1085,19 @@ test("a log step chart's selection reads real steps through its 1 step shift, an
 });
 
 test("a selection whose end reaches a time chart's right edge follows new points; one inside the plot, or on a chart zoomed short of its newest point, stays put", () => {
-  // Released past the right edge, in its last pixel column, or pressed in the right gutter and dragged left: the window keeps its start, and each reply moves its end to the newest point.
-  for (const [press, release] of [[200, 405], [200, 399.5], [405, 200]]) {
+  // Released past the right edge, or pressed in the right gutter and dragged left: the window keeps its start, and each reply moves its end to the newest point.
+  for (const [press, release] of [[200, 405], [405, 200]]) {
     const p = page(), c = p.create("g", [0, 100, 200, 300, 400]);
     dragSelect(p, "g", press, release);
     assert.deepEqual(xWindow(c), [200, 400]);
     c.setData(chartData([0, 200, 400, 600, 800]));
     assert.deepEqual(xWindow(c), [200, 800], `${press} to ${release}`);
   }
+  // Released in the plot's last pixel, or anywhere else inside it: the window stays put.
+  const q = page(), d = q.create("g", [0, 100, 200, 300, 400]);
+  dragSelect(q, "g", 200, 399.5);
+  d.setData(chartData([0, 200, 400, 600, 800]));
+  assert.deepEqual(xWindow(d), [200, 399.5]);
   const p = page(), c = p.create("g", [0, 100, 200, 300, 400]);
   dragSelect(p, "g", 100, 300);
   c.setData(chartData([0, 200, 400, 600, 800]));
@@ -1414,7 +1433,7 @@ test("an axis pull holds the y gutter at its pressed width, and every exit re-fi
 });
 
 test("a step chart showing its newest step zooms to its right edge with no end, for the store to leave open; one showing a closed window keeps its end", () => {
-  const selections = [[100, 300], [100, 399.5], [405, 100], [-5, 300]];
+  const selections = [[100, 300], [100, 400], [405, 100], [-5, 300]];
   const zooms = stepOpen => {
     const p = page();
     p.create("st", [0, 25, 50, 75, 100], { axis: "step", stepOpen });
@@ -1499,6 +1518,14 @@ test("an axis pull reads the hand against the plot's page x at its press, as a s
   assert.deepEqual(xWindow(c), held);
   p.fireWindow("mouseup", ev(60));
   assert.deepEqual([...xWindow(c), c.__kymo_userzoom, p.window.__kymo_zg], [...held, "follow", null]);
+});
+
+test("with single-click unzoom on, every click resets, a double-click's second included", () => {
+  // Every click acts: a double-click whose first press acted elsewhere sends the plot only its second click.
+  const p = page({ singleClick: true }), c = p.create("g", [0, 100, 200, 300, 400]);
+  zoomTo(c, 100, 300);
+  p.el("g").fire("click", { detail: 2 });
+  assert.deepEqual([...xWindow(c), c.__kymo_userzoom], [0, 400, false]);
 });
 
 test("with single-click unzoom on, the click a cancelled drag's release makes resets nothing", () => {

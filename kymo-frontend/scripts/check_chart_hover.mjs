@@ -38,12 +38,14 @@ test("nullGaps copies every column but x with its NaN gaps nulled and every othe
   assert.deepEqual(Array.from(data.slice(1), c => Array.from(c)), [[null, 1.5, Infinity], [-Infinity, -0, null]]);
 });
 
-test("the shared pointer mapping reads the live overlay rect, snaps the outer pixel to exact bounds, and rejects moves outside the plot band", () => {
+test("the shared pointer mapping reads the live overlay rect, clamps x past a side to its exact bound, and rejects moves outside the plot band", () => {
   const chart = { over: { getBoundingClientRect: () => ({ left: 100.25, top: 50, width: 235.390625, height: 200 }) } };
   const inside = plotPosition(chart, 150.25, 60);
   assert.deepEqual([inside.left, inside.top], [50, 10]);
-  for (const x of [80, 100.25, 101.25]) assert.equal(plotPosition(chart, x, 60).left, 0, `x ${x} maps to the first column`);
-  for (const x of [334.640625, 335.640625, 400]) assert.equal(plotPosition(chart, x, 60).left, 235.390625, `x ${x} maps to the last column`);
+  const w = 235.390625;
+  for (const x of [0, 0.5, 1, w - 1, w - 0.5, w]) assert.equal(plotPosition(chart, 100.25 + x, 60).left, x, `plot x ${x}`);
+  assert.equal(plotPosition(chart, 80, 60).left, 0, "the left gutter reads the left edge");
+  assert.equal(plotPosition(chart, 400, 60).left, w, "the right gutter reads the right edge");
   assert.equal(plotPosition(chart, 150, 49.9), null, "above the plot band");
   assert.equal(plotPosition(chart, 150, 250.1), null, "below the plot band");
   assert.equal(plotPosition({ over: { getBoundingClientRect: () => ({ left: 0, top: 0, width: 0, height: 200 }) } }, 0, 10), null, "an unsized plot");

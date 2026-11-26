@@ -27,7 +27,7 @@ if(prev&&prev.root&&prev.root.isConnected&&prev.__kymo_cfghash==='__KYMO_CFG_HAS
 }
 // The chart takes its container's box, as the ResizeObserver below does, so height is not structural config and a height change resizes in place. A hidden container has no box: it falls back to 600 wide at its CSS height.
 // This and the ResizeObserver floor the width, because uPlot mishandles a fractional one; a whole width gives a whole plot, since uPlot rounds the y axis's size up and the padding below is whole.
-// uPlot draws the cursor line at a rounded x but hides it once that x passes the plot's unrounded width (elTrans in uPlot's dom.js), so from a fraction of .5 the line vanishes on right-edge hovers, which hover_points.js snaps to the plot's edge.
+// uPlot draws the cursor line at a rounded x but hides it once that x passes the plot's unrounded width (elTrans in uPlot's dom.js), so from a fraction of .5 the line vanishes on right-edge hovers, which hover_points.js clamps to the plot's edge.
 // Its canvas bitmap is round(w * dpr) pixels stretched over w * dpr device pixels, which smears 1px lines when that isn't whole.
 // Rounding the container in CSS fails at browser zoom, where layout measures a whole CSS width a hair short (596.989 for 597).
 let box=el.getBoundingClientRect(),w=Math.floor(box.width)||600,h=box.height||parseFloat(getComputedStyle(el).height);
@@ -570,8 +570,8 @@ let resetZoom=function(){
 };
 if(!el.__kymo_unzoomclick){
   el.__kymo_unzoomclick=true;
-  el.addEventListener('click',function(ev){
-    if(!singleClickUnzoom()||ev.detail!==1)return;
+  el.addEventListener('click',function(){
+    if(!singleClickUnzoom())return;
     if(el.__kymo_skipUnzoomClick){el.__kymo_skipUnzoomClick=false;return;}
     resetZoom();
   });
@@ -646,11 +646,11 @@ if(!el.__kymo_zoomselect){
     if(!c.data[0].length)return;
     // The plot as it is now: uPlot writes the overlay's inline width and its left within uPlot's wrap, so these read no layout. The wrap's page x (wrapLeft) is the press's; a container resize cancels the gesture.
     let wrapLeft=c.over.getBoundingClientRect().left+window.scrollX-parseFloat(c.over.style.left),width=function(){return parseFloat(c.over.style.width);};
-    // The plot x of a page x, snapped as the hover snaps it (plotPosition): within 1 px of a side is that side, where the readout shows the first or the newest point.
-    let plotX=function(x){let px=x-wrapLeft-parseFloat(c.over.style.left),w=width();return px>0&&px<=1?0:px<w&&px>=w-1?w:px;};
+    // The plot x of a page x, unclamped: past a side, endpoint decides what it reads.
+    let plotX=function(x){return x-wrapLeft-parseFloat(c.over.style.left);};
     // The real x of a selection end at plot x px, read from the plot as it is now: the x under the pointer, or past an edge, a step chart's extrapolation from its bucket coverage, and a client chart's own bound for that edge, less its plotted shift. A step chart maps through its plot, visual range and bucket evidence (`supports`, which resolved expands the window to, rebuilt only when a reply replaces the data).
     let endpoint=function(px){
-      // The bound is exact where posToVal, through log10 and back, is not: at the right edge of a log chart from 0.001 to 3600.001 it returns 3600.0009999999957, which would end the window just short of its last point.
+      // At either edge, the scale's own bound: on a log axis posToVal can round an edge just inside the last point.
       if(!m.zr)return (px<=0?c.scales.x.min:px>=width()?c.scales.x.max:c.posToVal(px,'x'))-m.readoutXShift;
       if(supportsData!==c.data){supportsData=c.data;supports=stepSupports(c,m);}
       return mapSourcePlotX(supports&&buildSourceMap({axis:m.axis,width:width(),visualLo:c.scales.x.min-m.readoutXShift,visualHi:c.scales.x.max-m.readoutXShift,coverageLo:supports.coverage.lo,coverageHi:supports.coverage.hi}),px);
@@ -663,11 +663,11 @@ if(!el.__kymo_zoomselect){
     // The real-x window the selection makes, or null when it makes none; the moving end is read anew from the pointer. `reachesRightEdge`: an end is at or past the right edge, so the window may follow the newest data there.
     let resolved=function(){
       if(Math.abs(lastX-ev.pageX)<3)return null;
-      let w=width(),px=plotX(lastX),a=typeof down==='number'?down:endpoint(down.edge*w+down.past),b=endpoint(px);
+      let w=width(),movePx=plotX(lastX),a=typeof down==='number'?down:endpoint(down.edge*w+down.past),b=endpoint(movePx);
       if(!(Number.isFinite(a)&&Number.isFinite(b)))return null;
       let r=m.zr?expandWholeBuckets(supports,a,b):{lo:Math.min(a,b),hi:Math.max(a,b)};
       if(!r||!(r.hi>r.lo))return null;
-      r.reachesRightEdge=px>=w||down.edge===1;
+      r.reachesRightEdge=movePx>=w||down.edge===1;
       return r;
     };
     let s={srcId:'__KYMO_ID__',cursor:'crosshair',paint:function(){
